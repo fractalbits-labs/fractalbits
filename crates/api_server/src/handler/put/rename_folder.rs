@@ -34,7 +34,7 @@ pub async fn rename_folder_handler(ctx: ObjectRequestContext) -> Result<HttpResp
             &bucket.root_blob_name,
             &src_path,
             &dst_path,
-            Some(ctx.app.config.rpc_timeout()),
+            Some(ctx.app.config.rpc_request_timeout()),
             &ctx.trace_id
         )
     )

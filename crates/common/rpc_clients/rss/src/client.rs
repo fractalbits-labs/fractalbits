@@ -1,12 +1,13 @@
 use rpc_client_common::AutoReconnectRpcClient;
+use std::time::Duration;
 
 pub struct RpcClient {
     inner: AutoReconnectRpcClient<rss_codec::MessageCodec, rss_codec::MessageHeader>,
 }
 
 impl RpcClient {
-    pub fn new_from_addresses(addresses: Vec<String>) -> Self {
-        let inner = AutoReconnectRpcClient::new_from_addresses(addresses);
+    pub fn new_from_addresses(addresses: Vec<String>, connection_timeout: Duration) -> Self {
+        let inner = AutoReconnectRpcClient::new_from_addresses(addresses, connection_timeout);
         Self { inner }
     }
 

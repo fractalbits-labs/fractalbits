@@ -360,6 +360,7 @@ pub enum TestType {
         subcommand: MultiAzTestType,
     },
     LeaderElection,
+    BssNodeFailure,
 }
 
 #[derive(Parser, Clone, EnumString)]

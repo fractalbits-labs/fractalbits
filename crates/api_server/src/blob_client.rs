@@ -30,13 +30,15 @@ impl BlobClient {
     pub async fn new_with_data_vg_info(
         blob_storage_config: &BlobStorageConfig,
         rx: Receiver<BlobDeletionRequest>,
-        rpc_timeout: Duration,
+        rpc_request_timeout: Duration,
+        rpc_connection_timeout: Duration,
         data_blob_tracker: Option<Arc<DataBlobTracker>>,
         data_vg_info: data_types::DataVgInfo,
     ) -> Result<(Self, Option<Arc<Cache<String, String>>>), BlobStorageError> {
         let (storage, az_status_cache) = Self::create_storage_impl(
             blob_storage_config,
-            rpc_timeout,
+            rpc_request_timeout,
+            rpc_connection_timeout,
             data_blob_tracker,
             data_vg_info,
         )
@@ -48,7 +50,8 @@ impl BlobClient {
 
     async fn create_storage_impl(
         blob_storage_config: &BlobStorageConfig,
-        rpc_timeout: Duration,
+        rpc_request_timeout: Duration,
+        rpc_connection_timeout: Duration,
         data_blob_tracker: Option<Arc<DataBlobTracker>>,
         data_vg_info: data_types::DataVgInfo,
     ) -> Result<(Arc<BlobStorageImpl>, Option<Arc<Cache<String, String>>>), BlobStorageError> {
@@ -67,7 +70,8 @@ impl BlobClient {
                     S3HybridSingleAzStorage::new_with_data_vg_info(
                         data_vg_info.clone(),
                         s3_hybrid_config,
-                        rpc_timeout,
+                        rpc_request_timeout,
+                        rpc_connection_timeout,
                     )
                     .await?,
                 )

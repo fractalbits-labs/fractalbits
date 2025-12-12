@@ -30,10 +30,18 @@ impl Default for DataBlobTracker {
     }
 }
 
+const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl DataBlobTracker {
     pub fn new() -> Self {
-        let rss_client = RpcClientRss::new_from_addresses(vec!["localhost:9000".to_string()]);
-        let nss_client = RpcClientNss::new_from_address("localhost:8000".to_string());
+        let rss_client = RpcClientRss::new_from_addresses(
+            vec!["localhost:9000".to_string()],
+            DEFAULT_CONNECTION_TIMEOUT,
+        );
+        let nss_client = RpcClientNss::new_from_address(
+            "localhost:8000".to_string(),
+            DEFAULT_CONNECTION_TIMEOUT,
+        );
         Self {
             rss_client,
             nss_client,
@@ -41,8 +49,16 @@ impl DataBlobTracker {
     }
 
     pub fn with_endpoints(rss_endpoint: String, nss_endpoint: String) -> Self {
-        let rss_client = RpcClientRss::new_from_addresses(vec![rss_endpoint]);
-        let nss_client = RpcClientNss::new_from_address(nss_endpoint);
+        Self::with_endpoints_and_timeout(rss_endpoint, nss_endpoint, DEFAULT_CONNECTION_TIMEOUT)
+    }
+
+    pub fn with_endpoints_and_timeout(
+        rss_endpoint: String,
+        nss_endpoint: String,
+        connection_timeout: Duration,
+    ) -> Self {
+        let rss_client = RpcClientRss::new_from_addresses(vec![rss_endpoint], connection_timeout);
+        let nss_client = RpcClientNss::new_from_address(nss_endpoint, connection_timeout);
         Self {
             rss_client,
             nss_client,

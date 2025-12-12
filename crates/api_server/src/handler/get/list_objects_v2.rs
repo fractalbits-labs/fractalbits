@@ -308,7 +308,7 @@ pub async fn list_objects(
             &delimiter,
             &start_after,
             true,
-            Some(app.config.rpc_timeout()),
+            Some(app.config.rpc_request_timeout()),
             &trace_id
         )
     )

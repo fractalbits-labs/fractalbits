@@ -1,6 +1,7 @@
 use rpc_client_common::AutoReconnectRpcClient;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 const CONNS_PER_CORE: usize = 8;
 
@@ -11,11 +12,12 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
-    pub fn new_from_address(address: String) -> Self {
+    pub fn new_from_address(address: String, connection_timeout: Duration) -> Self {
         let mut connections = Vec::with_capacity(CONNS_PER_CORE);
 
         for _ in 0..CONNS_PER_CORE {
-            let inner = AutoReconnectRpcClient::new_from_address(address.clone());
+            let inner =
+                AutoReconnectRpcClient::new_from_address(address.clone(), connection_timeout);
             connections.push(Arc::new(inner));
         }
 

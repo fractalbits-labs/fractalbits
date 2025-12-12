@@ -23,13 +23,16 @@ impl S3HybridSingleAzStorage {
     pub async fn new_with_data_vg_info(
         data_vg_info: DataVgInfo,
         s3_hybrid_config: &S3HybridSingleAzConfig,
-        rpc_timeout: Duration,
+        rpc_request_timeout: Duration,
+        rpc_connection_timeout: Duration,
     ) -> Result<Self, BlobStorageError> {
         debug!("Initializing S3HybridSingleAzStorage with pre-fetched DataVgInfo");
 
-        let data_vg_proxy = Arc::new(DataVgProxy::new(data_vg_info, rpc_timeout).map_err(|e| {
-            BlobStorageError::Config(format!("Failed to initialize DataVgProxy: {}", e))
-        })?);
+        let data_vg_proxy = Arc::new(
+            DataVgProxy::new(data_vg_info, rpc_request_timeout, rpc_connection_timeout).map_err(
+                |e| BlobStorageError::Config(format!("Failed to initialize DataVgProxy: {}", e)),
+            )?,
+        );
 
         let client_s3 = create_s3_client(
             &s3_hybrid_config.s3_host,

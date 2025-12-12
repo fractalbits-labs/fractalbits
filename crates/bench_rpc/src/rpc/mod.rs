@@ -484,11 +484,17 @@ impl RewrkConnector {
     }
 
     async fn connect_nss(&self) -> anyhow::Result<Arc<RpcClientNss>> {
-        Ok(RpcClientNss::new_from_address(self.host.clone()).into())
+        Ok(
+            RpcClientNss::new_from_address(self.host.clone(), std::time::Duration::from_secs(5))
+                .into(),
+        )
     }
 
     async fn connect_bss(&self) -> anyhow::Result<Arc<RpcClientBss>> {
-        Ok(RpcClientBss::new_from_address(self.host.clone()).into())
+        Ok(
+            RpcClientBss::new_from_address(self.host.clone(), std::time::Duration::from_secs(5))
+                .into(),
+        )
     }
 
     #[allow(dead_code)]

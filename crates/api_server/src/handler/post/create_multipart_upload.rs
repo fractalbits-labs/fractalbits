@@ -63,7 +63,7 @@ pub async fn create_multipart_upload_handler(
             &bucket.root_blob_name,
             &ctx.key,
             object_layout_bytes.clone(),
-            Some(ctx.app.config.rpc_timeout()),
+            Some(ctx.app.config.rpc_request_timeout()),
             &ctx.trace_id
         )
     )

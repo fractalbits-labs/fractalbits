@@ -103,7 +103,8 @@ pub struct Config {
     pub root_domain: String,
     pub with_metrics: bool,
     pub http_request_timeout_seconds: u64,
-    pub rpc_timeout_seconds: u64,
+    pub rpc_request_timeout_seconds: u64,
+    pub rpc_connection_timeout_seconds: u64,
     pub rss_rpc_timeout_seconds: u64,
     pub client_request_timeout_seconds: u64,
     pub stats_dir: String,
@@ -115,8 +116,12 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn rpc_timeout(&self) -> Duration {
-        Duration::from_secs(self.rpc_timeout_seconds)
+    pub fn rpc_request_timeout(&self) -> Duration {
+        Duration::from_secs(self.rpc_request_timeout_seconds)
+    }
+
+    pub fn rpc_connection_timeout(&self) -> Duration {
+        Duration::from_secs(self.rpc_connection_timeout_seconds)
     }
 
     pub fn rss_rpc_timeout(&self) -> Duration {
@@ -162,7 +167,8 @@ impl Config {
             root_domain: ".localhost".into(),
             with_metrics: false,
             http_request_timeout_seconds: 120,
-            rpc_timeout_seconds: 30,
+            rpc_request_timeout_seconds: 30,
+            rpc_connection_timeout_seconds: 5,
             rss_rpc_timeout_seconds: 30,
             client_request_timeout_seconds: 120,
             stats_dir: "data/api-server/local/stats".into(),
@@ -189,7 +195,8 @@ impl Config {
             root_domain: ".localhost".into(),
             with_metrics: false,
             http_request_timeout_seconds: 120,
-            rpc_timeout_seconds: 30,
+            rpc_request_timeout_seconds: 30,
+            rpc_connection_timeout_seconds: 5,
             rss_rpc_timeout_seconds: 30,
             client_request_timeout_seconds: 120,
             stats_dir: "data/api-server/local/stats".into(),

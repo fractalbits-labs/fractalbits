@@ -2,6 +2,7 @@ use bytes::Bytes;
 use data_types::{DataBlobGuid, TraceId};
 use fake::Fake;
 use rpc_client_bss::*;
+use std::time::Duration;
 use tracing_test::traced_test;
 use uuid::Uuid;
 
@@ -20,7 +21,8 @@ async fn test_basic_blob_io_with_fixed_bytes() {
         return;
     }
 
-    let rpc_client = RpcClientBss::new_from_address(url.to_string());
+    let rpc_client =
+        RpcClientBss::new_from_address(url.to_string(), Duration::from_secs(5));
 
     for _ in 0..1 {
         let blob_guid = DataBlobGuid {
@@ -70,7 +72,8 @@ async fn test_basic_blob_io_with_random_bytes() {
         return;
     }
 
-    let rpc_client = RpcClientBss::new_from_address(url.to_string());
+    let rpc_client =
+        RpcClientBss::new_from_address(url.to_string(), Duration::from_secs(5));
 
     for _ in 0..1 {
         let blob_guid = DataBlobGuid {

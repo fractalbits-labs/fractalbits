@@ -75,8 +75,14 @@ impl AppState {
 
         debug!("Per-core AppState initialized with lazy BlobClient initialization");
 
-        let rpc_client_nss = RpcClientNss::new_from_address(config.nss_addr.clone());
-        let rpc_client_rss = RpcClientRss::new_from_addresses(config.rss_addrs.clone());
+        let rpc_client_nss = RpcClientNss::new_from_address(
+            config.nss_addr.clone(),
+            config.rpc_connection_timeout(),
+        );
+        let rpc_client_rss = RpcClientRss::new_from_addresses(
+            config.rss_addrs.clone(),
+            config.rpc_connection_timeout(),
+        );
 
         Self {
             config,
@@ -134,6 +140,7 @@ impl AppState {
                     &self.config.blob_storage,
                     rx,
                     self.config.rss_rpc_timeout(),
+                    self.config.rpc_connection_timeout(),
                     None,
                     data_vg_info,
                 )

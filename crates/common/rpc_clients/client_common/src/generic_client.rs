@@ -21,10 +21,6 @@ use tokio::sync::{
     oneshot,
 };
 use tokio::task::AbortHandle;
-use tokio_retry::{
-    Retry,
-    strategy::{FixedInterval, jitter},
-};
 use tracing::{debug, error, warn};
 
 type ZcMessageFrame<Header> = MessageFrame<Header, Vec<Bytes>>;
@@ -425,19 +421,18 @@ where
         Ok(())
     }
 
-    pub async fn establish_connection(addr: String) -> Result<Self, RpcError>
+    pub async fn establish_connection(
+        addr: String,
+        connect_timeout: Duration,
+    ) -> Result<Self, RpcError>
     where
         Header: Default,
     {
-        const MAX_CONNECTION_RETRIES: usize = 100 * 3600 * 24;
         let start = std::time::Instant::now();
-        let retry_strategy = FixedInterval::from_millis(10)
-            .map(jitter)
-            .take(MAX_CONNECTION_RETRIES);
 
-        debug!(rpc_type=%Codec::RPC_TYPE, %addr, "Trying to connect to rpc server");
+        debug!(rpc_type=%Codec::RPC_TYPE, %addr, ?connect_timeout, "Trying to connect to rpc server");
 
-        let client = Retry::spawn(retry_strategy, || async {
+        let client = match tokio::time::timeout(connect_timeout, async {
             let socket_addr = Self::resolve_address(&addr).await?;
             let stream = tokio::net::TcpStream::connect(socket_addr).await?;
 
@@ -451,10 +446,20 @@ where
             Self::new_internal_tokio(configured_stream).await
         })
         .await
-        .map_err(|e| {
-            warn!(rpc_type = %Codec::RPC_TYPE, addr = %addr, error = %e, "failed to connect RPC server");
-            RpcError::IoError(io::Error::other(e.to_string()))
-        })?;
+        {
+            Ok(Ok(client)) => client,
+            Ok(Err(e)) => {
+                warn!(rpc_type = %Codec::RPC_TYPE, %addr, error = %e, "failed to connect RPC server");
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                warn!(rpc_type = %Codec::RPC_TYPE, %addr, ?connect_timeout, "connection timeout to RPC server");
+                return Err(RpcError::IoError(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connection timeout after {:?}", connect_timeout),
+                )));
+            }
+        };
 
         let duration = start.elapsed();
         if duration > Duration::from_secs(1) {
