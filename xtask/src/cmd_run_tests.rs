@@ -27,6 +27,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
                 with_https: false,
                 bss_count: 6,
                 nss_disable_restart_limit: false,
+                rss_backend: Default::default(),
             },
         )?;
         cmd_service::start_service(ServiceName::All)?;

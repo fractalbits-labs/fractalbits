@@ -242,6 +242,7 @@ pub enum ServiceName {
     MinioAz1,
     MinioAz2,
     DdbLocal,
+    Etcd,
 }
 
 impl ServiceName {
@@ -257,6 +258,15 @@ pub enum DataBlobStorage {
     #[default]
     S3HybridSingleAz,
     S3ExpressMultiAz,
+}
+
+#[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
+#[strum(serialize_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum RssBackend {
+    #[default]
+    Ddb,
+    Etcd,
 }
 
 #[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
@@ -291,6 +301,7 @@ pub struct InitConfig {
     pub with_https: bool,
     pub bss_count: u32,
     pub nss_disable_restart_limit: bool,
+    pub rss_backend: RssBackend,
 }
 
 impl Default for InitConfig {
@@ -301,6 +312,7 @@ impl Default for InitConfig {
             with_https: false,
             bss_count: 1,
             nss_disable_restart_limit: false,
+            rss_backend: Default::default(),
         }
     }
 }
@@ -333,6 +345,10 @@ pub enum ServiceCommand {
 
         #[clap(long, long_help = "disable restart limit for NSS role agent")]
         nss_disable_restart_limit: bool,
+
+        #[clap(long, value_enum)]
+        #[arg(default_value_t)]
+        rss_backend: RssBackend,
     },
     Stop {
         #[clap(default_value = "all", value_enum)]
@@ -499,6 +515,7 @@ async fn main() -> CmdResult {
                 with_https,
                 bss_count,
                 nss_disable_restart_limit,
+                rss_backend,
             } => {
                 if bss_count != 1 && bss_count != 6 {
                     cmd_die!("bss_count must be either 1 or 6, got $bss_count");
@@ -509,6 +526,7 @@ async fn main() -> CmdResult {
                     with_https,
                     bss_count,
                     nss_disable_restart_limit,
+                    rss_backend,
                 };
                 cmd_service::init_service(service, cmd_build::build_mode(release), init_config)?;
             }
