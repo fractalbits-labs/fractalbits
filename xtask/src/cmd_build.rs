@@ -130,7 +130,9 @@ pub fn build_rust_servers(mode: BuildMode) -> CmdResult {
         BuildMode::Release => {
             run_cmd! {
                 info "Building rust-based servers in release mode ...";
-                $[build_envs] cargo build --release;
+                $[build_envs] cargo build --workspace
+                    --exclude container-all-in-one
+                    --release;
             }
         }
     }

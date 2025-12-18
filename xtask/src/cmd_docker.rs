@@ -9,10 +9,10 @@ pub fn run_cmd_docker(cmd: DockerCommand) -> CmdResult {
     match cmd {
         DockerCommand::Build {
             release,
-            prebuilt,
+            all_from_source,
             image_name,
             tag,
-        } => build_docker_image(release, prebuilt, &image_name, &tag),
+        } => build_docker_image(release, all_from_source, &image_name, &tag),
         DockerCommand::Run {
             image_name,
             tag,
@@ -25,7 +25,12 @@ pub fn run_cmd_docker(cmd: DockerCommand) -> CmdResult {
     }
 }
 
-fn build_docker_image(release: bool, prebuilt: bool, image_name: &str, tag: &str) -> CmdResult {
+fn build_docker_image(
+    release: bool,
+    all_from_source: bool,
+    image_name: &str,
+    tag: &str,
+) -> CmdResult {
     info!("Building Docker image: {}:{}", image_name, tag);
 
     let target_dir = if release {
@@ -36,23 +41,22 @@ fn build_docker_image(release: bool, prebuilt: bool, image_name: &str, tag: &str
     let staging_dir = "target/docker-staging";
     let bin_staging = format!("{}/bin", staging_dir);
 
-    if prebuilt {
-        info!("Using prebuilt binaries from prebuilt/ directory");
-        info!("Building api_server and docker-all-in-one only...");
-        if release {
-            run_cmd!(cargo build --release -p api_server -p docker-all-in-one)?;
-        } else {
-            run_cmd!(cargo build -p api_server -p docker-all-in-one)?;
-        }
-    } else {
-        info!("Building all binaries...");
+    if all_from_source {
+        info!("Building all binaries from source...");
         cmd_build::build_all(release)?;
 
-        info!("Building docker-all-in-one...");
+        info!("Building container-all-in-one...");
         if release {
-            run_cmd!(cargo build --release -p docker-all-in-one)?;
+            run_cmd!(cargo build --release -p container-all-in-one)?;
         } else {
-            run_cmd!(cargo build -p docker-all-in-one)?;
+            run_cmd!(cargo build -p container-all-in-one)?;
+        }
+    } else {
+        info!("Using prebuilt binaries from prebuilt/ directory");
+        if release {
+            run_cmd!(cargo build --release -p api_server -p container-all-in-one)?;
+        } else {
+            run_cmd!(cargo build -p api_server -p container-all-in-one)?;
         }
     }
 
@@ -66,7 +70,7 @@ fn build_docker_image(release: bool, prebuilt: bool, image_name: &str, tag: &str
     }?;
 
     // Copy binaries built in this repo
-    let local_binaries = ["api_server", "docker-all-in-one"];
+    let local_binaries = ["api_server", "container-all-in-one"];
     for bin in &local_binaries {
         let src = format!("{}/{}", target_dir, bin);
         if Path::new(&src).exists() {
@@ -76,18 +80,7 @@ fn build_docker_image(release: bool, prebuilt: bool, image_name: &str, tag: &str
         }
     }
 
-    if prebuilt {
-        // Use prebuilt binaries for external repos
-        let prebuilt_binaries = ["root_server", "rss_admin", "bss_server", "nss_server"];
-        for bin in &prebuilt_binaries {
-            let src = format!("prebuilt/{}", bin);
-            if Path::new(&src).exists() {
-                run_cmd!(cp $src $bin_staging/)?;
-            } else {
-                return Err(Error::other(format!("Prebuilt binary not found: {}", src)));
-            }
-        }
-    } else {
+    if all_from_source {
         // Use freshly built binaries
         let rust_binaries = ["root_server", "rss_admin"];
         for bin in &rust_binaries {
@@ -111,6 +104,17 @@ fn build_docker_image(release: bool, prebuilt: bool, image_name: &str, tag: &str
                 run_cmd!(cp $src $bin_staging/)?;
             } else {
                 return Err(Error::other(format!("Zig binary not found: {}", src)));
+            }
+        }
+    } else {
+        // Use prebuilt binaries for external repos
+        let prebuilt_binaries = ["root_server", "rss_admin", "bss_server", "nss_server"];
+        for bin in &prebuilt_binaries {
+            let src = format!("prebuilt/{}", bin);
+            if Path::new(&src).exists() {
+                run_cmd!(cp $src $bin_staging/)?;
+            } else {
+                return Err(Error::other(format!("Prebuilt binary not found: {}", src)));
             }
         }
     }
@@ -246,7 +250,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 
 VOLUME /data
 
-ENTRYPOINT ["docker-all-in-one"]
+ENTRYPOINT ["container-all-in-one"]
 CMD ["--bin-dir=/opt/fractalbits/bin", "--data-dir=/data"]
 "#;
 

@@ -19,7 +19,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[derive(Parser)]
 #[clap(
-    name = "docker-all-in-one",
+    name = "container-all-in-one",
     about = "All-in-one container orchestrator for fractalbits services"
 )]
 struct Opt {
@@ -294,7 +294,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("build info: {}", build_info);
 
     let opt = Opt::parse();
-    info!("Starting docker-all-in-one orchestrator");
+    info!("Starting container-all-in-one orchestrator");
     info!("  bin_dir: {:?}", opt.bin_dir);
     info!("  data_dir: {:?}", opt.data_dir);
     info!("  api_port: {}", opt.api_port);

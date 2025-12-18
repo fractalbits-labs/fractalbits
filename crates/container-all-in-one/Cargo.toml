@@ -1,10 +1,10 @@
 [package]
-name = "docker-all-in-one"
+name = "container-all-in-one"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "docker-all-in-one"
+name = "container-all-in-one"
 path = "src/main.rs"
 
 [dependencies]

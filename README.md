@@ -186,7 +186,7 @@ aws s3 mb s3://my-bucket
 aws s3 cp test.txt s3://my-bucket/
 ```
 
-The Docker image bundles all services (API server, BSS, NSS, RSS) into a single container orchestrated by the `docker-all-in-one` binary.
+The Docker image bundles all services (API server, BSS, NSS, RSS) into a single container orchestrated by the `container-all-in-one` binary.
 
 ## Bring Your Own Cloud (BYOC)
 

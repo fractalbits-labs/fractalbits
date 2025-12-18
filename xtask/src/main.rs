@@ -115,8 +115,11 @@ pub enum DockerCommand {
         #[clap(long, long_help = "release build or not")]
         release: bool,
 
-        #[clap(long, long_help = "Use prebuilt binaries from prebuilt/ directory")]
-        prebuilt: bool,
+        #[clap(
+            long,
+            long_help = "Build all binaries from source instead of using prebuilt"
+        )]
+        all_from_source: bool,
 
         #[clap(long, default_value = "fractalbits", long_help = "Docker image name")]
         image_name: String,
