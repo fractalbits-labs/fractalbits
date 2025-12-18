@@ -13,6 +13,7 @@ pub const MIRRORD_CONFIG: &str = "mirrord_cloud_config.toml";
 pub const ROOT_SERVER_CONFIG: &str = "root_server_cloud_config.toml";
 pub const NSS_ROLE_AGENT_CONFIG: &str = "nss_role_agent_cloud_config.toml";
 pub const BENCH_SERVER_BENCH_START_SCRIPT: &str = "bench_start.sh";
+pub const BOOTSTRAP_CONFIG: &str = "bootstrap.toml";
 pub const BOOTSTRAP_DONE_FILE: &str = "/opt/fractalbits/.bootstrap_done";
 pub const DDB_SERVICE_DISCOVERY_TABLE: &str = "fractalbits-service-discovery";
 pub const NETWORK_TUNING_SYS_CONFIG: &str = "99-network-tuning.conf";
@@ -49,7 +50,7 @@ fn download_binary(file_name: &str) -> CmdResult {
     let builds_bucket = get_builds_bucket()?;
     let cpu_arch = run_fun!(arch)?;
 
-    let download_path = if file_name == "fractalbits-bootstrap" || file_name == "warp" {
+    let s3_path = if file_name == "fractalbits-bootstrap" || file_name == "warp" {
         format!("{builds_bucket}/{cpu_arch}/{file_name}")
     } else {
         let instance_type = get_ec2_instance_type()?;
@@ -57,12 +58,16 @@ fn download_binary(file_name: &str) -> CmdResult {
         format!("{builds_bucket}/{cpu_arch}/{cpu_target}/{file_name}")
     };
 
-    run_cmd! {
-        info "Downloading $file_name from $download_path to $BIN_PATH";
-        aws s3 cp --no-progress $download_path $BIN_PATH;
-        chmod +x $BIN_PATH/$file_name
-    }?;
-    Ok(())
+    let local_path = format!("{BIN_PATH}{file_name}");
+    download_from_s3(&s3_path, &local_path)?;
+    run_cmd!(chmod +x $local_path)
+}
+
+pub fn download_from_s3(s3_path: &str, local_path: &str) -> CmdResult {
+    run_cmd!(
+        info "Downloading from $s3_path to $local_path";
+        aws s3 cp --no-progress $s3_path $local_path
+    )
 }
 
 pub fn get_builds_bucket() -> FunResult {

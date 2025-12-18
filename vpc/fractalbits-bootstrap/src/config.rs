@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::io::Error;
 use std::time::{Duration, Instant};
 
-use crate::common::{get_builds_bucket, get_instance_id};
+use crate::common::{
+    BOOTSTRAP_CONFIG, ETC_PATH, download_from_s3, get_builds_bucket, get_instance_id,
+};
 
-pub const BOOTSTRAP_CONFIG_FILE: &str = "bootstrap.toml";
-const CONFIG_DOWNLOAD_PATH: &str = "/tmp/bootstrap.toml";
-const CONFIG_RETRY_TIMEOUT_SECS: u64 = 60;
+const CONFIG_RETRY_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Deserialize)]
 pub struct BootstrapConfig {
@@ -73,19 +73,16 @@ pub struct InstanceConfig {
 impl BootstrapConfig {
     pub fn download_and_parse() -> Result<Self, Error> {
         let builds_bucket = get_builds_bucket()?;
-        let config_s3_path = format!("{builds_bucket}/{BOOTSTRAP_CONFIG_FILE}");
+        let s3_path = format!("{builds_bucket}/{BOOTSTRAP_CONFIG}");
+        let local_path = format!("{ETC_PATH}{BOOTSTRAP_CONFIG}");
         let instance_id = get_instance_id()?;
 
         let start_time = Instant::now();
         let timeout = Duration::from_secs(CONFIG_RETRY_TIMEOUT_SECS);
-
         loop {
-            run_cmd!(
-                info "Downloading bootstrap config from $config_s3_path";
-                aws s3 cp --no-progress $config_s3_path $CONFIG_DOWNLOAD_PATH
-            )?;
+            download_from_s3(&s3_path, &local_path)?;
 
-            let content = std::fs::read_to_string(CONFIG_DOWNLOAD_PATH)?;
+            let content = std::fs::read_to_string(&local_path)?;
             let config: BootstrapConfig = toml::from_str(&content)
                 .map_err(|e| Error::other(format!("TOML parse error: {e}")))?;
 
