@@ -1,0 +1,17 @@
+[package]
+name = "docker-all-in-one"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "docker-all-in-one"
+path = "src/main.rs"
+
+[dependencies]
+xtask_tools.workspace = true
+tokio.workspace = true
+cmd_lib.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tikv-jemallocator.workspace = true

@@ -5,9 +5,10 @@ use std::time::Duration;
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BlobStorageBackend {
-    #[default]
     S3HybridSingleAz,
     S3ExpressMultiAz,
+    #[default]
+    AllInBssSingleAz,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -151,7 +152,7 @@ pub struct S3HybridSingleAzConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        Self::s3_hybrid_single_az()
+        Self::all_in_bss_single_az()
     }
 }
 
@@ -211,6 +212,34 @@ impl Config {
                     ratelimit: RatelimitConfig::default(),
                     retry_config: S3RetryConfig::default(),
                 }),
+                s3_express_multi_az: None,
+            },
+            allow_missing_or_bad_signature: false,
+            worker_threads: 2,
+            set_thread_affinity: false,
+        }
+    }
+
+    pub fn all_in_bss_single_az() -> Self {
+        Self {
+            nss_addr: "127.0.0.1:8087".to_string(),
+            rss_addrs: vec!["127.0.0.1:8086".to_string()],
+            port: 8080,
+            mgmt_port: 18080,
+            https: HttpsConfig::default(),
+            region: "localdev".into(),
+            root_domain: ".localhost".into(),
+            with_metrics: false,
+            http_request_timeout_seconds: 120,
+            rpc_request_timeout_seconds: 30,
+            rpc_connection_timeout_seconds: 5,
+            rss_rpc_timeout_seconds: 30,
+            client_request_timeout_seconds: 120,
+            stats_dir: "data/api-server/local/stats".into(),
+            enable_stats_writer: false,
+            blob_storage: BlobStorageConfig {
+                backend: BlobStorageBackend::AllInBssSingleAz,
+                s3_hybrid_single_az: None,
                 s3_express_multi_az: None,
             },
             allow_missing_or_bad_signature: false,

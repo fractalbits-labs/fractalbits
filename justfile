@@ -24,3 +24,6 @@ repo *args:
 
 git *args:
   cargo xtask repo foreach git {{args}}
+
+docker *args:
+  cargo xtask docker {{args}}

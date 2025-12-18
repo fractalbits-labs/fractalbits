@@ -1,9 +1,11 @@
+mod all_in_bss_single_az_storage;
 mod retry;
 mod s3_common;
 mod s3_express_multi_az_storage;
 mod s3_hybrid_single_az_storage;
 
 pub use crate::config::RatelimitConfig;
+pub use all_in_bss_single_az_storage::AllInBssSingleAzStorage;
 pub use data_types::DataBlobGuid;
 pub use retry::S3RetryConfig;
 pub use s3_common::chunks_to_bytestream;
@@ -42,6 +44,7 @@ pub enum BlobLocation {
 pub enum BlobStorageImpl {
     HybridSingleAz(S3HybridSingleAzStorage),
     S3ExpressMultiAz(S3ExpressMultiAzStorage),
+    AllInBssSingleAz(AllInBssSingleAzStorage),
 }
 
 /// S3 operation retry macro - similar to rpc_retry but for S3 operations
@@ -361,6 +364,11 @@ impl BlobStorageImpl {
                     .put_blob(tracking_root_blob_name, blob_id, block_number, body)
                     .await
             }
+            BlobStorageImpl::AllInBssSingleAz(storage) => {
+                storage
+                    .put_blob(blob_id, volume_id, block_number, body, trace_id)
+                    .await
+            }
         }
     }
 
@@ -382,6 +390,11 @@ impl BlobStorageImpl {
             BlobStorageImpl::S3ExpressMultiAz(storage) => {
                 storage
                     .put_blob_vectored(tracking_root_blob_name, blob_id, block_number, chunks)
+                    .await
+            }
+            BlobStorageImpl::AllInBssSingleAz(storage) => {
+                storage
+                    .put_blob_vectored(blob_id, volume_id, block_number, chunks, trace_id)
                     .await
             }
         }
@@ -412,6 +425,11 @@ impl BlobStorageImpl {
             BlobStorageImpl::S3ExpressMultiAz(storage) => {
                 storage.get_blob(blob_guid, block_number, body).await
             }
+            BlobStorageImpl::AllInBssSingleAz(storage) => {
+                storage
+                    .get_blob(blob_guid, block_number, content_len, body, trace_id)
+                    .await
+            }
         }
     }
 
@@ -433,6 +451,9 @@ impl BlobStorageImpl {
                 storage
                     .delete_blob(tracking_root_blob_name, blob_guid, block_number)
                     .await
+            }
+            BlobStorageImpl::AllInBssSingleAz(storage) => {
+                storage.delete_blob(blob_guid, block_number, trace_id).await
             }
         }
     }

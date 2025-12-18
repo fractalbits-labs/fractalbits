@@ -18,6 +18,7 @@ use tracing::{Instrument, Span};
 use super::block_data_stream::BlockDataStream;
 use super::s3_streaming::S3StreamingPayload;
 use crate::{
+    BlobStorageBackend,
     blob_client::BlobDeletionRequest,
     handler::{
         ObjectRequestContext,
@@ -389,7 +390,12 @@ async fn put_object_streaming_internal(
         .map_err(|_| S3Error::InternalError)?;
 
     let total_size = size;
-    if total_size >= ObjectLayout::DEFAULT_BLOCK_SIZE as u64 {
+    // Only use S3_VOLUME for large objects when using S3-based backends
+    let uses_s3_for_large_blobs = matches!(
+        ctx.app.config.blob_storage.backend,
+        BlobStorageBackend::S3HybridSingleAz | BlobStorageBackend::S3ExpressMultiAz
+    );
+    if uses_s3_for_large_blobs && total_size >= ObjectLayout::DEFAULT_BLOCK_SIZE as u64 {
         blob_guid.volume_id = DataBlobGuid::S3_VOLUME;
     }
 
