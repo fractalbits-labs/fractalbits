@@ -324,8 +324,8 @@ pub enum DataBlobStorage {
 #[strum(serialize_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum RssBackend {
-    #[default]
     Ddb,
+    #[default]
     Etcd,
 }
 
