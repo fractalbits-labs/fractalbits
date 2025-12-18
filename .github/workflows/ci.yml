@@ -73,7 +73,7 @@ jobs:
       run: cargo xtask repo init
 
     - name: Build Docker image
-      run: cargo xtask docker build --release --prebuilt
+      run: cargo xtask docker build --release
 
     - name: Test Docker container
       run: |
@@ -116,7 +116,7 @@ jobs:
       run: cargo xtask repo init
 
     - name: Build Docker image
-      run: cargo xtask docker build --release --prebuilt
+      run: cargo xtask docker build --release
 
     - name: Log in to Container Registry
       uses: docker/login-action@v3
