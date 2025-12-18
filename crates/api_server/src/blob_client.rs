@@ -1,7 +1,7 @@
 use crate::{
     blob_storage::{
-        BlobLocation, BlobStorageError, BlobStorageImpl, S3ExpressMultiAzStorage,
-        S3HybridSingleAzStorage,
+        AllInBssSingleAzStorage, BlobLocation, BlobStorageError, BlobStorageImpl,
+        S3ExpressMultiAzStorage, S3HybridSingleAzStorage,
     },
     config::{BlobStorageBackend, BlobStorageConfig},
 };
@@ -104,6 +104,14 @@ impl BlobClient {
 
                 return Ok((Arc::new(storage), Some(az_status_cache)));
             }
+            BlobStorageBackend::AllInBssSingleAz => BlobStorageImpl::AllInBssSingleAz(
+                AllInBssSingleAzStorage::new_with_data_vg_info(
+                    data_vg_info.clone(),
+                    rpc_request_timeout,
+                    rpc_connection_timeout,
+                )
+                .await?,
+            ),
         };
 
         Ok((Arc::new(storage), None))
@@ -174,6 +182,7 @@ impl BlobClient {
         match &*self.storage {
             BlobStorageImpl::HybridSingleAz(storage) => storage.create_data_blob_guid(),
             BlobStorageImpl::S3ExpressMultiAz(storage) => storage.create_data_blob_guid(),
+            BlobStorageImpl::AllInBssSingleAz(storage) => storage.create_data_blob_guid(),
         }
     }
 

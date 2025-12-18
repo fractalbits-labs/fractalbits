@@ -5,14 +5,9 @@ use std::time::Duration;
 use crate::InitConfig;
 use crate::*;
 use colored::*;
-
-// Volume group quorum configuration constants
-const METADATA_VG_QUORUM_N: u32 = 6;
-const METADATA_VG_QUORUM_R: u32 = 4;
-const METADATA_VG_QUORUM_W: u32 = 4;
-const DATA_VG_QUORUM_N: u32 = 3;
-const DATA_VG_QUORUM_R: u32 = 2;
-const DATA_VG_QUORUM_W: u32 = 2;
+use xtask_tools::{
+    create_bss_dirs, create_nss_dirs, generate_bss_data_vg_config, generate_bss_metadata_vg_config,
+};
 
 pub fn init_service(
     service: ServiceName,
@@ -82,7 +77,7 @@ pub fn init_service(
 
         // Initialize NSS role states in service-discovery table
         let nss_roles_item = match init_config.data_blob_storage {
-            DataBlobStorage::S3HybridSingleAz => {
+            DataBlobStorage::S3HybridSingleAz | DataBlobStorage::AllInBssSingleAz => {
                 r#"{"service_id":{"S":"nss_roles"},"states":{"M":{"nss-A":{"S":"solo"}}}}"#
             }
             DataBlobStorage::S3ExpressMultiAz => {
@@ -168,7 +163,9 @@ pub fn init_service(
         // Initialize service-discovery keys using etcdctl
         let etcdctl = resolve_etcd_bin("etcdctl");
         let nss_roles_json = match init_config.data_blob_storage {
-            DataBlobStorage::S3HybridSingleAz => r#"{"states":{"nss-A":"solo"}}"#,
+            DataBlobStorage::S3HybridSingleAz | DataBlobStorage::AllInBssSingleAz => {
+                r#"{"states":{"nss-A":"solo"}}"#
+            }
             DataBlobStorage::S3ExpressMultiAz => {
                 r#"{"states":{"nss-A":"active","nss-B":"standby"}}"#
             }
@@ -224,7 +221,7 @@ pub fn init_service(
     let init_all_bss = |count: u32| -> CmdResult {
         create_bss_service_symlinks(count)?;
         for id in 0..count {
-            create_dirs_for_bss_server(count, id)?;
+            create_bss_dirs(Path::new("data"), id, count)?;
         }
         Ok(())
     };
@@ -612,6 +609,19 @@ fn all_services(
             }
             services
         }
+        DataBlobStorage::AllInBssSingleAz => {
+            let mut services = vec![
+                ServiceName::ApiServer,
+                ServiceName::NssRoleAgentA,
+                ServiceName::Bss,
+                ServiceName::Rss,
+                rss_backend_service,
+            ];
+            if with_managed_service {
+                services.push(ServiceName::Nss);
+            }
+            services
+        }
     };
     if sort {
         services.sort_by_key(|s| s.as_ref().to_string());
@@ -630,8 +640,11 @@ fn get_rss_backend_setting() -> RssBackend {
 fn get_data_blob_storage_setting() -> DataBlobStorage {
     if run_cmd!(grep -q multi_az data/etc/api_server.service &>/dev/null).is_ok() {
         DataBlobStorage::S3ExpressMultiAz
-    } else {
+    } else if run_cmd!(grep -q s3_hybrid_single_az data/etc/api_server.service &>/dev/null).is_ok()
+    {
         DataBlobStorage::S3HybridSingleAz
+    } else {
+        DataBlobStorage::AllInBssSingleAz
     }
 }
 
@@ -777,40 +790,55 @@ fn start_all_services() -> CmdResult {
     info!("Starting all services with systemd dependency management");
 
     // Start supporting services first based on backend configuration
-    let backend = get_rss_backend_setting();
-    match backend {
+    let rss_backend = get_rss_backend_setting();
+    let data_blob_storage = get_data_blob_storage_setting();
+
+    match rss_backend {
         RssBackend::Ddb => {
-            info!("Starting supporting services (ddb_local, minio instances)");
+            info!("Starting supporting services (ddb_local)");
             start_service(ServiceName::DdbLocal)?;
         }
         RssBackend::Etcd => {
-            info!("Starting supporting services (etcd, minio instances)");
+            info!("Starting supporting services (etcd)");
             start_service(ServiceName::Etcd)?;
         }
     }
-    start_service(ServiceName::Minio)?; // Original minio for NSS metadata (port 9000)
-    if run_cmd!(grep -q multi_az data/etc/api_server.service &>/dev/null).is_ok() {
-        start_service(ServiceName::MinioAz1)?; // Local AZ data blobs (port 9001)
-        start_service(ServiceName::MinioAz2)?; // Remote AZ data blobs (port 9002)
+
+    // Start minio only for S3-based backends
+    match data_blob_storage {
+        DataBlobStorage::S3HybridSingleAz => {
+            info!("Starting minio for S3HybridSingleAz");
+            start_service(ServiceName::Minio)?;
+        }
+        DataBlobStorage::S3ExpressMultiAz => {
+            info!("Starting minio instances for S3ExpressMultiAz");
+            start_service(ServiceName::Minio)?;
+            start_service(ServiceName::MinioAz1)?;
+            start_service(ServiceName::MinioAz2)?;
+        }
+        DataBlobStorage::AllInBssSingleAz => {}
     }
 
     // Start all main services - systemd dependencies will handle ordering
-    if run_cmd!(grep -q single_az data/etc/api_server.service).is_ok() {
-        info!("Starting single_az services");
-        start_service(ServiceName::Rss)?;
-        // Start all BSS instances
-        let bss_count = get_bss_count_from_config();
-        for id in 0..bss_count {
-            start_bss_instance(id)?;
+    match data_blob_storage {
+        DataBlobStorage::S3HybridSingleAz | DataBlobStorage::AllInBssSingleAz => {
+            info!("Starting single_az services");
+            start_service(ServiceName::Rss)?;
+            // Start all BSS instances
+            let bss_count = get_bss_count_from_config();
+            for id in 0..bss_count {
+                start_bss_instance(id)?;
+            }
+            start_service(ServiceName::NssRoleAgentA)?;
+            start_service(ServiceName::ApiServer)?;
         }
-        start_service(ServiceName::NssRoleAgentA)?;
-        start_service(ServiceName::ApiServer)?;
-    } else {
-        info!("Starting multi_az services (skipping BSS)");
-        start_service(ServiceName::NssRoleAgentB)?;
-        start_service(ServiceName::Rss)?;
-        start_service(ServiceName::NssRoleAgentA)?;
-        start_service(ServiceName::ApiServer)?;
+        DataBlobStorage::S3ExpressMultiAz => {
+            info!("Starting multi_az services (skipping BSS)");
+            start_service(ServiceName::NssRoleAgentB)?;
+            start_service(ServiceName::Rss)?;
+            start_service(ServiceName::NssRoleAgentA)?;
+            start_service(ServiceName::ApiServer)?;
+        }
     }
 
     info!("All services are started successfully!");
@@ -1006,7 +1034,14 @@ Environment="MINIO_REGION=localdev""##
             RssBackend::Etcd => "After=etcd.service\nWants=etcd.service\n".to_string(),
         },
         ServiceName::ApiServer | ServiceName::GuiServer => {
-            "After=rss.service nss.service minio.service\nWants=rss.service nss.service minio.service\n".to_string()
+            match init_config.data_blob_storage {
+                DataBlobStorage::AllInBssSingleAz => {
+                    "After=rss.service nss.service\nWants=rss.service nss.service\n".to_string()
+                }
+                _ => {
+                    "After=rss.service nss.service minio.service\nWants=rss.service nss.service minio.service\n".to_string()
+                }
+            }
         }
         _ => String::new(),
     };
@@ -1060,55 +1095,13 @@ WantedBy=multi-user.target
 
 fn create_dirs_for_nss_server() -> CmdResult {
     info!("Creating necessary directories for nss_server");
-    create_nss_dirs("nss-A")
+    run_cmd!(mkdir -p data/logs)?;
+    create_nss_dirs(Path::new("data"), "nss-A")
 }
 
 fn create_dirs_for_mirrord_server() -> CmdResult {
     info!("Creating necessary directories for mirrord");
-    create_nss_dirs("nss-B")
-}
-
-fn create_nss_dirs(dir_name: &str) -> CmdResult {
-    run_cmd! {
-        mkdir -p data/logs;
-        mkdir -p data/$dir_name/ebs;
-        mkdir -p data/$dir_name/local/stats;
-        mkdir -p data/$dir_name/local/meta_cache/blobs;
-    }?;
-    for i in 0..256 {
-        run_cmd!(mkdir -p data/$dir_name/local/meta_cache/blobs/$i)?;
-    }
-    Ok(())
-}
-
-fn create_dirs_for_bss_server(bss_count: u32, bss_id: u32) -> CmdResult {
-    info!("Creating necessary directories for bss{} server", bss_id);
-    run_cmd! {
-        mkdir -p data/bss$bss_id/local/stats;
-        mkdir -p data/bss$bss_id/local/blobs;
-    }?;
-
-    // Data volume
-    let data_volume_id = match bss_count {
-        1 => 1,
-        _ => (bss_id / DATA_VG_QUORUM_N) + 1,
-    };
-    run_cmd!(mkdir -p data/bss$bss_id/local/blobs/data_volume$data_volume_id)?;
-    for i in 0..256 {
-        run_cmd!(mkdir -p data/bss$bss_id/local/blobs/data_volume$data_volume_id/$i)?;
-    }
-
-    // Metadata volume - calculate based on metadata VG quorum N
-    let metadata_volume_id = match bss_count {
-        1 => 1,
-        _ => (bss_id / METADATA_VG_QUORUM_N) + 1,
-    };
-    run_cmd!(mkdir -p data/bss$bss_id/local/blobs/metadata_volume$metadata_volume_id)?;
-    for i in 0..256 {
-        run_cmd!(mkdir -p data/bss$bss_id/local/blobs/metadata_volume$metadata_volume_id/$i)?;
-    }
-
-    Ok(())
+    create_nss_dirs(Path::new("data"), "nss-B")
 }
 
 pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdResult {
@@ -1295,55 +1288,4 @@ fn generate_https_certificates() -> CmdResult {
     info!("  Certificate: data/etc/cert.pem (trusted by system)");
     info!("  Private key: data/etc/key.pem (unencrypted)");
     Ok(())
-}
-
-fn generate_volume_group_config(bss_count: u32, n: u32, r: u32, w: u32) -> String {
-    let num_volumes = bss_count / n;
-    let mut volumes = Vec::new();
-
-    for vol_idx in 0..num_volumes {
-        let start_idx = vol_idx * n;
-        let end_idx = start_idx + n;
-
-        let nodes: Vec<String> = (start_idx..end_idx)
-            .map(|i| {
-                format!(
-                    r#"{{"node_id":"bss{i}","ip":"127.0.0.1","port":{}}}"#,
-                    8088 + i
-                )
-            })
-            .collect();
-
-        volumes.push(format!(
-            r#"{{"volume_id":{},"bss_nodes":[{}]}}"#,
-            vol_idx + 1,
-            nodes.join(",")
-        ));
-    }
-
-    format!(
-        r#"{{"volumes":[{}],"quorum":{{"n":{n},"r":{r},"w":{w}}}}}"#,
-        volumes.join(","),
-    )
-}
-
-fn generate_bss_data_vg_config(bss_count: u32) -> String {
-    match bss_count {
-        1 => generate_volume_group_config(1, 1, 1, 1),
-        6 => generate_volume_group_config(6, DATA_VG_QUORUM_N, DATA_VG_QUORUM_R, DATA_VG_QUORUM_W),
-        _ => unreachable!("bss_count validated in main.rs"),
-    }
-}
-
-fn generate_bss_metadata_vg_config(bss_count: u32) -> String {
-    match bss_count {
-        1 => generate_volume_group_config(1, 1, 1, 1),
-        6 => generate_volume_group_config(
-            6,
-            METADATA_VG_QUORUM_N,
-            METADATA_VG_QUORUM_R,
-            METADATA_VG_QUORUM_W,
-        ),
-        _ => unreachable!("bss_count validated in main.rs"),
-    }
 }

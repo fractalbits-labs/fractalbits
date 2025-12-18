@@ -10,6 +10,7 @@ exclude = [
     "crates/api_server/benches",
     "crates/api_server/src",
     "crates/api_server/tests",
+    "crates/docker-all-in-one/src",
     "crates/bench_rpc/src",
     "crates/common/aws_signature/src",
     "crates/common/data_blob_tracking/src",
@@ -136,7 +137,7 @@ core_affinity = "0.7"
 
 # Dev dependencies
 aws-sdk-s3 = "1.65.0"
-cmd_lib = "2.0"
+cmd_lib = { version = "2.0", features = ["tracing"] }
 tracing-test = {version = "0.2.5", features = ["no-env-filter"]}
 env_logger = "0.11.5"
 num_cpus = "1.16.0"

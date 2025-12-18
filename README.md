@@ -147,6 +147,47 @@ just precheckin --s3-api-only
 just precheckin
 ```
 
+## Quick Start - Docker
+
+Run FractalBits in a single Docker container for quick testing and evaluation:
+
+```bash
+# Build Docker image (uses debug build by default)
+just docker build
+
+# Build release Docker image
+just docker build --release
+
+# Run container (foreground)
+just docker run
+
+# Run container with custom port
+just docker run --port 9080
+
+# Run container in background
+just docker run --detach --name fractalbits-dev
+
+# View logs
+just docker logs --name fractalbits-dev --follow
+
+# Stop container
+just docker stop --name fractalbits-dev
+```
+
+Once running, use any S3-compatible client:
+
+```bash
+export AWS_DEFAULT_REGION=localdev
+export AWS_ENDPOINT_URL_S3=http://localhost:8080
+export AWS_ACCESS_KEY_ID=test_api_key
+export AWS_SECRET_ACCESS_KEY=test_api_secret
+
+aws s3 mb s3://my-bucket
+aws s3 cp test.txt s3://my-bucket/
+```
+
+The Docker image bundles all services (API server, BSS, NSS, RSS) into a single container orchestrated by the `docker-all-in-one` binary.
+
 ## Bring Your Own Cloud (BYOC)
 
 FractalBits makes BYOC simple: build once, deploy with a single command, and launch a fully operational cloud storage system on AWS in under 5 minutes.

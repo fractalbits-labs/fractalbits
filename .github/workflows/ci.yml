@@ -8,6 +8,11 @@ on:
   pull_request:
     branches:
     - main
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -38,3 +43,100 @@ jobs:
 
     - name: Run precheckin
       run: cargo xtask precheckin
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y moreutils protobuf-compiler
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /usr/local/share/boost
+
+    - name: Load Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: false
+
+    - name: Run repo init
+      run: cargo xtask repo init
+
+    - name: Build Docker image
+      run: cargo xtask docker build --release --prebuilt
+
+    - name: Test Docker container
+      run: |
+        cargo xtask docker run --detach
+        sleep 60
+        curl -sf http://localhost:18080/mgmt/health || (docker logs fractalbits-dev && exit 1)
+        cargo test -p api_server --test basic || (docker logs fractalbits-dev && exit 1)
+        cargo xtask docker stop
+
+  docker-publish:
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y moreutils protobuf-compiler
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /usr/local/share/boost
+
+    - name: Load Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: false
+
+    - name: Run repo init
+      run: cargo xtask repo init
+
+    - name: Build Docker image
+      run: cargo xtask docker build --release --prebuilt
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata for Docker
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=sha,prefix=
+          type=raw,value=latest
+
+    - name: Tag and push Docker image
+      run: |
+        docker tag fractalbits:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        docker tag fractalbits:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest

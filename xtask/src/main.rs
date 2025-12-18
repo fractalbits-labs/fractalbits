@@ -1,6 +1,7 @@
 mod cmd_bench;
 mod cmd_build;
 mod cmd_deploy;
+mod cmd_docker;
 mod cmd_nightly;
 mod cmd_precheckin;
 mod cmd_repo;
@@ -101,6 +102,61 @@ enum Cmd {
     #[clap(about = "Git repos management commands")]
     #[command(subcommand)]
     Repo(RepoCommand),
+
+    #[clap(about = "Docker image build and run commands")]
+    #[command(subcommand)]
+    Docker(DockerCommand),
+}
+
+#[derive(Parser, Clone)]
+pub enum DockerCommand {
+    #[clap(about = "Build Docker image")]
+    Build {
+        #[clap(long, long_help = "release build or not")]
+        release: bool,
+
+        #[clap(long, long_help = "Use prebuilt binaries from prebuilt/ directory")]
+        prebuilt: bool,
+
+        #[clap(long, default_value = "fractalbits", long_help = "Docker image name")]
+        image_name: String,
+
+        #[clap(long, default_value = "latest", long_help = "Docker image tag")]
+        tag: String,
+    },
+
+    #[clap(about = "Run Docker container")]
+    Run {
+        #[clap(long, default_value = "fractalbits", long_help = "Docker image name")]
+        image_name: String,
+
+        #[clap(long, default_value = "latest", long_help = "Docker image tag")]
+        tag: String,
+
+        #[clap(long, default_value = "8080", long_help = "Host port for S3 API")]
+        port: u16,
+
+        #[clap(long, long_help = "Container name")]
+        name: Option<String>,
+
+        #[clap(long, long_help = "Run in detached mode")]
+        detach: bool,
+    },
+
+    #[clap(about = "Stop Docker container")]
+    Stop {
+        #[clap(long, long_help = "Container name to stop")]
+        name: Option<String>,
+    },
+
+    #[clap(about = "Show Docker container logs")]
+    Logs {
+        #[clap(long, long_help = "Container name")]
+        name: Option<String>,
+
+        #[clap(long, long_help = "Follow log output")]
+        follow: bool,
+    },
 }
 
 #[derive(Parser, Clone)]
@@ -255,9 +311,10 @@ impl ServiceName {
 #[strum(serialize_all = "snake_case")]
 #[clap(rename_all = "snake_case")]
 pub enum DataBlobStorage {
-    #[default]
     S3HybridSingleAz,
     S3ExpressMultiAz,
+    #[default]
+    AllInBssSingleAz,
 }
 
 #[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
@@ -583,6 +640,7 @@ async fn main() -> CmdResult {
             cmd_run_tests::run_tests(test_type).await?
         }
         Cmd::Repo(repo_cmd) => cmd_repo::run_cmd_repo(repo_cmd)?,
+        Cmd::Docker(docker_cmd) => cmd_docker::run_cmd_docker(docker_cmd)?,
     }
     Ok(())
 }

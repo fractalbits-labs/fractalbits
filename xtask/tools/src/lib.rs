@@ -1,7 +1,12 @@
 use cmd_lib::*;
 use rayon::prelude::*;
+use std::fs;
+use std::net::TcpStream;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
+use tracing::info;
 use uuid::Uuid;
 
 // Support GenUuids only for now
@@ -112,4 +117,124 @@ pub fn dump_vg_config(localdev: bool) -> CmdResult {
     }
 
     Ok(())
+}
+
+/// Check if a TCP port is ready for connections
+pub fn check_port_ready(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", port).parse().unwrap(),
+        Duration::from_secs(1),
+    )
+    .is_ok()
+}
+
+/// Create directories for BSS server
+pub fn create_bss_dirs(data_dir: &Path, bss_id: u32, bss_count: u32) -> CmdResult {
+    info!("Creating directories for bss{} server", bss_id);
+
+    let bss_dir = data_dir.join(format!("bss{}", bss_id));
+    fs::create_dir_all(bss_dir.join("local/stats"))?;
+    fs::create_dir_all(bss_dir.join("local/blobs"))?;
+
+    // Data volume
+    let data_volume_id = match bss_count {
+        1 => 1,
+        _ => (bss_id / 3) + 1, // DATA_VG_QUORUM_N = 3
+    };
+    let data_vol_dir = bss_dir.join(format!("local/blobs/data_volume{}", data_volume_id));
+    fs::create_dir_all(&data_vol_dir)?;
+    for i in 0..256 {
+        fs::create_dir_all(data_vol_dir.join(format!("{}", i)))?;
+    }
+
+    // Metadata volume
+    let metadata_volume_id = match bss_count {
+        1 => 1,
+        _ => (bss_id / 6) + 1, // METADATA_VG_QUORUM_N = 6
+    };
+    let meta_vol_dir = bss_dir.join(format!("local/blobs/metadata_volume{}", metadata_volume_id));
+    fs::create_dir_all(&meta_vol_dir)?;
+    for i in 0..256 {
+        fs::create_dir_all(meta_vol_dir.join(format!("{}", i)))?;
+    }
+
+    Ok(())
+}
+
+/// Create directories for NSS server
+pub fn create_nss_dirs(data_dir: &Path, dir_name: &str) -> CmdResult {
+    info!("Creating directories for {} server", dir_name);
+
+    let nss_dir = data_dir.join(dir_name);
+    fs::create_dir_all(nss_dir.join("ebs"))?;
+    fs::create_dir_all(nss_dir.join("local/stats"))?;
+    fs::create_dir_all(nss_dir.join("local/meta_cache/blobs"))?;
+
+    for i in 0..256 {
+        fs::create_dir_all(nss_dir.join(format!("local/meta_cache/blobs/{}", i)))?;
+    }
+
+    Ok(())
+}
+
+/// Generate volume group configuration JSON
+pub fn generate_volume_group_config(bss_count: u32, n: u32, r: u32, w: u32) -> String {
+    let num_volumes = bss_count / n;
+    let mut volumes = Vec::new();
+
+    for vol_idx in 0..num_volumes {
+        let start_idx = vol_idx * n;
+        let end_idx = start_idx + n;
+
+        let nodes: Vec<String> = (start_idx..end_idx)
+            .map(|i| {
+                format!(
+                    r#"{{"node_id":"bss{i}","ip":"127.0.0.1","port":{}}}"#,
+                    8088 + i
+                )
+            })
+            .collect();
+
+        volumes.push(format!(
+            r#"{{"volume_id":{},"bss_nodes":[{}]}}"#,
+            vol_idx + 1,
+            nodes.join(",")
+        ));
+    }
+
+    format!(
+        r#"{{"volumes":[{}],"quorum":{{"n":{n},"r":{r},"w":{w}}}}}"#,
+        volumes.join(","),
+    )
+}
+
+/// Generate BSS data volume group config for given bss_count
+pub fn generate_bss_data_vg_config(bss_count: u32) -> String {
+    const DATA_VG_QUORUM_N: u32 = 3;
+    const DATA_VG_QUORUM_R: u32 = 2;
+    const DATA_VG_QUORUM_W: u32 = 2;
+
+    match bss_count {
+        1 => generate_volume_group_config(1, 1, 1, 1),
+        6 => generate_volume_group_config(6, DATA_VG_QUORUM_N, DATA_VG_QUORUM_R, DATA_VG_QUORUM_W),
+        _ => generate_volume_group_config(1, 1, 1, 1),
+    }
+}
+
+/// Generate BSS metadata volume group config for given bss_count
+pub fn generate_bss_metadata_vg_config(bss_count: u32) -> String {
+    const METADATA_VG_QUORUM_N: u32 = 6;
+    const METADATA_VG_QUORUM_R: u32 = 4;
+    const METADATA_VG_QUORUM_W: u32 = 4;
+
+    match bss_count {
+        1 => generate_volume_group_config(1, 1, 1, 1),
+        6 => generate_volume_group_config(
+            6,
+            METADATA_VG_QUORUM_N,
+            METADATA_VG_QUORUM_R,
+            METADATA_VG_QUORUM_W,
+        ),
+        _ => generate_volume_group_config(1, 1, 1, 1),
+    }
 }
