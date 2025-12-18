@@ -1264,7 +1264,7 @@ fn resolve_binary_path(binary_name: &str, build_mode: BuildMode) -> String {
     candidates.into_iter().next().unwrap()
 }
 
-fn resolve_etcd_bin(binary_name: &str) -> String {
+pub fn resolve_etcd_bin(binary_name: &str) -> String {
     // Check system PATH first
     if let Ok(path) = run_fun!(bash -c "command -v $binary_name") {
         return path;

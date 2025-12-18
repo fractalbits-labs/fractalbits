@@ -7,6 +7,9 @@ service *args:
 precheckin *args:
   cargo xtask precheckin {{args}}
 
+run-tests *args:
+  cargo xtask run-tests {{args}}
+
 deploy *args:
   cargo xtask deploy {{args}}
 
