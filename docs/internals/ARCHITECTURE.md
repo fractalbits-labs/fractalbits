@@ -10,45 +10,54 @@ FractalBits uses a multi-tier architecture optimized for performance:
 └──────┬──────┘
        │ HTTP(S)
        ▼
-┌─────────────────────────────────┐
-│  API Server (Actix/Axum)        │  ← S3 API Frontend
-│  - AWS SigV4 Auth               │
-│  - Request Routing              │
-│  - Connection Pooling           │
-│  - Hybrid Storage Decision      │
-└──┬────┬─────────────┬───────┬───┘
-   │    │             │       │
-   │    │        ┌────▼──────┐│
-   │    │        │   RSS     ││      ← Coordination
-   │    │        │ (Rust)    ││
-   │    │        │ - Leader  ││
-   │    │        │   Election││
-   │    │        └───────────┘│
-   │    │                     │
-   │    │    ┌────────────────┘
-   │    │    │
-   │  ┌─▼────▼─────────┐
-   │  │     NSS        │             ← Metadata
-   │  │    (Zig)       │              (Full path, infinitely Splittable)
-   │  │  - FractalART  │
-   │  │    Index       │
-   │  └────┬───────────┘
-   │       │
-   │       │  ┌──────────────────────────────────┐
-   │       │  │  Hybrid Storage (based on size)  │
-   │       │  └──────────────────────────────────┘
-   │       │       │                      │
-   │       │       │ < 1MB                │ >= 1MB
-   │       │       ▼                      ▼
-   └───────┼──┐ ┌────────────┐    ┌──────────────┐
-           │  └─│    BSS     │    │   S3 Cloud   │
-           │    │   (Zig)    │    │  (AWS S3)    │
-           │    │  io_uring  │    │  - Durable   │
-           └───►│            │    │  - Scalable  │
-                └────────────┘    └──────────────┘
-                    ▲                     ▲
-                    │ Data Plane          │ Data Plane
-                    │ (Local NVMe)        │ (Cloud Storage)
+┌───────────────────────────────────┐
+│┌──────────────────────────────────┴┐
+││┌──────────────────────────────────┴┐
+│││  API Server (Actix/Axum)          │  ← S3 API Frontend (N instances)
+│││  - AWS SigV4 Auth                 │
+│││  - Request Routing                │
+│││  - Connection Pooling             │
+│││  - Hybrid Storage Decision        │
+└┤└──┬────┬─────────────┬───────┬────┬┘
+ └───┼────┼─────────────┼───────┼────┘
+     │    │             │       │
+     │    │      ┌──────▼─────┐ │
+     │    │      │┌───────────┴┐│       ← Coordination (HA pair)
+     │    │      ││    RSS     ││
+     │    │      ││   (Rust)   ││
+     │    │      ││  - Leader  ││
+     │    │      │└  Election ─┘│
+     │    │      └─────────────┘│
+     │    │                     │
+     │    │    ┌────────────────┘
+     │    │    │
+     │  ┌─▼────▼───────────┐
+     │  │┌─────────────────┴┐
+     │  ││┌─────────────────┴┐          ← Metadata (N instances)
+     │  │││     NSS          │           (Full path, infinitely Splittable)
+     │  │││    (Zig)         │
+     │  │││  - FractalART    │
+     │  │││    Index         │
+     │  └┤└────┬─────────────┘
+     │   └─────┼─────────────┘
+     │         │
+     │         │  ┌──────────────────────────────────┐
+     │         │  │  Hybrid Storage (based on size)  │
+     │         │  └──────────────────────────────────┘
+     │         │       │                      │
+     │         │       │ < 1MB                │ >= 1MB
+     │         │       ▼                      ▼
+     └─────────┼──┐ ┌────────────┐    ┌──────────────┐
+               │  │ │┌───────────┴┐   │   S3 Cloud   │
+               │  │ ││┌───────────┴┐  │  (AWS S3)    │
+               │  └─│││    BSS     │  │  - Durable   │
+               └───►│││   (Zig)    │  │  - Scalable  │
+                    │││  io_uring  │  └──────────────┘
+                    └┤└────────────┘        ▲
+                     └─────────────┘        │
+                          ▲                 │
+                          │ Data Plane      │ Data Plane
+                          │ (Local NVMe)    │ (Cloud Storage)
 ```
 
 ## Components

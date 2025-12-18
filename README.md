@@ -174,17 +174,7 @@ just docker logs --name fractalbits-dev --follow
 just docker stop --name fractalbits-dev
 ```
 
-Once running, use any S3-compatible client:
-
-```bash
-export AWS_DEFAULT_REGION=localdev
-export AWS_ENDPOINT_URL_S3=http://localhost:8080
-export AWS_ACCESS_KEY_ID=test_api_key
-export AWS_SECRET_ACCESS_KEY=test_api_secret
-
-aws s3 mb s3://my-bucket
-aws s3 cp test.txt s3://my-bucket/
-```
+Once running, see [Basic Usage Example](#basic-usage-example) for S3 client commands.
 
 The Docker image bundles all services (API server, BSS, NSS, RSS) into a single container orchestrated by the `container-all-in-one` binary.
 
