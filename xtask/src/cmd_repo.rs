@@ -102,7 +102,9 @@ fn show_repos_status() -> CmdResult {
 
     let mut table = Table::new();
     table.load_preset(presets::ASCII_BORDERS_ONLY_CONDENSED);
-    table.set_header(vec!["Path", "Branch", "Status", "Commit", "Message"]);
+    table.set_header(vec![
+        "Path", "User", "Branch", "Status", "Commit", "Message",
+    ]);
 
     for repo in all_repos() {
         let path = repo.path;
@@ -152,6 +154,11 @@ fn show_repos_status() -> CmdResult {
             )
         };
 
+        let username = run_fun! {
+            cd $path;
+            git config user.name
+        }?;
+
         // Create cells with appropriate colors
         let status_cell = match status {
             "clean" => Cell::new(status).fg(Color::Green),
@@ -168,6 +175,7 @@ fn show_repos_status() -> CmdResult {
 
         table.add_row(vec![
             Cell::new(path),
+            Cell::new(&username),
             branch_cell,
             status_cell,
             Cell::new(&commit),

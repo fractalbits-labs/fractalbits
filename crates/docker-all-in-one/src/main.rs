@@ -167,7 +167,10 @@ impl Orchestrator {
     fn start_rss(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let child = Command::new(self.bin_dir.join("root_server"))
             .env("RSS_BACKEND", "etcd")
-            .env("ETCD_ENDPOINTS", format!("http://127.0.0.1:{}", self.etcd_port))
+            .env(
+                "ETCD_ENDPOINTS",
+                format!("http://127.0.0.1:{}", self.etcd_port),
+            )
             .env("RUST_LOG", "info")
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -217,7 +220,10 @@ impl Orchestrator {
             .env("RUST_LOG", "info")
             .env("HTTPS_DISABLED", "1")
             .env("APP_BLOB_STORAGE_BACKEND", "all_in_bss_single_az")
-            .env("APP_STATS_DIR", self.data_dir.join("api-server/local/stats"))
+            .env(
+                "APP_STATS_DIR",
+                self.data_dir.join("api-server/local/stats"),
+            )
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()?;
@@ -273,8 +279,7 @@ impl Orchestrator {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with(
             tracing_subscriber::fmt::layer()
