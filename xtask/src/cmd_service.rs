@@ -157,10 +157,51 @@ pub fn init_service(
 
         Ok(())
     };
+    let init_minio = |data_dir: &str| -> CmdResult { run_cmd!(mkdir -p $data_dir) };
+    let init_etcd = || -> CmdResult {
+        ensure_etcd()?;
+        run_cmd! {
+            mkdir -p data/etcd;
+        }?;
+        start_service(ServiceName::Etcd)?;
+
+        // Initialize service-discovery keys using etcdctl
+        let etcdctl = resolve_etcd_bin("etcdctl");
+        let nss_roles_json = match init_config.data_blob_storage {
+            DataBlobStorage::S3HybridSingleAz => r#"{"states":{"nss-A":"solo"}}"#,
+            DataBlobStorage::S3ExpressMultiAz => {
+                r#"{"states":{"nss-A":"active","nss-B":"standby"}}"#
+            }
+        };
+
+        let az_status_json = r#"{"status":{"localdev-az1":"Normal","localdev-az2":"Normal"}}"#;
+        let bss_data_vg_config = generate_bss_data_vg_config(init_config.bss_count);
+        let bss_metadata_vg_config = generate_bss_metadata_vg_config(init_config.bss_count);
+
+        run_cmd! {
+            info "Initializing etcd service-discovery keys...";
+            $etcdctl put /fractalbits-service-discovery/nss_roles $nss_roles_json >/dev/null;
+            $etcdctl put /fractalbits-service-discovery/az_status $az_status_json >/dev/null;
+            $etcdctl put /fractalbits-service-discovery/bss-data-vg-config $bss_data_vg_config >/dev/null;
+            $etcdctl put /fractalbits-service-discovery/bss-metadata-vg-config $bss_metadata_vg_config >/dev/null;
+        }?;
+
+        stop_service(ServiceName::Etcd)?;
+        Ok(())
+    };
     let init_rss = || -> CmdResult {
-        // Start ddb_local service at first if needed, since root server stores infomation in ddb_local
-        if run_cmd!(systemctl --user is-active --quiet ddb_local.service).is_err() {
-            init_ddb_local()?;
+        // Start backend service (ddb_local or etcd) based on config
+        match init_config.rss_backend {
+            RssBackend::Ddb => {
+                if run_cmd!(systemctl --user is-active --quiet ddb_local.service).is_err() {
+                    init_ddb_local()?;
+                }
+            }
+            RssBackend::Etcd => {
+                if run_cmd!(systemctl --user is-active --quiet etcd.service).is_err() {
+                    init_etcd()?;
+                }
+            }
         }
 
         // Start RSS service since admin now connects via RPC
@@ -174,7 +215,10 @@ pub fn init_service(
 
         // Stop services after initialization
         stop_service(ServiceName::Rss)?;
-        stop_service(ServiceName::DdbLocal)?;
+        match init_config.rss_backend {
+            RssBackend::Ddb => stop_service(ServiceName::DdbLocal)?,
+            RssBackend::Etcd => stop_service(ServiceName::Etcd)?,
+        }
         Ok(())
     };
     let init_all_bss = |count: u32| -> CmdResult {
@@ -208,7 +252,6 @@ pub fn init_service(
         stop_service(ServiceName::Bss)?;
         Ok(())
     };
-    let init_minio = |data_dir: &str| -> CmdResult { run_cmd!(mkdir -p $data_dir) };
     let init_mirrord = || -> CmdResult {
         let format_log = "data/logs/format_mirrord.log";
         create_dirs_for_mirrord_server()?;
@@ -245,6 +288,7 @@ pub fn init_service(
         ServiceName::Nss => init_nss()?,
         ServiceName::NssRoleAgentA | ServiceName::NssRoleAgentB => {}
         ServiceName::Mirrord => init_mirrord()?,
+        ServiceName::Etcd => init_etcd()?,
         ServiceName::All => {
             if init_config.with_https {
                 generate_https_certificates()?;
@@ -313,6 +357,43 @@ fn ensure_minio() -> CmdResult {
         mkdir -p $minio_dir;
         curl -L -o $minio_path $download_url 2>&1;
         chmod +x $minio_path;
+    }?;
+
+    Ok(())
+}
+
+fn ensure_etcd() -> CmdResult {
+    let etcd_dir = "third_party/etcd";
+    let etcd_path = format!("{etcd_dir}/etcd");
+
+    // Check if etcd is already available
+    if run_cmd!(bash -c "command -v etcd" &>/dev/null).is_ok() || Path::new(&etcd_path).exists() {
+        return Ok(());
+    }
+
+    let etcd_version = "v3.6.7";
+    let etcd_tarball = format!("etcd-{etcd_version}-linux-amd64.tar.gz");
+    let download_url =
+        format!("https://github.com/etcd-io/etcd/releases/download/{etcd_version}/{etcd_tarball}");
+    let tarball_path = format!("third_party/{etcd_tarball}");
+
+    // Download if not already downloaded
+    if !Path::new(&tarball_path).exists() {
+        run_cmd! {
+            info "Downloading etcd binary...";
+            mkdir -p third_party;
+            curl -sL -o $tarball_path $download_url;
+        }?;
+    }
+
+    let extracted_dir = format!("third_party/etcd-{}-linux-amd64", etcd_version);
+    run_cmd! {
+        info "Extracting etcd...";
+        mkdir -p $etcd_dir;
+        tar -xzf $tarball_path -C third_party;
+        mv $extracted_dir/etcd $etcd_dir/;
+        mv $extracted_dir/etcdctl $etcd_dir/;
+        rm -rf $extracted_dir;
     }?;
 
     Ok(())
@@ -418,7 +499,12 @@ fn wait_for_port_ready(port: u16, timeout_secs: u32) -> CmdResult {
 
 pub fn stop_service(service: ServiceName) -> CmdResult {
     let services: Vec<ServiceName> = match service {
-        ServiceName::All => all_services(get_data_blob_storage_setting(), false, false),
+        ServiceName::All => all_services(
+            get_data_blob_storage_setting(),
+            get_rss_backend_setting(),
+            false,
+            false,
+        ),
         single_service => vec![single_service],
     };
 
@@ -486,9 +572,14 @@ pub fn stop_service(service: ServiceName) -> CmdResult {
 
 fn all_services(
     data_blob_storage: DataBlobStorage,
+    rss_backend: RssBackend,
     with_managed_service: bool,
     sort: bool,
 ) -> Vec<ServiceName> {
+    let rss_backend_service = match rss_backend {
+        RssBackend::Ddb => ServiceName::DdbLocal,
+        RssBackend::Etcd => ServiceName::Etcd,
+    };
     let mut services = match data_blob_storage {
         DataBlobStorage::S3HybridSingleAz => {
             let mut services = vec![
@@ -496,7 +587,7 @@ fn all_services(
                 ServiceName::NssRoleAgentA,
                 ServiceName::Bss,
                 ServiceName::Rss,
-                ServiceName::DdbLocal,
+                rss_backend_service,
                 ServiceName::Minio,
             ];
             if with_managed_service {
@@ -510,7 +601,7 @@ fn all_services(
                 ServiceName::NssRoleAgentA,
                 ServiceName::NssRoleAgentB,
                 ServiceName::Rss,
-                ServiceName::DdbLocal,
+                rss_backend_service,
                 ServiceName::Minio,
                 ServiceName::MinioAz1,
                 ServiceName::MinioAz2,
@@ -528,6 +619,14 @@ fn all_services(
     services
 }
 
+fn get_rss_backend_setting() -> RssBackend {
+    if run_cmd!(grep -q "RSS_BACKEND=etcd" data/etc/rss.service &>/dev/null).is_ok() {
+        RssBackend::Etcd
+    } else {
+        RssBackend::Ddb
+    }
+}
+
 fn get_data_blob_storage_setting() -> DataBlobStorage {
     if run_cmd!(grep -q multi_az data/etc/api_server.service &>/dev/null).is_ok() {
         DataBlobStorage::S3ExpressMultiAz
@@ -542,7 +641,12 @@ pub fn show_service_status(service: ServiceName) -> CmdResult {
             println!("Service Status:");
             println!("─────────────────────────────────────");
 
-            for svc in all_services(get_data_blob_storage_setting(), true, true) {
+            for svc in all_services(
+                get_data_blob_storage_setting(),
+                get_rss_backend_setting(),
+                true,
+                true,
+            ) {
                 if svc == ServiceName::Bss {
                     // Handle BSS template instances using helper functions
                     for bss_service_name in get_bss_service_names() {
@@ -672,9 +776,18 @@ fn create_minio_bucket(port: u16, bucket_name: &str) -> CmdResult {
 fn start_all_services() -> CmdResult {
     info!("Starting all services with systemd dependency management");
 
-    // Start supporting services first
-    info!("Starting supporting services (ddb_local, minio instances)");
-    start_service(ServiceName::DdbLocal)?;
+    // Start supporting services first based on backend configuration
+    let backend = get_rss_backend_setting();
+    match backend {
+        RssBackend::Ddb => {
+            info!("Starting supporting services (ddb_local, minio instances)");
+            start_service(ServiceName::DdbLocal)?;
+        }
+        RssBackend::Etcd => {
+            info!("Starting supporting services (etcd, minio instances)");
+            start_service(ServiceName::Etcd)?;
+        }
+    }
     start_service(ServiceName::Minio)?; // Original minio for NSS metadata (port 9000)
     if run_cmd!(grep -q multi_az data/etc/api_server.service &>/dev/null).is_ok() {
         start_service(ServiceName::MinioAz1)?; // Local AZ data blobs (port 9001)
@@ -727,11 +840,17 @@ fn create_systemd_unit_files_for_init(
         | ServiceName::DdbLocal
         | ServiceName::Minio
         | ServiceName::MinioAz1
-        | ServiceName::MinioAz2 => {
+        | ServiceName::MinioAz2
+        | ServiceName::Etcd => {
             create_systemd_unit_file(service, build_mode, init_config)?;
         }
         ServiceName::All => {
-            for service in all_services(init_config.data_blob_storage, true, false) {
+            for service in all_services(
+                init_config.data_blob_storage,
+                init_config.rss_backend,
+                true,
+                false,
+            ) {
                 create_systemd_unit_file(service, build_mode, init_config)?;
             }
         }
@@ -809,6 +928,10 @@ Environment="AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey"
 Environment="AWS_ENDPOINT_URL_DYNAMODB=http://localhost:8000""##
                 .to_string();
             env_settings += env_rust_log(build_mode);
+            env_settings += &format!(
+                "\nEnvironment=\"RSS_BACKEND={}\"",
+                init_config.rss_backend.as_ref()
+            );
             resolve_binary_path("root_server", build_mode)
         }
         ServiceName::ApiServer => {
@@ -860,6 +983,12 @@ Environment="MINIO_REGION=localdev""##
                 .to_string();
             format!("{minio_bin} server --address :9002 data/s3-localdev-az2/")
         }
+        ServiceName::Etcd => {
+            let etcd_bin = resolve_etcd_bin("etcd");
+            format!(
+                "{etcd_bin} --data-dir=./data/etcd --listen-client-urls=http://localhost:2379 --advertise-client-urls=http://localhost:2379"
+            )
+        }
         _ => unreachable!(),
     };
     let working_dir = match service {
@@ -870,13 +999,16 @@ Environment="MINIO_REGION=localdev""##
     // Add systemd dependencies based on service type
     let dependencies = match service {
         ServiceName::NssRoleAgentA | ServiceName::NssRoleAgentB => {
-            "After=rss.service\nWants=rss.service\n"
+            "After=rss.service\nWants=rss.service\n".to_string()
         }
-        ServiceName::Rss => "After=ddb_local.service\nWants=ddb_local.service\n",
+        ServiceName::Rss => match init_config.rss_backend {
+            RssBackend::Ddb => "After=ddb_local.service\nWants=ddb_local.service\n".to_string(),
+            RssBackend::Etcd => "After=etcd.service\nWants=etcd.service\n".to_string(),
+        },
         ServiceName::ApiServer | ServiceName::GuiServer => {
-            "After=rss.service nss.service minio.service\nWants=rss.service nss.service minio.service\n"
+            "After=rss.service nss.service minio.service\nWants=rss.service nss.service minio.service\n".to_string()
         }
-        _ => "",
+        _ => String::new(),
     };
 
     let (restart_settings, auto_restart) = if managed_service {
@@ -1015,6 +1147,7 @@ pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdRes
                 ServiceName::ApiServer | ServiceName::GuiServer => check_port_ready(8080),
                 ServiceName::NssRoleAgentA => check_port_ready(8087), // Check managed nss_server
                 ServiceName::NssRoleAgentB => check_port_ready(9999), // check managed mirrord
+                ServiceName::Etcd => check_port_ready(2379),
                 ServiceName::All => unreachable!("Should not check readiness for All"),
             };
 
@@ -1041,46 +1174,58 @@ pub fn check_port_ready(port: u16) -> bool {
 fn register_local_api_server() -> CmdResult {
     info!("Registering local api_server with service discovery");
 
-    // Create the JSON item for DynamoDB
-    let item_json = r#"{
-        "service_id": {"S": "api-server"},
-        "instances": {
-            "M": {
-                "local-dev": {"S": "127.0.0.1:8080"}
+    let backend = get_rss_backend_setting();
+    match backend {
+        RssBackend::Ddb => {
+            // Create the JSON item for DynamoDB
+            let item_json = r#"{
+                "service_id": {"S": "api-server"},
+                "instances": {
+                    "M": {
+                        "local-dev": {"S": "127.0.0.1:8080"}
+                    }
+                }
+            }"#;
+
+            // Try to update existing item first, if it doesn't exist, create it
+            let key_json = "{\"service_id\": {\"S\": \"api-server\"}}";
+            let attr_names = "{\"#instances\": \"instances\", \"#local\": \"local-dev\"}";
+            let attr_values = "{\":ip\": {\"S\": \"127.0.0.1:8080\"}}";
+
+            if run_cmd!(
+                AWS_DEFAULT_REGION=fakeRegion
+                AWS_ACCESS_KEY_ID=fakeMyKeyId
+                AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
+                AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
+                aws dynamodb update-item
+                    --table-name fractalbits-service-discovery
+                    --key $key_json
+                    --update-expression "SET #instances.#local = :ip"
+                    --expression-attribute-names $attr_names
+                    --expression-attribute-values $attr_values
+                    --condition-expression "attribute_exists(service_id)" 2>/dev/null
+            )
+            .is_err()
+            {
+                // Item doesn't exist, create it
+                run_cmd!(
+                    AWS_DEFAULT_REGION=fakeRegion
+                    AWS_ACCESS_KEY_ID=fakeMyKeyId
+                    AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
+                    AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
+                    aws dynamodb put-item
+                        --table-name fractalbits-service-discovery
+                        --item $item_json
+                )?;
             }
         }
-    }"#;
-
-    // Try to update existing item first, if it doesn't exist, create it
-    let key_json = "{\"service_id\": {\"S\": \"api-server\"}}";
-    let attr_names = "{\"#instances\": \"instances\", \"#local\": \"local-dev\"}";
-    let attr_values = "{\":ip\": {\"S\": \"127.0.0.1:8080\"}}";
-
-    if run_cmd!(
-        AWS_DEFAULT_REGION=fakeRegion
-        AWS_ACCESS_KEY_ID=fakeMyKeyId
-        AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
-        AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
-        aws dynamodb update-item
-            --table-name fractalbits-service-discovery
-            --key $key_json
-            --update-expression "SET #instances.#local = :ip"
-            --expression-attribute-names $attr_names
-            --expression-attribute-values $attr_values
-            --condition-expression "attribute_exists(service_id)" 2>/dev/null
-    )
-    .is_err()
-    {
-        // Item doesn't exist, create it
-        run_cmd!(
-            AWS_DEFAULT_REGION=fakeRegion
-            AWS_ACCESS_KEY_ID=fakeMyKeyId
-            AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
-            AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
-            aws dynamodb put-item
-                --table-name fractalbits-service-discovery
-                --item $item_json
-        )?;
+        RssBackend::Etcd => {
+            let etcdctl = resolve_etcd_bin("etcdctl");
+            let instances_json = r#"{"local-dev":"127.0.0.1:8080"}"#;
+            run_cmd!(
+                $etcdctl put /fractalbits-service-discovery/api-server $instances_json >/dev/null
+            )?;
+        }
     }
 
     info!("Local api_server registered in service discovery");
@@ -1117,6 +1262,17 @@ fn resolve_binary_path(binary_name: &str, build_mode: BuildMode) -> String {
 
     // Default to first candidate (target/build path)
     candidates.into_iter().next().unwrap()
+}
+
+pub fn resolve_etcd_bin(binary_name: &str) -> String {
+    // Check system PATH first
+    if let Ok(path) = run_fun!(bash -c "command -v $binary_name") {
+        return path;
+    }
+
+    // Fall back to third_party directory
+    let pwd = run_fun!(pwd).unwrap_or_else(|_| ".".to_string());
+    format!("{pwd}/third_party/etcd/{binary_name}")
 }
 
 fn generate_https_certificates() -> CmdResult {

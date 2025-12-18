@@ -104,26 +104,74 @@ fn run_fractal_art_tests() -> CmdResult {
 fn run_s3_api_tests(init_config: InitConfig, debug_api_server: bool) -> CmdResult {
     if debug_api_server {
         cmd_service::start_service(ServiceName::ApiServer)?;
-    } else {
-        cmd_service::init_service(ServiceName::All, BuildMode::Debug, init_config)?;
-        cmd_service::start_service(ServiceName::All)?;
+        run_cmd! {
+            info "Run cargo tests (s3 api tests)";
+            cargo test --package api_server;
+        }?;
+        if init_config.with_https {
+            run_cmd! {
+                info "Run cargo tests (s3 https api tests)";
+                USE_HTTPS_ENDPOINT=true cargo test --package api_server;
+            }?;
+        }
+        return Ok(());
     }
 
+    // Test with DDB backend
+    let ddb_config = InitConfig {
+        rss_backend: RssBackend::Ddb,
+        ..init_config
+    };
+    info!("Testing with DDB backend...");
+    cmd_service::init_service(ServiceName::All, BuildMode::Debug, ddb_config)?;
+    cmd_service::start_service(ServiceName::All)?;
+
     run_cmd! {
-        info "Run cargo tests (s3 api tests)";
+        info "Run cargo tests (s3 api tests - DDB backend)";
         cargo test --package api_server;
     }?;
 
     if init_config.with_https {
         run_cmd! {
-            info "Run cargo tests (s3 https api tests)";
+            info "Run cargo tests (s3 https api tests - DDB backend)";
             USE_HTTPS_ENDPOINT=true cargo test --package api_server;
         }?;
     }
 
-    if !debug_api_server {
-        let _ = cmd_service::stop_service(ServiceName::All);
+    cmd_service::stop_service(ServiceName::All)?;
+
+    // Clean up data directories to ensure fresh state for etcd backend test.
+    // NSS data from DDB run is incompatible and causes crashes when switching backends.
+    run_cmd! {
+        info "Cleaning up data directories before etcd backend test";
+        rm -rf data;
+    }?;
+
+    // Test with etcd backend
+    let etcd_config = InitConfig {
+        rss_backend: RssBackend::Etcd,
+        ..init_config
+    };
+    info!("Testing with etcd backend...");
+    cmd_service::init_service(ServiceName::All, BuildMode::Debug, etcd_config)?;
+    cmd_service::start_service(ServiceName::All)?;
+
+    // Wait for NSS to fully initialize (port check may pass before full init)
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    run_cmd! {
+        info "Run cargo tests (s3 api tests - etcd backend)";
+        cargo test --package api_server;
+    }?;
+
+    if init_config.with_https {
+        run_cmd! {
+            info "Run cargo tests (s3 https api tests - etcd backend)";
+            USE_HTTPS_ENDPOINT=true cargo test --package api_server;
+        }?;
     }
+
+    let _ = cmd_service::stop_service(ServiceName::All);
 
     Ok(())
 }
