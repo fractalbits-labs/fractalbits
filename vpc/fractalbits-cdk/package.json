@@ -11,15 +11,17 @@
     "cdk": "cdk"
   },
   "devDependencies": {
+    "@types/iarna__toml": "^2.0.5",
     "@types/jest": "^29.5.14",
     "@types/node": "22.7.9",
+    "aws-cdk": "2.1033.0",
     "jest": "^29.7.0",
     "ts-jest": "^29.2.5",
-    "aws-cdk": "2.1033.0",
     "ts-node": "^10.9.2",
     "typescript": "~5.6.3"
   },
   "dependencies": {
+    "@iarna/toml": "^2.2.5",
     "aws-cdk-lib": "2.196.0",
     "constructs": "^10.0.0"
   }

@@ -2,6 +2,9 @@ import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as s3 from "aws-cdk-lib/aws-s3";
+import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
+import * as TOML from "@iarna/toml";
 import { createInstance, createUserData, createEc2Asg } from "./ec2-utils";
 
 interface FractalbitsBenchVpcStackProps extends cdk.StackProps {
@@ -89,24 +92,69 @@ export class FractalbitsBenchVpcStack extends cdk.Stack {
       ec2Role,
     );
 
-    // Bench Client ASG - use the first private subnet
-    const benchClientBootstrapOptions = `bench_client`;
+    // Build bootstrap config for bench stack
+    const region = cdk.Stack.of(this).region;
+    const account = cdk.Stack.of(this).account;
+    const buildsBucket = s3.Bucket.fromBucketName(
+      this,
+      "BuildsBucket",
+      `fractalbits-builds-${region}-${account}`,
+    );
+
+    // Static config using TOML library
+    const staticConfig = {
+      global: {
+        for_bench: true,
+        data_blob_storage: "singleAz",
+        rss_ha_enabled: false,
+      },
+      aws: {
+        bucket: "unused",
+        local_az: "unused",
+        iam_role: ec2Role.roleName,
+      },
+      endpoints: {
+        nss_endpoint: "unused",
+        api_server_endpoint: props.serviceEndpoint,
+      },
+      resources: {
+        nss_a_id: "unused",
+      },
+    };
+
+    const staticPart =
+      "# Auto-generated bootstrap configuration for bench stack\n\n" +
+      TOML.stringify(staticConfig as TOML.JsonMap);
+
+    // Dynamic instance section with CFN token
+    const configContent = cdk.Fn.join("\n", [
+      staticPart.trimEnd(),
+      "",
+      cdk.Fn.join("", ['[instances."', benchServerInstance.instanceId, '"]']),
+      'service_type = "bench_server"',
+      `bench_client_num = ${props.benchClientCount}`,
+      "",
+    ]);
+
+    new s3deploy.BucketDeployment(this, "ConfigDeployment", {
+      sources: [s3deploy.Source.data("bootstrap.toml", configContent)],
+      destinationBucket: buildsBucket,
+    });
+
+    benchServerInstance.addUserData(createUserData(this).render());
+
+    // Bench Client ASG - instances discover their role from EC2 tags
     const benchClientAsg = createEc2Asg(
       this,
       "BenchClientAsg",
       this.vpc,
-      this.vpc.isolatedSubnets[0], // Use first isolated subnet
+      this.vpc.isolatedSubnets[0],
       privateSg,
       ec2Role,
       [props.benchClientInstanceType],
-      benchClientBootstrapOptions,
       props.benchClientCount,
       props.benchClientCount,
-    );
-
-    const bootstrapOptions = `bench_server --api_server_service_endpoint=${props.serviceEndpoint} --bench_client_num=${props.benchClientCount}`;
-    benchServerInstance.addUserData(
-      createUserData(this, bootstrapOptions).render(),
+      "bench_client",
     );
 
     // Outputs

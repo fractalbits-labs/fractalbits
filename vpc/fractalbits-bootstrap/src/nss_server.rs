@@ -1,4 +1,5 @@
 use super::common::*;
+use crate::config::BootstrapConfig;
 use cmd_lib::*;
 use rayon::prelude::*;
 use std::io::Error;
@@ -24,13 +25,11 @@ fn calculate_fa_journal_segment_size(volume_dev: &str) -> Result<u64, Error> {
     Ok(fa_journal_segment_size)
 }
 
-pub fn bootstrap(
-    volume_id: &str,
-    meta_stack_testing: bool,
-    for_bench: bool,
-    mirrord_endpoint: Option<&str>,
-    rss_ha_enabled: bool,
-) -> CmdResult {
+pub fn bootstrap(config: &BootstrapConfig, volume_id: &str, for_bench: bool) -> CmdResult {
+    let mirrord_endpoint = config.endpoints.mirrord_endpoint.as_deref();
+    let rss_ha_enabled = config.global.rss_ha_enabled;
+    let meta_stack_testing = config.global.meta_stack_testing;
+
     install_rpms(&["nvme-cli", "mdadm"])?;
     if meta_stack_testing || for_bench {
         download_binaries(&["test_fractal_art", "rewrk_rpc"])?;
@@ -39,12 +38,12 @@ pub fn bootstrap(
     download_binaries(&["nss_server", "nss_role_agent"])?;
     setup_configs(volume_id, "nss", mirrord_endpoint, rss_ha_enabled)?;
 
-    // Note for normal deployment, the nss_server service is not started
-    // until EBS/nss formatted from root_server
+    // For meta stack testing, format NSS immediately (no root_server to trigger via SSM)
     if meta_stack_testing {
         let volume_dev = get_volume_dev(volume_id);
         format_nss(volume_dev)?;
     }
+
     Ok(())
 }
 

@@ -2,6 +2,8 @@ import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as s3 from "aws-cdk-lib/aws-s3";
+import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
+import * as TOML from "@iarna/toml";
 import {
   createEbsVolume,
   createEc2Asg,
@@ -62,11 +64,48 @@ export class FractalbitsMetaStack extends cdk.Stack {
 
     let targetIdOutput: cdk.CfnOutput;
 
+    // Build bootstrap config for meta stack testing
+    const buildMetaStackConfig = (instanceEntries: string[]): string => {
+      // Static config using TOML library
+      const staticConfig = {
+        global: {
+          for_bench: false,
+          data_blob_storage: "singleAz",
+          rss_ha_enabled: false,
+          meta_stack_testing: true,
+        },
+        aws: {
+          bucket: "unused",
+          local_az: az,
+          iam_role: ec2Role.roleName,
+        },
+        endpoints: {
+          nss_endpoint: "unused",
+          api_server_endpoint: "unused",
+        },
+        resources: {
+          nss_a_id: "unused",
+        },
+      };
+
+      const staticPart =
+        "# Auto-generated bootstrap configuration for meta stack testing\n\n" +
+        TOML.stringify(staticConfig as TOML.JsonMap);
+
+      // Combine static part with dynamic instance entries
+      return cdk.Fn.join("\n", [staticPart.trimEnd(), "", ...instanceEntries]);
+    };
+
+    // Upload config to builds bucket
+    const region = cdk.Stack.of(this).region;
+    const account = cdk.Stack.of(this).account;
+    const buildsBucket = s3.Bucket.fromBucketName(
+      this,
+      "BuildsBucket",
+      `fractalbits-builds-${region}-${account}`,
+    );
+
     if (props.serviceName == "nss") {
-      const bucket = new s3.Bucket(this, "Bucket", {
-        removalPolicy: cdk.RemovalPolicy.DESTROY, // Delete bucket on stack delete
-        autoDeleteObjects: true, // Empty bucket before deletion
-      });
       const nssInstanceType = new ec2.InstanceType(
         props.nssInstanceType ?? "m7gd.2xlarge",
       );
@@ -84,9 +123,25 @@ export class FractalbitsMetaStack extends cdk.Stack {
         "MultiAttachVolume",
         az,
         instance.instanceId,
+        20,
+        10000,
       );
-      const nssBootstrapOptions = `nss_server --bucket=${bucket.bucketName} --volume_id=${ebsVolume.volumeId} --iam_role=${ec2Role.roleName} --meta_stack_testing`;
-      instance.addUserData(createUserData(this, nssBootstrapOptions).render());
+
+      // Build instance config entries using CloudFormation tokens
+      const instanceEntries = [
+        cdk.Fn.join("", ['[instances."', instance.instanceId, '"]']),
+        'service_type = "nss_server"',
+        cdk.Fn.join("", ['volume_id = "', ebsVolume.volumeId, '"']),
+        "",
+      ];
+
+      const configContent = buildMetaStackConfig(instanceEntries);
+      new s3deploy.BucketDeployment(this, "ConfigDeployment", {
+        sources: [s3deploy.Source.data("bootstrap.toml", configContent)],
+        destinationBucket: buildsBucket,
+      });
+
+      instance.addUserData(createUserData(this).render());
 
       targetIdOutput = new cdk.CfnOutput(this, "instanceId", {
         value: instance.instanceId,
@@ -100,18 +155,25 @@ export class FractalbitsMetaStack extends cdk.Stack {
         process.exit(1);
       }
       const bssInstanceTypes = props.bssInstanceTypes.split(",");
-      const bssBootstrapOptions = `bss_server --meta_stack_testing`;
+
+      // For BSS ASG, instances discover their role from EC2 tags
+      const configContent = buildMetaStackConfig([]);
+      new s3deploy.BucketDeployment(this, "ConfigDeployment", {
+        sources: [s3deploy.Source.data("bootstrap.toml", configContent)],
+        destinationBucket: buildsBucket,
+      });
+
       const bssAsg = createEc2Asg(
         this,
         "BssAsg",
         this.vpc,
-        this.vpc.isolatedSubnets[0], // Use first isolated subnet
+        this.vpc.isolatedSubnets[0],
         sg,
         ec2Role,
         bssInstanceTypes,
-        bssBootstrapOptions,
         1,
         1,
+        "bss_server",
       );
 
       targetIdOutput = new cdk.CfnOutput(this, "bssAsgName", {

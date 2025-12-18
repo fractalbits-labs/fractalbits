@@ -1,12 +1,16 @@
+use crate::config::BootstrapConfig;
 use crate::*;
 
-pub fn bootstrap(
-    bucket: Option<&str>,
-    nss_endpoint: &str,
-    remote_az: Option<&str>,
-    rss_ha_enabled: bool,
-    for_bench: bool,
-) -> CmdResult {
+pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
+    let bucket = if config.is_multi_az() {
+        None
+    } else {
+        Some(config.aws.bucket.as_str())
+    };
+    let nss_endpoint = &config.endpoints.nss_endpoint;
+    let remote_az = config.aws.remote_az.as_deref();
+    let rss_ha_enabled = config.global.rss_ha_enabled;
+
     download_binaries(&["api_server"])?;
     create_config(bucket, nss_endpoint, remote_az, rss_ha_enabled)?;
 

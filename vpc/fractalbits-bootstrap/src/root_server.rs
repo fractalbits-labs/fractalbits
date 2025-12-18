@@ -1,4 +1,5 @@
 use super::common::*;
+use crate::config::BootstrapConfig;
 use cmd_lib::*;
 use std::io::Error;
 
@@ -15,20 +16,54 @@ const META_DATA_VG_QUORUM_N: usize = 6;
 const META_DATA_VG_QUORUM_R: usize = 4;
 const META_DATA_VG_QUORUM_W: usize = 4;
 
-#[allow(clippy::too_many_arguments)]
 pub fn bootstrap(
+    config: &BootstrapConfig,
+    is_leader: bool,
+    follower_id: Option<String>,
+    for_bench: bool,
+) -> CmdResult {
+    let nss_endpoint = &config.endpoints.nss_endpoint;
+    let nss_a_id = &config.resources.nss_a_id;
+    let nss_b_id = config.resources.nss_b_id.as_deref();
+    let remote_az = config.aws.remote_az.as_deref();
+    let num_bss_nodes = config.global.num_bss_nodes;
+    let ha_enabled = config.global.rss_ha_enabled;
+
+    if is_leader {
+        bootstrap_leader(
+            nss_endpoint,
+            nss_a_id,
+            nss_b_id,
+            follower_id.as_deref(),
+            remote_az,
+            num_bss_nodes,
+            ha_enabled,
+            for_bench,
+        )
+    } else {
+        bootstrap_follower(nss_endpoint, ha_enabled)
+    }
+}
+
+fn bootstrap_follower(nss_endpoint: &str, ha_enabled: bool) -> CmdResult {
+    download_binaries(&["rss_admin", "root_server"])?;
+    create_rss_config(nss_endpoint, ha_enabled)?;
+    create_systemd_unit_file("rss", false)?;
+    create_ddb_register_and_deregister_service("root-server")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bootstrap_leader(
     nss_endpoint: &str,
     nss_a_id: &str,
     nss_b_id: Option<&str>,
-    volume_a_id: &str,
-    volume_b_id: Option<&str>,
     follower_id: Option<&str>,
     remote_az: Option<&str>,
     num_bss_nodes: Option<usize>,
     ha_enabled: bool,
     for_bench: bool,
 ) -> CmdResult {
-    // download_binaries(&["rss_admin", "root_server", "ebs-failover"])?;
     download_binaries(&["rss_admin", "root_server"])?;
 
     // Initialize AZ status if this is a multi-AZ deployment
@@ -62,17 +97,14 @@ pub fn bootstrap(
     }
 
     // Format nss-B first if it exists, then nss-A
-    if let (Some(nss_b_id), Some(volume_b_id)) = (nss_b_id, volume_b_id) {
-        info!("Formatting NSS instance {nss_b_id} (standby) with volume {volume_b_id}");
-        let ebs_dev = get_volume_dev(volume_b_id);
+    // NSS discovers its EBS device from bootstrap config
+    let bootstrap_bin = "/opt/fractalbits/bin/fractalbits-bootstrap";
+    if let Some(nss_b_id) = nss_b_id {
+        info!("Formatting NSS instance {nss_b_id} (standby)");
         wait_for_ssm_ready(nss_b_id);
-        let bootstrap_bin = "/opt/fractalbits/bin/fractalbits-bootstrap";
-        info!("Running format_nss on {nss_b_id} (standby) with device {ebs_dev}");
         run_cmd_with_ssm(
             nss_b_id,
-            &format!(
-                r##"sudo bash -c "{bootstrap_bin} format_nss --ebs_dev {ebs_dev} &>>{CLOUD_INIT_LOG}""##
-            ),
+            &format!(r##"sudo bash -c "{bootstrap_bin} --format-nss &>>{CLOUD_INIT_LOG}""##),
             false,
         )?;
         info!("Successfully formatted {nss_b_id} (standby)");
@@ -80,22 +112,20 @@ pub fn bootstrap(
 
     // Always format nss-A
     let role = if nss_b_id.is_some() { "active" } else { "solo" };
-    info!("Formatting NSS instance {nss_a_id} ({role}) with volume {volume_a_id}");
-    let ebs_dev = get_volume_dev(volume_a_id);
+    info!("Formatting NSS instance {nss_a_id} ({role})");
     wait_for_ssm_ready(nss_a_id);
-    let bootstrap_bin = "/opt/fractalbits/bin/fractalbits-bootstrap";
-    info!("Running format_nss on {nss_a_id} ({role}) with device {ebs_dev}");
     run_cmd_with_ssm(
         nss_a_id,
-        &format!(
-            r##"sudo bash -c "{bootstrap_bin} format_nss --ebs_dev {ebs_dev} &>>{CLOUD_INIT_LOG}""##
-        ),
+        &format!(r##"sudo bash -c "{bootstrap_bin} --format-nss &>>{CLOUD_INIT_LOG}""##),
         false,
     )?;
     info!("Successfully formatted {nss_a_id} ({role})");
 
     if ha_enabled {
         wait_for_leadership()?;
+    } else {
+        // For non-HA deployments, wait for root server to be ready
+        wait_for_rss_ready()?;
     }
 
     if for_bench {
@@ -362,6 +392,33 @@ fn initialize_az_status_in_ddb(remote_az: &str) -> CmdResult {
     Ok(())
 }
 
+fn wait_for_rss_ready() -> CmdResult {
+    info!("Waiting for root_server to be ready...");
+    let mut attempt = 0;
+    const RSS_PORT: u16 = 8088;
+
+    loop {
+        attempt += 1;
+        if check_port_ready("localhost", RSS_PORT) {
+            info!("Root_server is ready (port {} responding)", RSS_PORT);
+            return Ok(());
+        }
+
+        if attempt % 10 == 0 {
+            info!(
+                "Root_server not yet ready, waiting... (attempt {})",
+                attempt
+            );
+        }
+
+        if attempt >= MAX_POLL_ATTEMPTS {
+            cmd_die!("Timed out waiting for root_server to be ready");
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 fn wait_for_leadership() -> CmdResult {
     info!("Waiting for local root_server to become leader...");
     let mut attempt = 0;
@@ -567,6 +624,9 @@ api_server_mgmt_port = 18088
 
 # Nss server rpc server address
 nss_addr = "{nss_endpoint}:8088"
+
+# Backend storage (ddb or etcd)
+backend = "ddb"
 
 # Leader Election Configuration
 [leader_election]

@@ -1,4 +1,5 @@
 use super::common::*;
+use crate::config::BootstrapConfig;
 use cmd_lib::*;
 use rayon::prelude::*;
 use std::fs;
@@ -41,7 +42,10 @@ impl VolumeAssignments {
     }
 }
 
-pub fn bootstrap(meta_stack_testing: bool, for_bench: bool) -> CmdResult {
+pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
+    let for_bench = for_bench || config.global.for_bench;
+    let meta_stack_testing = config.global.meta_stack_testing;
+
     install_rpms(&["nvme-cli", "mdadm"])?;
     format_local_nvme_disks(false)?; // no twp support since experiment is done
     create_ddb_register_and_deregister_service("bss-server")?;

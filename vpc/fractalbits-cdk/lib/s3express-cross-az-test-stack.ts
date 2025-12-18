@@ -1,7 +1,12 @@
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
-import { createVpcEndpoints, createEc2Role, createInstance, getAzNameFromIdAtBuildTime } from "./ec2-utils";
+import {
+  createVpcEndpoints,
+  createEc2Role,
+  createInstance,
+  getAzNameFromIdAtBuildTime,
+} from "./ec2-utils";
 
 interface S3ExpressCrossAzTestStackProps extends cdk.StackProps {
   targetAz?: string;

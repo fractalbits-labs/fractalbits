@@ -148,10 +148,7 @@ export const createInstance = (
   });
 };
 
-export const createUserData = (
-  scope: Construct,
-  bootstrapOptions: string,
-): ec2.UserData => {
+export const createUserData = (scope: Construct): ec2.UserData => {
   const region = cdk.Stack.of(scope).region;
   const account = cdk.Stack.of(scope).account;
   const userData = ec2.UserData.forLinux();
@@ -159,10 +156,23 @@ export const createUserData = (
     "set -ex",
     `aws s3 cp --no-progress s3://fractalbits-builds-${region}-${account}/$(arch)/fractalbits-bootstrap /opt/fractalbits/bin/`,
     "chmod +x /opt/fractalbits/bin/fractalbits-bootstrap",
-    `/opt/fractalbits/bin/fractalbits-bootstrap ${bootstrapOptions}`,
+    "/opt/fractalbits/bin/fractalbits-bootstrap",
   );
   return userData;
 };
+
+export interface CreateEc2AsgOptions {
+  scope: Construct;
+  id: string;
+  vpc: ec2.Vpc;
+  specificSubnet: ec2.ISubnet;
+  sg: ec2.SecurityGroup;
+  role: iam.Role;
+  instanceTypeNames: string[];
+  minCapacity: number;
+  maxCapacity: number;
+  serviceType?: string;
+}
 
 export const createEc2Asg = (
   scope: Construct,
@@ -172,9 +182,9 @@ export const createEc2Asg = (
   sg: ec2.SecurityGroup,
   role: iam.Role,
   instanceTypeNames: string[],
-  bootstrapOptions: string,
   minCapacity: number,
   maxCapacity: number,
+  serviceType?: string,
 ): autoscaling.AutoScalingGroup => {
   if (instanceTypeNames.length === 0) {
     throw new Error("instanceTypeNames must not be empty.");
@@ -207,8 +217,13 @@ export const createEc2Asg = (
     machineImage: machineImage,
     securityGroup: sg,
     role: role,
-    userData: createUserData(scope, bootstrapOptions),
+    userData: createUserData(scope),
   });
+
+  if (serviceType) {
+    cdk.Tags.of(launchTemplate).add("fractalbits:ServiceType", serviceType);
+  }
+
   const launchTemplateOverrides = instanceTypeNames.map((typeName) => ({
     instanceType: new ec2.InstanceType(typeName),
   }));

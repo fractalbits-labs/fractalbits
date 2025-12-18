@@ -4,6 +4,7 @@ import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as autoscaling from "aws-cdk-lib/aws-autoscaling";
+import * as cr from "aws-cdk-lib/custom-resources";
 
 import {
   createInstance,
@@ -17,6 +18,7 @@ import {
   addAsgDynamoDbDeregistrationLifecycleHook,
   getAzNameFromIdAtBuildTime,
 } from "./ec2-utils";
+import { createConfigWithCfnTokens } from "./toml-config-builder";
 
 export interface FractalbitsVpcStackProps extends cdk.StackProps {
   numApiServers: number;
@@ -41,7 +43,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
   constructor(scope: Construct, id: string, props: FractalbitsVpcStackProps) {
     super(scope, id, props);
-    const forBenchFlag = props.benchType ? " --for_bench" : "";
     const dataBlobStorage = props.dataBlobStorage;
 
     // === VPC Configuration ===
@@ -176,21 +177,10 @@ export class FractalbitsVpcStack extends cdk.Stack {
       "key",
     );
 
-    // new dynamodb.Table(this, 'EBSFailoverStateTable', {
-    //   partitionKey: {
-    //     name: 'VolumeId',
-    //     type: dynamodb.AttributeType.STRING,
-    //   },
-    //   removalPolicy: cdk.RemovalPolicy.DESTROY, // Delete table on stack delete
-    //   billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-    //   tableName: 'ebs-failover-state',
-    // });
-
     // Define instance metadata, and create instances
     const nssInstanceType = new ec2.InstanceType(props.nssInstanceType);
     const rssInstanceType = new ec2.InstanceType("c7g.medium");
     const benchInstanceType = new ec2.InstanceType("c7g.large");
-    const bucketName = bucket.bucketName;
 
     // Get specific subnets for instances to ensure correct AZ placement
     const privateSubnets = this.vpc.isolatedSubnets;
@@ -269,7 +259,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
         sg: privateSg,
       });
       // Create bench_clients in a ASG group
-      const benchClientBootstrapOptions = `bench_client`;
       benchClientAsg = createEc2Asg(
         this,
         "benchClientAsg",
@@ -278,9 +267,9 @@ export class FractalbitsVpcStack extends cdk.Stack {
         privateSg,
         ec2Role,
         [props.benchClientInstanceType],
-        benchClientBootstrapOptions,
         props.numBenchClients,
         props.numBenchClients,
+        "bench_client",
       );
       // Add lifecycle hook for bench_client ASG
       addAsgDynamoDbDeregistrationLifecycleHook(
@@ -307,7 +296,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
     // Create bss_server in a ASG group only for hybrid mode
     let bssAsg: autoscaling.AutoScalingGroup | undefined;
     if (dataBlobStorage === "singleAz") {
-      const bssBootstrapOptions = `${forBenchFlag} bss_server`;
       bssAsg = createEc2Asg(
         this,
         "BssAsg",
@@ -316,9 +304,9 @@ export class FractalbitsVpcStack extends cdk.Stack {
         privateSg,
         ec2Role,
         props.bssInstanceTypes.split(","),
-        bssBootstrapOptions,
         props.numBssNodes,
         props.numBssNodes,
+        "bss_server",
       );
       // Add lifecycle hook for bss_server ASG
       addAsgDynamoDbDeregistrationLifecycleHook(
@@ -366,28 +354,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         ? nssPrivateLink.endpointDns
         : `${instances["nss-A"].instancePrivateIp}`;
 
-    // Reusable function to create bootstrap options for api_server and gui_server
-    const createApiServerBootstrapOptions = (serviceName: string) => {
-      const rssHaFlag = props.rootServerHa ? " --rss_ha_enabled" : "";
-      if (dataBlobStorage === "multiAz") {
-        return (
-          `${forBenchFlag} ${serviceName} ` +
-          `--remote_az=${azArray[1]} ` +
-          `--nss_endpoint=${nssEndpoint}${rssHaFlag}`
-        );
-      } else {
-        // Single-AZ: use direct NSS IP to avoid VPC endpoint latency
-        return (
-          `${forBenchFlag} ${serviceName} ` +
-          `--bucket=${bucketName} ` +
-          `--nss_endpoint=${nssEndpoint}${rssHaFlag}`
-        );
-      }
-    };
-
     // Create api_server(s) in a ASG group
-    const apiServerBootstrapOptions =
-      createApiServerBootstrapOptions("api_server");
     const apiServerAsg = createEc2Asg(
       this,
       "ApiServerAsg",
@@ -396,9 +363,9 @@ export class FractalbitsVpcStack extends cdk.Stack {
       privateSg,
       ec2Role,
       [props.apiServerInstanceType],
-      apiServerBootstrapOptions,
       props.numApiServers,
       props.numApiServers,
+      "api_server",
     );
 
     // Add lifecycle hook for api_server ASG
@@ -455,89 +422,12 @@ export class FractalbitsVpcStack extends cdk.Stack {
       ebsVolumeBId = ebsVolumeB.volumeId;
     }
 
-    // Create UserData: we need to make it a separate step since we want to get the instance/volume ids
-    const nssA = instances["nss-A"].instanceId;
-    const nssB = instances["nss-B"]?.instanceId || "";
     const ebsVolumeAId = ebsVolumeA.volumeId;
 
-    // Shared function to create NSS bootstrap options
-    const createNssBootstrapOptions = (volumeId: string) => {
-      const params = [
-        forBenchFlag,
-        "nss_server",
-        `--bucket=${bucketName}`,
-        `--volume_id=${volumeId}`,
-        `--iam_role=${ec2Role.roleName}`,
-      ];
-      // Only add mirrord_endpoint for multiAz mode
-      if (dataBlobStorage === "multiAz" && mirrordPrivateLink) {
-        params.push(`--mirrord_endpoint=${mirrordPrivateLink.endpointDns}`);
-      }
-      if (props.rootServerHa) {
-        params.push("--rss_ha_enabled");
-      }
-      return params.filter((p) => p).join(" ");
-    };
-
-    const instanceBootstrapOptions = [
-      {
-        id: "rss-A",
-        bootstrapOptions:
-          `${forBenchFlag} root_server ` +
-          `--nss_endpoint=${nssEndpoint} ` +
-          `--nss_a_id=${nssA} ` +
-          (nssB ? `--nss_b_id=${nssB} ` : "") +
-          `--volume_a_id=${ebsVolumeAId} ` +
-          (ebsVolumeBId ? `--volume_b_id=${ebsVolumeBId} ` : "") +
-          (props.rootServerHa
-            ? `--follower_id=${instances["rss-B"].instanceId} --ha_enabled `
-            : "") +
-          (dataBlobStorage === "multiAz"
-            ? `--remote_az=${azArray[1]}`
-            : `--num_bss_nodes=${props.numBssNodes}`),
-      },
-      {
-        id: "nss-A",
-        bootstrapOptions: createNssBootstrapOptions(ebsVolumeAId),
-      },
-    ];
-
-    // Only add rss-B bootstrap for HA mode
-    if (props.rootServerHa) {
-      instanceBootstrapOptions.splice(1, 0, {
-        id: "rss-B",
-        bootstrapOptions:
-          `${forBenchFlag} root_server ` +
-          `--nss_endpoint=${nssEndpoint} ` +
-          `--nss_a_id=${nssA} ` +
-          `--volume_a_id=${ebsVolumeAId}`,
-      });
+    // Add UserData to all instances - they will discover their role from TOML config
+    for (const instance of Object.values(instances)) {
+      instance.addUserData(createUserData(this).render());
     }
-
-    // Only add nss-B bootstrap for multiAz mode
-    if (dataBlobStorage === "multiAz" && ebsVolumeBId) {
-      instanceBootstrapOptions.push({
-        id: "nss-B",
-        bootstrapOptions: createNssBootstrapOptions(ebsVolumeBId),
-      });
-    }
-    if (props.benchType === "external") {
-      instanceBootstrapOptions.push({
-        id: "bench_server",
-        bootstrapOptions: `bench_server --api_server_endpoint=${nlb.loadBalancerDnsName} --bench_client_num=${props.numBenchClients} `,
-      });
-    }
-    if (props.browserIp) {
-      instanceBootstrapOptions.push({
-        id: "gui_server",
-        bootstrapOptions: createApiServerBootstrapOptions("gui_server"),
-      });
-    }
-    instanceBootstrapOptions.forEach(({ id, bootstrapOptions }) => {
-      instances[id]?.addUserData(
-        createUserData(this, bootstrapOptions).render(),
-      );
-    });
 
     // Outputs
     new cdk.CfnOutput(this, "FractalbitsBucketName", {
@@ -604,5 +494,68 @@ export class FractalbitsVpcStack extends cdk.Stack {
         description: "Public IP of the GUI Server",
       });
     }
+
+    // Generate and upload bootstrap TOML config to S3
+    const bootstrapConfigContent = createConfigWithCfnTokens(this, {
+      forBench: !!props.benchType,
+      dataBlobStorage: dataBlobStorage,
+      rssHaEnabled: props.rootServerHa,
+      numBssNodes:
+        dataBlobStorage === "singleAz" ? props.numBssNodes : undefined,
+      bucket: bucket.bucketName,
+      localAz: azArray[0],
+      remoteAz: dataBlobStorage === "multiAz" ? azArray[1] : undefined,
+      iamRole: ec2Role.roleName,
+      nssEndpoint: nssEndpoint,
+      mirrordEndpoint:
+        dataBlobStorage === "multiAz" && mirrordPrivateLink
+          ? mirrordPrivateLink.endpointDns
+          : undefined,
+      apiServerEndpoint: nlb.loadBalancerDnsName,
+      nssAId: instances["nss-A"].instanceId,
+      nssBId: instances["nss-B"]?.instanceId,
+      volumeAId: ebsVolumeAId,
+      volumeBId: ebsVolumeBId || undefined,
+      rssAId: instances["rss-A"].instanceId,
+      rssBId: props.rootServerHa ? instances["rss-B"]?.instanceId : undefined,
+      guiServerId: props.browserIp
+        ? instances["gui_server"]?.instanceId
+        : undefined,
+      benchServerId:
+        props.benchType === "external"
+          ? instances["bench_server"]?.instanceId
+          : undefined,
+      benchClientNum:
+        props.benchType === "external" ? props.numBenchClients : undefined,
+    });
+
+    const buildsBucket = `fractalbits-builds-${this.region}-${this.account}`;
+    new cr.AwsCustomResource(this, "UploadBootstrapConfig", {
+      onCreate: {
+        service: "S3",
+        action: "putObject",
+        parameters: {
+          Bucket: buildsBucket,
+          Key: "bootstrap.toml",
+          Body: bootstrapConfigContent,
+          ContentType: "text/plain",
+        },
+        physicalResourceId: cr.PhysicalResourceId.of("bootstrap-config"),
+      },
+      onUpdate: {
+        service: "S3",
+        action: "putObject",
+        parameters: {
+          Bucket: buildsBucket,
+          Key: "bootstrap.toml",
+          Body: bootstrapConfigContent,
+          ContentType: "text/plain",
+        },
+        physicalResourceId: cr.PhysicalResourceId.of("bootstrap-config"),
+      },
+      policy: cr.AwsCustomResourcePolicy.fromSdkCalls({
+        resources: cr.AwsCustomResourcePolicy.ANY_RESOURCE,
+      }),
+    });
   }
 }

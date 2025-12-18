@@ -3,6 +3,8 @@ mod bench_client;
 mod bench_server;
 mod bss_server;
 mod common;
+mod config;
+mod discovery;
 mod gui_server;
 mod nss_server;
 mod root_server;
@@ -11,7 +13,6 @@ use clap::Parser;
 use cmd_lib::*;
 use common::*;
 use std::io::Write;
-use strum::AsRefStr;
 
 #[derive(Parser)]
 #[clap(
@@ -19,173 +20,8 @@ use strum::AsRefStr;
     about = "Bootstrap for cloud ec2 instances"
 )]
 struct Opts {
-    #[clap(flatten)]
-    common: CommonOpts,
-
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Parser)]
-#[command(rename_all = "snake_case")]
-struct CommonOpts {
-    #[clap(long, default_value = "false", long_help = "For benchmarking")]
-    for_bench: bool,
-}
-
-#[allow(clippy::enum_variant_names)]
-#[derive(Parser, AsRefStr)]
-#[command(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-enum Command {
-    #[clap(about = "Run on api_server instance to bootstrap fractalbits service(s)")]
-    ApiServer {
-        #[clap(
-            long,
-            long_help = "S3 bucket name for fractalbits service (for hybrid mode)"
-        )]
-        bucket: Option<String>,
-
-        #[clap(long, long_help = "Remote AZ for S3 Express multi-AZ setup")]
-        remote_az: Option<String>,
-
-        #[clap(long, long_help = "primary nss_server endpoint")]
-        nss_endpoint: String,
-
-        #[clap(
-            long,
-            default_value = "false",
-            long_help = "Enable HA mode for root server"
-        )]
-        rss_ha_enabled: bool,
-    },
-
-    #[clap(about = "Run on gui_server instance to bootstrap fractalbits service(s)")]
-    GuiServer {
-        #[clap(
-            long,
-            long_help = "S3 bucket name for fractalbits service (for hybrid mode)"
-        )]
-        bucket: Option<String>,
-
-        #[clap(long, long_help = "Remote AZ for S3 Express multi-AZ setup")]
-        remote_az: Option<String>,
-
-        #[clap(long, long_help = "primary nss_server endpoint")]
-        nss_endpoint: String,
-
-        #[clap(
-            long,
-            default_value = "false",
-            long_help = "Enable HA mode for root server"
-        )]
-        rss_ha_enabled: bool,
-    },
-
-    #[clap(about = "Run on bss_server instance to bootstrap fractalbits service(s)")]
-    BssServer {
-        #[clap(long, default_value = "false", long_help = "For meta stack testing")]
-        meta_stack_testing: bool,
-    },
-
-    #[clap(about = "Run on nss_server instance to bootstrap fractalbits service(s)")]
-    NssServer {
-        #[clap(long, long_help = "S3 bucket name for fractalbits service")]
-        bucket: String,
-
-        #[clap(long, long_help = "Multi-attached EBS volume ID")]
-        volume_id: String,
-
-        #[clap(long, long_help = "EC2 IAM role")]
-        iam_role: String,
-
-        #[clap(long, default_value = "false", long_help = "For meta stack testing")]
-        meta_stack_testing: bool,
-
-        #[clap(long, long_help = "Mirrord endpoint for NSS communication")]
-        mirrord_endpoint: Option<String>,
-
-        #[clap(
-            long,
-            default_value = "false",
-            long_help = "Enable HA mode for root server"
-        )]
-        rss_ha_enabled: bool,
-    },
-
-    #[clap(about = "Run on root_server instance to bootstrap fractalbits service(s)")]
-    RootServer {
-        #[clap(long, long_help = "primary nss_server endpoint")]
-        nss_endpoint: String,
-
-        #[clap(long, long_help = "Primary nss_server ec2 instance ID")]
-        nss_a_id: String,
-
-        #[clap(long, long_help = "Secondary nss_server ec2 instance ID")]
-        nss_b_id: Option<String>,
-
-        #[clap(long, long_help = "EBS volume ID for nss-A")]
-        volume_a_id: String,
-
-        #[clap(long, long_help = "EBS volume ID for nss-B")]
-        volume_b_id: Option<String>,
-
-        #[clap(long, long_help = "Follower instance ID for root server")]
-        follower_id: Option<String>,
-
-        #[clap(long, long_help = "Remote AZ for S3 Express multi-AZ setup")]
-        remote_az: Option<String>,
-
-        #[clap(long, long_help = "Number of BSS nodes")]
-        num_bss_nodes: Option<usize>,
-
-        #[clap(
-            long,
-            default_value = "false",
-            long_help = "Enable HA mode for root server"
-        )]
-        ha_enabled: bool,
-    },
-
-    #[clap(
-        about = "Run on nss_server instance to format itself when receiving ssm command from root_server"
-    )]
-    FormatNss {
-        #[clap(long, long_help = "EBS device")]
-        ebs_dev: String,
-    },
-
-    #[clap(about = "Run on bench_server instance to benchmark fractalbits service(s)")]
-    BenchServer {
-        #[clap(long, long_help = "Service endpoint for benchmark")]
-        api_server_endpoint: String,
-
-        #[clap(long, long_help = "Number of bench clients")]
-        bench_client_num: usize,
-    },
-
-    #[clap(about = "Run on bench_client instance to benchmark fractalbits service(s)")]
-    BenchClient,
-
-    #[clap(about = "Run tool related commands")]
-    #[command(subcommand)]
-    Tools(ToolKind),
-}
-
-#[derive(Parser, Clone)]
-enum ToolKind {
-    GenUuids {
-        #[clap(short = 'n', long_help = "Number of uuids", default_value = "5000000")]
-        num: usize,
-
-        #[clap(
-            short = 'f',
-            long_help = "File output",
-            default_value = "/data/uuids.data"
-        )]
-        file: String,
-    },
-    DumpVgConfig,
+    #[arg(long, help = "Format NSS instance (called via SSM from root_server)")]
+    format_nss: bool,
 }
 
 #[cmd_lib::main]
@@ -220,100 +56,94 @@ fn main() -> CmdResult {
     eprintln!("build info: {}", build_info);
 
     let opts = Opts::parse();
-    let for_bench = opts.common.for_bench;
-    let command = opts.command.as_ref().to_owned();
-    if matches!(
-        opts.command,
-        Command::ApiServer { .. }
-            | Command::GuiServer { .. }
-            | Command::BssServer { .. }
-            | Command::NssServer { .. }
-            | Command::RootServer { .. }
-    ) {
-        common_setup()?;
+
+    if opts.format_nss {
+        let ebs_dev = discover_ebs_device()?;
+        nss_server::format_nss(ebs_dev)?;
+        run_cmd!(info "fractalbits-bootstrap --format-nss is done")?;
+    } else {
+        config_based_bootstrap()?;
     }
-    match opts.command {
-        Command::ApiServer {
-            bucket,
-            remote_az,
-            nss_endpoint,
-            rss_ha_enabled,
-        } => api_server::bootstrap(
-            bucket.as_deref(),
-            &nss_endpoint,
-            remote_az.as_deref(),
-            rss_ha_enabled,
-            for_bench,
-        )?,
-        Command::GuiServer {
-            bucket,
-            remote_az,
-            nss_endpoint,
-            rss_ha_enabled,
-        } => gui_server::bootstrap(
-            bucket.as_deref(),
-            &nss_endpoint,
-            remote_az.as_deref(),
-            rss_ha_enabled,
-        )?,
-        Command::BssServer { meta_stack_testing } => {
-            bss_server::bootstrap(meta_stack_testing, for_bench)?
-        }
-        Command::NssServer {
-            bucket: _,
-            volume_id,
-            meta_stack_testing,
-            iam_role: _,
-            mirrord_endpoint,
-            rss_ha_enabled,
-        } => nss_server::bootstrap(
-            &volume_id,
-            meta_stack_testing,
-            for_bench,
-            mirrord_endpoint.as_deref(),
-            rss_ha_enabled,
-        )?,
-        Command::RootServer {
-            nss_endpoint,
-            nss_a_id,
-            nss_b_id,
-            volume_a_id,
-            volume_b_id,
+
+    Ok(())
+}
+
+fn discover_ebs_device() -> Result<String, std::io::Error> {
+    use config::BootstrapConfig;
+
+    info!("Discovering EBS device from bootstrap config");
+
+    let config = BootstrapConfig::download_and_parse()?;
+    let instance_id = get_instance_id()?;
+
+    let instance_config = config.instances.get(&instance_id).ok_or_else(|| {
+        std::io::Error::other(format!("Instance {} not found in config", instance_id))
+    })?;
+
+    let volume_id = instance_config
+        .volume_id
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("volume_id not set in instance config"))?;
+
+    let ebs_dev = get_volume_dev(volume_id);
+    info!("Discovered EBS device: {ebs_dev} for volume {volume_id}");
+    Ok(ebs_dev)
+}
+
+fn config_based_bootstrap() -> CmdResult {
+    use config::BootstrapConfig;
+    use discovery::{ServiceType, discover_service_type};
+
+    info!("Starting config-based bootstrap mode");
+
+    let config = BootstrapConfig::download_and_parse()?;
+    let for_bench = config.global.for_bench;
+    let service_type = discover_service_type(&config)?;
+
+    common_setup()?;
+
+    let service_name = match &service_type {
+        ServiceType::RootServer {
+            is_leader,
             follower_id,
-            remote_az,
-            num_bss_nodes,
-            ha_enabled,
-        } => root_server::bootstrap(
-            &nss_endpoint,
-            &nss_a_id,
-            nss_b_id.as_deref(),
-            &volume_a_id,
-            volume_b_id.as_deref(),
-            follower_id.as_deref(),
-            remote_az.as_deref(),
-            num_bss_nodes,
-            ha_enabled,
-            for_bench,
-        )?,
-        Command::FormatNss { ebs_dev } => nss_server::format_nss(ebs_dev)?,
-        Command::BenchServer {
-            api_server_endpoint,
-            bench_client_num,
-        } => bench_server::bootstrap(api_server_endpoint, bench_client_num)?,
-        Command::BenchClient => bench_client::bootstrap()?,
-        Command::Tools(tool_kind) => match tool_kind {
-            ToolKind::GenUuids { num, file } => {
-                xtask_tools::gen_uuids(num, &file)?;
-            }
-            ToolKind::DumpVgConfig => {
-                xtask_tools::dump_vg_config(false)?;
-            }
-        },
-    }
+        } => {
+            root_server::bootstrap(&config, *is_leader, follower_id.clone(), for_bench)?;
+            "root_server"
+        }
+        ServiceType::NssServer { volume_id } => {
+            nss_server::bootstrap(&config, volume_id, for_bench)?;
+            "nss_server"
+        }
+        ServiceType::ApiServer => {
+            api_server::bootstrap(&config, for_bench)?;
+            "api_server"
+        }
+        ServiceType::BssServer => {
+            bss_server::bootstrap(&config, for_bench)?;
+            "bss_server"
+        }
+        ServiceType::GuiServer => {
+            gui_server::bootstrap(&config)?;
+            "gui_server"
+        }
+        ServiceType::BenchServer { bench_client_num } => {
+            let api_endpoint = config
+                .endpoints
+                .api_server_endpoint
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("api_server_endpoint not set in config"))?;
+            bench_server::bootstrap(api_endpoint.clone(), *bench_client_num)?;
+            "bench_server"
+        }
+        ServiceType::BenchClient => {
+            bench_client::bootstrap()?;
+            "bench_client"
+        }
+    };
 
     run_cmd! {
         touch $BOOTSTRAP_DONE_FILE;
-        info "fractalbits-bootstrap $command is done";
+        info "fractalbits-bootstrap (config mode) $service_name is done";
     }?;
     Ok(())
 }

@@ -1,5 +1,6 @@
 use cmd_lib::*;
 use std::io::Error;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 pub const BIN_PATH: &str = "/opt/fractalbits/bin/";
@@ -215,6 +216,22 @@ pub fn create_logrotate_for_stats() -> CmdResult {
 
 pub fn get_current_aws_region() -> FunResult {
     run_fun!(ec2-metadata --region | awk r"{print $2}")
+}
+
+pub fn get_ec2_tag(instance_id: &str, region: &str, tag_name: &str) -> FunResult {
+    let tag_value = run_fun!(
+        aws ec2 describe-tags
+            --region $region
+            --filters "Name=resource-id,Values=$instance_id" "Name=key,Values=$tag_name"
+            --query "Tags[0].Value" --output text
+    )?;
+
+    if tag_value.is_empty() || tag_value == "None" {
+        return Err(Error::other(format!(
+            "EC2 tag '{tag_name}' not found for instance {instance_id}"
+        )));
+    }
+    Ok(tag_value)
 }
 
 pub fn get_instance_id() -> FunResult {
@@ -1009,4 +1026,16 @@ pub fn setup_serial_console_password() -> CmdResult {
         echo "ec2-user:fractalbits!" | chpasswd;
     }?;
     Ok(())
+}
+
+pub fn check_port_ready(host: &str, port: u16) -> bool {
+    let addr = match (host, port).to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(addr) => addr,
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+
+    TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
 }

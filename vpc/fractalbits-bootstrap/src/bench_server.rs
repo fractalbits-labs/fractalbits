@@ -4,7 +4,6 @@ mod yaml_put;
 
 use super::common::*;
 use cmd_lib::*;
-use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 use {yaml_get::*, yaml_mixed::*, yaml_put::*};
 
@@ -113,16 +112,4 @@ fi
         chmod +x $BIN_PATH/$BENCH_SERVER_BENCH_START_SCRIPT;
     }?;
     Ok(())
-}
-
-fn check_port_ready(host: &str, port: u16) -> bool {
-    let addr = match (host, port).to_socket_addrs() {
-        Ok(mut addrs) => match addrs.next() {
-            Some(addr) => addr,
-            None => return false,
-        },
-        Err(_) => return false,
-    };
-
-    TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
 }
