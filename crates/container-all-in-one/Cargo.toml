@@ -8,6 +8,7 @@ name = "container-all-in-one"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
 xtask_tools.workspace = true
 tokio.workspace = true
 cmd_lib.workspace = true

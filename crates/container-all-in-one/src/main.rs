@@ -1,3 +1,4 @@
+use anyhow::Result;
 use clap::Parser;
 use std::io;
 use tokio::signal::unix::{SignalKind, signal};
@@ -38,14 +39,17 @@ struct Opt {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,cmd_lib=warn".into()),
         )
         .with(
             tracing_subscriber::fmt::layer()
-                .without_time()
+                .json()
+                .flatten_event(true)
+                .with_target(false)
                 .with_writer(io::stderr),
         )
         .init();
@@ -72,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start all services
     if let Err(e) = orchestrator.start_all().await {
         error!("Failed to start services: {}", e);
-        orchestrator.shutdown();
+        orchestrator.shutdown().await;
         return Err(e);
     }
 
@@ -88,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    orchestrator.shutdown();
+    orchestrator.shutdown().await;
     info!("Shutdown complete");
 
     Ok(())

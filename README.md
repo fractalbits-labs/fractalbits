@@ -149,7 +149,9 @@ just precheckin
 
 ## Quick Start - Docker
 
-Run FractalBits in a single Docker container for quick testing and evaluation:
+Run FractalBits in a single Docker container for quick testing and evaluation.
+
+### Using `just` Commands (Recommended)
 
 ```bash
 # Build Docker image (uses debug build by default)
@@ -172,6 +174,27 @@ just docker logs --name fractalbits-dev --follow
 
 # Stop container
 just docker stop --name fractalbits-dev
+```
+
+### Using Docker Directly
+
+The container requires `--privileged` mode because the storage engine uses io_uring for high-performance async I/O.
+
+```bash
+# Run the latest image
+docker run --rm --privileged -p 8080:8080 ghcr.io/fractalbits-labs/fractalbits-main:latest
+
+# Run a specific version
+docker run --rm --privileged -p 8080:8080 ghcr.io/fractalbits-labs/fractalbits-main:<commit-sha>
+
+# Run your custom-built image (after `cargo xtask docker build`)
+docker run --rm --privileged -p 8080:8080 fractalbits:latest
+
+# Run in background with persistent data
+docker run -d --privileged --name fractalbits \
+    -p 8080:8080 \
+    -v fractalbits-data:/data \
+    ghcr.io/fractalbits-labs/fractalbits-main:latest
 ```
 
 Once running, see [Basic Usage Example](#basic-usage-example) for S3 client commands.

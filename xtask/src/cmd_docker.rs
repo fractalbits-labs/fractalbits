@@ -1,3 +1,4 @@
+use crate::cmd_build::get_build_envs;
 use crate::*;
 use cmd_lib::*;
 use std::io::Error;
@@ -41,22 +42,24 @@ fn build_docker_image(
     let staging_dir = "target/docker-staging";
     let bin_staging = format!("{}/bin", staging_dir);
 
+    let build_envs = get_build_envs();
+
     if all_from_source {
         info!("Building all binaries from source...");
         cmd_build::build_all(release)?;
 
         info!("Building container-all-in-one...");
         if release {
-            run_cmd!(cargo build --release -p container-all-in-one)?;
+            run_cmd!($[build_envs] cargo build --release -p container-all-in-one)?;
         } else {
-            run_cmd!(cargo build -p container-all-in-one)?;
+            run_cmd!($[build_envs] cargo build -p container-all-in-one)?;
         }
     } else {
         info!("Using prebuilt binaries from prebuilt/ directory");
         if release {
-            run_cmd!(cargo build --release -p api_server -p container-all-in-one)?;
+            run_cmd!($[build_envs] cargo build --release -p api_server -p container-all-in-one)?;
         } else {
-            run_cmd!(cargo build -p api_server -p container-all-in-one)?;
+            run_cmd!($[build_envs] cargo build -p api_server -p container-all-in-one)?;
         }
     }
 
