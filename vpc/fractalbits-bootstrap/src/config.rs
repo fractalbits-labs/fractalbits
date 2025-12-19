@@ -80,7 +80,20 @@ impl BootstrapConfig {
         let start_time = Instant::now();
         let timeout = Duration::from_secs(CONFIG_RETRY_TIMEOUT_SECS);
         loop {
-            download_from_s3(&s3_path, &local_path)?;
+            // Retry download if the file doesn't exist yet (race condition with CDK deployment)
+            match download_from_s3(&s3_path, &local_path) {
+                Ok(_) => {}
+                Err(e) => {
+                    if start_time.elapsed() > timeout {
+                        return Err(Error::other(format!(
+                            "Failed to download bootstrap config after {CONFIG_RETRY_TIMEOUT_SECS}s: {e}"
+                        )));
+                    }
+                    info!("Download failed ({e}), waiting 5s and retrying...");
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
+            }
 
             let content = std::fs::read_to_string(&local_path)?;
             let config: BootstrapConfig = toml::from_str(&content)
