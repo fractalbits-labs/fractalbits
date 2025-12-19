@@ -9,6 +9,7 @@ use rustls::{
 };
 use rustls_pemfile::{certs, private_key};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::io::IsTerminal;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,7 +42,11 @@ fn main() -> std::io::Result<()> {
                 })
                 .unwrap_or_else(|_| format!("info,{third_party_filter}").into()),
         )
-        .with(tracing_subscriber::fmt::layer().without_time())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_ansi(std::io::stdout().is_terminal()),
+        )
         .init();
 
     let main_build_info = option_env!("MAIN_BUILD_INFO").unwrap_or("unknown");

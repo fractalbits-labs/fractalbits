@@ -150,6 +150,8 @@ just precheckin
 ## Quick Start - Docker
 
 Run FractalBits in a single Docker container for quick testing and evaluation.
+The Docker image bundles all services (API server, BSS, NSS, RSS) into a single
+container orchestrated by the `container-all-in-one` binary.
 
 ### Using `just` Commands (Recommended)
 
@@ -198,8 +200,6 @@ docker run -d --privileged --name fractalbits \
 ```
 
 Once running, see [Basic Usage Example](#basic-usage-example) for S3 client commands.
-
-The Docker image bundles all services (API server, BSS, NSS, RSS) into a single container orchestrated by the `container-all-in-one` binary.
 
 ## Bring Your Own Cloud (BYOC)
 
