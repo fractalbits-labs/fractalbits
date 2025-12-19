@@ -5,6 +5,7 @@ mod bss_server;
 mod common;
 mod config;
 mod discovery;
+mod etcd_cluster;
 mod etcd_server;
 mod gui_server;
 mod nss_server;

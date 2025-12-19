@@ -1,28 +1,24 @@
 use crate::common::*;
-use crate::config::EtcdConfig;
 use cmd_lib::*;
-use std::io::Error;
 
 const ETCD_DATA_DIR: &str = "/data/local/etcd";
 const ETCD_CLIENT_PORT: u16 = 2379;
 const ETCD_PEER_PORT: u16 = 2380;
 const ETCD_CONFIG_FILE: &str = "etcd.yaml";
 
-pub fn bootstrap(etcd_config: &EtcdConfig) -> CmdResult {
-    info!("Starting etcd bootstrap");
+pub fn bootstrap_new_cluster(initial_cluster: &str) -> CmdResult {
+    info!("Starting etcd bootstrap with dynamic cluster");
 
     download_etcd_binaries()?;
 
     let my_ip = get_private_ip()?;
-    let member_name = get_my_member_name(&my_ip, &etcd_config.bss_ips)?;
+    let member_name = format!("bss-{}", my_ip.replace('.', "-"));
 
     info!("Member name: {member_name}, IP: {my_ip}");
-
-    let initial_cluster = generate_initial_cluster_config(&etcd_config.bss_ips);
     info!("Initial cluster: {initial_cluster}");
 
     create_etcd_data_dir()?;
-    create_etcd_config_file(&member_name, &my_ip, &initial_cluster)?;
+    create_etcd_config_file(&member_name, &my_ip, initial_cluster)?;
     create_etcd_systemd_service()?;
 
     info!("etcd bootstrap complete");
@@ -32,28 +28,6 @@ pub fn bootstrap(etcd_config: &EtcdConfig) -> CmdResult {
 fn download_etcd_binaries() -> CmdResult {
     info!("Downloading etcd binaries");
     download_binaries(&["etcd", "etcdctl"])
-}
-
-fn generate_initial_cluster_config(bss_ips: &[String]) -> String {
-    let cluster_members: Vec<String> = bss_ips
-        .iter()
-        .enumerate()
-        .map(|(i, ip)| format!("bss-{}=http://{}:{}", i + 1, ip, ETCD_PEER_PORT))
-        .collect();
-
-    cluster_members.join(",")
-}
-
-fn get_my_member_name(my_ip: &str, bss_ips: &[String]) -> Result<String, Error> {
-    for (i, ip) in bss_ips.iter().enumerate() {
-        if ip == my_ip {
-            return Ok(format!("bss-{}", i + 1));
-        }
-    }
-    Err(Error::other(format!(
-        "My IP {} not found in BSS IPs: {:?}",
-        my_ip, bss_ips
-    )))
 }
 
 fn create_etcd_data_dir() -> CmdResult {

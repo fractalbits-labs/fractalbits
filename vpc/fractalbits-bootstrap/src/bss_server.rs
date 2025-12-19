@@ -1,5 +1,8 @@
 use super::common::*;
 use crate::config::BootstrapConfig;
+use crate::etcd_cluster::{
+    EtcdClusterCoordinator, get_all_registered_bss_nodes_s3, set_cluster_state_s3,
+};
 use cmd_lib::*;
 use rayon::prelude::*;
 use std::fs;
@@ -69,13 +72,13 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     create_ena_irq_affinity_service()?;
     create_nvme_tuning_service()?;
 
-    // Start etcd BEFORE setup_volume_directories when using etcd backend
-    // This allows RSS leader to write volume configs to etcd, which BSS then reads
+    // Start etcd BEFORE setup_volume_directories
+    // BSS nodes coordinate via S3 to form etcd cluster, then RSS writes volume configs to etcd
     if let Some(etcd_config) = &config.etcd
         && etcd_config.enabled
     {
-        info!("etcd is enabled, starting etcd bootstrap");
-        super::etcd_server::bootstrap(etcd_config)?;
+        info!("Starting etcd bootstrap with S3-based cluster discovery");
+        bootstrap_etcd(etcd_config)?;
     }
 
     setup_volume_directories(config, use_etcd)?;
@@ -86,6 +89,39 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
         info "Syncing file system changes";
         sync;
     }?;
+
+    Ok(())
+}
+
+fn bootstrap_etcd(etcd_config: &crate::config::EtcdConfig) -> CmdResult {
+    let cluster_id = &etcd_config.cluster_id;
+    let s3_bucket = &etcd_config.s3_bucket;
+    let quorum_size = etcd_config.quorum_size;
+
+    let coordinator = EtcdClusterCoordinator::new(cluster_id, s3_bucket, quorum_size)?;
+
+    // REGISTER: Write node info to S3
+    info!("Registering node in S3 for cluster {cluster_id}");
+    coordinator.register_node()?;
+
+    // DISCOVER: Wait for all nodes to register
+    info!("Waiting for {quorum_size} nodes to register");
+    let nodes = coordinator.wait_for_quorum()?;
+    info!(
+        "Found {} nodes: {:?}",
+        nodes.len(),
+        nodes.iter().map(|n| &n.ip).collect::<Vec<_>>()
+    );
+
+    // ELECTION: All nodes have same view, generate initial-cluster
+    let initial_cluster = coordinator.generate_initial_cluster(&nodes);
+    info!("Generated initial-cluster: {initial_cluster}");
+
+    // START: All nodes start etcd together with initial-cluster-state: new
+    super::etcd_server::bootstrap_new_cluster(&initial_cluster)?;
+
+    // Mark cluster as active in S3 (any node can do this, idempotent)
+    set_cluster_state_s3(s3_bucket, cluster_id, "active")?;
 
     Ok(())
 }
@@ -201,16 +237,17 @@ fn get_ddb_config(service_key: &str) -> FunResult {
 }
 
 fn get_etcd_config(config: &BootstrapConfig, service_key: &str) -> FunResult {
-    let etcd_endpoints = if let Some(etcd_config) = &config.etcd {
-        etcd_config
-            .bss_ips
-            .iter()
-            .map(|ip| format!("http://{}:2379", ip))
-            .collect::<Vec<_>>()
-            .join(",")
-    } else {
-        return Err(Error::other("etcd config missing"));
-    };
+    let etcd_config = config
+        .etcd
+        .as_ref()
+        .ok_or_else(|| Error::other("etcd config missing"))?;
+
+    let nodes = get_all_registered_bss_nodes_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
+    let etcd_endpoints = nodes
+        .iter()
+        .map(|node| format!("http://{}:2379", node.ip))
+        .collect::<Vec<_>>()
+        .join(",");
 
     let etcdctl = format!("{BIN_PATH}etcdctl");
     let key = format!("/fractalbits-service-discovery/{}", service_key);

@@ -87,7 +87,7 @@ High-performance blob data storage engine:
 
 ### **RSS - Root Service Server** (Rust)
 Cluster coordination providing:
-- Leader election using DynamoDB
+- Leader election using DynamoDB or etcd
 - API key management
 - Bucket management
 - Volume group configuration

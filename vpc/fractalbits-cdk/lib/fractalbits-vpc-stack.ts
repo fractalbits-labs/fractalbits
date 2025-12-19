@@ -308,26 +308,21 @@ export class FractalbitsVpcStack extends cdk.Stack {
       );
     });
 
-    // Create BSS nodes as individual instances (stateful service shouldn't use ASG)
-    const bssInstances: ec2.Instance[] = [];
+    // Create BSS nodes in ASG (dynamic cluster discovery via S3)
+    let bssAsg: autoscaling.AutoScalingGroup | undefined;
     if (dataBlobStorage === "singleAz") {
-      const bssInstanceType = new ec2.InstanceType(
-        props.bssInstanceTypes.split(",")[0],
+      bssAsg = createEc2Asg(
+        this,
+        "BssAsg",
+        this.vpc,
+        subnet1,
+        privateSg,
+        ec2Role,
+        [props.bssInstanceTypes.split(",")[0]],
+        props.numBssNodes,
+        props.numBssNodes,
+        "bss_server",
       );
-      for (let i = 1; i <= props.numBssNodes; i++) {
-        const bssId = `bss-${i}`;
-        const bssInstance = createInstance(
-          this,
-          this.vpc,
-          bssId,
-          subnet1,
-          bssInstanceType,
-          privateSg,
-          ec2Role,
-        );
-        instances[bssId] = bssInstance;
-        bssInstances.push(bssInstance);
-      }
     }
 
     // Create PrivateLink setup for NSS and RSS services
@@ -493,6 +488,13 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
+    if (bssAsg) {
+      new cdk.CfnOutput(this, "bssAsgName", {
+        value: bssAsg.autoScalingGroupName,
+        description: `BSS Auto Scaling Group Name`,
+      });
+    }
+
     if (props.browserIp) {
       new cdk.CfnOutput(this, "GuiServerPublicIp", {
         value: instances["gui_server"].instancePublicIp,
@@ -501,16 +503,13 @@ export class FractalbitsVpcStack extends cdk.Stack {
     }
 
     // Generate and upload bootstrap TOML config to S3
-    // Collect BSS instance IDs and IPs for etcd cluster configuration
-    const bssInstanceIds: string[] = [];
-    const bssInstanceIps: string[] = [];
-    for (let i = 1; i <= props.numBssNodes; i++) {
-      const bssId = `bss-${i}`;
-      if (instances[bssId]) {
-        bssInstanceIds.push(instances[bssId].instanceId);
-        bssInstanceIps.push(instances[bssId].instancePrivateIp);
-      }
-    }
+    // For etcd backend with ASG, BSS nodes discover each other via S3
+    // Use timestamp to ensure unique cluster ID per deployment (avoids stale S3 registrations)
+    const etcdClusterId =
+      props.rssBackend === "etcd" && dataBlobStorage === "singleAz"
+        ? `fractalbits-${Date.now()}`
+        : undefined;
+    const buildsBucket = `fractalbits-builds-${this.region}-${this.account}`;
 
     const bootstrapConfigContent = createConfigWithCfnTokens(this, {
       forBench: !!props.benchType,
@@ -544,11 +543,10 @@ export class FractalbitsVpcStack extends cdk.Stack {
           : undefined,
       benchClientNum:
         props.benchType === "external" ? props.numBenchClients : undefined,
-      bssInstanceIds: dataBlobStorage === "singleAz" ? bssInstanceIds : [],
-      bssInstanceIps: dataBlobStorage === "singleAz" ? bssInstanceIps : [],
+      etcdClusterId: etcdClusterId,
+      etcdS3Bucket: etcdClusterId ? buildsBucket : undefined,
     });
 
-    const buildsBucket = `fractalbits-builds-${this.region}-${this.account}`;
     new cr.AwsCustomResource(this, "UploadBootstrapConfig", {
       onCreate: {
         service: "S3",

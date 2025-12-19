@@ -177,8 +177,8 @@ export function createConfigWithCfnTokens(
     guiServerId?: string;
     benchServerId?: string;
     benchClientNum?: number;
-    bssInstanceIds?: string[];
-    bssInstanceIps?: string[];
+    etcdClusterId?: string;
+    etcdS3Bucket?: string;
   },
 ): string {
   // Build static config using TOML library
@@ -233,22 +233,19 @@ export function createConfigWithCfnTokens(
     lines.push(tomlLine("volume_b_id", props.volumeBId));
   }
 
-  // [etcd] section with BSS IPs for cluster formation (when using etcd backend)
+  // [etcd] section with S3-based dynamic cluster discovery (when using etcd backend)
   if (
     props.rssBackend === "etcd" &&
-    props.bssInstanceIps &&
-    props.bssInstanceIps.length > 0
+    props.etcdClusterId &&
+    props.etcdS3Bucket &&
+    props.numBssNodes
   ) {
     lines.push("");
     lines.push("[etcd]");
     lines.push("enabled = true");
-    // Build bss_ips array with CFN tokens
-    const ipLines = props.bssInstanceIps.map((ip) =>
-      cdk.Fn.join("", ['  "', ip, '",']),
-    );
-    lines.push("bss_ips = [");
-    lines.push(...ipLines);
-    lines.push("]");
+    lines.push(`cluster_id = "${props.etcdClusterId}"`);
+    lines.push(`quorum_size = ${props.numBssNodes}`);
+    lines.push(`s3_bucket = "${props.etcdS3Bucket}"`);
   }
 
   // Instance sections with CFN tokens
@@ -288,15 +285,6 @@ export function createConfigWithCfnTokens(
     lines.push(instanceHeader(props.benchServerId));
     lines.push('service_type = "bench_server"');
     lines.push(`bench_client_num = ${props.benchClientNum}`);
-  }
-
-  // BSS instance sections with CFN tokens
-  if (props.bssInstanceIds && props.bssInstanceIds.length > 0) {
-    for (const bssId of props.bssInstanceIds) {
-      lines.push("");
-      lines.push(instanceHeader(bssId));
-      lines.push('service_type = "bss_server"');
-    }
   }
 
   lines.push("");

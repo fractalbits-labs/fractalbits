@@ -1,5 +1,6 @@
 use super::common::*;
 use crate::config::BootstrapConfig;
+use crate::etcd_cluster::{get_all_registered_bss_nodes_s3, get_cluster_state_s3};
 use cmd_lib::*;
 use std::io::Error;
 
@@ -205,19 +206,32 @@ fn initialize_nss_roles(
 fn initialize_bss_volume_groups(config: &BootstrapConfig, total_bss_nodes: usize) -> CmdResult {
     info!("Initializing BSS volume group configurations...");
 
-    // For etcd backend, we get BSS IPs from config (they're known at deploy time)
-    // For DDB backend, we wait for BSS nodes to register dynamically
     let bss_addresses: Vec<(String, String)> = if config.is_etcd_backend() {
-        if let Some(etcd_config) = &config.etcd {
-            etcd_config
-                .bss_ips
-                .iter()
-                .enumerate()
-                .map(|(i, ip)| (format!("bss-{}", i + 1), ip.clone()))
-                .collect()
-        } else {
-            return Err(Error::other("etcd config missing for etcd backend"));
+        let etcd_config = config
+            .etcd
+            .as_ref()
+            .ok_or_else(|| Error::other("etcd config missing for etcd backend"))?;
+
+        info!("Waiting for etcd cluster to become active via S3...");
+        wait_for_etcd_cluster_active_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
+
+        info!("Getting BSS nodes from S3 registry...");
+        let bss_nodes =
+            get_all_registered_bss_nodes_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
+
+        if bss_nodes.len() < total_bss_nodes {
+            return Err(Error::other(format!(
+                "Not enough BSS nodes registered: {} < {}",
+                bss_nodes.len(),
+                total_bss_nodes
+            )));
         }
+
+        bss_nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| (format!("bss-{}", i + 1), node.ip.clone()))
+            .collect()
     } else {
         let region = get_current_aws_region()?;
         info!("Waiting for all BSS nodes to register in service discovery...");
@@ -352,10 +366,10 @@ fn build_volume_group_config(
 }
 
 fn wait_for_all_bss_nodes(region: &str, expected_count: usize) -> CmdResult {
-    let mut attempt = 0;
+    let mut i = 0;
 
     loop {
-        attempt += 1;
+        i += 1;
 
         // Query the service discovery table to check how many BSS nodes are registered
         let result = run_fun! {
@@ -381,7 +395,7 @@ fn wait_for_all_bss_nodes(region: &str, expected_count: usize) -> CmdResult {
             }
         }
 
-        if attempt >= MAX_POLL_ATTEMPTS {
+        if i >= MAX_POLL_ATTEMPTS {
             cmd_die!("Timed out waiting for all BSS nodes to register in service discovery");
         }
 
@@ -444,14 +458,20 @@ fn initialize_az_status(config: &BootstrapConfig, remote_az: &str) -> CmdResult 
 }
 
 fn wait_for_etcd_cluster(config: &BootstrapConfig) -> CmdResult {
-    info!("Waiting for etcd cluster to be healthy...");
+    let etcd_config = config
+        .etcd
+        .as_ref()
+        .ok_or_else(|| Error::other("etcd config missing"))?;
 
+    wait_for_etcd_cluster_active_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
+
+    info!("Waiting for etcd cluster to be healthy...");
     let etcd_endpoints = get_etcd_endpoints(config)?;
     let etcdctl = format!("{BIN_PATH}etcdctl");
-    let mut attempt = 0;
+    let mut i = 0;
 
     loop {
-        attempt += 1;
+        i += 1;
 
         let result = run_cmd!($etcdctl --endpoints=$etcd_endpoints endpoint health 2>/dev/null);
         if result.is_ok() {
@@ -459,14 +479,11 @@ fn wait_for_etcd_cluster(config: &BootstrapConfig) -> CmdResult {
             return Ok(());
         }
 
-        if attempt % 10 == 0 {
-            info!(
-                "etcd cluster not yet healthy, waiting... (attempt {})",
-                attempt
-            );
+        if i % 10 == 0 {
+            info!("etcd cluster not yet healthy, waiting... (attempt {i})");
         }
 
-        if attempt >= MAX_POLL_ATTEMPTS {
+        if i >= MAX_POLL_ATTEMPTS {
             cmd_die!("Timed out waiting for etcd cluster to be healthy");
         }
 
@@ -474,39 +491,74 @@ fn wait_for_etcd_cluster(config: &BootstrapConfig) -> CmdResult {
     }
 }
 
-fn get_etcd_endpoints(config: &BootstrapConfig) -> Result<String, Error> {
-    if let Some(etcd_config) = &config.etcd {
-        Ok(etcd_config
-            .bss_ips
-            .iter()
-            .map(|ip| format!("http://{}:2379", ip))
-            .collect::<Vec<_>>()
-            .join(","))
-    } else {
-        Err(Error::other("etcd config missing"))
+fn wait_for_etcd_cluster_active_s3(bucket: &str, cluster_id: &str) -> CmdResult {
+    info!("Waiting for etcd cluster to become active via S3...");
+    let mut i = 0;
+
+    loop {
+        i += 1;
+
+        match get_cluster_state_s3(bucket, cluster_id) {
+            Ok(state) if state == "active" => {
+                info!("etcd cluster is active");
+                return Ok(());
+            }
+            Ok(state) => {
+                if i % 10 == 0 {
+                    info!("etcd cluster state: {state}, waiting... (attempt {i})");
+                }
+            }
+            Err(_) => {
+                if i % 10 == 0 {
+                    info!("etcd cluster state not available, waiting... (attempt {i})");
+                }
+            }
+        }
+
+        if i >= MAX_POLL_ATTEMPTS {
+            cmd_die!("Timed out waiting for etcd cluster to become active");
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECONDS));
     }
+}
+
+fn get_etcd_endpoints(config: &BootstrapConfig) -> Result<String, Error> {
+    let etcd_config = config
+        .etcd
+        .as_ref()
+        .ok_or_else(|| Error::other("etcd config missing"))?;
+
+    let bss_nodes =
+        get_all_registered_bss_nodes_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
+    if bss_nodes.is_empty() {
+        return Err(Error::other("No BSS nodes registered in S3"));
+    }
+
+    Ok(bss_nodes
+        .iter()
+        .map(|node| format!("http://{}:2379", node.ip))
+        .collect::<Vec<_>>()
+        .join(","))
 }
 
 fn wait_for_rss_ready() -> CmdResult {
     info!("Waiting for root_server to be ready...");
-    let mut attempt = 0;
+    let mut i = 0;
     const RSS_PORT: u16 = 8088;
 
     loop {
-        attempt += 1;
+        i += 1;
         if check_port_ready("localhost", RSS_PORT) {
             info!("Root_server is ready (port {} responding)", RSS_PORT);
             return Ok(());
         }
 
-        if attempt % 10 == 0 {
-            info!(
-                "Root_server not yet ready, waiting... (attempt {})",
-                attempt
-            );
+        if i % 10 == 0 {
+            info!("Root_server not yet ready, waiting... (attempt {i})");
         }
 
-        if attempt >= MAX_POLL_ATTEMPTS {
+        if i >= MAX_POLL_ATTEMPTS {
             cmd_die!("Timed out waiting for root_server to be ready");
         }
 
@@ -516,11 +568,11 @@ fn wait_for_rss_ready() -> CmdResult {
 
 fn wait_for_leadership() -> CmdResult {
     info!("Waiting for local root_server to become leader...");
-    let mut attempt = 0;
+    let mut i = 0;
     const HEALTH_PORT: u16 = 18088;
 
     loop {
-        attempt += 1;
+        i += 1;
 
         // Check if the health endpoint is responding and reports leadership
         let health_url = format!("http://localhost:{HEALTH_PORT}");
@@ -542,7 +594,7 @@ fn wait_for_leadership() -> CmdResult {
             }
         }
 
-        if attempt >= MAX_POLL_ATTEMPTS {
+        if i >= MAX_POLL_ATTEMPTS {
             cmd_die!("Timed out waiting for root_server to become leader");
         }
 
@@ -566,9 +618,9 @@ fn start_follower_root_server(follower_id: &str) -> CmdResult {
 }
 
 fn wait_for_ssm_ready(instance_id: &str) {
-    let mut attempt = 0;
+    let mut i = 0;
     loop {
-        attempt += 1;
+        i += 1;
         let result = run_fun! {
             aws ssm describe-instance-information
                 --filters "Key=InstanceIds,Values=$instance_id"
@@ -581,15 +633,15 @@ fn wait_for_ssm_ready(instance_id: &str) {
             _ => std::thread::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECONDS)),
         };
 
-        if attempt >= MAX_POLL_ATTEMPTS {
+        if i >= MAX_POLL_ATTEMPTS {
             cmd_die!("Timed out while waiting for SSM after $MAX_POLL_ATTEMPTS attempts.");
         }
     }
 
     info!("Waiting for {instance_id} cloud init to be done");
-    let mut attempt = 0;
+    let mut i = 0;
     loop {
-        attempt += 1;
+        i += 1;
         let result = run_cmd_with_ssm(instance_id, &format!("test -f {BOOTSTRAP_DONE_FILE}"), true);
         match result {
             Ok(()) => break,
@@ -598,7 +650,7 @@ fn wait_for_ssm_ready(instance_id: &str) {
             }
         }
 
-        if attempt >= MAX_POLL_ATTEMPTS {
+        if i >= MAX_POLL_ATTEMPTS {
             cmd_die!("Timed out while waiting for cloud init after $MAX_POLL_ATTEMPTS attempts.");
         }
     }
@@ -622,9 +674,9 @@ fn run_cmd_with_ssm(instance_id: &str, cmd: &str, quiet: bool) -> CmdResult {
             "Command sent to {instance_id} successfully. Command ID: {command_id}. Polling for results..."
         );
     }
-    let mut attempt = 0;
+    let mut i = 0;
     loop {
-        attempt += 1;
+        i += 1;
         let invocation_json = run_fun! {
             aws ssm get-command-invocation
                 --command-id "$command_id"
@@ -656,7 +708,7 @@ fn run_cmd_with_ssm(instance_id: &str, cmd: &str, quiet: bool) -> CmdResult {
                 std::thread::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECONDS));
             }
         }
-        if attempt >= MAX_POLL_ATTEMPTS {
+        if i >= MAX_POLL_ATTEMPTS {
             return Err(Error::other(format!(
                 "Timed out polling for command result after {MAX_POLL_ATTEMPTS} attempts."
             )));
@@ -700,18 +752,27 @@ fn create_rss_config(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: b
     let region = get_current_aws_region()?;
     let instance_id = get_instance_id()?;
 
-    // Determine backend and etcd endpoints
     let backend = if config.is_etcd_backend() {
         "etcd"
     } else {
         "ddb"
     };
+
     let etcd_endpoints_line = if let Some(etcd_config) = &config.etcd {
-        if etcd_config.enabled && !etcd_config.bss_ips.is_empty() {
-            let endpoints: Vec<String> = etcd_config
-                .bss_ips
+        if etcd_config.enabled {
+            info!("Waiting for etcd cluster to become active before creating RSS config...");
+            wait_for_etcd_cluster_active_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
+
+            let bss_nodes =
+                get_all_registered_bss_nodes_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
+            if bss_nodes.is_empty() {
+                return Err(Error::other(
+                    "No BSS nodes registered in S3 for etcd endpoints",
+                ));
+            }
+            let endpoints: Vec<String> = bss_nodes
                 .iter()
-                .map(|ip| format!("http://{}:2379", ip))
+                .map(|node| format!("http://{}:2379", node.ip))
                 .collect();
             format!(
                 "\n# etcd endpoints for cluster connection\netcd_endpoints = {:?}",

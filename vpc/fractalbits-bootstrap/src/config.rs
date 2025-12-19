@@ -38,7 +38,9 @@ pub struct GlobalConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct EtcdConfig {
     pub enabled: bool,
-    pub bss_ips: Vec<String>,
+    pub cluster_id: String,
+    pub quorum_size: usize,
+    pub s3_bucket: String,
 }
 
 #[derive(Debug, Deserialize)]

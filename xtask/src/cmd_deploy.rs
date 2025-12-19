@@ -15,6 +15,7 @@ pub struct VpcConfig {
     pub bench_client_instance_type: String,
     pub az: Option<String>,
     pub root_server_ha: bool,
+    pub rss_backend: crate::RssBackend,
 }
 
 #[derive(Clone)]
@@ -383,6 +384,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         bench_client_instance_type,
         az,
         root_server_ha,
+        rss_backend,
     } = config;
 
     // Note: Template-based configuration is handled in CDK (vpc/fractalbits-cdk/bin/fractalbits-vpc.ts)
@@ -443,6 +445,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     if root_server_ha {
         add_context("rootServerHa", "true".to_string());
     }
+    add_context("rssBackend", rss_backend.as_ref().to_string());
 
     // Deploy the VPC stack
     run_cmd! {

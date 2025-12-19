@@ -258,6 +258,14 @@ pub enum DeployCommand {
             long_help = "Enable root server high availability (2 RSS instances)"
         )]
         root_server_ha: bool,
+
+        #[clap(
+            long,
+            value_enum,
+            long_help = "RSS backend storage (ddb or etcd)",
+            default_value = "ddb"
+        )]
+        rss_backend: RssBackend,
     },
 
     #[clap(about = "Destroy VPC infrastructure (including s3 builds bucket cleanup)")]
@@ -625,6 +633,7 @@ async fn main() -> CmdResult {
                 bench_client_instance_type,
                 az,
                 root_server_ha,
+                rss_backend,
             } => cmd_deploy::create_vpc(cmd_deploy::VpcConfig {
                 template,
                 num_api_servers,
@@ -636,6 +645,7 @@ async fn main() -> CmdResult {
                 bench_client_instance_type,
                 az,
                 root_server_ha,
+                rss_backend,
             })?,
             DeployCommand::DestroyVpc => cmd_deploy::destroy_vpc()?,
         },
