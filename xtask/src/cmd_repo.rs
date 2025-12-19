@@ -4,10 +4,10 @@ use comfy_table::{Cell, Color, Table, presets};
 use std::path::Path;
 
 #[derive(Clone)]
-struct Repo {
-    path: &'static str,
-    url: &'static str,
-    branch: &'static str,
+pub struct Repo {
+    pub path: &'static str,
+    pub url: &'static str,
+    pub branch: &'static str,
 }
 
 // Define git repos as constants
@@ -44,7 +44,7 @@ const GIT_REPOS: &[Repo] = &[
     },
     PREBUILT_REPO,
 ];
-const PREBUILT_REPO: Repo = Repo {
+pub const PREBUILT_REPO: Repo = Repo {
     path: "prebuilt",
     url: "https://github.com/fractalbits-labs/fractalbits-prebuilt.git",
     branch: "main",
@@ -75,13 +75,13 @@ fn list_repos() -> CmdResult {
     Ok(())
 }
 
-fn all_repos() -> impl Iterator<Item = &'static Repo> {
+pub fn all_repos() -> impl Iterator<Item = &'static Repo> {
     GIT_REPOS.iter().filter(|repo| {
         repo.path != "prebuilt" && Path::new(&format!("{}/.git/", repo.path)).exists()
     })
 }
 
-fn repo_has_changes(path: &str) -> bool {
+pub fn repo_has_changes(path: &str) -> bool {
     let has_staged_changes =
         |path: &str| run_cmd!(cd $path; git diff-index --quiet --cached HEAD --).is_err();
     let has_local_changes = |path: &str| run_cmd!(cd $path; git diff --quiet).is_err();

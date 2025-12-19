@@ -13,6 +13,9 @@ run-tests *args:
 deploy *args:
   cargo xtask deploy {{args}}
 
+prebuilt *args:
+  cargo xtask prebuilt {{args}}
+
 describe-stack *args:
   cargo xtask tools describe-stack {{args}}
 

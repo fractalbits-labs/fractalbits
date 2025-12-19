@@ -3,6 +3,7 @@ mod cmd_build;
 mod cmd_deploy;
 mod cmd_docker;
 mod cmd_nightly;
+mod cmd_prebuilt;
 mod cmd_precheckin;
 mod cmd_repo;
 mod cmd_run_tests;
@@ -107,6 +108,10 @@ enum Cmd {
     #[clap(about = "Docker image build and run commands")]
     #[command(subcommand)]
     Docker(DockerCommand),
+
+    #[clap(about = "Prebuilt binaries management commands")]
+    #[command(subcommand)]
+    Prebuilt(PrebuiltCommand),
 }
 
 #[derive(Parser, Clone)]
@@ -161,6 +166,27 @@ pub enum DockerCommand {
         #[clap(long, long_help = "Follow log output")]
         follow: bool,
     },
+}
+
+#[derive(Parser, Clone)]
+pub enum PrebuiltCommand {
+    #[clap(about = "Publish prebuilt binaries to remote repository")]
+    Publish {
+        #[clap(long, long_help = "Skip the build step (use existing binaries)")]
+        skip_build: bool,
+
+        #[clap(long, long_help = "Dry run - don't commit or push")]
+        dry_run: bool,
+
+        #[clap(
+            long,
+            long_help = "Allow publishing even if some repos have uncommitted changes"
+        )]
+        allow_dirty: bool,
+    },
+
+    #[clap(about = "Update prebuilt binaries to latest version (shallow clone)")]
+    Update,
 }
 
 #[derive(Parser, Clone)]
@@ -655,6 +681,7 @@ async fn main() -> CmdResult {
         }
         Cmd::Repo(repo_cmd) => cmd_repo::run_cmd_repo(repo_cmd)?,
         Cmd::Docker(docker_cmd) => cmd_docker::run_cmd_docker(docker_cmd)?,
+        Cmd::Prebuilt(prebuilt_cmd) => cmd_prebuilt::run_cmd_prebuilt(prebuilt_cmd)?,
     }
     Ok(())
 }
