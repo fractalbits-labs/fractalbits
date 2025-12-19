@@ -50,6 +50,8 @@ async fn main() -> Result<()> {
                 .json()
                 .flatten_event(true)
                 .with_target(false)
+                .with_file(false)
+                .with_line_number(false)
                 .with_writer(io::stderr),
         )
         .init();

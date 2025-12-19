@@ -42,11 +42,14 @@ fn main() -> std::io::Result<()> {
                 })
                 .unwrap_or_else(|_| format!("info,{third_party_filter}").into()),
         )
-        .with(
+        .with({
+            let is_terminal = std::io::stdout().is_terminal();
             tracing_subscriber::fmt::layer()
                 .without_time()
-                .with_ansi(std::io::stdout().is_terminal()),
-        )
+                .with_ansi(is_terminal)
+                .with_level(is_terminal)
+                .with_target(is_terminal)
+        })
         .init();
 
     let main_build_info = option_env!("MAIN_BUILD_INFO").unwrap_or("unknown");

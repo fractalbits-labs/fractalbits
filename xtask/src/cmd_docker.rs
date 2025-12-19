@@ -166,7 +166,29 @@ fn run_docker_container(
         run_cmd!(docker run -d --privileged --name $container_name -p $port_mapping -p $mgmt_port_mapping -v "fractalbits-data:/data" $image)?;
         info!("Container started in detached mode: {}", container_name);
     } else {
-        run_cmd!(docker run --rm --privileged --name $container_name -p $port_mapping -p $mgmt_port_mapping -v "fractalbits-data:/data" $image)?;
+        // Use std::process::Command for interactive mode to pass through raw output
+        let status = std::process::Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--privileged",
+                "--name",
+                container_name,
+                "-p",
+                &port_mapping,
+                "-p",
+                mgmt_port_mapping,
+                "-v",
+                "fractalbits-data:/data",
+                &image,
+            ])
+            .status()?;
+        if !status.success() {
+            return Err(Error::other(format!(
+                "docker run failed with exit code: {:?}",
+                status.code()
+            )));
+        }
     }
 
     Ok(())
