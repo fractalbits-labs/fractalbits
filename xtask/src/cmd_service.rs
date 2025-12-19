@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::InitConfig;
+use crate::etcd_utils::{ensure_etcd_local, resolve_etcd_bin};
 use crate::*;
 use colored::*;
 use xtask_tools::{
@@ -154,7 +155,7 @@ pub fn init_service(
     };
     let init_minio = |data_dir: &str| -> CmdResult { run_cmd!(mkdir -p $data_dir) };
     let init_etcd = || -> CmdResult {
-        ensure_etcd()?;
+        ensure_etcd_local()?;
         run_cmd! {
             mkdir -p data/etcd;
         }?;
@@ -354,43 +355,6 @@ fn ensure_minio() -> CmdResult {
         mkdir -p $minio_dir;
         curl -L -o $minio_path $download_url 2>&1;
         chmod +x $minio_path;
-    }?;
-
-    Ok(())
-}
-
-fn ensure_etcd() -> CmdResult {
-    let etcd_dir = "third_party/etcd";
-    let etcd_path = format!("{etcd_dir}/etcd");
-
-    // Check if etcd is already available
-    if run_cmd!(bash -c "command -v etcd" &>/dev/null).is_ok() || Path::new(&etcd_path).exists() {
-        return Ok(());
-    }
-
-    let etcd_version = "v3.6.7";
-    let etcd_tarball = format!("etcd-{etcd_version}-linux-amd64.tar.gz");
-    let download_url =
-        format!("https://github.com/etcd-io/etcd/releases/download/{etcd_version}/{etcd_tarball}");
-    let tarball_path = format!("third_party/{etcd_tarball}");
-
-    // Download if not already downloaded
-    if !Path::new(&tarball_path).exists() {
-        run_cmd! {
-            info "Downloading etcd binary...";
-            mkdir -p third_party;
-            curl -sL -o $tarball_path $download_url;
-        }?;
-    }
-
-    let extracted_dir = format!("third_party/etcd-{}-linux-amd64", etcd_version);
-    run_cmd! {
-        info "Extracting etcd...";
-        mkdir -p $etcd_dir;
-        tar -xzf $tarball_path -C third_party;
-        mv $extracted_dir/etcd $etcd_dir/;
-        mv $extracted_dir/etcdctl $etcd_dir/;
-        rm -rf $extracted_dir;
     }?;
 
     Ok(())
@@ -1255,17 +1219,6 @@ fn resolve_binary_path(binary_name: &str, build_mode: BuildMode) -> String {
 
     // Default to first candidate (target/build path)
     candidates.into_iter().next().unwrap()
-}
-
-pub fn resolve_etcd_bin(binary_name: &str) -> String {
-    // Check system PATH first
-    if let Ok(path) = run_fun!(bash -c "command -v $binary_name") {
-        return path;
-    }
-
-    // Fall back to third_party directory
-    let pwd = run_fun!(pwd).unwrap_or_else(|_| ".".to_string());
-    format!("{pwd}/third_party/etcd/{binary_name}")
 }
 
 fn generate_https_certificates() -> CmdResult {

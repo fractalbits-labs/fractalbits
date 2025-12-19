@@ -50,7 +50,10 @@ fn download_binary(file_name: &str) -> CmdResult {
     let builds_bucket = get_builds_bucket()?;
     let cpu_arch = run_fun!(arch)?;
 
-    let s3_path = if file_name == "fractalbits-bootstrap" || file_name == "warp" {
+    let s3_path = if matches!(
+        file_name,
+        "fractalbits-bootstrap" | "warp" | "etcd" | "etcdctl"
+    ) {
         format!("{builds_bucket}/{cpu_arch}/{file_name}")
     } else {
         let instance_type = get_ec2_instance_type()?;
@@ -245,6 +248,10 @@ pub fn get_instance_id() -> FunResult {
 
 pub fn get_ec2_instance_type() -> FunResult {
     run_fun!(ec2-metadata --instance-type | awk r"{print $2}")
+}
+
+pub fn get_private_ip() -> FunResult {
+    run_fun!(ec2-metadata --local-ipv4 | awk r"{print $2}")
 }
 
 pub fn get_cpu_target_from_instance_type(instance_type: &str) -> &'static str {

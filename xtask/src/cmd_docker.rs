@@ -1,4 +1,5 @@
 use crate::cmd_build::get_build_envs;
+use crate::etcd_utils::ensure_etcd_local;
 use crate::*;
 use cmd_lib::*;
 use std::io::Error;
@@ -64,7 +65,7 @@ fn build_docker_image(
     }
 
     info!("Ensuring etcd binary...");
-    ensure_etcd()?;
+    ensure_etcd_local()?;
 
     info!("Preparing staging directory...");
     run_cmd! {
@@ -190,41 +191,6 @@ fn show_docker_logs(name: Option<&str>, follow: bool) -> CmdResult {
     } else {
         run_cmd!(docker logs $container_name)?;
     }
-
-    Ok(())
-}
-
-fn ensure_etcd() -> CmdResult {
-    let etcd_dir = "third_party/etcd";
-    let etcd_path = format!("{etcd_dir}/etcd");
-
-    if Path::new(&etcd_path).exists() {
-        return Ok(());
-    }
-
-    let etcd_version = "v3.6.7";
-    let etcd_tarball = format!("etcd-{etcd_version}-linux-amd64.tar.gz");
-    let download_url =
-        format!("https://github.com/etcd-io/etcd/releases/download/{etcd_version}/{etcd_tarball}");
-    let tarball_path = format!("third_party/{etcd_tarball}");
-
-    if !Path::new(&tarball_path).exists() {
-        run_cmd! {
-            info "Downloading etcd binary...";
-            mkdir -p third_party;
-            curl -L -o $tarball_path $download_url 2>&1;
-        }?;
-    }
-
-    let extracted_dir = format!("third_party/etcd-{}-linux-amd64", etcd_version);
-    run_cmd! {
-        info "Extracting etcd...";
-        mkdir -p $etcd_dir;
-        tar xzf $tarball_path -C third_party;
-        mv $extracted_dir/etcd $etcd_dir/;
-        mv $extracted_dir/etcdctl $etcd_dir/;
-        rm -rf $extracted_dir;
-    }?;
 
     Ok(())
 }

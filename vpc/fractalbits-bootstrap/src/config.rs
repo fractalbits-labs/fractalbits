@@ -17,6 +17,8 @@ pub struct BootstrapConfig {
     pub endpoints: EndpointsConfig,
     pub resources: ResourcesConfig,
     #[serde(default)]
+    pub etcd: Option<EtcdConfig>,
+    #[serde(default)]
     pub instances: HashMap<String, InstanceConfig>,
 }
 
@@ -26,9 +28,17 @@ pub struct GlobalConfig {
     pub data_blob_storage: String,
     pub rss_ha_enabled: bool,
     #[serde(default)]
+    pub rss_backend: String,
+    #[serde(default)]
     pub num_bss_nodes: Option<usize>,
     #[serde(default)]
     pub meta_stack_testing: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EtcdConfig {
+    pub enabled: bool,
+    pub bss_ips: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,5 +128,9 @@ impl BootstrapConfig {
 
     pub fn is_multi_az(&self) -> bool {
         self.global.data_blob_storage == "multiAz"
+    }
+
+    pub fn is_etcd_backend(&self) -> bool {
+        self.global.rss_backend == "etcd"
     }
 }

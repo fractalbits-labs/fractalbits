@@ -159,6 +159,7 @@ export function createConfigWithCfnTokens(
     forBench: boolean;
     dataBlobStorage: "singleAz" | "multiAz";
     rssHaEnabled: boolean;
+    rssBackend: "etcd" | "ddb";
     numBssNodes?: number;
     bucket: string;
     localAz: string;
@@ -176,6 +177,8 @@ export function createConfigWithCfnTokens(
     guiServerId?: string;
     benchServerId?: string;
     benchClientNum?: number;
+    bssInstanceIds?: string[];
+    bssInstanceIps?: string[];
   },
 ): string {
   // Build static config using TOML library
@@ -184,6 +187,7 @@ export function createConfigWithCfnTokens(
       for_bench: props.forBench,
       data_blob_storage: props.dataBlobStorage,
       rss_ha_enabled: props.rssHaEnabled,
+      rss_backend: props.rssBackend,
     },
     aws: {
       local_az: props.localAz,
@@ -229,6 +233,24 @@ export function createConfigWithCfnTokens(
     lines.push(tomlLine("volume_b_id", props.volumeBId));
   }
 
+  // [etcd] section with BSS IPs for cluster formation (when using etcd backend)
+  if (
+    props.rssBackend === "etcd" &&
+    props.bssInstanceIps &&
+    props.bssInstanceIps.length > 0
+  ) {
+    lines.push("");
+    lines.push("[etcd]");
+    lines.push("enabled = true");
+    // Build bss_ips array with CFN tokens
+    const ipLines = props.bssInstanceIps.map((ip) =>
+      cdk.Fn.join("", ['  "', ip, '",']),
+    );
+    lines.push("bss_ips = [");
+    lines.push(...ipLines);
+    lines.push("]");
+  }
+
   // Instance sections with CFN tokens
   lines.push("");
   lines.push(instanceHeader(props.rssAId));
@@ -266,6 +288,15 @@ export function createConfigWithCfnTokens(
     lines.push(instanceHeader(props.benchServerId));
     lines.push('service_type = "bench_server"');
     lines.push(`bench_client_num = ${props.benchClientNum}`);
+  }
+
+  // BSS instance sections with CFN tokens
+  if (props.bssInstanceIds && props.bssInstanceIds.length > 0) {
+    for (const bssId of props.bssInstanceIds) {
+      lines.push("");
+      lines.push(instanceHeader(bssId));
+      lines.push('service_type = "bss_server"');
+    }
   }
 
   lines.push("");

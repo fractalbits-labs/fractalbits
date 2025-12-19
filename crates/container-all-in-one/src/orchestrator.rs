@@ -116,10 +116,10 @@ impl Orchestrator {
         let bss_metadata_vg = generate_bss_metadata_vg_config(1);
 
         run_cmd! {
-            $etcdctl put /fractalbits-service-discovery/nss_roles $nss_roles_json;
-            $etcdctl put /fractalbits-service-discovery/az_status $az_status_json;
-            $etcdctl put /fractalbits-service-discovery/bss-data-vg-config $bss_data_vg;
-            $etcdctl put /fractalbits-service-discovery/bss-metadata-vg-config $bss_metadata_vg;
+            $etcdctl put /fractalbits-service-discovery/nss_roles $nss_roles_json >/dev/null;
+            $etcdctl put /fractalbits-service-discovery/az_status $az_status_json >/dev/null;
+            $etcdctl put /fractalbits-service-discovery/bss-data-vg-config $bss_data_vg >/dev/null;
+            $etcdctl put /fractalbits-service-discovery/bss-metadata-vg-config $bss_metadata_vg >/dev/null;
         }?;
 
         Ok(())

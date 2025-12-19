@@ -1,5 +1,5 @@
 use crate::RssBackend;
-use crate::cmd_service::resolve_etcd_bin;
+use crate::etcd_utils::resolve_etcd_bin;
 use cmd_lib::*;
 use colored::*;
 use std::collections::HashMap;

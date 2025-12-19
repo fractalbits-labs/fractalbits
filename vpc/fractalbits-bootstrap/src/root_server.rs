@@ -31,6 +31,7 @@ pub fn bootstrap(
 
     if is_leader {
         bootstrap_leader(
+            config,
             nss_endpoint,
             nss_a_id,
             nss_b_id,
@@ -41,13 +42,17 @@ pub fn bootstrap(
             for_bench,
         )
     } else {
-        bootstrap_follower(nss_endpoint, ha_enabled)
+        bootstrap_follower(config, nss_endpoint, ha_enabled)
     }
 }
 
-fn bootstrap_follower(nss_endpoint: &str, ha_enabled: bool) -> CmdResult {
-    download_binaries(&["rss_admin", "root_server"])?;
-    create_rss_config(nss_endpoint, ha_enabled)?;
+fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: bool) -> CmdResult {
+    let mut binaries = vec!["rss_admin", "root_server"];
+    if config.is_etcd_backend() {
+        binaries.push("etcdctl");
+    }
+    download_binaries(&binaries)?;
+    create_rss_config(config, nss_endpoint, ha_enabled)?;
     create_systemd_unit_file("rss", false)?;
     create_ddb_register_and_deregister_service("root-server")?;
     Ok(())
@@ -55,6 +60,7 @@ fn bootstrap_follower(nss_endpoint: &str, ha_enabled: bool) -> CmdResult {
 
 #[allow(clippy::too_many_arguments)]
 fn bootstrap_leader(
+    config: &BootstrapConfig,
     nss_endpoint: &str,
     nss_a_id: &str,
     nss_b_id: Option<&str>,
@@ -64,14 +70,18 @@ fn bootstrap_leader(
     ha_enabled: bool,
     for_bench: bool,
 ) -> CmdResult {
-    download_binaries(&["rss_admin", "root_server"])?;
+    let mut binaries = vec!["rss_admin", "root_server"];
+    if config.is_etcd_backend() {
+        binaries.push("etcdctl");
+    }
+    download_binaries(&binaries)?;
 
     // Initialize AZ status if this is a multi-AZ deployment
     if let Some(remote_az) = remote_az {
-        initialize_az_status_in_ddb(remote_az)?;
+        initialize_az_status(config, remote_az)?;
     }
 
-    create_rss_config(nss_endpoint, ha_enabled)?;
+    create_rss_config(config, nss_endpoint, ha_enabled)?;
     // setup_cloudwatch_agent()?;
     create_systemd_unit_file("rss", !ha_enabled || follower_id.is_some())?;
     create_ddb_register_and_deregister_service("root-server")?;
@@ -87,13 +97,13 @@ fn bootstrap_leader(
         create_s3_express_bucket(remote_az, S3EXPRESS_REMOTE_BUCKET_CONFIG)?;
     }
 
-    // Initialize NSS role states in DynamoDB
-    initialize_nss_roles_in_ddb(nss_a_id, nss_b_id)?;
+    // Initialize NSS role states in service discovery
+    initialize_nss_roles(config, nss_a_id, nss_b_id)?;
 
-    // Initialize BSS volume group configurations in DynamoDB (only for single-AZ mode)
+    // Initialize BSS volume group configurations in service discovery (only for single-AZ mode)
     if remote_az.is_none() {
         let total_bss_nodes = num_bss_nodes.unwrap_or(TOTAL_BSS_NODES);
-        initialize_bss_volume_groups_in_ddb(total_bss_nodes)?;
+        initialize_bss_volume_groups(config, total_bss_nodes)?;
     }
 
     // Format nss-B first if it exists, then nss-A
@@ -144,62 +154,85 @@ fn bootstrap_leader(
     Ok(())
 }
 
-fn initialize_nss_roles_in_ddb(nss_a_id: &str, nss_b_id: Option<&str>) -> CmdResult {
-    let region = get_current_aws_region()?;
+fn initialize_nss_roles(
+    config: &BootstrapConfig,
+    nss_a_id: &str,
+    nss_b_id: Option<&str>,
+) -> CmdResult {
+    info!("Initializing NSS role states in service discovery");
 
-    info!("Initializing NSS role states in service-discovery table");
-
-    let nss_roles_item = if let Some(nss_b_id) = nss_b_id {
-        // Multi-AZ mode: nss-A as active, nss-B as standby
+    let nss_roles_json = if let Some(nss_b_id) = nss_b_id {
         info!("Setting {nss_a_id} as active");
         info!("Setting {nss_b_id} as standby");
-        format!(
-            r#"{{"service_id":{{"S":"{}"}},"states":{{"M":{{"{nss_a_id}":{{"S":"active"}},"{nss_b_id}":{{"S":"standby"}}}}}}}}"#,
-            NSS_ROLES_KEY
-        )
+        format!(r#"{{"states":{{"{nss_a_id}":"active","{nss_b_id}":"standby"}}}}"#)
     } else {
-        // Single-AZ mode: only nss-A as solo
         info!("Setting {nss_a_id} as solo");
-        format!(
-            r#"{{"service_id":{{"S":"{}"}},"states":{{"M":{{"{nss_a_id}":{{"S":"solo"}}}}}}}}"#,
-            NSS_ROLES_KEY
-        )
+        format!(r#"{{"states":{{"{nss_a_id}":"solo"}}}}"#)
     };
 
-    // Put nss_roles entry with states map
-    run_cmd! {
-        aws dynamodb put-item
-            --table-name $DDB_SERVICE_DISCOVERY_TABLE
-            --item $nss_roles_item
-            --region $region
-    }?;
+    if config.is_etcd_backend() {
+        wait_for_etcd_cluster(config)?;
+        let etcdctl = format!("{BIN_PATH}etcdctl");
+        let etcd_endpoints = get_etcd_endpoints(config)?;
+        let key = "/fractalbits-service-discovery/nss_roles";
+        run_cmd!($etcdctl --endpoints=$etcd_endpoints put $key $nss_roles_json >/dev/null)?;
+    } else {
+        let region = get_current_aws_region()?;
+        let nss_roles_item = if let Some(nss_b_id) = nss_b_id {
+            format!(
+                r#"{{"service_id":{{"S":"{}"}},"states":{{"M":{{"{nss_a_id}":{{"S":"active"}},"{nss_b_id}":{{"S":"standby"}}}}}}}}"#,
+                NSS_ROLES_KEY
+            )
+        } else {
+            format!(
+                r#"{{"service_id":{{"S":"{}"}},"states":{{"M":{{"{nss_a_id}":{{"S":"solo"}}}}}}}}"#,
+                NSS_ROLES_KEY
+            )
+        };
 
-    info!("NSS roles initialized in service-discovery table");
+        run_cmd! {
+            aws dynamodb put-item
+                --table-name $DDB_SERVICE_DISCOVERY_TABLE
+                --item $nss_roles_item
+                --region $region
+        }?;
+    }
+
+    info!("NSS roles initialized in service discovery");
     Ok(())
 }
 
-fn initialize_bss_volume_groups_in_ddb(total_bss_nodes: usize) -> CmdResult {
-    let region = get_current_aws_region()?;
+fn initialize_bss_volume_groups(config: &BootstrapConfig, total_bss_nodes: usize) -> CmdResult {
+    info!("Initializing BSS volume group configurations...");
 
-    info!("Waiting for all BSS nodes to register in service discovery...");
+    // For etcd backend, we get BSS IPs from config (they're known at deploy time)
+    // For DDB backend, we wait for BSS nodes to register dynamically
+    let bss_addresses: Vec<(String, String)> = if config.is_etcd_backend() {
+        if let Some(etcd_config) = &config.etcd {
+            etcd_config
+                .bss_ips
+                .iter()
+                .enumerate()
+                .map(|(i, ip)| (format!("bss-{}", i + 1), ip.clone()))
+                .collect()
+        } else {
+            return Err(Error::other("etcd config missing for etcd backend"));
+        }
+    } else {
+        let region = get_current_aws_region()?;
+        info!("Waiting for all BSS nodes to register in service discovery...");
+        wait_for_all_bss_nodes(&region, total_bss_nodes)?;
+        let bss_instances = get_all_bss_addresses(&region)?;
+        let mut sorted_instances: Vec<_> = bss_instances.into_iter().collect();
+        sorted_instances.sort_by(|a, b| a.0.cmp(&b.0));
+        sorted_instances
+    };
 
-    // Wait for all BSS nodes to register
-    wait_for_all_bss_nodes(&region, total_bss_nodes)?;
-
-    // Now retrieve all BSS addresses
-    let bss_instances = get_all_bss_addresses(&region)?;
-
-    // Sort by instance ID to ensure consistent ordering
-    let mut sorted_instances: Vec<_> = bss_instances.into_iter().collect();
-    sorted_instances.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut bss_addresses = Vec::new();
-    for (instance_id, address) in sorted_instances.iter() {
-        info!("Found {} at {}", instance_id, address);
-        bss_addresses.push((instance_id.clone(), address.clone()));
+    for (instance_id, address) in bss_addresses.iter() {
+        info!("BSS node: {} at {}", instance_id, address);
     }
 
-    info!("All BSS nodes registered. Initializing volume group configurations...");
+    info!("All BSS nodes available. Initializing volume group configurations...");
 
     // Adjust quorum settings for single BSS node deployments
     let (data_vg_quorum_n, data_vg_quorum_r, data_vg_quorum_w) = match total_bss_nodes {
@@ -217,7 +250,6 @@ fn initialize_bss_volume_groups_in_ddb(total_bss_nodes: usize) -> CmdResult {
             META_DATA_VG_QUORUM_R,
             META_DATA_VG_QUORUM_W,
         ),
-        // Allow it to have the same quorum as data_vg
         n if n % DATA_VG_QUORUM_N == 0 => (DATA_VG_QUORUM_N, DATA_VG_QUORUM_R, DATA_VG_QUORUM_W),
         _ => cmd_die!(
             "Unsupported number of bss nodes (1 or $META_DATA_VG_QUORUM_N}*k ): $total_bss_nodes"
@@ -231,21 +263,6 @@ fn initialize_bss_volume_groups_in_ddb(total_bss_nodes: usize) -> CmdResult {
         data_vg_quorum_w,
     );
 
-    let bss_data_vg_config_item = format!(
-        r#"{{"service_id":{{"S":"{}"}},"value":{{"S":"{}"}}}}"#,
-        BSS_DATA_VG_CONFIG_KEY,
-        bss_data_vg_config_json
-            .replace('"', r#"\""#)
-            .replace('\n', "")
-    );
-
-    run_cmd! {
-        aws dynamodb put-item
-            --table-name $DDB_SERVICE_DISCOVERY_TABLE
-            --item $bss_data_vg_config_item
-            --region $region
-    }?;
-
     let bss_metadata_vg_config_json = build_volume_group_config(
         &bss_addresses,
         metadata_vg_quorum_n,
@@ -253,22 +270,49 @@ fn initialize_bss_volume_groups_in_ddb(total_bss_nodes: usize) -> CmdResult {
         metadata_vg_quorum_w,
     );
 
-    let bss_metadata_vg_config_item = format!(
-        r#"{{"service_id":{{"S":"{}"}},"value":{{"S":"{}"}}}}"#,
-        BSS_METADATA_VG_CONFIG_KEY,
-        bss_metadata_vg_config_json
-            .replace('"', r#"\""#)
-            .replace('\n', "")
-    );
+    if config.is_etcd_backend() {
+        let etcdctl = format!("{BIN_PATH}etcdctl");
+        let etcd_endpoints = get_etcd_endpoints(config)?;
+        let data_key = "/fractalbits-service-discovery/bss-data-vg-config";
+        let metadata_key = "/fractalbits-service-discovery/bss-metadata-vg-config";
+        run_cmd! {
+            $etcdctl --endpoints=$etcd_endpoints put $data_key $bss_data_vg_config_json >/dev/null;
+            $etcdctl --endpoints=$etcd_endpoints put $metadata_key $bss_metadata_vg_config_json >/dev/null;
+        }?;
+    } else {
+        let region = get_current_aws_region()?;
+        let bss_data_vg_config_item = format!(
+            r#"{{"service_id":{{"S":"{}"}},"value":{{"S":"{}"}}}}"#,
+            BSS_DATA_VG_CONFIG_KEY,
+            bss_data_vg_config_json
+                .replace('"', r#"\""#)
+                .replace('\n', "")
+        );
 
-    run_cmd! {
-        aws dynamodb put-item
-            --table-name $DDB_SERVICE_DISCOVERY_TABLE
-            --item $bss_metadata_vg_config_item
-            --region $region
-    }?;
+        run_cmd! {
+            aws dynamodb put-item
+                --table-name $DDB_SERVICE_DISCOVERY_TABLE
+                --item $bss_data_vg_config_item
+                --region $region
+        }?;
 
-    info!("BSS volume group configurations initialized in service-discovery table");
+        let bss_metadata_vg_config_item = format!(
+            r#"{{"service_id":{{"S":"{}"}},"value":{{"S":"{}"}}}}"#,
+            BSS_METADATA_VG_CONFIG_KEY,
+            bss_metadata_vg_config_json
+                .replace('"', r#"\""#)
+                .replace('\n', "")
+        );
+
+        run_cmd! {
+            aws dynamodb put-item
+                --table-name $DDB_SERVICE_DISCOVERY_TABLE
+                --item $bss_metadata_vg_config_item
+                --region $region
+        }?;
+    }
+
+    info!("BSS volume group configurations initialized in service discovery");
     Ok(())
 }
 
@@ -366,30 +410,81 @@ fn get_all_bss_addresses(
     Ok(addresses)
 }
 
-fn initialize_az_status_in_ddb(remote_az: &str) -> CmdResult {
-    let region = get_current_aws_region()?;
+fn initialize_az_status(config: &BootstrapConfig, remote_az: &str) -> CmdResult {
     let local_az = get_current_aws_az_id()?;
 
-    info!("Initializing AZ status in service-discovery table");
+    info!("Initializing AZ status in service discovery");
     info!("Setting {local_az} and {remote_az} to Normal");
 
-    let az_status_item = format!(
-        r#"{{"service_id":{{"S":"{}"}},"status":{{"M":{{"{local_az}":{{"S":"Normal"}},"{remote_az}":{{"S":"Normal"}}}}}}}}"#,
-        AZ_STATUS_KEY
-    );
+    if config.is_etcd_backend() {
+        wait_for_etcd_cluster(config)?;
+        let etcdctl = format!("{BIN_PATH}etcdctl");
+        let etcd_endpoints = get_etcd_endpoints(config)?;
+        let key = "/fractalbits-service-discovery/az_status";
+        let az_status_json =
+            format!(r#"{{"status":{{"{local_az}":"Normal","{remote_az}":"Normal"}}}}"#);
+        run_cmd!($etcdctl --endpoints=$etcd_endpoints put $key $az_status_json >/dev/null)?;
+    } else {
+        let region = get_current_aws_region()?;
+        let az_status_item = format!(
+            r#"{{"service_id":{{"S":"{}"}},"status":{{"M":{{"{local_az}":{{"S":"Normal"}},"{remote_az}":{{"S":"Normal"}}}}}}}}"#,
+            AZ_STATUS_KEY
+        );
 
-    // Put az_status entry with status map
-    run_cmd! {
-        aws dynamodb put-item
-            --table-name $DDB_SERVICE_DISCOVERY_TABLE
-            --item $az_status_item
-            --region $region
-    }?;
+        run_cmd! {
+            aws dynamodb put-item
+                --table-name $DDB_SERVICE_DISCOVERY_TABLE
+                --item $az_status_item
+                --region $region
+        }?;
+    }
 
-    info!(
-        "AZ status initialized in service-discovery table ({local_az}: Normal, {remote_az}: Normal)"
-    );
+    info!("AZ status initialized in service discovery ({local_az}: Normal, {remote_az}: Normal)");
     Ok(())
+}
+
+fn wait_for_etcd_cluster(config: &BootstrapConfig) -> CmdResult {
+    info!("Waiting for etcd cluster to be healthy...");
+
+    let etcd_endpoints = get_etcd_endpoints(config)?;
+    let etcdctl = format!("{BIN_PATH}etcdctl");
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+
+        let result = run_cmd!($etcdctl --endpoints=$etcd_endpoints endpoint health 2>/dev/null);
+        if result.is_ok() {
+            info!("etcd cluster is healthy");
+            return Ok(());
+        }
+
+        if attempt % 10 == 0 {
+            info!(
+                "etcd cluster not yet healthy, waiting... (attempt {})",
+                attempt
+            );
+        }
+
+        if attempt >= MAX_POLL_ATTEMPTS {
+            cmd_die!("Timed out waiting for etcd cluster to be healthy");
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECONDS));
+    }
+}
+
+fn get_etcd_endpoints(config: &BootstrapConfig) -> Result<String, Error> {
+    if let Some(etcd_config) = &config.etcd {
+        Ok(etcd_config
+            .bss_ips
+            .iter()
+            .map(|ip| format!("http://{}:2379", ip))
+            .collect::<Vec<_>>()
+            .join(","))
+    } else {
+        Err(Error::other("etcd config missing"))
+    }
 }
 
 fn wait_for_rss_ready() -> CmdResult {
@@ -601,9 +696,34 @@ fencing_timeout_seconds = 300                  # Max time to wait for instance t
     Ok(())
 }
 
-fn create_rss_config(nss_endpoint: &str, ha_enabled: bool) -> CmdResult {
+fn create_rss_config(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: bool) -> CmdResult {
     let region = get_current_aws_region()?;
     let instance_id = get_instance_id()?;
+
+    // Determine backend and etcd endpoints
+    let backend = if config.is_etcd_backend() {
+        "etcd"
+    } else {
+        "ddb"
+    };
+    let etcd_endpoints_line = if let Some(etcd_config) = &config.etcd {
+        if etcd_config.enabled && !etcd_config.bss_ips.is_empty() {
+            let endpoints: Vec<String> = etcd_config
+                .bss_ips
+                .iter()
+                .map(|ip| format!("http://{}:2379", ip))
+                .collect();
+            format!(
+                "\n# etcd endpoints for cluster connection\netcd_endpoints = {:?}",
+                endpoints
+            )
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
     let config_content = format!(
         r##"# Root Server Configuration
 
@@ -626,20 +746,20 @@ api_server_mgmt_port = 18088
 nss_addr = "{nss_endpoint}:8088"
 
 # Backend storage (ddb or etcd)
-backend = "ddb"
+backend = "{backend}"{etcd_endpoints_line}
 
-# Leader Election Configuration
+# Leader Election Configuration (uses the same backend as RSS: ddb or etcd)
 [leader_election]
-# Whether leader election is disabled
+# Whether leader election is enabled
 enabled = {ha_enabled}
 
 # Instance ID for this root server
 instance_id = "{instance_id}"
 
-# DynamoDB table name for leader election
+# Table name (for DDB) or key prefix (for etcd) for leader election
 table_name = "fractalbits-leader-election"
 
-# Key used in DynamoDB table to identify this leader election group
+# Key used to identify this leader election group
 leader_key = "root-server-leader"
 
 # How long a leader holds the lease before it expires (in seconds)
@@ -647,11 +767,11 @@ leader_key = "root-server-leader"
 lease_duration_secs = 60
 
 # How often to send heartbeats and check leadership status (in seconds)
-# Set to 15s for less aggressive DynamoDB polling while maintaining responsiveness
+# Set to 15s for less aggressive polling while maintaining responsiveness
 # With 50% renewal threshold, renewal happens at 30s, giving 30s buffer
 heartbeat_interval_secs = 15
 
-# Maximum number of retry attempts for DynamoDB operations
+# Maximum number of retry attempts for leader election operations
 # Increased to 5 for better startup resilience
 max_retry_attempts = 5
 

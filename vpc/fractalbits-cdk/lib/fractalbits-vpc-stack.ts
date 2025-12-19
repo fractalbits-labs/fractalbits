@@ -35,6 +35,7 @@ export interface FractalbitsVpcStackProps extends cdk.StackProps {
   rootServerHa: boolean;
   ebsVolumeSize: number;
   ebsVolumeIops: number;
+  rssBackend: "etcd" | "ddb";
 }
 
 export class FractalbitsVpcStack extends cdk.Stack {
@@ -148,6 +149,20 @@ export class FractalbitsVpcStack extends cdk.Stack {
         ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
         ec2.Port.tcp(7761),
         "Allow access to port 7761 from within VPC",
+      );
+    }
+
+    // Add etcd ports when using etcd backend
+    if (props.rssBackend === "etcd") {
+      privateSg.addIngressRule(
+        ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+        ec2.Port.tcp(2379),
+        "Allow etcd client access from within VPC",
+      );
+      privateSg.addIngressRule(
+        ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+        ec2.Port.tcp(2380),
+        "Allow etcd peer-to-peer communication within VPC",
       );
     }
 
@@ -293,29 +308,26 @@ export class FractalbitsVpcStack extends cdk.Stack {
       );
     });
 
-    // Create bss_server in a ASG group only for hybrid mode
-    let bssAsg: autoscaling.AutoScalingGroup | undefined;
+    // Create BSS nodes as individual instances (stateful service shouldn't use ASG)
+    const bssInstances: ec2.Instance[] = [];
     if (dataBlobStorage === "singleAz") {
-      bssAsg = createEc2Asg(
-        this,
-        "BssAsg",
-        this.vpc,
-        subnet1,
-        privateSg,
-        ec2Role,
-        props.bssInstanceTypes.split(","),
-        props.numBssNodes,
-        props.numBssNodes,
-        "bss_server",
+      const bssInstanceType = new ec2.InstanceType(
+        props.bssInstanceTypes.split(",")[0],
       );
-      // Add lifecycle hook for bss_server ASG
-      addAsgDynamoDbDeregistrationLifecycleHook(
-        this,
-        "BssServer",
-        bssAsg,
-        "bss-server",
-        "fractalbits-service-discovery",
-      );
+      for (let i = 1; i <= props.numBssNodes; i++) {
+        const bssId = `bss-${i}`;
+        const bssInstance = createInstance(
+          this,
+          this.vpc,
+          bssId,
+          subnet1,
+          bssInstanceType,
+          privateSg,
+          ec2Role,
+        );
+        instances[bssId] = bssInstance;
+        bssInstances.push(bssInstance);
+      }
     }
 
     // Create PrivateLink setup for NSS and RSS services
@@ -469,13 +481,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
-    if (bssAsg) {
-      new cdk.CfnOutput(this, "bssAsgName", {
-        value: bssAsg.autoScalingGroupName,
-        description: `Bss Auto Scaling Group Name`,
-      });
-    }
-
     new cdk.CfnOutput(this, "apiServerAsgName", {
       value: apiServerAsg.autoScalingGroupName,
       description: `Api Server Auto Scaling Group Name`,
@@ -496,10 +501,22 @@ export class FractalbitsVpcStack extends cdk.Stack {
     }
 
     // Generate and upload bootstrap TOML config to S3
+    // Collect BSS instance IDs and IPs for etcd cluster configuration
+    const bssInstanceIds: string[] = [];
+    const bssInstanceIps: string[] = [];
+    for (let i = 1; i <= props.numBssNodes; i++) {
+      const bssId = `bss-${i}`;
+      if (instances[bssId]) {
+        bssInstanceIds.push(instances[bssId].instanceId);
+        bssInstanceIps.push(instances[bssId].instancePrivateIp);
+      }
+    }
+
     const bootstrapConfigContent = createConfigWithCfnTokens(this, {
       forBench: !!props.benchType,
       dataBlobStorage: dataBlobStorage,
       rssHaEnabled: props.rootServerHa,
+      rssBackend: props.rssBackend,
       numBssNodes:
         dataBlobStorage === "singleAz" ? props.numBssNodes : undefined,
       bucket: bucket.bucketName,
@@ -527,6 +544,8 @@ export class FractalbitsVpcStack extends cdk.Stack {
           : undefined,
       benchClientNum:
         props.benchType === "external" ? props.numBenchClients : undefined,
+      bssInstanceIds: dataBlobStorage === "singleAz" ? bssInstanceIds : [],
+      bssInstanceIps: dataBlobStorage === "singleAz" ? bssInstanceIps : [],
     });
 
     const buildsBucket = `fractalbits-builds-${this.region}-${this.account}`;

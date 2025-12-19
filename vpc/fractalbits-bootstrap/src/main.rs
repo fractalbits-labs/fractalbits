@@ -5,6 +5,7 @@ mod bss_server;
 mod common;
 mod config;
 mod discovery;
+mod etcd_server;
 mod gui_server;
 mod nss_server;
 mod root_server;
@@ -143,7 +144,8 @@ fn config_based_bootstrap() -> CmdResult {
 
     run_cmd! {
         touch $BOOTSTRAP_DONE_FILE;
-        info "fractalbits-bootstrap (config mode) $service_name is done";
+        sync;
+        info "fractalbits-bootstrap $service_name is done";
     }?;
     Ok(())
 }

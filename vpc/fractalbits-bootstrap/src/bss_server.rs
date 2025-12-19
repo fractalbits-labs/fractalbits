@@ -45,11 +45,16 @@ impl VolumeAssignments {
 pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     let for_bench = for_bench || config.global.for_bench;
     let meta_stack_testing = config.global.meta_stack_testing;
+    let use_etcd = config.is_etcd_backend();
 
     install_rpms(&["nvme-cli", "mdadm"])?;
     format_local_nvme_disks(false)?; // no twp support since experiment is done
     create_ddb_register_and_deregister_service("bss-server")?;
-    download_binaries(&["bss_server"])?;
+    let mut binaries = vec!["bss_server"];
+    if use_etcd {
+        binaries.push("etcdctl");
+    }
+    download_binaries(&binaries)?;
 
     create_coredump_config()?;
 
@@ -63,7 +68,17 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     create_logrotate_for_stats()?;
     create_ena_irq_affinity_service()?;
     create_nvme_tuning_service()?;
-    setup_volume_directories()?;
+
+    // Start etcd BEFORE setup_volume_directories when using etcd backend
+    // This allows RSS leader to write volume configs to etcd, which BSS then reads
+    if let Some(etcd_config) = &config.etcd
+        && etcd_config.enabled
+    {
+        info!("etcd is enabled, starting etcd bootstrap");
+        super::etcd_server::bootstrap(etcd_config)?;
+    }
+
+    setup_volume_directories(config, use_etcd)?;
     create_bss_config()?;
     create_systemd_unit_file("bss", true)?;
 
@@ -75,12 +90,12 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     Ok(())
 }
 
-fn setup_volume_directories() -> CmdResult {
+fn setup_volume_directories(config: &BootstrapConfig, use_etcd: bool) -> CmdResult {
     let instance_id = get_instance_id()?;
     info!("BSS instance ID: {instance_id}");
 
-    let assignments = match wait_for_volume_configs() {
-        Ok(()) => match get_volume_assignments(&instance_id) {
+    let assignments = match wait_for_volume_configs(config, use_etcd) {
+        Ok(()) => match get_volume_assignments(config, &instance_id, use_etcd) {
             Ok(assignments) => {
                 info!("Volume assignments for {instance_id}: {assignments:?}");
 
@@ -125,31 +140,43 @@ set_thread_affinity = true
     Ok(())
 }
 
-fn wait_for_volume_configs() -> CmdResult {
+fn wait_for_volume_configs(config: &BootstrapConfig, use_etcd: bool) -> CmdResult {
     const TIMEOUT_SECS: u64 = 300;
     const POLL_INTERVAL_SECS: u64 = 1;
 
-    info!("Waiting for BSS volume configurations in DDB...");
+    let backend_name = if use_etcd { "etcd" } else { "DDB" };
+    info!("Waiting for BSS volume configurations in {backend_name}...");
     let start = std::time::Instant::now();
 
     while start.elapsed().as_secs() < TIMEOUT_SECS {
         // Check if both configs exist AND contain valid JSON
-        if let (Ok(data_config), Ok(metadata_config)) = (
-            get_ddb_config(BSS_DATA_VG_CONFIG_KEY),
-            get_ddb_config(BSS_METADATA_VG_CONFIG_KEY),
-        ) {
+        let data_result = if use_etcd {
+            get_etcd_config(config, BSS_DATA_VG_CONFIG_KEY)
+        } else {
+            get_ddb_config(BSS_DATA_VG_CONFIG_KEY)
+        };
+
+        let metadata_result = if use_etcd {
+            get_etcd_config(config, BSS_METADATA_VG_CONFIG_KEY)
+        } else {
+            get_ddb_config(BSS_METADATA_VG_CONFIG_KEY)
+        };
+
+        if let (Ok(data_config), Ok(metadata_config)) = (data_result, metadata_result) {
             // Verify the configs contain valid JSON
             if serde_json::from_str::<serde_json::Value>(&data_config).is_ok()
                 && serde_json::from_str::<serde_json::Value>(&metadata_config).is_ok()
             {
-                info!("Volume configurations found in DDB");
+                info!("Volume configurations found in {backend_name}");
                 return Ok(());
             }
         }
         std::thread::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS));
     }
 
-    Err(Error::other("Timeout waiting for volume configs"))
+    Err(Error::other(format!(
+        "Timeout waiting for volume configs in {backend_name}"
+    )))
 }
 
 fn get_ddb_config(service_key: &str) -> FunResult {
@@ -173,7 +200,47 @@ fn get_ddb_config(service_key: &str) -> FunResult {
     Ok(result)
 }
 
-fn get_volume_assignments(instance_id: &str) -> Result<VolumeAssignments, Error> {
+fn get_etcd_config(config: &BootstrapConfig, service_key: &str) -> FunResult {
+    let etcd_endpoints = if let Some(etcd_config) = &config.etcd {
+        etcd_config
+            .bss_ips
+            .iter()
+            .map(|ip| format!("http://{}:2379", ip))
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        return Err(Error::other("etcd config missing"));
+    };
+
+    let etcdctl = format!("{BIN_PATH}etcdctl");
+    let key = format!("/fractalbits-service-discovery/{}", service_key);
+
+    let result =
+        run_fun!($etcdctl --endpoints=$etcd_endpoints get $key --print-value-only 2>/dev/null)?;
+
+    if result.is_empty() {
+        return Err(Error::other(format!(
+            "Config {} not found in etcd",
+            service_key
+        )));
+    }
+
+    Ok(result.trim().to_string())
+}
+
+fn get_volume_assignments(
+    config: &BootstrapConfig,
+    instance_id: &str,
+    use_etcd: bool,
+) -> Result<VolumeAssignments, Error> {
+    // For etcd backend, configs use IP addresses as identifiers
+    // For DDB backend, configs use instance IDs
+    let my_ip = if use_etcd {
+        Some(get_private_ip()?)
+    } else {
+        None
+    };
+
     let find_volume = |config_json: &str| -> Result<Option<usize>, Error> {
         let config: serde_json::Value = serde_json::from_str(config_json)
             .map_err(|e| Error::other(format!("Failed to parse config: {}", e)))?;
@@ -182,7 +249,14 @@ fn get_volume_assignments(instance_id: &str) -> Result<VolumeAssignments, Error>
             for volume in volumes {
                 if let Some(nodes) = volume["bss_nodes"].as_array() {
                     for node in nodes {
-                        if node["node_id"].as_str() == Some(instance_id) {
+                        // For DDB backend, match by node_id (instance ID)
+                        // For etcd backend, match by IP address
+                        let matches = if let Some(ref ip) = my_ip {
+                            node["ip"].as_str() == Some(ip.as_str())
+                        } else {
+                            node["node_id"].as_str() == Some(instance_id)
+                        };
+                        if matches {
                             return Ok(volume["volume_id"].as_u64().map(|v| v as usize));
                         }
                     }
@@ -195,10 +269,18 @@ fn get_volume_assignments(instance_id: &str) -> Result<VolumeAssignments, Error>
 
     let mut assignments = VolumeAssignments::default();
 
-    let data_config = get_ddb_config(BSS_DATA_VG_CONFIG_KEY)?;
+    let data_config = if use_etcd {
+        get_etcd_config(config, BSS_DATA_VG_CONFIG_KEY)?
+    } else {
+        get_ddb_config(BSS_DATA_VG_CONFIG_KEY)?
+    };
     assignments.data_volume = find_volume(&data_config)?;
 
-    let metadata_config = get_ddb_config(BSS_METADATA_VG_CONFIG_KEY)?;
+    let metadata_config = if use_etcd {
+        get_etcd_config(config, BSS_METADATA_VG_CONFIG_KEY)?
+    } else {
+        get_ddb_config(BSS_METADATA_VG_CONFIG_KEY)?
+    };
     assignments.metadata_volume = find_volume(&metadata_config)?;
 
     Ok(assignments)

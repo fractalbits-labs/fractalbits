@@ -1,3 +1,4 @@
+use crate::etcd_utils::download_etcd_for_deploy;
 use crate::*;
 use colored::*;
 use dialoguer::Input;
@@ -232,6 +233,7 @@ pub fn build(
     // Download (extract) warp binary for each architecture
     if deploy_target == DeployTarget::All {
         download_warp_binaries()?;
+        download_etcd_for_deploy()?;
     }
 
     info!("Deploy build is done");
