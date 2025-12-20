@@ -14,12 +14,14 @@ mod root_server;
 use clap::Parser;
 use cmd_lib::*;
 use common::*;
-use std::io::Write;
+use config::BootstrapConfig;
+use discovery::{ServiceType, discover_service_type};
+use std::io::{self, Write};
 
 #[derive(Parser)]
 #[clap(
     name = "fractalbits-bootstrap",
-    about = "Bootstrap for cloud ec2 instances"
+    about = "Bootstrap for fractalbits cluster"
 )]
 struct Opts {
     #[arg(long, help = "Format NSS instance (called via SSM from root_server)")]
@@ -60,42 +62,16 @@ fn main() -> CmdResult {
     let opts = Opts::parse();
 
     if opts.format_nss {
-        let ebs_dev = discover_ebs_device()?;
-        nss_server::format_nss(ebs_dev)?;
-        run_cmd!(info "fractalbits-bootstrap --format-nss is done")?;
+        nss_server::ebs::format_nss()?;
+        info!("fractalbits-bootstrap --format-nss is done");
     } else {
-        config_based_bootstrap()?;
+        generic_bootstrap()?;
     }
 
     Ok(())
 }
 
-fn discover_ebs_device() -> Result<String, std::io::Error> {
-    use config::BootstrapConfig;
-
-    info!("Discovering EBS device from bootstrap config");
-
-    let config = BootstrapConfig::download_and_parse()?;
-    let instance_id = get_instance_id()?;
-
-    let instance_config = config.instances.get(&instance_id).ok_or_else(|| {
-        std::io::Error::other(format!("Instance {} not found in config", instance_id))
-    })?;
-
-    let volume_id = instance_config
-        .volume_id
-        .as_ref()
-        .ok_or_else(|| std::io::Error::other("volume_id not set in instance config"))?;
-
-    let ebs_dev = get_volume_dev(volume_id);
-    info!("Discovered EBS device: {ebs_dev} for volume {volume_id}");
-    Ok(ebs_dev)
-}
-
-fn config_based_bootstrap() -> CmdResult {
-    use config::BootstrapConfig;
-    use discovery::{ServiceType, discover_service_type};
-
+fn generic_bootstrap() -> CmdResult {
     info!("Starting config-based bootstrap mode");
 
     let config = BootstrapConfig::download_and_parse()?;
@@ -133,7 +109,7 @@ fn config_based_bootstrap() -> CmdResult {
                 .endpoints
                 .api_server_endpoint
                 .as_ref()
-                .ok_or_else(|| std::io::Error::other("api_server_endpoint not set in config"))?;
+                .ok_or_else(|| io::Error::other("api_server_endpoint not set in config"))?;
             bench_server::bootstrap(api_endpoint.clone(), *bench_client_num)?;
             "bench_server"
         }
