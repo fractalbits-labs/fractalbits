@@ -1,9 +1,6 @@
 use super::common::*;
 use crate::config::BootstrapConfig;
-use crate::etcd_cluster::{
-    generate_initial_cluster, get_registered_nodes, register_node, set_cluster_state_s3,
-    wait_for_cluster,
-};
+use crate::workflow::{EtcdNodeInfo, WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use rayon::prelude::*;
 use std::fs;
@@ -51,6 +48,11 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     let meta_stack_testing = config.global.meta_stack_testing;
     let use_etcd = config.is_etcd_backend();
 
+    let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Bss)?;
+
+    // Complete instances-ready stage
+    barrier.complete_stage(stages::INSTANCES_READY, None)?;
+
     install_rpms(&["nvme-cli", "mdadm"])?;
     format_local_nvme_disks(false)?; // no twp support since experiment is done
     create_ddb_register_and_deregister_service("bss-server")?;
@@ -73,15 +75,20 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     create_ena_irq_affinity_service()?;
     create_nvme_tuning_service()?;
 
-    // Start etcd BEFORE setup_volume_directories
-    // BSS nodes coordinate via S3 to form etcd cluster, then RSS writes volume configs to etcd
+    // Start etcd using workflow-based cluster discovery
+    // BSS nodes coordinate via S3 to form etcd cluster
     if let Some(etcd_config) = &config.etcd
         && etcd_config.enabled
     {
-        info!("Starting etcd bootstrap with S3-based cluster discovery");
-        bootstrap_etcd(etcd_config)?;
+        info!("Starting etcd bootstrap with workflow-based cluster discovery");
+        bootstrap_etcd(&barrier, etcd_config)?;
     }
 
+    // Wait for RSS to initialize and publish volume configs
+    info!("Waiting for RSS to initialize...");
+    barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
+
+    // Now get volume configs and setup directories
     setup_volume_directories(config, use_etcd)?;
     create_bss_config()?;
     create_systemd_unit_file("bss", true)?;
@@ -91,21 +98,23 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
         sync;
     }?;
 
+    // Signal that BSS is configured and ready
+    barrier.complete_stage(stages::BSS_CONFIGURED, None)?;
+    barrier.complete_stage(stages::SERVICES_READY, None)?;
+
     Ok(())
 }
 
-fn bootstrap_etcd(etcd_config: &crate::config::EtcdConfig) -> CmdResult {
-    let cluster_id = &etcd_config.cluster_id;
-    let s3_bucket = &etcd_config.s3_bucket;
+fn bootstrap_etcd(barrier: &WorkflowBarrier, etcd_config: &crate::config::EtcdConfig) -> CmdResult {
     let cluster_size = etcd_config.cluster_size;
 
-    // REGISTER: Write node info to S3
-    info!("Registering node in S3 for cluster {cluster_id}");
-    register_node(s3_bucket, cluster_id)?;
+    // REGISTER: Write node info to S3 via workflow barrier
+    info!("Registering etcd node via workflow barrier");
+    barrier.register_etcd_node()?;
 
     // DISCOVER: Wait for all nodes to register
-    info!("Waiting for {cluster_size} nodes to register");
-    let nodes = wait_for_cluster(s3_bucket, cluster_id, cluster_size)?;
+    info!("Waiting for {cluster_size} etcd nodes to register");
+    let nodes = barrier.wait_for_etcd_nodes(cluster_size, timeouts::ETCD_READY)?;
     info!(
         "Found {} nodes: {:?}",
         nodes.len(),
@@ -113,14 +122,15 @@ fn bootstrap_etcd(etcd_config: &crate::config::EtcdConfig) -> CmdResult {
     );
 
     // ELECTION: All nodes have same view, generate initial-cluster
-    let initial_cluster = generate_initial_cluster(&nodes);
+    let initial_cluster = EtcdNodeInfo::generate_initial_cluster(&nodes);
     info!("Generated initial-cluster: {initial_cluster}");
 
     // START: All nodes start etcd together with initial-cluster-state: new
     super::etcd_server::bootstrap_new_cluster(&initial_cluster)?;
 
-    // Mark cluster as active in S3 (any node can do this, idempotent)
-    set_cluster_state_s3(s3_bucket, cluster_id, "active")?;
+    // Signal that etcd cluster is ready (any node can do this, idempotent)
+    // Only one node needs to signal, but it's safe for all to try
+    barrier.complete_global_stage(stages::ETCD_READY, None)?;
 
     Ok(())
 }
@@ -236,12 +246,18 @@ fn get_ddb_config(service_key: &str) -> FunResult {
 }
 
 fn get_etcd_config(config: &BootstrapConfig, service_key: &str) -> FunResult {
-    let etcd_config = config
-        .etcd
+    // Get etcd endpoints from workflow barrier (nodes are already registered)
+    let cluster_id = config
+        .global
+        .workflow_cluster_id
         .as_ref()
-        .ok_or_else(|| Error::other("etcd config missing"))?;
+        .ok_or_else(|| Error::other("workflow_cluster_id not configured"))?;
 
-    let nodes = get_registered_nodes(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
+    let bucket = get_builds_bucket()?.trim_start_matches("s3://").to_string();
+    let instance_id = get_instance_id()?;
+    let barrier = WorkflowBarrier::new(&bucket, cluster_id, &instance_id, "bss_server");
+
+    let nodes = barrier.get_etcd_nodes()?;
     let etcd_endpoints = nodes
         .iter()
         .map(|node| format!("http://{}:2379", node.ip))

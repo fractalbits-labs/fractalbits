@@ -44,14 +44,15 @@ pub struct GlobalConfig {
     pub num_bss_nodes: Option<usize>,
     #[serde(default)]
     pub meta_stack_testing: bool,
+    /// Unique cluster ID for workflow barriers (set by CDK at deploy time)
+    #[serde(default)]
+    pub workflow_cluster_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EtcdConfig {
     pub enabled: bool,
-    pub cluster_id: String,
     pub cluster_size: usize,
-    pub s3_bucket: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,8 +85,6 @@ pub struct InstanceConfig {
     pub service_type: String,
     #[serde(default)]
     pub role: Option<String>,
-    #[serde(default)]
-    pub leader_id: Option<String>,
     #[serde(default)]
     pub volume_id: Option<String>,
     #[serde(default)]

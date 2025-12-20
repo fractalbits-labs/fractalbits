@@ -1,4 +1,5 @@
 use crate::config::BootstrapConfig;
+use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use crate::*;
 use std::io::Error;
 
@@ -9,7 +10,27 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     let rss_ha_enabled = config.global.rss_ha_enabled;
 
+    let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Api)?;
+
+    // Complete instances-ready stage
+    barrier.complete_stage(stages::INSTANCES_READY, None)?;
+
     download_binaries(&["api_server"])?;
+
+    // Wait for RSS to initialize before we can get RSS IPs
+    info!("Waiting for RSS to initialize...");
+    barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
+
+    // Wait for NSS journals to be ready before we can serve requests
+    info!("Waiting for NSS journals to be ready...");
+    // Determine expected NSS count (1 for single-AZ, 2 for multi-AZ)
+    let expected_nss = if remote_az.is_some() { 2 } else { 1 };
+    barrier.wait_for_nodes(
+        stages::NSS_JOURNAL_READY,
+        expected_nss,
+        timeouts::NSS_JOURNAL_READY,
+    )?;
+
     create_config(
         data_blob_storage,
         bucket,
@@ -31,6 +52,9 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     // setup_cloudwatch_agent()?;
     create_systemd_unit_file("api_server", true)?;
     create_ddb_register_and_deregister_service("api-server")?;
+
+    // Signal that API server is ready
+    barrier.complete_stage(stages::SERVICES_READY, None)?;
 
     Ok(())
 }

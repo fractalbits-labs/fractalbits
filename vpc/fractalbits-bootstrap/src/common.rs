@@ -28,7 +28,6 @@ pub const NSS_ROLES_KEY: &str = "nss_roles";
 pub const AZ_STATUS_KEY: &str = "az_status";
 #[allow(dead_code)]
 pub const CLOUDWATCH_AGENT_CONFIG: &str = "cloudwatch_agent_config.json";
-pub const CLOUD_INIT_LOG: &str = "/var/log/cloud-init-output.log";
 pub const S3EXPRESS_LOCAL_BUCKET_CONFIG: &str = "s3express-local-bucket-config.json";
 pub const S3EXPRESS_REMOTE_BUCKET_CONFIG: &str = "s3express-remote-bucket-config.json";
 
@@ -1061,4 +1060,25 @@ pub fn check_port_ready(host: &str, port: u16) -> bool {
     };
 
     TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
+}
+
+pub fn wait_for_service_ready(service_name: &str, port: u16, timeout_secs: u64) -> CmdResult {
+    info!("Waiting for {service_name} to be ready...");
+    let mut wait_secs = 0;
+
+    while !check_port_ready("localhost", port) {
+        wait_secs += 1;
+        if wait_secs % 10 == 0 {
+            info!("{service_name} not yet ready, waiting... ({wait_secs}s)");
+        }
+        if wait_secs >= timeout_secs {
+            return Err(Error::other(format!(
+                "Timeout waiting for {service_name} to be ready ({timeout_secs}s)"
+            )));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    info!("{service_name} is ready (port {port} responding)");
+    Ok(())
 }

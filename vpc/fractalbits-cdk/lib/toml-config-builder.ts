@@ -124,9 +124,6 @@ export function buildInstanceConfigs(entries: InstanceConfigEntry[]): string {
     if (entry.role) {
       instanceConfig.role = entry.role;
     }
-    if (entry.leaderId) {
-      instanceConfig.leader_id = entry.leaderId;
-    }
     if (entry.volumeId) {
       instanceConfig.volume_id = entry.volumeId;
     }
@@ -183,8 +180,7 @@ export function createConfigWithCfnTokens(
     guiServerId?: string;
     benchServerId?: string;
     benchClientNum?: number;
-    etcdClusterId?: string;
-    etcdS3Bucket?: string;
+    workflowClusterId?: string;
   },
 ): string {
   // Build static config using TOML library
@@ -200,6 +196,12 @@ export function createConfigWithCfnTokens(
 
   if (props.numBssNodes !== undefined) {
     (staticConfig.global as TOML.JsonMap).num_bss_nodes = props.numBssNodes;
+  }
+
+  // Add workflow_cluster_id for S3-based workflow barriers
+  if (props.workflowClusterId) {
+    (staticConfig.global as TOML.JsonMap).workflow_cluster_id =
+      props.workflowClusterId;
   }
 
   if (props.bucket || props.remoteAz) {
@@ -245,18 +247,11 @@ export function createConfigWithCfnTokens(
   }
 
   // [etcd] section with S3-based dynamic cluster discovery (when using etcd backend)
-  if (
-    props.rssBackend === "etcd" &&
-    props.etcdClusterId &&
-    props.etcdS3Bucket &&
-    props.numBssNodes
-  ) {
+  if (props.rssBackend === "etcd" && props.numBssNodes) {
     lines.push("");
     lines.push("[etcd]");
     lines.push("enabled = true");
-    lines.push(`cluster_id = "${props.etcdClusterId}"`);
     lines.push(`cluster_size = ${props.numBssNodes}`);
-    lines.push(`s3_bucket = "${props.etcdS3Bucket}"`);
   }
 
   // Instance sections with CFN tokens
@@ -270,7 +265,6 @@ export function createConfigWithCfnTokens(
     lines.push(instanceHeader(props.rssBId));
     lines.push('service_type = "root_server"');
     lines.push('role = "follower"');
-    lines.push(tomlLine("leader_id", props.rssAId));
   }
 
   lines.push("");

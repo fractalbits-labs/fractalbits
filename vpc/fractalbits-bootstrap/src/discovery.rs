@@ -8,19 +8,12 @@ pub const SERVICE_TYPE_TAG: &str = "fractalbits:ServiceType";
 
 #[derive(Debug, Clone)]
 pub enum ServiceType {
-    RootServer {
-        is_leader: bool,
-        follower_id: Option<String>,
-    },
-    NssServer {
-        volume_id: Option<String>,
-    },
+    RootServer { is_leader: bool },
+    NssServer { volume_id: Option<String> },
     ApiServer,
     BssServer,
     GuiServer,
-    BenchServer {
-        bench_client_num: usize,
-    },
+    BenchServer { bench_client_num: usize },
     BenchClient,
 }
 
@@ -33,7 +26,7 @@ pub fn discover_service_type(config: &BootstrapConfig) -> Result<ServiceType, Er
             "Found instance config in TOML: {:?}",
             instance_config.service_type
         );
-        return parse_instance_config(config, &instance_id, instance_config);
+        return parse_instance_config(config, instance_config);
     }
 
     info!("Instance not in TOML config, querying EC2 tag: {SERVICE_TYPE_TAG}");
@@ -53,22 +46,13 @@ pub fn discover_service_type(config: &BootstrapConfig) -> Result<ServiceType, Er
 
 fn parse_instance_config(
     config: &BootstrapConfig,
-    instance_id: &str,
     instance_config: &InstanceConfig,
 ) -> Result<ServiceType, Error> {
     match instance_config.service_type.as_str() {
         "root_server" => {
             let role = instance_config.role.as_deref().unwrap_or("leader");
             let is_leader = role == "leader";
-            let follower_id = if is_leader {
-                find_follower_id(config, instance_id)
-            } else {
-                None
-            };
-            Ok(ServiceType::RootServer {
-                is_leader,
-                follower_id,
-            })
+            Ok(ServiceType::RootServer { is_leader })
         }
         "nss_server" => {
             let volume_id = instance_config.volume_id.clone();
@@ -95,16 +79,4 @@ fn parse_instance_config(
             instance_config.service_type
         ))),
     }
-}
-
-fn find_follower_id(config: &BootstrapConfig, leader_id: &str) -> Option<String> {
-    for (instance_id, instance_config) in &config.instances {
-        if instance_config.service_type == "root_server"
-            && instance_config.role.as_deref() == Some("follower")
-            && instance_config.leader_id.as_deref() == Some(leader_id)
-        {
-            return Some(instance_id.clone());
-        }
-    }
-    None
 }

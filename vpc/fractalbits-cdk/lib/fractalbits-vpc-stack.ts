@@ -512,13 +512,11 @@ export class FractalbitsVpcStack extends cdk.Stack {
     }
 
     // Generate and upload bootstrap TOML config to S3
-    // For etcd backend with ASG, BSS nodes discover each other via S3
-    // Use timestamp to ensure unique cluster ID per deployment (avoids stale S3 registrations)
-    const etcdClusterId =
-      props.rssBackend === "etcd" && singleAz
-        ? `fractalbits-${Date.now()}`
-        : undefined;
     const buildsBucket = `fractalbits-builds-${this.region}-${this.account}`;
+
+    // Generate unique workflow cluster ID for S3-based bootstrap coordination
+    // Each deployment gets fresh workflow state to avoid stale barrier objects
+    const workflowClusterId = `fractalbits-${Date.now()}`;
 
     const bootstrapConfigContent = createConfigWithCfnTokens(this, {
       forBench: !!props.benchType,
@@ -552,8 +550,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
           : undefined,
       benchClientNum:
         props.benchType === "external" ? props.numBenchClients : undefined,
-      etcdClusterId: etcdClusterId,
-      etcdS3Bucket: etcdClusterId ? buildsBucket : undefined,
+      workflowClusterId: workflowClusterId,
     });
 
     new cr.AwsCustomResource(this, "UploadBootstrapConfig", {

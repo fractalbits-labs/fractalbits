@@ -19,7 +19,7 @@ pub(crate) fn calculate_fa_journal_segment_size() -> Result<u64, Error> {
 }
 
 pub fn format() -> CmdResult {
-    wait_and_format_nss(true)?;
+    format_nss(true)?;
     info!("NSS server formatted successfully (nvme mode)");
     Ok(())
 }

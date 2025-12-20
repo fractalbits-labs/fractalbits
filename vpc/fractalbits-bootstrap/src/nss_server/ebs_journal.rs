@@ -18,8 +18,10 @@ pub(crate) fn calculate_fa_journal_segment_size(volume_dev: &str) -> Result<u64,
     Ok(fa_journal_segment_size)
 }
 
-pub fn format() -> CmdResult {
-    let ebs_dev = discover_ebs_device()?;
+/// Format EBS journal with a specific volume ID
+pub fn format_with_volume_id(volume_id: &str) -> CmdResult {
+    let ebs_dev = get_volume_dev(volume_id);
+    info!("Formatting EBS device: {ebs_dev} for volume {volume_id}");
     format_internal(&ebs_dev)?;
     Ok(())
 }
@@ -37,7 +39,7 @@ pub(crate) fn format_internal(ebs_dev: &str) -> CmdResult {
         mount $ebs_dev /data/ebs;
     }?;
 
-    wait_and_format_nss(false)?;
+    format_nss(false)?;
 
     run_cmd! {
         info "Enabling udev rules for EBS";
@@ -49,40 +51,6 @@ pub(crate) fn format_internal(ebs_dev: &str) -> CmdResult {
     }?;
 
     Ok(())
-}
-
-pub(crate) fn create_ebs_udev_rule(volume_id: &str, service_name: &str) -> CmdResult {
-    let content = format!(
-        r##"KERNEL=="nvme*n*", SUBSYSTEM=="block", ENV{{ID_SERIAL}}=="Amazon_Elastic_Block_Store_{}_1", TAG+="systemd", ENV{{SYSTEMD_WANTS}}="{service_name}.service""##,
-        volume_id.replace("-", "")
-    );
-    run_cmd! {
-        echo $content > $ETC_PATH/99-ebs.rules;
-        ln -s $ETC_PATH/99-ebs.rules /etc/udev/rules.d/;
-    }?;
-
-    Ok(())
-}
-
-fn discover_ebs_device() -> Result<String, io::Error> {
-    info!("Discovering EBS device from bootstrap config");
-
-    let config = BootstrapConfig::download_and_parse()?;
-    let instance_id = get_instance_id()?;
-
-    let instance_config = config
-        .instances
-        .get(&instance_id)
-        .ok_or_else(|| io::Error::other(format!("Instance {} not found in config", instance_id)))?;
-
-    let volume_id = instance_config
-        .volume_id
-        .as_ref()
-        .ok_or_else(|| io::Error::other("volume_id not set in instance config"))?;
-
-    let ebs_dev = get_volume_dev(volume_id);
-    info!("Discovered EBS device: {ebs_dev} for volume {volume_id}");
-    Ok(ebs_dev)
 }
 
 pub fn get_volume_dev(volume_id: &str) -> String {

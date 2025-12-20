@@ -5,31 +5,17 @@ mod bss_server;
 mod common;
 mod config;
 mod discovery;
-mod etcd_cluster;
 mod etcd_server;
 mod gui_server;
 mod nss_server;
 mod root_server;
+mod workflow;
 
-use clap::Parser;
 use cmd_lib::*;
 use common::*;
 use config::BootstrapConfig;
 use discovery::{ServiceType, discover_service_type};
 use std::io::{self, Write};
-
-#[derive(Parser)]
-#[clap(
-    name = "fractalbits-bootstrap",
-    about = "Bootstrap for fractalbits cluster"
-)]
-struct Opts {
-    #[arg(
-        long,
-        help = "Format EBS journal for NSS instance (called via SSM from root_server)"
-    )]
-    format_ebs_journal: bool,
-}
 
 #[cmd_lib::main]
 fn main() -> CmdResult {
@@ -62,16 +48,7 @@ fn main() -> CmdResult {
     let build_info = format!("{}, build time: {}", main_build_info, build_timestamp);
     eprintln!("build info: {}", build_info);
 
-    let opts = Opts::parse();
-
-    if opts.format_ebs_journal {
-        nss_server::ebs_journal::format()?;
-        info!("fractalbits-bootstrap --format-nss is done");
-    } else {
-        generic_bootstrap()?;
-    }
-
-    Ok(())
+    generic_bootstrap()
 }
 
 fn generic_bootstrap() -> CmdResult {
@@ -84,11 +61,8 @@ fn generic_bootstrap() -> CmdResult {
     common_setup()?;
 
     let service_name = match &service_type {
-        ServiceType::RootServer {
-            is_leader,
-            follower_id,
-        } => {
-            root_server::bootstrap(&config, *is_leader, follower_id.clone(), for_bench)?;
+        ServiceType::RootServer { is_leader } => {
+            root_server::bootstrap(&config, *is_leader, for_bench)?;
             "root_server"
         }
         ServiceType::NssServer { volume_id } => {

@@ -1,10 +1,9 @@
 use super::common::*;
-use crate::config::{BootstrapConfig, JournalType};
-use crate::etcd_cluster::{get_cluster_state_s3, get_registered_nodes};
+use crate::config::BootstrapConfig;
+use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use std::io::Error;
 
-const COMMAND_TIMEOUT_SECONDS: u64 = 300;
 const POLL_INTERVAL_SECONDS: u64 = 1;
 const MAX_POLL_ATTEMPTS: u64 = 300;
 
@@ -17,12 +16,7 @@ const META_DATA_VG_QUORUM_N: usize = 6;
 const META_DATA_VG_QUORUM_R: usize = 4;
 const META_DATA_VG_QUORUM_W: usize = 4;
 
-pub fn bootstrap(
-    config: &BootstrapConfig,
-    is_leader: bool,
-    follower_id: Option<String>,
-    for_bench: bool,
-) -> CmdResult {
+pub fn bootstrap(config: &BootstrapConfig, is_leader: bool, for_bench: bool) -> CmdResult {
     let nss_endpoint = &config.endpoints.nss_endpoint;
     let nss_a_id = &config.resources.nss_a_id;
     let nss_b_id = config.resources.nss_b_id.as_deref();
@@ -36,7 +30,6 @@ pub fn bootstrap(
             nss_endpoint,
             nss_a_id,
             nss_b_id,
-            follower_id.as_deref(),
             remote_az,
             num_bss_nodes,
             ha_enabled,
@@ -48,14 +41,28 @@ pub fn bootstrap(
 }
 
 fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: bool) -> CmdResult {
+    let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Rss)?;
+
+    // Complete instances-ready stage
+    barrier.complete_stage(stages::INSTANCES_READY, None)?;
+
     let mut binaries = vec!["rss_admin", "root_server"];
     if config.is_etcd_backend() {
         binaries.push("etcdctl");
     }
     download_binaries(&binaries)?;
+
+    // Wait for leader to initialize RSS
+    info!("Follower waiting for RSS leader to initialize...");
+    barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
+
     create_rss_config(config, nss_endpoint, ha_enabled)?;
-    create_systemd_unit_file("rss", false)?;
+    create_systemd_unit_file("rss", true)?; // Start immediately
     create_ddb_register_and_deregister_service("root-server")?;
+
+    // Complete services-ready stage
+    barrier.complete_stage(stages::SERVICES_READY, None)?;
+
     Ok(())
 }
 
@@ -65,12 +72,22 @@ fn bootstrap_leader(
     nss_endpoint: &str,
     nss_a_id: &str,
     nss_b_id: Option<&str>,
-    follower_id: Option<&str>,
     remote_az: Option<&str>,
     num_bss_nodes: Option<usize>,
     ha_enabled: bool,
     for_bench: bool,
 ) -> CmdResult {
+    let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Rss)?;
+
+    // Complete instances-ready stage
+    barrier.complete_stage(stages::INSTANCES_READY, None)?;
+
+    // Wait for etcd cluster if using etcd backend
+    if config.is_etcd_backend() {
+        info!("Waiting for etcd cluster to be ready...");
+        barrier.wait_for_global(stages::ETCD_READY, timeouts::ETCD_READY)?;
+    }
+
     let mut binaries = vec!["rss_admin", "root_server"];
     if config.is_etcd_backend() {
         binaries.push("etcdctl");
@@ -83,104 +100,57 @@ fn bootstrap_leader(
     }
 
     create_rss_config(config, nss_endpoint, ha_enabled)?;
-    // setup_cloudwatch_agent()?;
-    create_systemd_unit_file("rss", !ha_enabled || follower_id.is_some())?;
+    create_systemd_unit_file("rss", true)?;
     create_ddb_register_and_deregister_service("root-server")?;
 
-    // Initialize NSS formatting and root server startup
+    // Wait for RSS to be ready before signaling RSS_INITIALIZED
+    if ha_enabled {
+        wait_for_leadership()?;
+    } else {
+        wait_for_service_ready("root_server", 8088, 300)?;
+    }
+
     // Create S3 Express buckets if remote_az is provided
     if let Some(remote_az) = remote_az {
-        // Create local S3 Express bucket
         let local_az = get_current_aws_az_id()?;
         create_s3_express_bucket(&local_az, S3EXPRESS_LOCAL_BUCKET_CONFIG)?;
-
-        // Create remote S3 Express bucket
         create_s3_express_bucket(remote_az, S3EXPRESS_REMOTE_BUCKET_CONFIG)?;
     }
 
     // Initialize NSS role states in service discovery
     initialize_nss_roles(config, nss_a_id, nss_b_id)?;
 
+    // Complete RSS initialized stage - signals NSS and other services can proceed
+    barrier.complete_global_stage(stages::RSS_INITIALIZED, None)?;
+
     // Initialize BSS volume group configurations in service discovery (only for single-AZ mode)
     if remote_az.is_none() {
         let total_bss_nodes = num_bss_nodes.unwrap_or(TOTAL_BSS_NODES);
-        initialize_bss_volume_groups(config, total_bss_nodes)?;
+        initialize_bss_volume_groups(config, &barrier, total_bss_nodes)?;
     }
 
-    // For nvme journal type, NSS formats locally during bootstrap - no SSM needed
-    // For ebs journal type, we need to trigger NSS formatting via SSM
-    if config.global.journal_type == JournalType::Ebs {
-        // Format nss-B first if it exists, then nss-A
-        // NSS discovers its EBS device from bootstrap config
-        let bootstrap_bin = "/opt/fractalbits/bin/fractalbits-bootstrap";
-        if let Some(nss_b_id) = nss_b_id {
-            info!("Formatting NSS instance {nss_b_id} (standby)");
-            wait_for_ssm_ready(nss_b_id);
-            run_cmd_with_ssm(
-                nss_b_id,
-                &format!(r##"sudo bash -c "{bootstrap_bin} --format-ebs-journal &>>{CLOUD_INIT_LOG}""##),
-                false,
-            )?;
-            info!("Successfully formatted {nss_b_id} (standby)");
-        }
+    // Wait for NSS formatting to complete via workflow barriers
+    let expected_nss = if nss_b_id.is_some() { 2 } else { 1 };
+    info!("Waiting for {expected_nss} NSS instance(s) to complete formatting...");
+    barrier.wait_for_nodes(stages::NSS_FORMATTED, expected_nss, timeouts::NSS_FORMATTED)?;
+    info!("All NSS instances have completed formatting");
 
-        // Always format nss-A
-        let role = if nss_b_id.is_some() { "active" } else { "solo" };
-        info!("Formatting NSS instance {nss_a_id} ({role})");
-        wait_for_ssm_ready(nss_a_id);
-        run_cmd_with_ssm(
-            nss_a_id,
-            &format!(r##"sudo bash -c "{bootstrap_bin} --format-ebs-journal &>>{CLOUD_INIT_LOG}""##),
-            false,
-        )?;
-        info!("Successfully formatted {nss_a_id} ({role})");
-    } else {
-        info!("Journal type is nvme - NSS formats locally, skipping SSM formatting");
-    }
-
-    if ha_enabled {
-        wait_for_leadership()?;
-    } else {
-        // For non-HA deployments, wait for root server to be ready
-        wait_for_rss_ready()?;
-    }
-
-    // For NVMe journal type, start nss_role_agent via SSM after metadata VG is configured
-    // For EBS, nss_role_agent is started by udev rule when volume is attached after format
-    if config.global.journal_type == JournalType::Nvme {
-        info!("Starting nss_role_agent on NSS instances via SSM (NVMe mode)");
-        wait_for_ssm_ready(nss_a_id);
-        run_cmd_with_ssm(
-            nss_a_id,
-            "sudo systemctl start nss_role_agent.service",
-            false,
-        )?;
-        info!("Successfully started nss_role_agent on {nss_a_id}");
-
-        if let Some(nss_b_id) = nss_b_id {
-            wait_for_ssm_ready(nss_b_id);
-            run_cmd_with_ssm(
-                nss_b_id,
-                "sudo systemctl start nss_role_agent.service",
-                false,
-            )?;
-            info!("Successfully started nss_role_agent on {nss_b_id}");
-        }
-    }
+    // Wait for NSS journal to be ready via workflow barriers
+    info!("Waiting for {expected_nss} NSS instance(s) to have journal ready...");
+    barrier.wait_for_nodes(
+        stages::NSS_JOURNAL_READY,
+        expected_nss,
+        timeouts::NSS_JOURNAL_READY,
+    )?;
+    info!("All NSS instances have journal ready");
 
     if for_bench {
         run_cmd!($BIN_PATH/rss_admin --rss-addr=127.0.0.1:8088 api-key init-test)?;
     }
 
-    // Start follower root server if follower_id is provided
-    if let Some(follower_id) = follower_id {
-        start_follower_root_server(follower_id)?;
+    // Complete services-ready stage
+    barrier.complete_stage(stages::SERVICES_READY, None)?;
 
-        // Only bootstrap ebs_failover service if nss_b_id exists
-        // if let Some(nss_b_id) = nss_b_id {
-        //     bootstrap_ebs_failover_service(nss_a_id, nss_b_id, volume_a_id)?;
-        // }
-    }
     Ok(())
 }
 
@@ -201,7 +171,6 @@ fn initialize_nss_roles(
     };
 
     if config.is_etcd_backend() {
-        wait_for_etcd_cluster(config)?;
         let etcdctl = format!("{BIN_PATH}etcdctl");
         let etcd_endpoints = get_etcd_endpoints(config)?;
         let key = "/fractalbits-service-discovery/nss_roles";
@@ -232,20 +201,16 @@ fn initialize_nss_roles(
     Ok(())
 }
 
-fn initialize_bss_volume_groups(config: &BootstrapConfig, total_bss_nodes: usize) -> CmdResult {
+fn initialize_bss_volume_groups(
+    config: &BootstrapConfig,
+    barrier: &WorkflowBarrier,
+    total_bss_nodes: usize,
+) -> CmdResult {
     info!("Initializing BSS volume group configurations...");
 
     let bss_addresses: Vec<(String, String)> = if config.is_etcd_backend() {
-        let etcd_config = config
-            .etcd
-            .as_ref()
-            .ok_or_else(|| Error::other("etcd config missing for etcd backend"))?;
-
-        info!("Waiting for etcd cluster to become active via S3...");
-        wait_for_etcd_cluster_active_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
-
-        info!("Getting BSS nodes from S3 registry...");
-        let bss_nodes = get_registered_nodes(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
+        info!("Getting BSS nodes from workflow barrier...");
+        let bss_nodes = barrier.get_etcd_nodes()?;
 
         if bss_nodes.len() < total_bss_nodes {
             return Err(Error::other(format!(
@@ -459,7 +424,6 @@ fn initialize_az_status(config: &BootstrapConfig, remote_az: &str) -> CmdResult 
     info!("Setting {local_az} and {remote_az} to Normal");
 
     if config.is_etcd_backend() {
-        wait_for_etcd_cluster(config)?;
         let etcdctl = format!("{BIN_PATH}etcdctl");
         let etcd_endpoints = get_etcd_endpoints(config)?;
         let key = "/fractalbits-service-discovery/az_status";
@@ -485,81 +449,13 @@ fn initialize_az_status(config: &BootstrapConfig, remote_az: &str) -> CmdResult 
     Ok(())
 }
 
-fn wait_for_etcd_cluster(config: &BootstrapConfig) -> CmdResult {
-    let etcd_config = config
-        .etcd
-        .as_ref()
-        .ok_or_else(|| Error::other("etcd config missing"))?;
-
-    wait_for_etcd_cluster_active_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
-
-    info!("Waiting for etcd cluster to be healthy...");
-    let etcd_endpoints = get_etcd_endpoints(config)?;
-    let etcdctl = format!("{BIN_PATH}etcdctl");
-    let mut i = 0;
-
-    loop {
-        i += 1;
-
-        let result = run_cmd!($etcdctl --endpoints=$etcd_endpoints endpoint health 2>/dev/null);
-        if result.is_ok() {
-            info!("etcd cluster is healthy");
-            return Ok(());
-        }
-
-        if i % 10 == 0 {
-            info!("etcd cluster not yet healthy, waiting... (attempt {i})");
-        }
-
-        if i >= MAX_POLL_ATTEMPTS {
-            cmd_die!("Timed out waiting for etcd cluster to be healthy");
-        }
-
-        std::thread::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECONDS));
-    }
-}
-
-fn wait_for_etcd_cluster_active_s3(bucket: &str, cluster_id: &str) -> CmdResult {
-    info!("Waiting for etcd cluster to become active via S3...");
-    let mut i = 0;
-
-    loop {
-        i += 1;
-
-        match get_cluster_state_s3(bucket, cluster_id) {
-            Ok(state) if state == "active" => {
-                info!("etcd cluster is active");
-                return Ok(());
-            }
-            Ok(state) => {
-                if i % 10 == 0 {
-                    info!("etcd cluster state: {state}, waiting... (attempt {i})");
-                }
-            }
-            Err(_) => {
-                if i % 10 == 0 {
-                    info!("etcd cluster state not available, waiting... (attempt {i})");
-                }
-            }
-        }
-
-        if i >= MAX_POLL_ATTEMPTS {
-            cmd_die!("Timed out waiting for etcd cluster to become active");
-        }
-
-        std::thread::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECONDS));
-    }
-}
-
 fn get_etcd_endpoints(config: &BootstrapConfig) -> Result<String, Error> {
-    let etcd_config = config
-        .etcd
-        .as_ref()
-        .ok_or_else(|| Error::other("etcd config missing"))?;
+    // Use workflow barrier to get etcd nodes
+    let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Rss)?;
+    let bss_nodes = barrier.get_etcd_nodes()?;
 
-    let bss_nodes = get_registered_nodes(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
     if bss_nodes.is_empty() {
-        return Err(Error::other("No BSS nodes registered in S3"));
+        return Err(Error::other("No BSS nodes registered in workflow"));
     }
 
     Ok(bss_nodes
@@ -567,30 +463,6 @@ fn get_etcd_endpoints(config: &BootstrapConfig) -> Result<String, Error> {
         .map(|node| format!("http://{}:2379", node.ip))
         .collect::<Vec<_>>()
         .join(","))
-}
-
-fn wait_for_rss_ready() -> CmdResult {
-    info!("Waiting for root_server to be ready...");
-    let mut i = 0;
-    const RSS_PORT: u16 = 8088;
-
-    loop {
-        i += 1;
-        if check_port_ready("localhost", RSS_PORT) {
-            info!("Root_server is ready (port {} responding)", RSS_PORT);
-            return Ok(());
-        }
-
-        if i % 10 == 0 {
-            info!("Root_server not yet ready, waiting... (attempt {i})");
-        }
-
-        if i >= MAX_POLL_ATTEMPTS {
-            cmd_die!("Timed out waiting for root_server to be ready");
-        }
-
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
 }
 
 fn wait_for_leadership() -> CmdResult {
@@ -601,7 +473,6 @@ fn wait_for_leadership() -> CmdResult {
     loop {
         i += 1;
 
-        // Check if the health endpoint is responding and reports leadership
         let health_url = format!("http://localhost:{HEALTH_PORT}");
         let result = run_fun!(curl -s $health_url 2>/dev/null | jq -r ".is_leader");
 
@@ -611,13 +482,17 @@ fn wait_for_leadership() -> CmdResult {
                 break;
             }
             Ok(ref response) => {
-                info!(
-                    "Root_server not yet leader (is_leader: {}), waiting...",
-                    response.trim()
-                );
+                if i % 10 == 0 {
+                    info!(
+                        "Root_server not yet leader (is_leader: {}), waiting...",
+                        response.trim()
+                    );
+                }
             }
             Err(_) => {
-                info!("Health endpoint not yet responding, waiting...");
+                if i % 10 == 0 {
+                    info!("Health endpoint not yet responding, waiting...");
+                }
             }
         }
 
@@ -631,150 +506,6 @@ fn wait_for_leadership() -> CmdResult {
     Ok(())
 }
 
-fn start_follower_root_server(follower_id: &str) -> CmdResult {
-    info!("Starting rss service on follower instance {follower_id}");
-    wait_for_ssm_ready(follower_id);
-
-    // The follower instance should have already run its own bootstrap process
-    // (with no follower_id parameter) to set up configs and systemd unit file
-    // We just need to start the service
-    run_cmd_with_ssm(follower_id, "sudo systemctl start rss.service", false)?;
-
-    info!("Successfully started rss service on follower {follower_id}");
-    Ok(())
-}
-
-fn wait_for_ssm_ready(instance_id: &str) {
-    let mut i = 0;
-    loop {
-        i += 1;
-        let result = run_fun! {
-            aws ssm describe-instance-information
-                --filters "Key=InstanceIds,Values=$instance_id"
-
-                --output json | jq -r ".InstanceInformationList[0].PingStatus"
-        };
-        info!("Ping {instance_id} status: {result:?}");
-        match result {
-            Ok(ref s) if s == "Online" => break,
-            _ => std::thread::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECONDS)),
-        };
-
-        if i >= MAX_POLL_ATTEMPTS {
-            cmd_die!("Timed out while waiting for SSM after $MAX_POLL_ATTEMPTS attempts.");
-        }
-    }
-
-    info!("Waiting for {instance_id} cloud init to be done");
-    let mut i = 0;
-    loop {
-        i += 1;
-        let result = run_cmd_with_ssm(instance_id, &format!("test -f {BOOTSTRAP_DONE_FILE}"), true);
-        match result {
-            Ok(()) => break,
-            _ => {
-                std::thread::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECONDS));
-            }
-        }
-
-        if i >= MAX_POLL_ATTEMPTS {
-            cmd_die!("Timed out while waiting for cloud init after $MAX_POLL_ATTEMPTS attempts.");
-        }
-    }
-}
-
-fn run_cmd_with_ssm(instance_id: &str, cmd: &str, quiet: bool) -> CmdResult {
-    if !quiet {
-        info!("Running {cmd} on {instance_id} with SSM");
-    };
-    let command_id = run_fun! {
-        aws ssm send-command
-            --instance-ids "$instance_id"
-            --document-name "AWS-RunShellScript"
-            --parameters "commands=[\'$cmd\']"
-            --timeout-seconds "$COMMAND_TIMEOUT_SECONDS"
-            --query "Command.CommandId"
-            --output text
-    }?;
-    if !quiet {
-        info!(
-            "Command sent to {instance_id} successfully. Command ID: {command_id}. Polling for results..."
-        );
-    }
-    let mut i = 0;
-    loop {
-        i += 1;
-        let invocation_json = run_fun! {
-            aws ssm get-command-invocation
-                --command-id "$command_id"
-                --instance-id "$instance_id"
-        }?;
-        let status = run_fun!(echo $invocation_json | jq -r .Status)?;
-
-        if !quiet {
-            info!("Command status from {instance_id} is: {status}");
-        }
-        match status.as_ref() {
-            "Success" => break,
-            "Failed" => {
-                if !quiet {
-                    warn!("Command execution failed on the remote instance.");
-                }
-                let error_output = run_fun!(echo $invocation_json | jq -r .StandardErrorContent)?;
-                return Err(Error::other(format!(
-                    "Remote Error Output:\n---\n{error_output}---"
-                )));
-            }
-            "TimedOut" => {
-                return Err(Error::other(format!(
-                    "Command timed out on the remote instance after {COMMAND_TIMEOUT_SECONDS} seconds."
-                )));
-            }
-            _ => {
-                // Status is Pending, InProgress, Cancelling, etc.
-                std::thread::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECONDS));
-            }
-        }
-        if i >= MAX_POLL_ATTEMPTS {
-            return Err(Error::other(format!(
-                "Timed out polling for command result after {MAX_POLL_ATTEMPTS} attempts."
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(unused)]
-fn bootstrap_ebs_failover_service(nss_a_id: &str, nss_b_id: &str, volume_id: &str) -> CmdResult {
-    let service_name = "ebs-failover";
-
-    let config_content = format!(
-        r##"nss_a_id = "{nss_a_id}"    # Primary instance ID
-nss_b_id = "{nss_b_id}"  # Secondary instance ID
-volume_id = "{volume_id}"            # EBS volume ID
-device_name = "/dev/xvdf"                      # Device name for OS
-
-dynamodb_table_name = "ebs-failover-state"     # Name of the pre-created DynamoDB table
-
-check_interval_seconds = 30                    # How often to perform health checks
-health_check_timeout_seconds = 15              # Timeout for each health check attempt
-post_failover_delay_seconds = 60               # Pause after a failover before resuming checks
-
-enable_fencing = true                          # Set to true to enable STONITH
-fencing_action = "stop"                        # "stop" or "terminate"
-fencing_timeout_seconds = 300                  # Max time to wait for instance to stop/terminate
-"##
-    );
-    run_cmd! {
-        mkdir -p $ETC_PATH;
-        echo $config_content > $ETC_PATH/${service_name}-config.toml;
-    }?;
-
-    create_systemd_unit_file(service_name, true)?;
-    Ok(())
-}
-
 fn create_rss_config(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: bool) -> CmdResult {
     let region = get_current_aws_region()?;
     let instance_id = get_instance_id()?;
@@ -785,28 +516,23 @@ fn create_rss_config(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: b
         "ddb"
     };
 
-    let etcd_endpoints_line = if let Some(etcd_config) = &config.etcd {
-        if etcd_config.enabled {
-            info!("Waiting for etcd cluster to become active before creating RSS config...");
-            wait_for_etcd_cluster_active_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
-
-            let bss_nodes = get_registered_nodes(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
-            if bss_nodes.is_empty() {
-                return Err(Error::other(
-                    "No BSS nodes registered in S3 for etcd endpoints",
-                ));
-            }
-            let endpoints: Vec<String> = bss_nodes
-                .iter()
-                .map(|node| format!("http://{}:2379", node.ip))
-                .collect();
-            format!(
-                "\n# etcd endpoints for cluster connection\netcd_endpoints = {:?}",
-                endpoints
-            )
-        } else {
-            String::new()
+    let etcd_endpoints_line = if config.is_etcd_backend() {
+        // Use workflow barrier to get etcd nodes
+        let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Rss)?;
+        let bss_nodes = barrier.get_etcd_nodes()?;
+        if bss_nodes.is_empty() {
+            return Err(Error::other(
+                "No BSS nodes registered in workflow for etcd endpoints",
+            ));
         }
+        let endpoints: Vec<String> = bss_nodes
+            .iter()
+            .map(|node| format!("http://{}:2379", node.ip))
+            .collect();
+        format!(
+            "\n# etcd endpoints for cluster connection\netcd_endpoints = {:?}",
+            endpoints
+        )
     } else {
         String::new()
     };
@@ -850,16 +576,12 @@ table_name = "fractalbits-leader-election"
 leader_key = "root-server-leader"
 
 # How long a leader holds the lease before it expires (in seconds)
-# Increased to 60s for better stability against transient network issues
 lease_duration_secs = 60
 
 # How often to send heartbeats and check leadership status (in seconds)
-# Set to 15s for less aggressive polling while maintaining responsiveness
-# With 50% renewal threshold, renewal happens at 30s, giving 30s buffer
 heartbeat_interval_secs = 15
 
 # Maximum number of retry attempts for leader election operations
-# Increased to 5 for better startup resilience
 max_retry_attempts = 5
 
 # Enable monitoring and metrics collection

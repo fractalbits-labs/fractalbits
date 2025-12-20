@@ -3,9 +3,10 @@ pub mod nvme_journal;
 
 use super::common::*;
 use crate::config::{BootstrapConfig, JournalType};
+use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use rayon::prelude::*;
-use std::io::{self, Error};
+use std::io::Error;
 
 const BLOB_DRAM_MEM_PERCENT: f64 = 0.8;
 const NSS_META_CACHE_SHARDS: usize = 256;
@@ -15,6 +16,11 @@ pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: b
     let rss_ha_enabled = config.global.rss_ha_enabled;
     let meta_stack_testing = config.global.meta_stack_testing;
     let journal_type = config.global.journal_type;
+
+    let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Nss)?;
+
+    // Complete instances-ready stage
+    barrier.complete_stage(stages::INSTANCES_READY, None)?;
 
     install_rpms(&["nvme-cli", "mdadm"])?;
     if meta_stack_testing || for_bench {
@@ -31,25 +37,36 @@ pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: b
         rss_ha_enabled,
     )?;
 
-    // For meta stack testing, format NSS immediately (no root_server to trigger via SSM)
-    if meta_stack_testing {
-        let volume_id =
-            volume_id.ok_or_else(|| Error::other("volume_id required for ebs journal type"))?;
-        let volume_dev = ebs_journal::get_volume_dev(volume_id);
-        ebs_journal::format_internal(&volume_dev)?;
-        return Ok(());
-    }
+    // Wait for RSS to initialize before proceeding with journal formatting
+    info!("Waiting for RSS to initialize...");
+    barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
 
+    // Format journal based on type
     match journal_type {
         JournalType::Nvme => {
             nvme_journal::format()?;
-            // NVMe mode: root_server will trigger nss_role_agent via SSM after metadata VG is configured
         }
         JournalType::Ebs => {
-            // EBS mode: format called from main() when triggered via SSM
-            // service started by udev rule when volume is attached
+            let volume_id =
+                volume_id.ok_or_else(|| Error::other("volume_id required for ebs journal type"))?;
+            ebs_journal::format_with_volume_id(volume_id)?;
         }
     }
+
+    // Signal that formatting is complete
+    barrier.complete_stage(stages::NSS_FORMATTED, None)?;
+
+    // Start nss_role_agent after formatting
+    run_cmd!(systemctl start nss_role_agent.service)?;
+
+    // Wait for nss_server to be ready before signaling
+    wait_for_service_ready("nss_server", 8088, 120)?;
+
+    // Signal that journal is ready and nss_server is accepting connections
+    barrier.complete_stage(stages::NSS_JOURNAL_READY, None)?;
+
+    // Complete services-ready stage
+    barrier.complete_stage(stages::SERVICES_READY, None)?;
 
     Ok(())
 }
@@ -73,10 +90,9 @@ fn setup_configs(
     create_nss_config(volume_dev.as_deref(), shared_dir)?;
     create_mirrord_config(volume_dev.as_deref(), shared_dir)?;
 
-    // EBS-specific: mount unit and udev rule
-    if let (JournalType::Ebs, Some(vid), Some(vdev)) = (journal_type, volume_id, &volume_dev) {
+    // EBS-specific: mount unit
+    if let (JournalType::Ebs, Some(vdev)) = (journal_type, &volume_dev) {
         create_mount_unit(vdev, "/data/ebs", "ext4")?;
-        ebs_journal::create_ebs_udev_rule(vid, "nss_role_agent")?;
     }
 
     // Common configs
@@ -164,19 +180,10 @@ fa_journal_segment_size = {fa_journal_segment_size}
     Ok(())
 }
 
-/// Wait for /data/local mount, create common directories, and run nss_server format.
+/// Create common directories and run nss_server format.
 /// If `create_journal_dir` is true, also creates /data/local/journal (for nvme mode).
-pub(crate) fn wait_and_format_nss(create_journal_dir: bool) -> CmdResult {
-    let mut wait_secs = 0;
-    while run_cmd!(mountpoint -q "/data/local").is_err() {
-        wait_secs += 1;
-        info!("Waiting for /data/local to be mounted ({wait_secs}s)");
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        if wait_secs >= 120 {
-            cmd_die!("Timeout when waiting for /data/local to be mounted (120s)");
-        }
-    }
-
+/// Note: /data/local is already mounted by format_local_nvme_disks() earlier in bootstrap.
+pub(crate) fn format_nss(create_journal_dir: bool) -> CmdResult {
     if create_journal_dir {
         run_cmd! {
             info "Creating directories for nss_server";
