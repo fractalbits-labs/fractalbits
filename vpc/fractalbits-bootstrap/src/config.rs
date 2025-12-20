@@ -13,7 +13,8 @@ const CONFIG_RETRY_TIMEOUT_SECS: u64 = 120;
 #[derive(Debug, Deserialize)]
 pub struct BootstrapConfig {
     pub global: GlobalConfig,
-    pub aws: AwsConfig,
+    #[serde(default)]
+    pub aws: Option<AwsConfig>,
     pub endpoints: EndpointsConfig,
     pub resources: ResourcesConfig,
     #[serde(default)]
@@ -39,7 +40,7 @@ pub struct GlobalConfig {
 pub struct EtcdConfig {
     pub enabled: bool,
     pub cluster_id: String,
-    pub quorum_size: usize,
+    pub cluster_size: usize,
     pub s3_bucket: String,
 }
 
@@ -47,8 +48,7 @@ pub struct EtcdConfig {
 pub struct AwsConfig {
     pub bucket: String,
     #[allow(dead_code)]
-    #[serde(default)]
-    pub local_az: Option<String>,
+    pub local_az: String,
     #[serde(default)]
     pub remote_az: Option<String>,
 }
@@ -126,10 +126,6 @@ impl BootstrapConfig {
             info!("Instance {instance_id} not yet in config, waiting 5s and retrying...");
             std::thread::sleep(Duration::from_secs(5));
         }
-    }
-
-    pub fn is_multi_az(&self) -> bool {
-        self.global.data_blob_storage == "multiAz"
     }
 
     pub fn is_etcd_backend(&self) -> bool {

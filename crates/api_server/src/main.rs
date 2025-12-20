@@ -46,7 +46,7 @@ fn main() -> std::io::Result<()> {
             let is_terminal = std::io::stdout().is_terminal();
             tracing_subscriber::fmt::layer()
                 .without_time()
-                .with_ansi(is_terminal)
+                .with_ansi(false)
                 .with_level(is_terminal)
                 .with_target(is_terminal)
         })

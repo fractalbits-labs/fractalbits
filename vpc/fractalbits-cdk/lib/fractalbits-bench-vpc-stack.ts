@@ -105,7 +105,7 @@ export class FractalbitsBenchVpcStack extends cdk.Stack {
     const staticConfig = {
       global: {
         for_bench: true,
-        data_blob_storage: "singleAz",
+        data_blob_storage: "all_in_bss_single_az",
         rss_ha_enabled: false,
       },
       aws: {

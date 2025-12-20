@@ -78,6 +78,8 @@ fn create_etcd_systemd_service() -> CmdResult {
 Description=etcd distributed key-value store
 After=network-online.target data-local.mount
 Requires=data-local.mount
+StartLimitIntervalSec=600
+StartLimitBurst=3
 
 [Service]
 Type=notify
@@ -85,9 +87,6 @@ ExecStart={etcd_bin} --config-file={config_path}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
-
-StartLimitIntervalSec=600
-StartLimitBurst=3
 
 [Install]
 WantedBy=multi-user.target

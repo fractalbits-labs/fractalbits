@@ -70,7 +70,7 @@ export class FractalbitsMetaStack extends cdk.Stack {
       const staticConfig = {
         global: {
           for_bench: false,
-          data_blob_storage: "singleAz",
+          data_blob_storage: "all_in_bss_single_az",
           rss_ha_enabled: false,
           meta_stack_testing: true,
         },

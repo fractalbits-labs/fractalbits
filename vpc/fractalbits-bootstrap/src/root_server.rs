@@ -1,6 +1,6 @@
 use super::common::*;
 use crate::config::BootstrapConfig;
-use crate::etcd_cluster::{get_all_registered_bss_nodes_s3, get_cluster_state_s3};
+use crate::etcd_cluster::{get_cluster_state_s3, get_registered_nodes};
 use cmd_lib::*;
 use std::io::Error;
 
@@ -26,7 +26,7 @@ pub fn bootstrap(
     let nss_endpoint = &config.endpoints.nss_endpoint;
     let nss_a_id = &config.resources.nss_a_id;
     let nss_b_id = config.resources.nss_b_id.as_deref();
-    let remote_az = config.aws.remote_az.as_deref();
+    let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     let num_bss_nodes = config.global.num_bss_nodes;
     let ha_enabled = config.global.rss_ha_enabled;
 
@@ -216,8 +216,7 @@ fn initialize_bss_volume_groups(config: &BootstrapConfig, total_bss_nodes: usize
         wait_for_etcd_cluster_active_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
 
         info!("Getting BSS nodes from S3 registry...");
-        let bss_nodes =
-            get_all_registered_bss_nodes_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
+        let bss_nodes = get_registered_nodes(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
 
         if bss_nodes.len() < total_bss_nodes {
             return Err(Error::other(format!(
@@ -529,8 +528,7 @@ fn get_etcd_endpoints(config: &BootstrapConfig) -> Result<String, Error> {
         .as_ref()
         .ok_or_else(|| Error::other("etcd config missing"))?;
 
-    let bss_nodes =
-        get_all_registered_bss_nodes_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
+    let bss_nodes = get_registered_nodes(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
     if bss_nodes.is_empty() {
         return Err(Error::other("No BSS nodes registered in S3"));
     }
@@ -763,8 +761,7 @@ fn create_rss_config(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: b
             info!("Waiting for etcd cluster to become active before creating RSS config...");
             wait_for_etcd_cluster_active_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
 
-            let bss_nodes =
-                get_all_registered_bss_nodes_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
+            let bss_nodes = get_registered_nodes(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
             if bss_nodes.is_empty() {
                 return Err(Error::other(
                     "No BSS nodes registered in S3 for etcd endpoints",

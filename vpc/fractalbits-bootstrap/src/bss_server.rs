@@ -1,7 +1,8 @@
 use super::common::*;
 use crate::config::BootstrapConfig;
 use crate::etcd_cluster::{
-    EtcdClusterCoordinator, get_all_registered_bss_nodes_s3, set_cluster_state_s3,
+    generate_initial_cluster, get_registered_nodes, register_node, set_cluster_state_s3,
+    wait_for_cluster,
 };
 use cmd_lib::*;
 use rayon::prelude::*;
@@ -96,17 +97,15 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
 fn bootstrap_etcd(etcd_config: &crate::config::EtcdConfig) -> CmdResult {
     let cluster_id = &etcd_config.cluster_id;
     let s3_bucket = &etcd_config.s3_bucket;
-    let quorum_size = etcd_config.quorum_size;
-
-    let coordinator = EtcdClusterCoordinator::new(cluster_id, s3_bucket, quorum_size)?;
+    let cluster_size = etcd_config.cluster_size;
 
     // REGISTER: Write node info to S3
     info!("Registering node in S3 for cluster {cluster_id}");
-    coordinator.register_node()?;
+    register_node(s3_bucket, cluster_id)?;
 
     // DISCOVER: Wait for all nodes to register
-    info!("Waiting for {quorum_size} nodes to register");
-    let nodes = coordinator.wait_for_quorum()?;
+    info!("Waiting for {cluster_size} nodes to register");
+    let nodes = wait_for_cluster(s3_bucket, cluster_id, cluster_size)?;
     info!(
         "Found {} nodes: {:?}",
         nodes.len(),
@@ -114,7 +113,7 @@ fn bootstrap_etcd(etcd_config: &crate::config::EtcdConfig) -> CmdResult {
     );
 
     // ELECTION: All nodes have same view, generate initial-cluster
-    let initial_cluster = coordinator.generate_initial_cluster(&nodes);
+    let initial_cluster = generate_initial_cluster(&nodes);
     info!("Generated initial-cluster: {initial_cluster}");
 
     // START: All nodes start etcd together with initial-cluster-state: new
@@ -242,7 +241,7 @@ fn get_etcd_config(config: &BootstrapConfig, service_key: &str) -> FunResult {
         .as_ref()
         .ok_or_else(|| Error::other("etcd config missing"))?;
 
-    let nodes = get_all_registered_bss_nodes_s3(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
+    let nodes = get_registered_nodes(&etcd_config.s3_bucket, &etcd_config.cluster_id)?;
     let etcd_endpoints = nodes
         .iter()
         .map(|node| format!("http://{}:2379", node.ip))

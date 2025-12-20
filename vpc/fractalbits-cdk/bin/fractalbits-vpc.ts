@@ -17,7 +17,8 @@ const apiServerInstanceType =
   app.node.tryGetContext("apiServerInstanceType") ?? "c8g.xlarge";
 const benchClientInstanceType =
   app.node.tryGetContext("benchClientInstanceType") ?? "c8g.xlarge";
-const dataBlobStorage = app.node.tryGetContext("dataBlobStorage") ?? "singleAz";
+const dataBlobStorage =
+  app.node.tryGetContext("dataBlobStorage") ?? "all_in_bss_single_az";
 const rssBackend = app.node.tryGetContext("rssBackend") ?? "ddb";
 const browserIp = app.node.tryGetContext("browserIp") ?? null;
 // Note: Context values from CLI are always strings, so convert to numbers
@@ -55,11 +56,12 @@ const env = {
 };
 
 // Determine default AZ based on deployment mode and region
-// For singleAz: single AZ ID (e.g., "usw2-az3")
-// For multiAz: AZ pair (e.g., "usw2-az3,usw2-az4")
+// For single-AZ modes: single AZ ID (e.g., "usw2-az3")
+// For multi-AZ: AZ pair (e.g., "usw2-az3,usw2-az4")
+const isMultiAz = dataBlobStorage === "s3_express_multi_az";
 let az = app.node.tryGetContext("az");
 if (!az) {
-  if (dataBlobStorage === "singleAz") {
+  if (!isMultiAz) {
     // Default single AZ based on region
     az = env.region === "us-east-1" ? "use1-az4" : "usw2-az3";
   } else {

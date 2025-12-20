@@ -2,9 +2,14 @@ import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as TOML from "@iarna/toml";
 
+export type DataBlobStorage =
+  | "all_in_bss_single_az"
+  | "s3_hybrid_single_az"
+  | "s3_express_multi_az";
+
 export interface BootstrapConfigProps {
   forBench: boolean;
-  dataBlobStorage: "singleAz" | "multiAz";
+  dataBlobStorage: DataBlobStorage;
   rssHaEnabled: boolean;
   numBssNodes?: number;
   metaStackTesting?: boolean;
@@ -157,11 +162,11 @@ export function createConfigWithCfnTokens(
   scope: cdk.Stack,
   props: {
     forBench: boolean;
-    dataBlobStorage: "singleAz" | "multiAz";
+    dataBlobStorage: DataBlobStorage;
     rssHaEnabled: boolean;
     rssBackend: "etcd" | "ddb";
     numBssNodes?: number;
-    bucket: string;
+    bucket?: string;
     localAz: string;
     remoteAz?: string;
     iamRole: string;
@@ -189,16 +194,17 @@ export function createConfigWithCfnTokens(
       rss_ha_enabled: props.rssHaEnabled,
       rss_backend: props.rssBackend,
     },
-    aws: {
-      local_az: props.localAz,
-    },
   };
 
   if (props.numBssNodes !== undefined) {
     (staticConfig.global as TOML.JsonMap).num_bss_nodes = props.numBssNodes;
   }
-  if (props.remoteAz) {
-    (staticConfig.aws as TOML.JsonMap).remote_az = props.remoteAz;
+
+  if (props.bucket || props.remoteAz) {
+    staticConfig.aws = { local_az: props.localAz };
+    if (props.remoteAz) {
+      (staticConfig.aws as TOML.JsonMap).remote_az = props.remoteAz;
+    }
   }
 
   const staticPart =
@@ -208,9 +214,9 @@ export function createConfigWithCfnTokens(
   // Dynamic parts with CFN tokens
   const lines: string[] = [staticPart.trimEnd()];
 
-  // [aws] section - bucket is a CFN token
-  lines.push("");
-  lines.push(tomlLine("bucket", props.bucket));
+  if (props.bucket) {
+    lines.push(tomlLine("bucket", props.bucket));
+  }
 
   // [endpoints] section with CFN tokens
   lines.push("");
@@ -244,7 +250,7 @@ export function createConfigWithCfnTokens(
     lines.push("[etcd]");
     lines.push("enabled = true");
     lines.push(`cluster_id = "${props.etcdClusterId}"`);
-    lines.push(`quorum_size = ${props.numBssNodes}`);
+    lines.push(`cluster_size = ${props.numBssNodes}`);
     lines.push(`s3_bucket = "${props.etcdS3Bucket}"`);
   }
 

@@ -1,18 +1,22 @@
 use crate::config::BootstrapConfig;
 use crate::*;
+use std::io::Error;
 
 pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
-    let bucket = if config.is_multi_az() {
-        None
-    } else {
-        Some(config.aws.bucket.as_str())
-    };
+    let data_blob_storage = &config.global.data_blob_storage;
+    let bucket = config.aws.as_ref().map(|aws| aws.bucket.as_str());
     let nss_endpoint = &config.endpoints.nss_endpoint;
-    let remote_az = config.aws.remote_az.as_deref();
+    let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     let rss_ha_enabled = config.global.rss_ha_enabled;
 
     download_binaries(&["api_server"])?;
-    create_config(bucket, nss_endpoint, remote_az, rss_ha_enabled)?;
+    create_config(
+        data_blob_storage,
+        bucket,
+        nss_endpoint,
+        remote_az,
+        rss_ha_enabled,
+    )?;
 
     info!("Creating directories for api_server");
     run_cmd!(mkdir -p "/data/local/stats")?;
@@ -32,6 +36,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
 }
 
 pub fn create_config(
+    data_blob_storage: &str,
     bucket: Option<&str>,
     nss_endpoint: &str,
     remote_az: Option<&str>,
@@ -49,7 +54,9 @@ pub fn create_config(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let config_content = if let Some(remote_az) = remote_az {
+    let config_content = if data_blob_storage == "s3_express_multi_az" {
+        let remote_az =
+            remote_az.ok_or_else(|| Error::other("remote_az required for s3_express_multi_az"))?;
         // S3 Express Multi-AZ configuration
         let local_az = get_current_aws_az_id()?;
         let local_bucket = get_s3_express_bucket_name(&local_az)?;
@@ -109,10 +116,8 @@ max_backoff_us = 500
 backoff_multiplier = 1.0
 "##
         )
-    } else {
-        // Hybrid single az configuration
-        let bucket_name =
-            bucket.ok_or_else(|| std::io::Error::other("Bucket name required for hybrid mode"))?;
+    } else if let Some(bucket_name) = bucket {
+        // S3 Hybrid single-az configuration
         format!(
             r##"nss_addr = "{nss_endpoint}:8088"
 rss_addrs = [{rss_addrs_toml}]
@@ -160,6 +165,38 @@ max_attempts = 8
 initial_backoff_us = 15000
 max_backoff_us = 2000000
 backoff_multiplier = 1.8
+"##
+        )
+    } else {
+        // AllInBss single-az configuration
+        format!(
+            r##"nss_addr = "{nss_endpoint}:8088"
+rss_addrs = [{rss_addrs_toml}]
+region = "{aws_region}"
+port = 80
+mgmt_port = 18088
+root_domain = ".localhost"
+with_metrics = true
+http_request_timeout_seconds = 100
+rpc_request_timeout_seconds = 15
+rpc_connection_timeout_seconds = 5
+rss_rpc_timeout_seconds = 30
+client_request_timeout_seconds = 10
+stats_dir = "/data/local/stats"
+enable_stats_writer = false
+allow_missing_or_bad_signature = false
+worker_threads = {num_cores}
+set_thread_affinity = true
+
+[https]
+enabled = false
+port = 443
+cert_file = "/opt/fractalbits/etc/cert.pem"
+key_file = "/opt/fractalbits/etc/key.pem"
+force_http1_only = false
+
+[blob_storage]
+backend = "all_in_bss_single_az"
 "##
         )
     };

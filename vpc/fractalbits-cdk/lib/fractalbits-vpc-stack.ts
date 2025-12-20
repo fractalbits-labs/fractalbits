@@ -18,7 +18,10 @@ import {
   addAsgDynamoDbDeregistrationLifecycleHook,
   getAzNameFromIdAtBuildTime,
 } from "./ec2-utils";
-import { createConfigWithCfnTokens } from "./toml-config-builder";
+import {
+  createConfigWithCfnTokens,
+  DataBlobStorage,
+} from "./toml-config-builder";
 
 export interface FractalbitsVpcStackProps extends cdk.StackProps {
   numApiServers: number;
@@ -31,11 +34,15 @@ export interface FractalbitsVpcStackProps extends cdk.StackProps {
   benchClientInstanceType: string;
   nssInstanceType: string;
   browserIp?: string;
-  dataBlobStorage: "singleAz" | "multiAz";
+  dataBlobStorage: DataBlobStorage;
   rootServerHa: boolean;
   ebsVolumeSize: number;
   ebsVolumeIops: number;
   rssBackend: "etcd" | "ddb";
+}
+
+function isSingleAzMode(mode: DataBlobStorage): boolean {
+  return mode === "all_in_bss_single_az" || mode === "s3_hybrid_single_az";
 }
 
 export class FractalbitsVpcStack extends cdk.Stack {
@@ -45,6 +52,8 @@ export class FractalbitsVpcStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: FractalbitsVpcStackProps) {
     super(scope, id, props);
     const dataBlobStorage = props.dataBlobStorage;
+    const singleAz = isSingleAzMode(dataBlobStorage);
+    const multiAz = dataBlobStorage === "s3_express_multi_az";
 
     // === VPC Configuration ===
     // Parse az based on deployment mode
@@ -53,30 +62,26 @@ export class FractalbitsVpcStack extends cdk.Stack {
     const azArray = props.az.split(",");
 
     // Validate az format based on deployment mode
-    if (dataBlobStorage === "singleAz" && azArray.length !== 1) {
+    if (singleAz && azArray.length !== 1) {
       throw new Error(
-        `singleAz mode requires single AZ ID (e.g., "usw2-az3"), got: "${props.az}"`,
+        `Single-AZ mode requires single AZ ID (e.g., "usw2-az3"), got: "${props.az}"`,
       );
     }
-    if (dataBlobStorage === "multiAz" && azArray.length !== 2) {
+    if (multiAz && azArray.length !== 2) {
       throw new Error(
-        `multiAz mode requires AZ pair (e.g., "usw2-az3,usw2-az4"), got: "${props.az}"`,
+        `Multi-AZ mode requires AZ pair (e.g., "usw2-az3,usw2-az4"), got: "${props.az}"`,
       );
     }
 
     // Resolve AZ IDs to actual AZ names
     const az1 = getAzNameFromIdAtBuildTime(azArray[0]);
     // Only resolve second AZ for multi-AZ mode
-    const az2 =
-      dataBlobStorage === "multiAz"
-        ? getAzNameFromIdAtBuildTime(azArray[1])
-        : "";
+    const az2 = multiAz ? getAzNameFromIdAtBuildTime(azArray[1]) : "";
 
     // Determine availability zones based on storage mode
-    const availabilityZones =
-      dataBlobStorage === "singleAz"
-        ? [az1] // Single AZ for single-AZ mode
-        : [az1, az2]; // Multi-AZ for multi-AZ mode
+    const availabilityZones = singleAz
+      ? [az1] // Single AZ for single-AZ mode
+      : [az1, az2]; // Multi-AZ for multi-AZ mode
 
     // Create VPC with specific availability zones using resolved zone names
     this.vpc = new ec2.Vpc(this, "FractalbitsVpc", {
@@ -203,7 +208,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
     const subnet1 = privateSubnets[0]; // First AZ (private)
     // Only get second subnet for multi-AZ mode
     const subnet2 =
-      dataBlobStorage === "multiAz" && privateSubnets.length > 1
+      multiAz && privateSubnets.length > 1
         ? privateSubnets[1] // Second AZ (private)
         : subnet1; // Use first subnet for single-AZ mode
     const publicSubnet1 = publicSubnets[0]; // First AZ (public)
@@ -229,13 +234,13 @@ export class FractalbitsVpcStack extends cdk.Stack {
         id: "rss-B",
         instanceType: rssInstanceType,
         // For singleAz, place rss-B in same AZ as rss-A
-        specificSubnet: dataBlobStorage === "singleAz" ? subnet1 : subnet2,
+        specificSubnet: singleAz ? subnet1 : subnet2,
         sg: privateSg,
       });
     }
 
     // Only create nss-B for multiAz mode
-    if (dataBlobStorage === "multiAz") {
+    if (multiAz) {
       instanceConfigs.push({
         id: "nss-B",
         instanceType: nssInstanceType,
@@ -310,7 +315,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     // Create BSS nodes in ASG (dynamic cluster discovery via S3)
     let bssAsg: autoscaling.AutoScalingGroup | undefined;
-    if (dataBlobStorage === "singleAz") {
+    if (singleAz) {
       bssAsg = createEc2Asg(
         this,
         "BssAsg",
@@ -332,7 +337,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
     // NSS PrivateLink - only for multiAz mode
     // For single-AZ, use direct instance IP to avoid VPC endpoint latency
     let nssPrivateLink: any;
-    if (dataBlobStorage === "multiAz") {
+    if (multiAz) {
       const nssTargets = [instances["nss-A"], instances["nss-B"]];
       nssPrivateLink = createPrivateLinkNlb(
         this,
@@ -345,7 +350,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     // Only create mirrord for multiAz mode
     let mirrordPrivateLink: any;
-    if (dataBlobStorage === "multiAz") {
+    if (multiAz) {
       mirrordPrivateLink = createPrivateLinkNlb(
         this,
         "Mirrord",
@@ -356,10 +361,9 @@ export class FractalbitsVpcStack extends cdk.Stack {
     }
 
     // Determine NSS endpoint based on mode
-    const nssEndpoint =
-      dataBlobStorage === "multiAz"
-        ? nssPrivateLink.endpointDns
-        : `${instances["nss-A"].instancePrivateIp}`;
+    const nssEndpoint = multiAz
+      ? nssPrivateLink.endpointDns
+      : `${instances["nss-A"].instancePrivateIp}`;
 
     // Create api_server(s) in a ASG group
     const apiServerAsg = createEc2Asg(
@@ -389,7 +393,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       vpc: this.vpc,
       internetFacing: false,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
-      crossZoneEnabled: dataBlobStorage === "multiAz", // Only enable cross-zone for multi-AZ
+      crossZoneEnabled: multiAz, // Only enable cross-zone for multi-AZ
     });
     const listener = nlb.addListener("ApiListener", { port: 80 });
     listener.addTargets("ApiTargets", {
@@ -417,7 +421,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
     // Only create volume B for multiAz mode
     let ebsVolumeB: any;
     let ebsVolumeBId: string = "";
-    if (dataBlobStorage === "multiAz") {
+    if (multiAz) {
       ebsVolumeB = createEbsVolume(
         this,
         "MultiAttachVolumeB",
@@ -454,7 +458,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
     });
 
     // Only output mirrord endpoint for multiAz mode
-    if (dataBlobStorage === "multiAz" && mirrordPrivateLink) {
+    if (multiAz && mirrordPrivateLink) {
       new cdk.CfnOutput(this, "MirrordEndpointDns", {
         value: mirrordPrivateLink.endpointDns,
         description: "VPC Endpoint DNS for Mirrord service",
@@ -469,7 +473,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
     });
 
     // Only output volume B for multiAz mode
-    if (dataBlobStorage === "multiAz" && ebsVolumeBId) {
+    if (multiAz && ebsVolumeBId) {
       new cdk.CfnOutput(this, "VolumeBId", {
         value: ebsVolumeBId,
         description: "EBS volume B ID",
@@ -506,7 +510,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
     // For etcd backend with ASG, BSS nodes discover each other via S3
     // Use timestamp to ensure unique cluster ID per deployment (avoids stale S3 registrations)
     const etcdClusterId =
-      props.rssBackend === "etcd" && dataBlobStorage === "singleAz"
+      props.rssBackend === "etcd" && singleAz
         ? `fractalbits-${Date.now()}`
         : undefined;
     const buildsBucket = `fractalbits-builds-${this.region}-${this.account}`;
@@ -516,15 +520,14 @@ export class FractalbitsVpcStack extends cdk.Stack {
       dataBlobStorage: dataBlobStorage,
       rssHaEnabled: props.rootServerHa,
       rssBackend: props.rssBackend,
-      numBssNodes:
-        dataBlobStorage === "singleAz" ? props.numBssNodes : undefined,
-      bucket: bucket.bucketName,
+      numBssNodes: singleAz ? props.numBssNodes : undefined,
+      bucket: undefined, // allInBss and multiAz don't need CDK bucket; hybrid would need it
       localAz: azArray[0],
-      remoteAz: dataBlobStorage === "multiAz" ? azArray[1] : undefined,
+      remoteAz: multiAz ? azArray[1] : undefined,
       iamRole: ec2Role.roleName,
       nssEndpoint: nssEndpoint,
       mirrordEndpoint:
-        dataBlobStorage === "multiAz" && mirrordPrivateLink
+        multiAz && mirrordPrivateLink
           ? mirrordPrivateLink.endpointDns
           : undefined,
       apiServerEndpoint: nlb.loadBalancerDnsName,

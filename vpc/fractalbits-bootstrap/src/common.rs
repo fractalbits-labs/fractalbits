@@ -175,7 +175,7 @@ BindsTo={requires}
 [Service]
 {scheduling}
 {auto_restart}
-LimitNOFILE=1000000
+LimitNOFILE=65536
 LimitCORE=infinity
 WorkingDirectory={working_dir}{env_settings}
 ExecStart={exec_start}
