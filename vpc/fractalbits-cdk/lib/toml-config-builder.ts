@@ -165,6 +165,7 @@ export function createConfigWithCfnTokens(
     dataBlobStorage: DataBlobStorage;
     rssHaEnabled: boolean;
     rssBackend: "etcd" | "ddb";
+    journalType: "ebs" | "nvme";
     numBssNodes?: number;
     bucket?: string;
     localAz: string;
@@ -193,6 +194,7 @@ export function createConfigWithCfnTokens(
       data_blob_storage: props.dataBlobStorage,
       rss_ha_enabled: props.rssHaEnabled,
       rss_backend: props.rssBackend,
+      journal_type: props.journalType,
     },
   };
 
@@ -234,9 +236,12 @@ export function createConfigWithCfnTokens(
   if (props.nssBId) {
     lines.push(tomlLine("nss_b_id", props.nssBId));
   }
-  lines.push(tomlLine("volume_a_id", props.volumeAId));
-  if (props.volumeBId) {
-    lines.push(tomlLine("volume_b_id", props.volumeBId));
+  // Only include volume IDs for ebs journal type
+  if (props.journalType === "ebs" && props.volumeAId) {
+    lines.push(tomlLine("volume_a_id", props.volumeAId));
+    if (props.volumeBId) {
+      lines.push(tomlLine("volume_b_id", props.volumeBId));
+    }
   }
 
   // [etcd] section with S3-based dynamic cluster discovery (when using etcd backend)
@@ -271,13 +276,19 @@ export function createConfigWithCfnTokens(
   lines.push("");
   lines.push(instanceHeader(props.nssAId));
   lines.push('service_type = "nss_server"');
-  lines.push(tomlLine("volume_id", props.volumeAId));
+  // Only include volume_id for ebs journal type
+  if (props.journalType === "ebs" && props.volumeAId) {
+    lines.push(tomlLine("volume_id", props.volumeAId));
+  }
 
-  if (props.nssBId && props.volumeBId) {
+  if (props.nssBId) {
     lines.push("");
     lines.push(instanceHeader(props.nssBId));
     lines.push('service_type = "nss_server"');
-    lines.push(tomlLine("volume_id", props.volumeBId));
+    // Only include volume_id for ebs journal type
+    if (props.journalType === "ebs" && props.volumeBId) {
+      lines.push(tomlLine("volume_id", props.volumeBId));
+    }
   }
 
   if (props.guiServerId) {

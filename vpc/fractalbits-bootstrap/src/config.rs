@@ -23,6 +23,14 @@ pub struct BootstrapConfig {
     pub instances: HashMap<String, InstanceConfig>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalType {
+    #[default]
+    Ebs,
+    Nvme,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct GlobalConfig {
     pub for_bench: bool,
@@ -30,6 +38,8 @@ pub struct GlobalConfig {
     pub rss_ha_enabled: bool,
     #[serde(default)]
     pub rss_backend: String,
+    #[serde(default)]
+    pub journal_type: JournalType,
     #[serde(default)]
     pub num_bss_nodes: Option<usize>,
     #[serde(default)]

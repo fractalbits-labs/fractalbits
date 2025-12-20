@@ -24,8 +24,11 @@ use std::io::{self, Write};
     about = "Bootstrap for fractalbits cluster"
 )]
 struct Opts {
-    #[arg(long, help = "Format NSS instance (called via SSM from root_server)")]
-    format_nss: bool,
+    #[arg(
+        long,
+        help = "Format EBS journal for NSS instance (called via SSM from root_server)"
+    )]
+    format_ebs_journal: bool,
 }
 
 #[cmd_lib::main]
@@ -61,8 +64,8 @@ fn main() -> CmdResult {
 
     let opts = Opts::parse();
 
-    if opts.format_nss {
-        nss_server::ebs::format_nss()?;
+    if opts.format_ebs_journal {
+        nss_server::ebs_journal::format()?;
         info!("fractalbits-bootstrap --format-nss is done");
     } else {
         generic_bootstrap()?;
@@ -89,7 +92,7 @@ fn generic_bootstrap() -> CmdResult {
             "root_server"
         }
         ServiceType::NssServer { volume_id } => {
-            nss_server::bootstrap(&config, volume_id, for_bench)?;
+            nss_server::bootstrap(&config, volume_id.as_deref(), for_bench)?;
             "nss_server"
         }
         ServiceType::ApiServer => {

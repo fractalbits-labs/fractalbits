@@ -18,13 +18,13 @@ pub(crate) fn calculate_fa_journal_segment_size(volume_dev: &str) -> Result<u64,
     Ok(fa_journal_segment_size)
 }
 
-pub fn format_nss() -> CmdResult {
+pub fn format() -> CmdResult {
     let ebs_dev = discover_ebs_device()?;
-    format_nss_internal(&ebs_dev)?;
+    format_internal(&ebs_dev)?;
     Ok(())
 }
 
-pub(crate) fn format_nss_internal(ebs_dev: &str) -> CmdResult {
+pub(crate) fn format_internal(ebs_dev: &str) -> CmdResult {
     run_cmd! {
         info "Disabling udev rules for EBS";
         ln -sf /dev/null /etc/udev/rules.d/99-ebs.rules;
@@ -37,42 +37,7 @@ pub(crate) fn format_nss_internal(ebs_dev: &str) -> CmdResult {
         mount $ebs_dev /data/ebs;
     }?;
 
-    let mut wait_secs = 0;
-    while run_cmd!(mountpoint -q "/data/local").is_err() {
-        wait_secs += 1;
-        info!("Waiting for /data/local to be mounted ({wait_secs}s)");
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        if wait_secs >= 120 {
-            cmd_die!("Timeout when waiting for /data/local to be mounted (120s)");
-        }
-    }
-
-    run_cmd! {
-        info "Creating directories for nss_server";
-        mkdir -p /data/local/stats;
-        mkdir -p /data/local/meta_cache/blobs;
-    }?;
-
-    info!(
-        "Creating {} meta cache shard directories in parallel",
-        NSS_META_CACHE_SHARDS
-    );
-    let shards: Vec<usize> = (0..NSS_META_CACHE_SHARDS).collect();
-    shards.par_iter().try_for_each(|&i| {
-        let shard_dir = format!("/data/local/meta_cache/blobs/{}", i);
-        std::fs::create_dir(&shard_dir)
-            .map_err(|e| Error::other(format!("Failed to create {}: {}", shard_dir, e)))
-    })?;
-
-    run_cmd! {
-        info "Syncing file system changes";
-        sync;
-    }?;
-
-    run_cmd! {
-        info "Running format for nss_server";
-        /opt/fractalbits/bin/nss_server format -c ${ETC_PATH}${NSS_SERVER_CONFIG};
-    }?;
+    wait_and_format_nss(false)?;
 
     run_cmd! {
         info "Enabling udev rules for EBS";

@@ -39,6 +39,7 @@ export interface FractalbitsVpcStackProps extends cdk.StackProps {
   ebsVolumeSize: number;
   ebsVolumeIops: number;
   rssBackend: "etcd" | "ddb";
+  journalType: "ebs" | "nvme";
 }
 
 function isSingleAzMode(mode: DataBlobStorage): boolean {
@@ -408,32 +409,33 @@ export class FractalbitsVpcStack extends cdk.Stack {
       },
     });
 
-    // Create EBS Volumes for nss_servers using resolved zone names
-    const ebsVolumeA = createEbsVolume(
-      this,
-      "MultiAttachVolumeA",
-      subnet1.availabilityZone,
-      instances["nss-A"].instanceId,
-      props.ebsVolumeSize,
-      props.ebsVolumeIops,
-    );
-
-    // Only create volume B for multiAz mode
-    let ebsVolumeB: any;
+    // Create EBS Volumes for nss_servers only when journalType is "ebs"
+    let ebsVolumeAId: string = "";
     let ebsVolumeBId: string = "";
-    if (multiAz) {
-      ebsVolumeB = createEbsVolume(
+    if (props.journalType === "ebs") {
+      const ebsVolumeA = createEbsVolume(
         this,
-        "MultiAttachVolumeB",
-        subnet2.availabilityZone,
-        instances["nss-B"].instanceId,
+        "MultiAttachVolumeA",
+        subnet1.availabilityZone,
+        instances["nss-A"].instanceId,
         props.ebsVolumeSize,
         props.ebsVolumeIops,
       );
-      ebsVolumeBId = ebsVolumeB.volumeId;
-    }
+      ebsVolumeAId = ebsVolumeA.volumeId;
 
-    const ebsVolumeAId = ebsVolumeA.volumeId;
+      // Only create volume B for multiAz mode
+      if (multiAz) {
+        const ebsVolumeB = createEbsVolume(
+          this,
+          "MultiAttachVolumeB",
+          subnet2.availabilityZone,
+          instances["nss-B"].instanceId,
+          props.ebsVolumeSize,
+          props.ebsVolumeIops,
+        );
+        ebsVolumeBId = ebsVolumeB.volumeId;
+      }
+    }
 
     // Add UserData to all instances - they will discover their role from TOML config
     for (const instance of Object.values(instances)) {
@@ -467,12 +469,15 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     this.nlbLoadBalancerDnsName = nlb.loadBalancerDnsName;
 
-    new cdk.CfnOutput(this, "VolumeAId", {
-      value: ebsVolumeAId,
-      description: "EBS volume A ID",
-    });
+    // Only output EBS volume IDs when journalType is "ebs"
+    if (ebsVolumeAId) {
+      new cdk.CfnOutput(this, "VolumeAId", {
+        value: ebsVolumeAId,
+        description: "EBS volume A ID",
+      });
+    }
 
-    // Only output volume B for multiAz mode
+    // Only output volume B for multiAz mode with EBS
     if (multiAz && ebsVolumeBId) {
       new cdk.CfnOutput(this, "VolumeBId", {
         value: ebsVolumeBId,
@@ -520,6 +525,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       dataBlobStorage: dataBlobStorage,
       rssHaEnabled: props.rootServerHa,
       rssBackend: props.rssBackend,
+      journalType: props.journalType,
       numBssNodes: singleAz ? props.numBssNodes : undefined,
       bucket: undefined, // allInBss and multiAz don't need CDK bucket; hybrid would need it
       localAz: azArray[0],

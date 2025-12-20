@@ -1,3 +1,4 @@
+use crate::config::JournalType;
 use cmd_lib::*;
 use std::io::Error;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -83,6 +84,14 @@ pub fn get_builds_bucket() -> FunResult {
 }
 
 pub fn create_systemd_unit_file(service_name: &str, enable_now: bool) -> CmdResult {
+    create_systemd_unit_file_with_journal_type(service_name, enable_now, None)
+}
+
+pub fn create_systemd_unit_file_with_journal_type(
+    service_name: &str,
+    enable_now: bool,
+    journal_type: Option<JournalType>,
+) -> CmdResult {
     let working_dir = "/data";
     let mut requires = "";
     let mut env_settings = String::new();
@@ -114,12 +123,20 @@ Environment="HOST_ID={instance_id}"
         }
         "nss" => {
             managed_service = true;
-            requires = "data-ebs.mount data-local.mount";
+            requires = match journal_type {
+                Some(JournalType::Nvme) => "data-local.mount",
+                Some(JournalType::Ebs) => "data-ebs.mount data-local.mount",
+                None => unreachable!(),
+            };
             format!("{BIN_PATH}nss_server serve -c {ETC_PATH}{NSS_SERVER_CONFIG}")
         }
         "mirrord" => {
             managed_service = true;
-            requires = "data-ebs.mount data-local.mount";
+            requires = match journal_type {
+                Some(JournalType::Nvme) => "data-local.mount",
+                Some(JournalType::Ebs) => "data-ebs.mount data-local.mount",
+                None => unreachable!(),
+            };
             format!("{BIN_PATH}{service_name} -c {ETC_PATH}{MIRRORD_CONFIG}")
         }
         "rss" => {

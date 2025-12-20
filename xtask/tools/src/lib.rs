@@ -166,7 +166,7 @@ pub fn create_nss_dirs(data_dir: &Path, dir_name: &str) -> CmdResult {
     info!("Creating directories for {} server", dir_name);
 
     let nss_dir = data_dir.join(dir_name);
-    fs::create_dir_all(nss_dir.join("ebs"))?;
+    fs::create_dir_all(nss_dir.join("local/journal"))?;
     fs::create_dir_all(nss_dir.join("local/stats"))?;
     fs::create_dir_all(nss_dir.join("local/meta_cache/blobs"))?;
 

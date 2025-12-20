@@ -1,5 +1,5 @@
 use super::common::*;
-use crate::config::BootstrapConfig;
+use crate::config::{BootstrapConfig, JournalType};
 use crate::etcd_cluster::{get_cluster_state_s3, get_registered_nodes};
 use cmd_lib::*;
 use std::io::Error;
@@ -107,36 +107,65 @@ fn bootstrap_leader(
         initialize_bss_volume_groups(config, total_bss_nodes)?;
     }
 
-    // Format nss-B first if it exists, then nss-A
-    // NSS discovers its EBS device from bootstrap config
-    let bootstrap_bin = "/opt/fractalbits/bin/fractalbits-bootstrap";
-    if let Some(nss_b_id) = nss_b_id {
-        info!("Formatting NSS instance {nss_b_id} (standby)");
-        wait_for_ssm_ready(nss_b_id);
+    // For nvme journal type, NSS formats locally during bootstrap - no SSM needed
+    // For ebs journal type, we need to trigger NSS formatting via SSM
+    if config.global.journal_type == JournalType::Ebs {
+        // Format nss-B first if it exists, then nss-A
+        // NSS discovers its EBS device from bootstrap config
+        let bootstrap_bin = "/opt/fractalbits/bin/fractalbits-bootstrap";
+        if let Some(nss_b_id) = nss_b_id {
+            info!("Formatting NSS instance {nss_b_id} (standby)");
+            wait_for_ssm_ready(nss_b_id);
+            run_cmd_with_ssm(
+                nss_b_id,
+                &format!(r##"sudo bash -c "{bootstrap_bin} --format-ebs-journal &>>{CLOUD_INIT_LOG}""##),
+                false,
+            )?;
+            info!("Successfully formatted {nss_b_id} (standby)");
+        }
+
+        // Always format nss-A
+        let role = if nss_b_id.is_some() { "active" } else { "solo" };
+        info!("Formatting NSS instance {nss_a_id} ({role})");
+        wait_for_ssm_ready(nss_a_id);
         run_cmd_with_ssm(
-            nss_b_id,
-            &format!(r##"sudo bash -c "{bootstrap_bin} --format-nss &>>{CLOUD_INIT_LOG}""##),
+            nss_a_id,
+            &format!(r##"sudo bash -c "{bootstrap_bin} --format-ebs-journal &>>{CLOUD_INIT_LOG}""##),
             false,
         )?;
-        info!("Successfully formatted {nss_b_id} (standby)");
+        info!("Successfully formatted {nss_a_id} ({role})");
+    } else {
+        info!("Journal type is nvme - NSS formats locally, skipping SSM formatting");
     }
-
-    // Always format nss-A
-    let role = if nss_b_id.is_some() { "active" } else { "solo" };
-    info!("Formatting NSS instance {nss_a_id} ({role})");
-    wait_for_ssm_ready(nss_a_id);
-    run_cmd_with_ssm(
-        nss_a_id,
-        &format!(r##"sudo bash -c "{bootstrap_bin} --format-nss &>>{CLOUD_INIT_LOG}""##),
-        false,
-    )?;
-    info!("Successfully formatted {nss_a_id} ({role})");
 
     if ha_enabled {
         wait_for_leadership()?;
     } else {
         // For non-HA deployments, wait for root server to be ready
         wait_for_rss_ready()?;
+    }
+
+    // For NVMe journal type, start nss_role_agent via SSM after metadata VG is configured
+    // For EBS, nss_role_agent is started by udev rule when volume is attached after format
+    if config.global.journal_type == JournalType::Nvme {
+        info!("Starting nss_role_agent on NSS instances via SSM (NVMe mode)");
+        wait_for_ssm_ready(nss_a_id);
+        run_cmd_with_ssm(
+            nss_a_id,
+            "sudo systemctl start nss_role_agent.service",
+            false,
+        )?;
+        info!("Successfully started nss_role_agent on {nss_a_id}");
+
+        if let Some(nss_b_id) = nss_b_id {
+            wait_for_ssm_ready(nss_b_id);
+            run_cmd_with_ssm(
+                nss_b_id,
+                "sudo systemctl start nss_role_agent.service",
+                false,
+            )?;
+            info!("Successfully started nss_role_agent on {nss_b_id}");
+        }
     }
 
     if for_bench {

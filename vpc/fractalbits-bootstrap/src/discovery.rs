@@ -2,7 +2,7 @@ use log::info;
 use std::io::Error;
 
 use crate::common::{get_current_aws_region, get_ec2_tag, get_instance_id};
-use crate::config::{BootstrapConfig, InstanceConfig};
+use crate::config::{BootstrapConfig, InstanceConfig, JournalType};
 
 pub const SERVICE_TYPE_TAG: &str = "fractalbits:ServiceType";
 
@@ -13,7 +13,7 @@ pub enum ServiceType {
         follower_id: Option<String>,
     },
     NssServer {
-        volume_id: String,
+        volume_id: Option<String>,
     },
     ApiServer,
     BssServer,
@@ -71,10 +71,13 @@ fn parse_instance_config(
             })
         }
         "nss_server" => {
-            let volume_id = instance_config
-                .volume_id
-                .clone()
-                .ok_or_else(|| Error::other("NSS server config missing volume_id"))?;
+            let volume_id = instance_config.volume_id.clone();
+            // volume_id is required for ebs journal type
+            if config.global.journal_type == JournalType::Ebs && volume_id.is_none() {
+                return Err(Error::other(
+                    "NSS server config missing volume_id for ebs journal type",
+                ));
+            }
             Ok(ServiceType::NssServer { volume_id })
         }
         "api_server" => Ok(ServiceType::ApiServer),
