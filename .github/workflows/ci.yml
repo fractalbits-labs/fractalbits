@@ -22,7 +22,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Install system dependencies
-      run: sudo apt-get update && sudo apt-get install -y moreutils
+      run: sudo apt-get update && sudo apt-get install -y moreutils protobuf-compiler
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -76,7 +76,7 @@ jobs:
       run: cargo xtask repo init
 
     - name: Build Docker image
-      run: cargo xtask prebuilt update && cargo xtask docker build --release
+      run: cargo xtask docker build --release
 
     - name: Test Docker container
       run: |

@@ -183,11 +183,26 @@ fn ensure_protoc() -> CmdResult {
     let download_url = format!("{base_url}/v{version}/{file_name}");
     let zip_path = format!("third_party/{file_name}");
 
-    run_cmd! {
-        info "Downloading protoc binary since command not found";
-        curl -qL -o $zip_path $download_url &>/dev/null;
-        mkdir -p $protoc_dir;
-    }?;
+    info!("Downloading protoc binary since command not found");
+    run_cmd!(mkdir -p $protoc_dir)?;
+
+    // Try download with retry
+    let mut download_success = false;
+    for attempt in 1..=2 {
+        if run_cmd!(curl -qL -o $zip_path $download_url 1>"/dev/null" 2>&1).is_ok() {
+            download_success = true;
+            break;
+        }
+        if attempt == 1 {
+            info!("Download failed, retrying...");
+        }
+    }
+
+    if !download_success {
+        return Err(std::io::Error::other(
+            "Failed to download protoc after 2 attempts",
+        ));
+    }
 
     extract_zip(&zip_path, protoc_dir)?;
 
