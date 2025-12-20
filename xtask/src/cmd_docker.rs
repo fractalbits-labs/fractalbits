@@ -3,7 +3,6 @@ use crate::etcd_utils::ensure_etcd_local;
 use crate::*;
 use cmd_lib::*;
 use std::io::Error;
-use std::path::Path;
 
 const DEFAULT_CONTAINER_NAME: &str = "fractalbits-dev";
 
@@ -35,33 +34,24 @@ fn build_docker_image(
 ) -> CmdResult {
     info!("Building Docker image: {}:{}", image_name, tag);
 
-    let target_dir = if release {
-        "target/release"
+    let build_envs = get_build_envs();
+    let (build_flag, target_dir) = if release {
+        ("--release", "target/release")
     } else {
-        "target/debug"
+        ("", "target/debug")
     };
     let staging_dir = "target/docker-staging";
-    let bin_staging = format!("{}/bin", staging_dir);
-
-    let build_envs = get_build_envs();
+    let bin_staging = format!("{staging_dir}/bin");
 
     if all_from_source {
         info!("Building all binaries from source...");
         cmd_build::build_all(release)?;
 
         info!("Building container-all-in-one...");
-        if release {
-            run_cmd!($[build_envs] cargo build --release -p container-all-in-one)?;
-        } else {
-            run_cmd!($[build_envs] cargo build -p container-all-in-one)?;
-        }
+        run_cmd!($[build_envs] cargo build $build_flag -p container-all-in-one)?;
     } else {
         info!("Using prebuilt binaries from prebuilt/ directory");
-        if release {
-            run_cmd!($[build_envs] cargo build --release -p api_server -p container-all-in-one)?;
-        } else {
-            run_cmd!($[build_envs] cargo build -p api_server -p container-all-in-one)?;
-        }
+        run_cmd!($[build_envs] cargo build $build_flag -p api_server -p container-all-in-one)?;
     }
 
     info!("Ensuring etcd binary...");
@@ -74,52 +64,26 @@ fn build_docker_image(
     }?;
 
     // Copy binaries built in this repo
-    let local_binaries = ["api_server", "container-all-in-one"];
-    for bin in &local_binaries {
-        let src = format!("{}/{}", target_dir, bin);
-        if Path::new(&src).exists() {
-            run_cmd!(cp $src $bin_staging/)?;
-        } else {
-            return Err(Error::other(format!("Binary not found: {}", src)));
-        }
+    let local_rust_binaries = ["api_server", "container-all-in-one"];
+    for rust_bin in &local_rust_binaries {
+        run_cmd!(cp $target_dir/$rust_bin $bin_staging/)?;
     }
 
     if all_from_source {
         // Use freshly built binaries
         let rust_binaries = ["root_server", "rss_admin"];
         for bin in &rust_binaries {
-            let src = format!("{}/{}", target_dir, bin);
-            if Path::new(&src).exists() {
-                run_cmd!(cp $src $bin_staging/)?;
-            } else {
-                return Err(Error::other(format!("Rust binary not found: {}", src)));
-            }
+            run_cmd!(cp $target_dir/$bin $bin_staging/)?;
         }
-
-        let zig_out = if release {
-            crate::ZIG_RELEASE_OUT
-        } else {
-            crate::ZIG_DEBUG_OUT
-        };
         let zig_binaries = ["bss_server", "nss_server"];
-        for bin in &zig_binaries {
-            let src = format!("{}/bin/{}", zig_out, bin);
-            if Path::new(&src).exists() {
-                run_cmd!(cp $src $bin_staging/)?;
-            } else {
-                return Err(Error::other(format!("Zig binary not found: {}", src)));
-            }
+        for zig_bin in &zig_binaries {
+            run_cmd!(cp $target_dir/zig-out/bin/$zig_bin $bin_staging/)?;
         }
     } else {
         // Use prebuilt binaries for external repos
         let prebuilt_binaries = ["root_server", "rss_admin", "bss_server", "nss_server"];
         for bin in &prebuilt_binaries {
-            let src = format!("prebuilt/{}", bin);
-            if Path::new(&src).exists() {
-                run_cmd!(cp $src $bin_staging/)?;
-            } else {
-                return Err(Error::other(format!("Prebuilt binary not found: {}", src)));
-            }
+            run_cmd!(cp prebuilt/$bin $bin_staging/)?;
         }
     }
 
