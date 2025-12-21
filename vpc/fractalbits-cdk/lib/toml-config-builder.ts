@@ -164,7 +164,7 @@ export function createConfigWithCfnTokens(
     rssBackend: "etcd" | "ddb";
     journalType: "ebs" | "nvme";
     numBssNodes?: number;
-    bucket?: string;
+    dataBlobBucket?: string;
     localAz: string;
     remoteAz?: string;
     iamRole: string;
@@ -204,7 +204,7 @@ export function createConfigWithCfnTokens(
       props.workflowClusterId;
   }
 
-  if (props.bucket || props.remoteAz) {
+  if (props.dataBlobBucket || props.remoteAz) {
     staticConfig.aws = { local_az: props.localAz };
     if (props.remoteAz) {
       (staticConfig.aws as TOML.JsonMap).remote_az = props.remoteAz;
@@ -218,8 +218,8 @@ export function createConfigWithCfnTokens(
   // Dynamic parts with CFN tokens
   const lines: string[] = [staticPart.trimEnd()];
 
-  if (props.bucket) {
-    lines.push(tomlLine("bucket", props.bucket));
+  if (props.dataBlobBucket) {
+    lines.push(tomlLine("data_blob_bucket", props.dataBlobBucket));
   }
 
   // [endpoints] section with CFN tokens

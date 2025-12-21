@@ -4,7 +4,7 @@
 //! objects to S3. This provides clear dependency ordering and visibility
 //! into bootstrap progress.
 
-use crate::common::{get_builds_bucket, get_instance_id, get_private_ip};
+use crate::common::{get_bootstrap_bucket, get_instance_id, get_private_ip};
 use crate::config::BootstrapConfig;
 use cmd_lib::*;
 use serde::{Deserialize, Serialize};
@@ -76,7 +76,9 @@ impl WorkflowBarrier {
             .as_ref()
             .ok_or_else(|| Error::other("workflow_cluster_id not configured"))?;
 
-        let bucket = get_builds_bucket()?.trim_start_matches("s3://").to_string();
+        let bucket = get_bootstrap_bucket()?
+            .trim_start_matches("s3://")
+            .to_string();
         let instance_id = get_instance_id()?;
         Ok(Self::new(
             &bucket,

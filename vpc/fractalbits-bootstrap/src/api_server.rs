@@ -5,7 +5,7 @@ use std::io::Error;
 
 pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     let data_blob_storage = &config.global.data_blob_storage;
-    let bucket = config.aws.as_ref().map(|aws| aws.bucket.as_str());
+    let data_blob_bucket = config.aws.as_ref().map(|aws| aws.data_blob_bucket.as_str());
     let nss_endpoint = &config.endpoints.nss_endpoint;
     let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     let rss_ha_enabled = config.global.rss_ha_enabled;
@@ -33,7 +33,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
 
     create_config(
         data_blob_storage,
-        bucket,
+        data_blob_bucket,
         nss_endpoint,
         remote_az,
         rss_ha_enabled,
@@ -61,7 +61,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
 
 pub fn create_config(
     data_blob_storage: &str,
-    bucket: Option<&str>,
+    data_blob_bucket: Option<&str>,
     nss_endpoint: &str,
     remote_az: Option<&str>,
     rss_ha_enabled: bool,
@@ -140,7 +140,7 @@ max_backoff_us = 500
 backoff_multiplier = 1.0
 "##
         )
-    } else if let Some(bucket_name) = bucket {
+    } else if let Some(bucket_name) = data_blob_bucket {
         // S3 Hybrid single-az configuration
         format!(
             r##"nss_addr = "{nss_endpoint}:8088"

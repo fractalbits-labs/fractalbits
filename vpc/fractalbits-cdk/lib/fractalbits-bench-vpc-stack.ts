@@ -98,7 +98,7 @@ export class FractalbitsBenchVpcStack extends cdk.Stack {
     const buildsBucket = s3.Bucket.fromBucketName(
       this,
       "BuildsBucket",
-      `fractalbits-builds-${region}-${account}`,
+      `fractalbits-bootstrap-${region}-${account}`,
     );
 
     // Static config using TOML library

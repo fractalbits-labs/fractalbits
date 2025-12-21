@@ -284,7 +284,7 @@ fn download_warp_binaries() -> CmdResult {
 
 pub fn upload() -> CmdResult {
     // Check/create S3 bucket and sync
-    let bucket_name = get_build_bucket_name()?;
+    let bucket_name = get_bootstrap_bucket_name()?;
     let bucket = format!("s3://{bucket_name}");
 
     // Check if the bucket exists; create if it doesn't
@@ -304,10 +304,10 @@ pub fn upload() -> CmdResult {
     Ok(())
 }
 
-fn get_build_bucket_name() -> FunResult {
+fn get_bootstrap_bucket_name() -> FunResult {
     let region = run_fun!(aws configure get region)?;
     let account_id = run_fun!(aws sts get-caller-identity --query Account --output text)?;
-    Ok(format!("fractalbits-builds-{region}-{account_id}"))
+    Ok(format!("fractalbits-bootstrap-{region}-{account_id}"))
 }
 
 pub fn destroy_vpc() -> CmdResult {
@@ -343,14 +343,14 @@ pub fn destroy_vpc() -> CmdResult {
     }?;
 
     // Then cleanup S3 bucket
-    cleanup_builds_bucket()?;
+    cleanup_bootstrap_bucket()?;
 
     info!("VPC destruction completed successfully");
     Ok(())
 }
 
-fn cleanup_builds_bucket() -> CmdResult {
-    let bucket_name = get_build_bucket_name()?;
+fn cleanup_bootstrap_bucket() -> CmdResult {
+    let bucket_name = get_bootstrap_bucket_name()?;
     let bucket = format!("s3://{bucket_name}");
 
     // Check if the bucket exists

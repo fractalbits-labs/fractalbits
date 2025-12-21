@@ -172,11 +172,14 @@ export class FractalbitsVpcStack extends cdk.Stack {
       );
     }
 
-    const bucket = new s3.Bucket(this, "Bucket", {
-      // No bucketName provided – name will be auto-generated
-      removalPolicy: cdk.RemovalPolicy.DESTROY, // Delete bucket on stack delete
-      autoDeleteObjects: true, // Empty bucket before deletion
-    });
+    // Create data blob bucket only for s3_hybrid_single_az mode
+    let dataBlobBucket: s3.Bucket | undefined;
+    if (dataBlobStorage === "s3_hybrid_single_az") {
+      dataBlobBucket = new s3.Bucket(this, "DataBlobBucket", {
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+        autoDeleteObjects: true,
+      });
+    }
 
     // Create DynamoDB tables
     createDynamoDbTable(
@@ -443,9 +446,12 @@ export class FractalbitsVpcStack extends cdk.Stack {
     }
 
     // Outputs
-    new cdk.CfnOutput(this, "FractalbitsBucketName", {
-      value: bucket.bucketName,
-    });
+    if (dataBlobBucket) {
+      new cdk.CfnOutput(this, "DataBlobBucketName", {
+        value: dataBlobBucket.bucketName,
+        description: "S3 bucket for data blob storage (hybrid mode)",
+      });
+    }
 
     for (const [id, instance] of Object.entries(instances)) {
       new cdk.CfnOutput(this, `${id} Id`, {
@@ -512,7 +518,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
     }
 
     // Generate and upload bootstrap TOML config to S3
-    const buildsBucket = `fractalbits-builds-${this.region}-${this.account}`;
+    const bootstrapBucket = `fractalbits-bootstrap-${this.region}-${this.account}`;
 
     // Generate unique workflow cluster ID for S3-based bootstrap coordination
     // Each deployment gets fresh workflow state to avoid stale barrier objects
@@ -525,7 +531,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       rssBackend: props.rssBackend,
       journalType: props.journalType,
       numBssNodes: singleAz ? props.numBssNodes : undefined,
-      bucket: undefined, // allInBss and multiAz don't need CDK bucket; hybrid would need it
+      dataBlobBucket: dataBlobBucket?.bucketName,
       localAz: azArray[0],
       remoteAz: multiAz ? azArray[1] : undefined,
       iamRole: ec2Role.roleName,
@@ -558,7 +564,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         service: "S3",
         action: "putObject",
         parameters: {
-          Bucket: buildsBucket,
+          Bucket: bootstrapBucket,
           Key: "bootstrap.toml",
           Body: bootstrapConfigContent,
           ContentType: "text/plain",
@@ -569,7 +575,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         service: "S3",
         action: "putObject",
         parameters: {
-          Bucket: buildsBucket,
+          Bucket: bootstrapBucket,
           Key: "bootstrap.toml",
           Body: bootstrapConfigContent,
           ContentType: "text/plain",

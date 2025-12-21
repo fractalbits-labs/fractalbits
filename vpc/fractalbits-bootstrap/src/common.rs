@@ -47,18 +47,18 @@ pub fn download_binaries(file_list: &[&str]) -> CmdResult {
 }
 
 fn download_binary(file_name: &str) -> CmdResult {
-    let builds_bucket = get_builds_bucket()?;
+    let bootstrap_bucket = get_bootstrap_bucket()?;
     let cpu_arch = run_fun!(arch)?;
 
     let s3_path = if matches!(
         file_name,
         "fractalbits-bootstrap" | "warp" | "etcd" | "etcdctl"
     ) {
-        format!("{builds_bucket}/{cpu_arch}/{file_name}")
+        format!("{bootstrap_bucket}/{cpu_arch}/{file_name}")
     } else {
         let instance_type = get_ec2_instance_type()?;
         let cpu_target = get_cpu_target_from_instance_type(&instance_type);
-        format!("{builds_bucket}/{cpu_arch}/{cpu_target}/{file_name}")
+        format!("{bootstrap_bucket}/{cpu_arch}/{cpu_target}/{file_name}")
     };
 
     let local_path = format!("{BIN_PATH}{file_name}");
@@ -73,13 +73,17 @@ pub fn download_from_s3(s3_path: &str, local_path: &str) -> CmdResult {
     )
 }
 
-pub fn get_builds_bucket() -> FunResult {
-    let builds_bucket = format!(
-        "s3://fractalbits-builds-{}-{}",
-        get_current_aws_region()?,
-        get_account_id()?
-    );
-    Ok(builds_bucket)
+pub fn get_bootstrap_bucket() -> FunResult {
+    let bootstrap_bucket = if is_ec2_environment() {
+        format!(
+            "s3://fractalbits-bootstrap-{}-{}",
+            get_current_aws_region()?,
+            get_account_id()?
+        )
+    } else {
+        "s3://fractalbits-bootstrap".into()
+    };
+    Ok(bootstrap_bucket)
 }
 
 pub fn create_systemd_unit_file(service_name: &str, enable_now: bool) -> CmdResult {
@@ -236,6 +240,11 @@ pub fn create_logrotate_for_stats() -> CmdResult {
     }?;
 
     Ok(())
+}
+
+/// Check if we're running in an EC2/cloud environment (as a system service)
+pub fn is_ec2_environment() -> bool {
+    std::path::Path::new("/opt/fractalbits/bin/fractalbits-bootstrap-ec2").exists()
 }
 
 pub fn get_current_aws_region() -> FunResult {

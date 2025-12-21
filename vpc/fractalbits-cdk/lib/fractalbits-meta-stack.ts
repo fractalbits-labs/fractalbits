@@ -102,7 +102,7 @@ export class FractalbitsMetaStack extends cdk.Stack {
     const buildsBucket = s3.Bucket.fromBucketName(
       this,
       "BuildsBucket",
-      `fractalbits-builds-${region}-${account}`,
+      `fractalbits-bootstrap-${region}-${account}`,
     );
 
     if (props.serviceName == "nss") {

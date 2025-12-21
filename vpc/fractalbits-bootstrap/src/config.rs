@@ -5,7 +5,7 @@ use std::io::Error;
 use std::time::{Duration, Instant};
 
 use crate::common::{
-    BOOTSTRAP_CONFIG, ETC_PATH, download_from_s3, get_builds_bucket, get_instance_id,
+    BOOTSTRAP_CONFIG, ETC_PATH, download_from_s3, get_bootstrap_bucket, get_instance_id,
 };
 
 const CONFIG_RETRY_TIMEOUT_SECS: u64 = 120;
@@ -57,7 +57,7 @@ pub struct EtcdConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct AwsConfig {
-    pub bucket: String,
+    pub data_blob_bucket: String,
     #[allow(dead_code)]
     pub local_az: String,
     #[serde(default)]
@@ -93,7 +93,7 @@ pub struct InstanceConfig {
 
 impl BootstrapConfig {
     pub fn download_and_parse() -> Result<Self, Error> {
-        let builds_bucket = get_builds_bucket()?;
+        let builds_bucket = get_bootstrap_bucket()?;
         let s3_path = format!("{builds_bucket}/{BOOTSTRAP_CONFIG}");
         let local_path = format!("{ETC_PATH}{BOOTSTRAP_CONFIG}");
         let instance_id = get_instance_id()?;
