@@ -9,6 +9,29 @@ use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
+#[derive(Clone, Copy, PartialEq, Default, clap::ValueEnum)]
+pub enum VpcTarget {
+    OnPrem,
+    #[default]
+    Aws,
+}
+
+pub fn get_bootstrap_bucket_name(vpc_target: VpcTarget) -> FunResult {
+    match vpc_target {
+        VpcTarget::OnPrem => Ok("fractalbits-bootstrap".to_string()),
+        VpcTarget::Aws => {
+            let region = run_fun!(aws configure get region)?;
+            let account_id = run_fun!(aws sts get-caller-identity --query Account --output text)?;
+            Ok(format!("fractalbits-bootstrap-{region}-{account_id}"))
+        }
+    }
+}
+
+/// Check if we're running in an EC2/cloud environment (as a system service)
+pub fn is_ec2_environment() -> bool {
+    std::path::Path::new("/opt/fractalbits/bin/fractalbits-bootstrap-ec2").exists()
+}
+
 // Support GenUuids only for now
 pub fn gen_uuids(num: usize, file: &str) -> CmdResult {
     info!("Generating {num} uuids into file {file}");

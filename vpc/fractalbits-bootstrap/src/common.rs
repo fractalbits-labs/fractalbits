@@ -3,6 +3,7 @@ use cmd_lib::*;
 use std::io::Error;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
+use xtask_common::{VpcTarget, get_bootstrap_bucket_name, is_ec2_environment};
 
 pub const BIN_PATH: &str = "/opt/fractalbits/bin/";
 pub const ETC_PATH: &str = "/opt/fractalbits/etc/";
@@ -74,16 +75,13 @@ pub fn download_from_s3(s3_path: &str, local_path: &str) -> CmdResult {
 }
 
 pub fn get_bootstrap_bucket() -> FunResult {
-    let bootstrap_bucket = if is_ec2_environment() {
-        format!(
-            "s3://fractalbits-bootstrap-{}-{}",
-            get_current_aws_region()?,
-            get_account_id()?
-        )
+    let vpc_target = if is_ec2_environment() {
+        VpcTarget::Aws
     } else {
-        "s3://fractalbits-bootstrap".into()
+        VpcTarget::OnPrem
     };
-    Ok(bootstrap_bucket)
+    let bucket_name = get_bootstrap_bucket_name(vpc_target)?;
+    Ok(format!("s3://{bucket_name}"))
 }
 
 pub fn create_systemd_unit_file(service_name: &str, enable_now: bool) -> CmdResult {
@@ -240,11 +238,6 @@ pub fn create_logrotate_for_stats() -> CmdResult {
     }?;
 
     Ok(())
-}
-
-/// Check if we're running in an EC2/cloud environment (as a system service)
-pub fn is_ec2_environment() -> bool {
-    std::path::Path::new("/opt/fractalbits/bin/fractalbits-bootstrap-ec2").exists()
 }
 
 pub fn get_current_aws_region() -> FunResult {

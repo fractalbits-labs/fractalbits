@@ -1,10 +1,11 @@
 [package]
-name = "xtask_tools"
+name = "xtask_common"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 cmd_lib.workspace = true
+clap.workspace = true
 num_cpus.workspace = true
 rayon.workspace = true
 uuid.workspace = true

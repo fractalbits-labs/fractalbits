@@ -9,7 +9,7 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
-use xtask_tools::{
+use xtask_common::{
     check_port_ready, create_bss_dirs, create_nss_dirs, generate_bss_data_vg_config,
     generate_bss_metadata_vg_config,
 };

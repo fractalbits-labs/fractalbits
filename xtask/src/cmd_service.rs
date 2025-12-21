@@ -6,7 +6,7 @@ use crate::InitConfig;
 use crate::etcd_utils::{ensure_etcd_local, resolve_etcd_bin};
 use crate::*;
 use colored::*;
-use xtask_tools::{
+use xtask_common::{
     create_bss_dirs, create_nss_dirs, generate_bss_data_vg_config, generate_bss_metadata_vg_config,
 };
 

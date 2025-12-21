@@ -53,7 +53,7 @@ bss_codec = { path = "crates/common/rpc_codecs/bss_codec" }
 nss_codec = { path = "crates/common/rpc_codecs/nss_codec" }
 rss_codec = { path = "crates/common/rpc_codecs/rss_codec" }
 test_common = { path = "crates/common/test_common" }
-xtask_tools = { path = "xtask/tools" }
+xtask_common = { path = "xtask/common" }
 
 tokio-util = { version = "0.7.12", features = ["codec"] }
 tokio-stream = "0.1.16"

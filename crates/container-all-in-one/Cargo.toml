@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-xtask_tools.workspace = true
+xtask_common.workspace = true
 tokio.workspace = true
 cmd_lib.workspace = true
 clap.workspace = true

@@ -6,13 +6,13 @@ use std::collections::HashMap;
 pub fn run_cmd_tool(tool_kind: ToolKind) -> CmdResult {
     match tool_kind {
         ToolKind::GenUuids { num, file } => {
-            xtask_tools::gen_uuids(num, &file)?;
+            xtask_common::gen_uuids(num, &file)?;
         }
         ToolKind::DescribeStack { stack_name } => {
             describe_stack(&stack_name)?;
         }
         ToolKind::DumpVgConfig { localdev } => {
-            xtask_tools::dump_vg_config(localdev)?;
+            xtask_common::dump_vg_config(localdev)?;
         }
     }
     Ok(())

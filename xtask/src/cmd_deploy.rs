@@ -3,6 +3,8 @@ use crate::*;
 use colored::*;
 use dialoguer::Input;
 use std::path::Path;
+pub use xtask_common::VpcTarget;
+use xtask_common::get_bootstrap_bucket_name;
 
 pub struct VpcConfig {
     pub template: Option<crate::VpcTemplate>,
@@ -282,9 +284,9 @@ fn download_warp_binaries() -> CmdResult {
     Ok(())
 }
 
-pub fn upload() -> CmdResult {
+pub fn upload(vpc_target: VpcTarget) -> CmdResult {
     // Check/create S3 bucket and sync
-    let bucket_name = get_bootstrap_bucket_name()?;
+    let bucket_name = get_bootstrap_bucket_name(vpc_target)?;
     let bucket = format!("s3://{bucket_name}");
 
     // Check if the bucket exists; create if it doesn't
@@ -302,12 +304,6 @@ pub fn upload() -> CmdResult {
         info "Syncing all binaries is done";
     }?;
     Ok(())
-}
-
-fn get_bootstrap_bucket_name() -> FunResult {
-    let region = run_fun!(aws configure get region)?;
-    let account_id = run_fun!(aws sts get-caller-identity --query Account --output text)?;
-    Ok(format!("fractalbits-bootstrap-{region}-{account_id}"))
 }
 
 pub fn destroy_vpc() -> CmdResult {
@@ -350,7 +346,7 @@ pub fn destroy_vpc() -> CmdResult {
 }
 
 fn cleanup_bootstrap_bucket() -> CmdResult {
-    let bucket_name = get_bootstrap_bucket_name()?;
+    let bucket_name = get_bootstrap_bucket_name(VpcTarget::Aws)?;
     let bucket = format!("s3://{bucket_name}");
 
     // Check if the bucket exists

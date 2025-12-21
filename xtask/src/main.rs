@@ -236,7 +236,10 @@ pub enum DeployCommand {
     },
 
     #[clap(about = "Upload prebuilt binaries to s3 builds bucket")]
-    Upload,
+    Upload {
+        #[clap(long, value_enum, default_value = "aws")]
+        vpc_target: xtask_common::VpcTarget,
+    },
 
     #[clap(about = "Create VPC infrastructure using CDK")]
     CreateVpc {
@@ -647,7 +650,7 @@ async fn main() -> CmdResult {
                 zig_extra_build,
                 api_server_build_env,
             } => cmd_deploy::build(target, release, &zig_extra_build, &api_server_build_env)?,
-            DeployCommand::Upload => cmd_deploy::upload()?,
+            DeployCommand::Upload { vpc_target } => cmd_deploy::upload(vpc_target)?,
             DeployCommand::CreateVpc {
                 template,
                 num_api_servers,
