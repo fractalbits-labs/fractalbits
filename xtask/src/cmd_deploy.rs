@@ -1,10 +1,21 @@
+use crate::deploy_bootstrap;
 use crate::etcd_utils::download_etcd_for_deploy;
 use crate::*;
 use colored::*;
 use dialoguer::Input;
 use std::path::Path;
 pub use xtask_common::VpcTarget;
-use xtask_common::get_bootstrap_bucket_name;
+
+pub fn get_bootstrap_bucket_name(vpc_target: VpcTarget) -> FunResult {
+    match vpc_target {
+        VpcTarget::OnPrem => Ok("fractalbits-bootstrap".to_string()),
+        VpcTarget::Aws => {
+            let region = run_fun!(aws configure get region)?;
+            let account_id = run_fun!(aws sts get-caller-identity --query Account --output text)?;
+            Ok(format!("fractalbits-bootstrap-{region}-{account_id}"))
+        }
+    }
+}
 
 pub struct VpcConfig {
     pub template: Option<crate::VpcTemplate>,
@@ -452,6 +463,9 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
             --require-approval never 2>&1;
         info "VPC deployment completed successfully";
     }?;
+
+    // Show bootstrap progress
+    deploy_bootstrap::show_progress()?;
 
     Ok(())
 }

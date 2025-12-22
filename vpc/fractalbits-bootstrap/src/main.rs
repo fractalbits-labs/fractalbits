@@ -55,6 +55,12 @@ fn generic_bootstrap() -> CmdResult {
     info!("Starting config-based bootstrap mode");
 
     let config = BootstrapConfig::download_and_parse()?;
+
+    // Backup config to workflow directory for progress tracking
+    if let Some(cluster_id) = &config.global.workflow_cluster_id {
+        let _ = backup_config_to_workflow(cluster_id);
+    }
+
     let for_bench = config.global.for_bench;
     let service_type = discover_service_type(&config)?;
 
@@ -87,11 +93,11 @@ fn generic_bootstrap() -> CmdResult {
                 .api_server_endpoint
                 .as_ref()
                 .ok_or_else(|| io::Error::other("api_server_endpoint not set in config"))?;
-            bench_server::bootstrap(api_endpoint.clone(), *bench_client_num)?;
+            bench_server::bootstrap(&config, api_endpoint.clone(), *bench_client_num)?;
             "bench_server"
         }
         ServiceType::BenchClient => {
-            bench_client::bootstrap()?;
+            bench_client::bootstrap(&config)?;
             "bench_client"
         }
     };

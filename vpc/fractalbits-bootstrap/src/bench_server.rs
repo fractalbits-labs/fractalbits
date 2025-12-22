@@ -3,6 +3,8 @@ mod yaml_mixed;
 mod yaml_put;
 
 use super::common::*;
+use crate::config::BootstrapConfig;
+use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use cmd_lib::*;
 use std::time::Duration;
 use {yaml_get::*, yaml_mixed::*, yaml_put::*};
@@ -29,7 +31,14 @@ const WORKLOAD_CONFIGS: &[WorkloadConfig] = &[
     },
 ];
 
-pub fn bootstrap(api_server_endpoint: String, bench_client_num: usize) -> CmdResult {
+pub fn bootstrap(
+    config: &BootstrapConfig,
+    api_server_endpoint: String,
+    bench_client_num: usize,
+) -> CmdResult {
+    let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Bench)?;
+    barrier.complete_stage(stages::INSTANCES_READY, None)?;
+
     download_binaries(&["warp"])?;
     setup_serial_console_password()?;
 
@@ -41,30 +50,30 @@ pub fn bootstrap(api_server_endpoint: String, bench_client_num: usize) -> CmdRes
         warp_client_ips.push_str(&format!("  - {ip}:7761\n"));
     }
 
-    for config in WORKLOAD_CONFIGS {
+    for wl_config in WORKLOAD_CONFIGS {
         create_put_workload_config(
             &warp_client_ips,
             &region,
             &api_server_endpoint,
             "2m",
-            config.size_kb,
-            config.put_concurrent_ops,
+            wl_config.size_kb,
+            wl_config.put_concurrent_ops,
         )?;
         create_get_workload_config(
             &warp_client_ips,
             &region,
             &api_server_endpoint,
             "2m",
-            config.size_kb,
-            config.get_concurrent_ops,
+            wl_config.size_kb,
+            wl_config.get_concurrent_ops,
         )?;
         create_mixed_workload_config(
             &warp_client_ips,
             &region,
             &api_server_endpoint,
             "2m",
-            config.size_kb,
-            config.mixed_concurrent_ops,
+            wl_config.size_kb,
+            wl_config.mixed_concurrent_ops,
         )?;
     }
 
@@ -81,6 +90,8 @@ pub fn bootstrap(api_server_endpoint: String, bench_client_num: usize) -> CmdRes
     );
 
     create_bench_start_script(&region, &api_server_endpoint)?;
+
+    barrier.complete_stage(stages::SERVICES_READY, None)?;
 
     Ok(())
 }

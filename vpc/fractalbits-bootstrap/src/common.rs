@@ -3,7 +3,6 @@ use cmd_lib::*;
 use std::io::Error;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
-use xtask_common::{VpcTarget, get_bootstrap_bucket_name, is_ec2_environment};
 
 pub const BIN_PATH: &str = "/opt/fractalbits/bin/";
 pub const ETC_PATH: &str = "/opt/fractalbits/etc/";
@@ -48,7 +47,7 @@ pub fn download_binaries(file_list: &[&str]) -> CmdResult {
 }
 
 fn download_binary(file_name: &str) -> CmdResult {
-    let bootstrap_bucket = get_bootstrap_bucket()?;
+    let bootstrap_bucket = get_bootstrap_bucket();
     let cpu_arch = run_fun!(arch)?;
 
     let s3_path = if matches!(
@@ -74,14 +73,26 @@ pub fn download_from_s3(s3_path: &str, local_path: &str) -> CmdResult {
     )
 }
 
-pub fn get_bootstrap_bucket() -> FunResult {
-    let vpc_target = if is_ec2_environment() {
-        VpcTarget::Aws
-    } else {
-        VpcTarget::OnPrem
-    };
-    let bucket_name = get_bootstrap_bucket_name(vpc_target)?;
-    Ok(format!("s3://{bucket_name}"))
+pub fn get_bootstrap_bucket() -> String {
+    let bucket_name =
+        std::env::var("BOOTSTRAP_BUCKET").unwrap_or_else(|_| "fractalbits-bootstrap".to_string());
+    format!("s3://{bucket_name}")
+}
+
+pub fn backup_config_to_workflow(cluster_id: &str) -> CmdResult {
+    let bucket = get_bootstrap_bucket();
+    let local_path = format!("{ETC_PATH}{BOOTSTRAP_CONFIG}");
+    let workflow_path = format!("{bucket}/workflow/{cluster_id}/{BOOTSTRAP_CONFIG}");
+
+    // Check if already backed up (only first instance needs to do this)
+    let exists = run_fun!(aws s3 ls $workflow_path 2>/dev/null);
+    if exists.is_ok() && !exists.unwrap().trim().is_empty() {
+        return Ok(());
+    }
+
+    info!("Backing up bootstrap config to {workflow_path}");
+    run_cmd!(aws s3 cp $local_path $workflow_path --quiet)?;
+    Ok(())
 }
 
 pub fn create_systemd_unit_file(service_name: &str, enable_now: bool) -> CmdResult {

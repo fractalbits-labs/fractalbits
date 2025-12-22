@@ -1,5 +1,6 @@
 use crate::api_server;
 use crate::config::BootstrapConfig;
+use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use crate::*;
 
 pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
@@ -9,9 +10,12 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     let rss_ha_enabled = config.global.rss_ha_enabled;
 
+    let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Api)?;
+    barrier.complete_stage(stages::INSTANCES_READY, None)?;
+
     download_binaries(&["api_server"])?;
-    let builds_bucket = get_bootstrap_bucket()?;
-    run_cmd!(aws s3 cp --no-progress $builds_bucket/ui $GUI_WEB_ROOT --recursive)?;
+    let bootstrap_bucket = get_bootstrap_bucket();
+    run_cmd!(aws s3 cp --no-progress $bootstrap_bucket/ui $GUI_WEB_ROOT --recursive)?;
 
     api_server::create_config(
         data_blob_storage,
@@ -22,6 +26,8 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     )?;
     // setup_cloudwatch_agent()?;
     create_systemd_unit_file("gui_server", true)?;
+
+    barrier.complete_stage(stages::SERVICES_READY, None)?;
 
     Ok(())
 }

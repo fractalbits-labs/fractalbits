@@ -524,17 +524,18 @@ export class FractalbitsVpcStack extends cdk.Stack {
     // Each deployment gets fresh workflow state to avoid stale barrier objects
     const workflowClusterId = `fractalbits-${Date.now()}`;
 
-    const bootstrapConfigContent = createConfigWithCfnTokens(this, {
+    const bootstrapConfigContent = createConfigWithCfnTokens({
       forBench: !!props.benchType,
       dataBlobStorage: dataBlobStorage,
       rssHaEnabled: props.rootServerHa,
       rssBackend: props.rssBackend,
       journalType: props.journalType,
       numBssNodes: singleAz ? props.numBssNodes : undefined,
+      numApiServers: props.numApiServers,
+      numBenchClients: props.numBenchClients,
       dataBlobBucket: dataBlobBucket?.bucketName,
       localAz: azArray[0],
       remoteAz: multiAz ? azArray[1] : undefined,
-      iamRole: ec2Role.roleName,
       nssEndpoint: nssEndpoint,
       mirrordEndpoint:
         multiAz && mirrordPrivateLink

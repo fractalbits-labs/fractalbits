@@ -1,147 +1,10 @@
 import * as cdk from "aws-cdk-lib";
-import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as TOML from "@iarna/toml";
 
 export type DataBlobStorage =
   | "all_in_bss_single_az"
   | "s3_hybrid_single_az"
   | "s3_express_multi_az";
-
-export interface BootstrapConfigProps {
-  forBench: boolean;
-  dataBlobStorage: DataBlobStorage;
-  rssHaEnabled: boolean;
-  numBssNodes?: number;
-  metaStackTesting?: boolean;
-  bucket: string;
-  localAz: string;
-  remoteAz?: string;
-  iamRole: string;
-  nssEndpoint: string;
-  mirrordEndpoint?: string;
-  apiServerEndpoint: string;
-  instances: Record<string, ec2.Instance>;
-  nssAId: string;
-  nssBId?: string;
-  volumeAId: string;
-  volumeBId?: string;
-  benchClientNum?: number;
-}
-
-export interface InstanceConfigEntry {
-  instanceId: string;
-  serviceType: string;
-  role?: string;
-  leaderId?: string;
-  volumeId?: string;
-  benchClientNum?: number;
-}
-
-// Static config structure (values known at synthesis time)
-interface StaticConfig {
-  global: {
-    for_bench: boolean;
-    data_blob_storage: string;
-    rss_ha_enabled: boolean;
-    num_bss_nodes?: number;
-    meta_stack_testing?: boolean;
-  };
-  aws: {
-    bucket: string;
-    local_az: string;
-    remote_az?: string;
-    iam_role: string;
-  };
-  endpoints: {
-    nss_endpoint: string;
-    mirrord_endpoint?: string;
-    api_server_endpoint: string;
-  };
-  resources: {
-    nss_a_id: string;
-    nss_b_id?: string;
-    volume_a_id: string;
-    volume_b_id?: string;
-  };
-}
-
-// Build static config using TOML library (for configs without CFN tokens)
-export function buildBootstrapConfig(props: BootstrapConfigProps): string {
-  const config: StaticConfig = {
-    global: {
-      for_bench: props.forBench,
-      data_blob_storage: props.dataBlobStorage,
-      rss_ha_enabled: props.rssHaEnabled,
-    },
-    aws: {
-      bucket: props.bucket,
-      local_az: props.localAz,
-      iam_role: props.iamRole,
-    },
-    endpoints: {
-      nss_endpoint: props.nssEndpoint,
-      api_server_endpoint: props.apiServerEndpoint,
-    },
-    resources: {
-      nss_a_id: props.nssAId,
-      volume_a_id: props.volumeAId,
-    },
-  };
-
-  if (props.numBssNodes !== undefined) {
-    config.global.num_bss_nodes = props.numBssNodes;
-  }
-  if (props.metaStackTesting) {
-    config.global.meta_stack_testing = true;
-  }
-  if (props.remoteAz) {
-    config.aws.remote_az = props.remoteAz;
-  }
-  if (props.mirrordEndpoint) {
-    config.endpoints.mirrord_endpoint = props.mirrordEndpoint;
-  }
-  if (props.nssBId) {
-    config.resources.nss_b_id = props.nssBId;
-  }
-  if (props.volumeBId) {
-    config.resources.volume_b_id = props.volumeBId;
-  }
-
-  return (
-    "# Auto-generated bootstrap configuration\n# Do not edit manually\n\n" +
-    TOML.stringify(config as unknown as TOML.JsonMap)
-  );
-}
-
-// Build instance configs (for static instance IDs known at synthesis time)
-export function buildInstanceConfigs(entries: InstanceConfigEntry[]): string {
-  const instances: Record<string, TOML.JsonMap> = {};
-
-  for (const entry of entries) {
-    const instanceConfig: TOML.JsonMap = {
-      service_type: entry.serviceType,
-    };
-    if (entry.role) {
-      instanceConfig.role = entry.role;
-    }
-    if (entry.volumeId) {
-      instanceConfig.volume_id = entry.volumeId;
-    }
-    if (entry.benchClientNum !== undefined) {
-      instanceConfig.bench_client_num = entry.benchClientNum;
-    }
-    instances[entry.instanceId] = instanceConfig;
-  }
-
-  return TOML.stringify({ instances } as TOML.JsonMap);
-}
-
-export function buildFullConfig(
-  baseConfig: string,
-  instanceConfigs: string,
-): string {
-  return `${baseConfig}\n${instanceConfigs}`;
-}
 
 // Helper to create a TOML key-value line with a CFN token value
 function tomlLine(key: string, value: string): string {
@@ -155,34 +18,32 @@ function instanceHeader(instanceId: string): string {
 
 // Build config with CFN tokens (hybrid approach)
 // Static parts use TOML.stringify, dynamic parts use cdk.Fn.join
-export function createConfigWithCfnTokens(
-  scope: cdk.Stack,
-  props: {
-    forBench: boolean;
-    dataBlobStorage: DataBlobStorage;
-    rssHaEnabled: boolean;
-    rssBackend: "etcd" | "ddb";
-    journalType: "ebs" | "nvme";
-    numBssNodes?: number;
-    dataBlobBucket?: string;
-    localAz: string;
-    remoteAz?: string;
-    iamRole: string;
-    nssEndpoint: string;
-    mirrordEndpoint?: string;
-    apiServerEndpoint: string;
-    nssAId: string;
-    nssBId?: string;
-    volumeAId: string;
-    volumeBId?: string;
-    rssAId: string;
-    rssBId?: string;
-    guiServerId?: string;
-    benchServerId?: string;
-    benchClientNum?: number;
-    workflowClusterId?: string;
-  },
-): string {
+export function createConfigWithCfnTokens(props: {
+  forBench: boolean;
+  dataBlobStorage: DataBlobStorage;
+  rssHaEnabled: boolean;
+  rssBackend: "etcd" | "ddb";
+  journalType: "ebs" | "nvme";
+  numBssNodes?: number;
+  numApiServers?: number;
+  numBenchClients?: number;
+  dataBlobBucket?: string;
+  localAz: string;
+  remoteAz?: string;
+  nssEndpoint: string;
+  mirrordEndpoint?: string;
+  apiServerEndpoint: string;
+  nssAId: string;
+  nssBId?: string;
+  volumeAId: string;
+  volumeBId?: string;
+  rssAId: string;
+  rssBId?: string;
+  guiServerId?: string;
+  benchServerId?: string;
+  benchClientNum?: number;
+  workflowClusterId?: string;
+}): string {
   // Build static config using TOML library
   const staticConfig: Record<string, TOML.JsonMap> = {
     global: {
@@ -196,6 +57,13 @@ export function createConfigWithCfnTokens(
 
   if (props.numBssNodes !== undefined) {
     (staticConfig.global as TOML.JsonMap).num_bss_nodes = props.numBssNodes;
+  }
+  if (props.numApiServers !== undefined) {
+    (staticConfig.global as TOML.JsonMap).num_api_servers = props.numApiServers;
+  }
+  if (props.numBenchClients !== undefined) {
+    (staticConfig.global as TOML.JsonMap).num_bench_clients =
+      props.numBenchClients;
   }
 
   // Add workflow_cluster_id for S3-based workflow barriers

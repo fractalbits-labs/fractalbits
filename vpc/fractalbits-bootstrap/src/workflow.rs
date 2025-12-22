@@ -21,6 +21,7 @@ pub enum WorkflowServiceType {
     Nss,
     Bss,
     Api,
+    Bench,
 }
 
 impl WorkflowServiceType {
@@ -30,6 +31,7 @@ impl WorkflowServiceType {
             Self::Nss => "nss_server",
             Self::Bss => "bss_server",
             Self::Api => "api_server",
+            Self::Bench => "bench",
         }
     }
 }
@@ -76,7 +78,7 @@ impl WorkflowBarrier {
             .as_ref()
             .ok_or_else(|| Error::other("workflow_cluster_id not configured"))?;
 
-        let bucket = get_bootstrap_bucket()?
+        let bucket = get_bootstrap_bucket()
             .trim_start_matches("s3://")
             .to_string();
         let instance_id = get_instance_id()?;

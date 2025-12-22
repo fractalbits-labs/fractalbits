@@ -9,6 +9,7 @@ mod cmd_repo;
 mod cmd_run_tests;
 mod cmd_service;
 mod cmd_tool;
+mod deploy_bootstrap;
 mod etcd_utils;
 
 use clap::{ArgAction, Parser};
@@ -299,6 +300,9 @@ pub enum DeployCommand {
 
     #[clap(about = "Destroy VPC infrastructure (including s3 builds bucket cleanup)")]
     DestroyVpc,
+
+    #[clap(about = "Show bootstrap progress for a VPC deployment")]
+    BootstrapProgress,
 }
 
 #[derive(Clone, AsRefStr, EnumString, clap::ValueEnum)]
@@ -677,6 +681,7 @@ async fn main() -> CmdResult {
                 rss_backend,
             })?,
             DeployCommand::DestroyVpc => cmd_deploy::destroy_vpc()?,
+            DeployCommand::BootstrapProgress => deploy_bootstrap::show_progress()?,
         },
         Cmd::RunTests { test_type } => {
             let test_type = test_type.unwrap_or(TestType::All);

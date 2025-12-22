@@ -93,8 +93,8 @@ pub struct InstanceConfig {
 
 impl BootstrapConfig {
     pub fn download_and_parse() -> Result<Self, Error> {
-        let builds_bucket = get_bootstrap_bucket()?;
-        let s3_path = format!("{builds_bucket}/{BOOTSTRAP_CONFIG}");
+        let bootstrap_bucket = get_bootstrap_bucket();
+        let s3_path = format!("{bootstrap_bucket}/{BOOTSTRAP_CONFIG}");
         let local_path = format!("{ETC_PATH}{BOOTSTRAP_CONFIG}");
         let instance_id = get_instance_id()?;
 
