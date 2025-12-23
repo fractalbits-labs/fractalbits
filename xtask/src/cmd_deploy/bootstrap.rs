@@ -1,4 +1,6 @@
-use crate::cmd_deploy::{VpcTarget, get_bootstrap_bucket_name};
+use super::common::VpcTarget;
+use super::upload::get_bootstrap_bucket_name;
+use crate::CmdResult;
 use cmd_lib::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Deserialize;

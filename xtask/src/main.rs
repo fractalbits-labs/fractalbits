@@ -9,7 +9,6 @@ mod cmd_repo;
 mod cmd_run_tests;
 mod cmd_service;
 mod cmd_tool;
-mod deploy_bootstrap;
 mod etcd_utils;
 
 use clap::{ArgAction, Parser};
@@ -685,7 +684,7 @@ async fn main() -> CmdResult {
             })?,
             DeployCommand::DestroyVpc => cmd_deploy::destroy_vpc()?,
             DeployCommand::BootstrapProgress { vpc_target } => {
-                deploy_bootstrap::show_progress(vpc_target)?
+                cmd_deploy::bootstrap::show_progress(vpc_target)?
             }
         },
         Cmd::RunTests { test_type } => {
