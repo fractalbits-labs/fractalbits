@@ -21,6 +21,16 @@ pub fn gen_version_id() -> Uuid {
 impl ObjectLayout {
     pub const DEFAULT_BLOCK_SIZE: u32 = 1024 * 1024 - 256;
 
+    /// Returns true if the object is in a final state and can be listed/returned.
+    /// Objects in Mpu(Uploading) or Mpu(Aborted) states are not listable.
+    #[inline]
+    pub fn is_listable(&self) -> bool {
+        matches!(
+            &self.state,
+            ObjectState::Normal(_) | ObjectState::Mpu(MpuState::Completed(_))
+        )
+    }
+
     #[inline]
     pub fn get_blob_location(&self) -> Result<BlobLocation, S3Error> {
         let blob_guid = self.blob_guid()?;

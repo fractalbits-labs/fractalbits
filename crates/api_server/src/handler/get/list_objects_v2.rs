@@ -339,6 +339,10 @@ pub async fn list_objects(
         match rkyv::from_bytes::<ObjectLayout, Error>(&inode_with_key.inode) {
             Err(e) => return Err(e.into()),
             Ok(obj) => {
+                // Skip objects in non-final states (e.g., in-progress or aborted MPU)
+                if !obj.is_listable() {
+                    continue;
+                }
                 let mut key = inode_with_key.key[1..].to_owned();
                 assert_eq!(Some('\0'), key.pop()); // removing nss's trailing '\0'
                 objs.push(Object::from_layout_and_key(obj, key)?);
