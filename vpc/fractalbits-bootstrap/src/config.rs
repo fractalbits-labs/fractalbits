@@ -31,8 +31,18 @@ pub enum JournalType {
     Nvme,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VpcTarget {
+    #[default]
+    Aws,
+    OnPrem,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct GlobalConfig {
+    #[serde(default)]
+    pub target: VpcTarget,
     pub for_bench: bool,
     pub data_blob_storage: String,
     pub rss_ha_enabled: bool,
@@ -44,7 +54,8 @@ pub struct GlobalConfig {
     pub num_bss_nodes: Option<usize>,
     #[serde(default)]
     pub meta_stack_testing: bool,
-    /// Unique cluster ID for workflow barriers (set by CDK at deploy time)
+    #[serde(default)]
+    pub cpu_target: Option<String>,
     #[serde(default)]
     pub workflow_cluster_id: Option<String>,
 }
@@ -53,6 +64,8 @@ pub struct GlobalConfig {
 pub struct EtcdConfig {
     pub enabled: bool,
     pub cluster_size: usize,
+    #[serde(default)]
+    pub endpoints: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +102,8 @@ pub struct InstanceConfig {
     pub volume_id: Option<String>,
     #[serde(default)]
     pub bench_client_num: Option<usize>,
+    #[serde(default)]
+    pub private_ip: Option<String>,
 }
 
 impl BootstrapConfig {
@@ -96,7 +111,6 @@ impl BootstrapConfig {
         let bootstrap_bucket = get_bootstrap_bucket();
         let s3_path = format!("{bootstrap_bucket}/{BOOTSTRAP_CONFIG}");
         let local_path = format!("{ETC_PATH}{BOOTSTRAP_CONFIG}");
-        let instance_id = get_instance_id()?;
 
         let start_time = Instant::now();
         let timeout = Duration::from_secs(CONFIG_RETRY_TIMEOUT_SECS);
@@ -119,6 +133,12 @@ impl BootstrapConfig {
             let content = std::fs::read_to_string(&local_path)?;
             let config: BootstrapConfig = toml::from_str(&content)
                 .map_err(|e| Error::other(format!("TOML parse error: {e}")))?;
+
+            // Get instance_id based on target (hostname for on-prem, EC2 metadata for AWS)
+            let instance_id = match config.global.target {
+                VpcTarget::OnPrem => run_fun!(hostname)?,
+                VpcTarget::Aws => get_instance_id()?,
+            };
 
             if config.instances.contains_key(&instance_id) {
                 info!("Found instance {instance_id} in bootstrap config");

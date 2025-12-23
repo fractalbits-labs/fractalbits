@@ -1,5 +1,5 @@
 use super::common::*;
-use crate::config::BootstrapConfig;
+use crate::config::{BootstrapConfig, VpcTarget};
 use crate::workflow::{EtcdNodeInfo, WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use rayon::prelude::*;
@@ -55,12 +55,12 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
 
     install_rpms(&["nvme-cli", "mdadm"])?;
     format_local_nvme_disks(false)?; // no twp support since experiment is done
-    create_ddb_register_and_deregister_service("bss-server")?;
+
     let mut binaries = vec!["bss_server"];
     if use_etcd {
         binaries.push("etcdctl");
     }
-    download_binaries(&binaries)?;
+    download_binaries(config, &binaries)?;
 
     create_coredump_config()?;
 
@@ -68,11 +68,13 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     run_cmd!(mkdir -p "/data/local/stats")?;
 
     if meta_stack_testing || for_bench {
-        let _ = download_binaries(&["rewrk_rpc"]); // i3, i3en may not compile rewrk_rpc tool
+        let _ = download_binaries(config, &["rewrk_rpc"]); // i3, i3en may not compile rewrk_rpc tool
     }
 
     create_logrotate_for_stats()?;
-    create_ena_irq_affinity_service()?;
+    if config.global.target == VpcTarget::Aws {
+        create_ena_irq_affinity_service()?;
+    }
     create_nvme_tuning_service()?;
 
     // Start etcd using workflow-based cluster discovery
@@ -81,8 +83,12 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
         && etcd_config.enabled
     {
         info!("Starting etcd bootstrap with workflow-based cluster discovery");
-        bootstrap_etcd(&barrier, etcd_config)?;
+        bootstrap_etcd(config, &barrier, etcd_config)?;
     }
+
+    // Register BSS service AFTER etcd is bootstrapped (if using etcd backend)
+    // This ensures etcd endpoints are available for registration
+    register_service(config, "bss-server")?;
 
     // Wait for RSS to initialize and publish volume configs
     info!("Waiting for RSS to initialize...");
@@ -105,7 +111,11 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     Ok(())
 }
 
-fn bootstrap_etcd(barrier: &WorkflowBarrier, etcd_config: &crate::config::EtcdConfig) -> CmdResult {
+fn bootstrap_etcd(
+    config: &BootstrapConfig,
+    barrier: &WorkflowBarrier,
+    etcd_config: &crate::config::EtcdConfig,
+) -> CmdResult {
     let cluster_size = etcd_config.cluster_size;
 
     // REGISTER: Write node info to S3 via workflow barrier
@@ -126,7 +136,7 @@ fn bootstrap_etcd(barrier: &WorkflowBarrier, etcd_config: &crate::config::EtcdCo
     info!("Generated initial-cluster: {initial_cluster}");
 
     // START: All nodes start etcd together with initial-cluster-state: new
-    super::etcd_server::bootstrap_new_cluster(&initial_cluster)?;
+    super::etcd_server::bootstrap_new_cluster(config, &initial_cluster)?;
 
     // Signal that etcd cluster is ready (any node can do this, idempotent)
     // Only one node needs to signal, but it's safe for all to try
@@ -136,7 +146,7 @@ fn bootstrap_etcd(barrier: &WorkflowBarrier, etcd_config: &crate::config::EtcdCo
 }
 
 fn setup_volume_directories(config: &BootstrapConfig, use_etcd: bool) -> CmdResult {
-    let instance_id = get_instance_id()?;
+    let instance_id = get_instance_id_from_config(config)?;
     info!("BSS instance ID: {instance_id}");
 
     let assignments = match wait_for_volume_configs(config, use_etcd) {
@@ -256,7 +266,7 @@ fn get_etcd_config(config: &BootstrapConfig, service_key: &str) -> FunResult {
     let bucket = get_bootstrap_bucket()
         .trim_start_matches("s3://")
         .to_string();
-    let instance_id = get_instance_id()?;
+    let instance_id = get_instance_id_from_config(config)?;
     let barrier = WorkflowBarrier::new(&bucket, cluster_id, &instance_id, "bss_server");
 
     let nodes = barrier.get_etcd_nodes()?;
@@ -290,7 +300,7 @@ fn get_volume_assignments(
     // For etcd backend, configs use IP addresses as identifiers
     // For DDB backend, configs use instance IDs
     let my_ip = if use_etcd {
-        Some(get_private_ip()?)
+        Some(get_private_ip_from_config(config, instance_id)?)
     } else {
         None
     };

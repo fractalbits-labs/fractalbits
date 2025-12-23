@@ -151,20 +151,36 @@ fn get_workflow_config_by_id(bucket: &str, cluster_id: &str) -> Result<WorkflowC
     parse_workflow_config(&content)
 }
 
-fn count_stage_completions(bucket: &str, cluster_id: &str, stage: &str) -> usize {
-    let prefix = format!("s3://{bucket}/workflow/{cluster_id}/stages/{stage}/");
-    let output = run_fun!(aws s3 ls $prefix 2>/dev/null).unwrap_or_default();
-    output.lines().filter(|l| l.ends_with(".json")).count()
+/// Cached S3 listing for all stages - avoids repeated S3 calls
+struct StageCache {
+    /// Lines from `aws s3 ls --recursive` output
+    lines: Vec<String>,
 }
 
-fn check_global_stage(bucket: &str, cluster_id: &str, stage: &str) -> bool {
-    let path = format!("s3://{bucket}/workflow/{cluster_id}/stages/{stage}.json");
-    let result = run_fun!(aws s3 ls $path 2>/dev/null);
-    result.is_ok() && !result.unwrap().trim().is_empty()
+impl StageCache {
+    fn fetch(bucket: &str, cluster_id: &str) -> Self {
+        let prefix = format!("s3://{bucket}/workflow/{cluster_id}/stages/");
+        let output = run_fun!(aws s3 ls --recursive $prefix 2>/dev/null).unwrap_or_default();
+        let lines = output.lines().map(|s| s.to_string()).collect();
+        Self { lines }
+    }
+
+    fn count_stage_completions(&self, stage: &str) -> usize {
+        let stage_prefix = format!("stages/{stage}/");
+        self.lines
+            .iter()
+            .filter(|l| l.contains(&stage_prefix) && l.ends_with(".json"))
+            .count()
+    }
+
+    fn check_global_stage(&self, stage: &str) -> bool {
+        let stage_file = format!("stages/{stage}.json");
+        self.lines.iter().any(|l| l.contains(&stage_file))
+    }
 }
 
-pub fn show_progress() -> CmdResult {
-    let bucket = get_bootstrap_bucket_name(VpcTarget::Aws)?;
+pub fn show_progress(target: VpcTarget) -> CmdResult {
+    let bucket = get_bootstrap_bucket_name(target)?;
 
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
@@ -252,6 +268,8 @@ pub fn show_progress() -> CmdResult {
     }
 
     loop {
+        // Single S3 call per iteration - fetch all stage data at once
+        let cache = StageCache::fetch(&bucket, &cluster_id);
         let mut all_complete = true;
 
         for (pb, stage, expected, finished) in &mut bars {
@@ -261,7 +279,7 @@ pub fn show_progress() -> CmdResult {
 
             let desc = stage.desc;
             if stage.is_global {
-                let complete = check_global_stage(&bucket, &cluster_id, stage.name);
+                let complete = cache.check_global_stage(stage.name);
                 if complete {
                     pb.set_style(style_global_done.clone());
                     pb.set_prefix("[OK]");
@@ -273,7 +291,7 @@ pub fn show_progress() -> CmdResult {
                     pb.set_prefix("[..]");
                 }
             } else {
-                let count = count_stage_completions(&bucket, &cluster_id, stage.name);
+                let count = cache.count_stage_completions(stage.name);
                 pb.set_position(count as u64);
 
                 if count >= *expected {

@@ -2,7 +2,7 @@ pub mod ebs_journal;
 pub mod nvme_journal;
 
 use super::common::*;
-use crate::config::{BootstrapConfig, JournalType};
+use crate::config::{BootstrapConfig, JournalType, VpcTarget};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use rayon::prelude::*;
@@ -13,7 +13,6 @@ const NSS_META_CACHE_SHARDS: usize = 256;
 
 pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: bool) -> CmdResult {
     let mirrord_endpoint = config.endpoints.mirrord_endpoint.as_deref();
-    let rss_ha_enabled = config.global.rss_ha_enabled;
     let meta_stack_testing = config.global.meta_stack_testing;
     let journal_type = config.global.journal_type;
 
@@ -24,22 +23,29 @@ pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: b
 
     install_rpms(&["nvme-cli", "mdadm"])?;
     if meta_stack_testing || for_bench {
-        download_binaries(&["test_fractal_art", "rewrk_rpc"])?;
+        let _ = download_binaries(config, &["test_fractal_art", "rewrk_rpc"]);
     }
     format_local_nvme_disks(false)?;
-    download_binaries(&["nss_server", "nss_role_agent"])?;
 
-    setup_configs(
-        journal_type,
-        volume_id,
-        "nss",
-        mirrord_endpoint,
-        rss_ha_enabled,
-    )?;
+    let mut binaries = vec!["nss_server", "nss_role_agent"];
+    if config.is_etcd_backend() {
+        binaries.push("etcdctl");
+    }
+    download_binaries(config, &binaries)?;
 
-    // Wait for RSS to initialize before proceeding with journal formatting
+    // When using etcd backend, wait for etcd cluster to be ready first
+    if config.is_etcd_backend() {
+        info!("Waiting for etcd cluster to be ready...");
+        barrier.wait_for_global(stages::ETCD_READY, timeouts::ETCD_READY)?;
+        info!("etcd cluster is ready");
+    }
+
+    // Wait for RSS to initialize - RSS will have registered with service discovery by then
+    // This must happen before setup_configs because create_nss_role_agent_config needs RSS IPs
     info!("Waiting for RSS to initialize...");
     barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
+
+    setup_configs(config, journal_type, volume_id, "nss", mirrord_endpoint)?;
 
     // Format journal based on type
     match journal_type {
@@ -72,11 +78,11 @@ pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: b
 }
 
 fn setup_configs(
+    config: &BootstrapConfig,
     journal_type: JournalType,
     volume_id: Option<&str>,
     service_name: &str,
     mirrord_endpoint: Option<&str>,
-    rss_ha_enabled: bool,
 ) -> CmdResult {
     // Journal-type specific config paths
     let (volume_dev, shared_dir) = match journal_type {
@@ -97,7 +103,7 @@ fn setup_configs(
 
     // Common configs
     create_coredump_config()?;
-    create_nss_role_agent_config(mirrord_endpoint, rss_ha_enabled)?;
+    create_nss_role_agent_config(config, mirrord_endpoint)?;
     create_systemd_unit_file("nss_role_agent", false)?;
 
     // Systemd units - NVMe needs journal_type for local mount dependency
@@ -105,7 +111,9 @@ fn setup_configs(
     create_systemd_unit_file_with_journal_type(service_name, false, Some(journal_type))?;
 
     create_logrotate_for_stats()?;
-    create_ena_irq_affinity_service()?;
+    if config.global.target == VpcTarget::Aws {
+        create_ena_irq_affinity_service()?;
+    }
     create_nvme_tuning_service()?;
     Ok(())
 }
@@ -223,12 +231,16 @@ pub(crate) fn format_nss(create_journal_dir: bool) -> CmdResult {
     Ok(())
 }
 
-fn create_nss_role_agent_config(mirrord_endpoint: Option<&str>, rss_ha_enabled: bool) -> CmdResult {
-    let instance_id = get_instance_id()?;
+fn create_nss_role_agent_config(
+    config: &BootstrapConfig,
+    mirrord_endpoint: Option<&str>,
+) -> CmdResult {
+    let rss_ha_enabled = config.global.rss_ha_enabled;
+    let instance_id = get_instance_id_from_config(config)?;
 
-    // Query DDB for RSS instance IPs
+    // Query service discovery for RSS instance IPs
     let expected_rss_count = if rss_ha_enabled { 2 } else { 1 };
-    let rss_ips = get_service_ips("root-server", expected_rss_count);
+    let rss_ips = get_service_ips_with_backend(config, "root-server", expected_rss_count);
     let rss_addrs_toml = rss_ips
         .iter()
         .map(|ip| format!("\"{}:8088\"", ip))

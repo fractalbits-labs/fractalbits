@@ -6,6 +6,8 @@ export type DataBlobStorage =
   | "s3_hybrid_single_az"
   | "s3_express_multi_az";
 
+export type VpcTarget = "aws" | "on_prem";
+
 // Helper to create a TOML key-value line with a CFN token value
 function tomlLine(key: string, value: string): string {
   return cdk.Fn.join("", [key, ' = "', value, '"']);
@@ -16,9 +18,16 @@ function instanceHeader(instanceId: string): string {
   return cdk.Fn.join("", ['[instances."', instanceId, '"]']);
 }
 
+// Instance configuration with optional private IP
+export interface InstanceProps {
+  id: string;
+  privateIp?: string;
+}
+
 // Build config with CFN tokens (hybrid approach)
 // Static parts use TOML.stringify, dynamic parts use cdk.Fn.join
 export function createConfigWithCfnTokens(props: {
+  target?: VpcTarget; // defaults to "aws"
   forBench: boolean;
   dataBlobStorage: DataBlobStorage;
   rssHaEnabled: boolean;
@@ -27,26 +36,31 @@ export function createConfigWithCfnTokens(props: {
   numBssNodes?: number;
   numApiServers?: number;
   numBenchClients?: number;
+  cpuTarget?: string; // e.g., "i3", "graviton3"
   dataBlobBucket?: string;
   localAz: string;
   remoteAz?: string;
   nssEndpoint: string;
   mirrordEndpoint?: string;
   apiServerEndpoint: string;
-  nssAId: string;
-  nssBId?: string;
+  nssA: InstanceProps;
+  nssB?: InstanceProps;
   volumeAId: string;
   volumeBId?: string;
-  rssAId: string;
-  rssBId?: string;
-  guiServerId?: string;
-  benchServerId?: string;
+  rssA: InstanceProps;
+  rssB?: InstanceProps;
+  guiServer?: InstanceProps;
+  benchServer?: InstanceProps;
   benchClientNum?: number;
   workflowClusterId?: string;
+  etcdEndpoints?: string; // for static etcd endpoints
+  bootstrapBucket?: string; // S3 bucket name for bootstrap files
 }): string {
   // Build static config using TOML library
+  const target = props.target ?? "aws";
   const staticConfig: Record<string, TOML.JsonMap> = {
     global: {
+      target: target,
       for_bench: props.forBench,
       data_blob_storage: props.dataBlobStorage,
       rss_ha_enabled: props.rssHaEnabled,
@@ -54,6 +68,11 @@ export function createConfigWithCfnTokens(props: {
       journal_type: props.journalType,
     },
   };
+
+  if (props.bootstrapBucket) {
+    (staticConfig.global as TOML.JsonMap).bootstrap_bucket =
+      props.bootstrapBucket;
+  }
 
   if (props.numBssNodes !== undefined) {
     (staticConfig.global as TOML.JsonMap).num_bss_nodes = props.numBssNodes;
@@ -64,6 +83,9 @@ export function createConfigWithCfnTokens(props: {
   if (props.numBenchClients !== undefined) {
     (staticConfig.global as TOML.JsonMap).num_bench_clients =
       props.numBenchClients;
+  }
+  if (props.cpuTarget) {
+    (staticConfig.global as TOML.JsonMap).cpu_target = props.cpuTarget;
   }
 
   // Add workflow_cluster_id for S3-based workflow barriers
@@ -102,9 +124,9 @@ export function createConfigWithCfnTokens(props: {
   // [resources] section with CFN tokens
   lines.push("");
   lines.push("[resources]");
-  lines.push(tomlLine("nss_a_id", props.nssAId));
-  if (props.nssBId) {
-    lines.push(tomlLine("nss_b_id", props.nssBId));
+  lines.push(tomlLine("nss_a_id", props.nssA.id));
+  if (props.nssB) {
+    lines.push(tomlLine("nss_b_id", props.nssB.id));
   }
   // Only include volume IDs for ebs journal type
   if (props.journalType === "ebs" && props.volumeAId) {
@@ -120,50 +142,67 @@ export function createConfigWithCfnTokens(props: {
     lines.push("[etcd]");
     lines.push("enabled = true");
     lines.push(`cluster_size = ${props.numBssNodes}`);
+    // Add static endpoints for on-prem
+    if (props.etcdEndpoints) {
+      lines.push(tomlLine("endpoints", props.etcdEndpoints));
+    }
   }
+
+  // Helper to add private_ip if present
+  const addPrivateIp = (instance: InstanceProps) => {
+    if (instance.privateIp) {
+      lines.push(tomlLine("private_ip", instance.privateIp));
+    }
+  };
 
   // Instance sections with CFN tokens
   lines.push("");
-  lines.push(instanceHeader(props.rssAId));
+  lines.push(instanceHeader(props.rssA.id));
   lines.push('service_type = "root_server"');
   lines.push('role = "leader"');
+  addPrivateIp(props.rssA);
 
-  if (props.rssBId) {
+  if (props.rssB) {
     lines.push("");
-    lines.push(instanceHeader(props.rssBId));
+    lines.push(instanceHeader(props.rssB.id));
     lines.push('service_type = "root_server"');
     lines.push('role = "follower"');
+    addPrivateIp(props.rssB);
   }
 
   lines.push("");
-  lines.push(instanceHeader(props.nssAId));
+  lines.push(instanceHeader(props.nssA.id));
   lines.push('service_type = "nss_server"');
   // Only include volume_id for ebs journal type
   if (props.journalType === "ebs" && props.volumeAId) {
     lines.push(tomlLine("volume_id", props.volumeAId));
   }
+  addPrivateIp(props.nssA);
 
-  if (props.nssBId) {
+  if (props.nssB) {
     lines.push("");
-    lines.push(instanceHeader(props.nssBId));
+    lines.push(instanceHeader(props.nssB.id));
     lines.push('service_type = "nss_server"');
     // Only include volume_id for ebs journal type
     if (props.journalType === "ebs" && props.volumeBId) {
       lines.push(tomlLine("volume_id", props.volumeBId));
     }
+    addPrivateIp(props.nssB);
   }
 
-  if (props.guiServerId) {
+  if (props.guiServer) {
     lines.push("");
-    lines.push(instanceHeader(props.guiServerId));
+    lines.push(instanceHeader(props.guiServer.id));
     lines.push('service_type = "gui_server"');
+    addPrivateIp(props.guiServer);
   }
 
-  if (props.benchServerId && props.benchClientNum !== undefined) {
+  if (props.benchServer && props.benchClientNum !== undefined) {
     lines.push("");
-    lines.push(instanceHeader(props.benchServerId));
+    lines.push(instanceHeader(props.benchServer.id));
     lines.push('service_type = "bench_server"');
     lines.push(`bench_client_num = ${props.benchClientNum}`);
+    addPrivateIp(props.benchServer);
   }
 
   lines.push("");

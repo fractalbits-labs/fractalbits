@@ -1,21 +1,21 @@
-use crate::config::BootstrapConfig;
+use crate::config::{BootstrapConfig, VpcTarget};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use crate::*;
 use std::io::Error;
 
 pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
-    let data_blob_storage = &config.global.data_blob_storage;
-    let data_blob_bucket = config.aws.as_ref().map(|aws| aws.data_blob_bucket.as_str());
     let nss_endpoint = &config.endpoints.nss_endpoint;
     let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
-    let rss_ha_enabled = config.global.rss_ha_enabled;
 
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Api)?;
-
     // Complete instances-ready stage
     barrier.complete_stage(stages::INSTANCES_READY, None)?;
 
-    download_binaries(&["api_server"])?;
+    let mut binaries = vec!["api_server"];
+    if config.is_etcd_backend() {
+        binaries.push("etcdctl");
+    }
+    download_binaries(config, &binaries)?;
 
     // Wait for RSS to initialize before we can get RSS IPs
     info!("Waiting for RSS to initialize...");
@@ -31,27 +31,23 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
         timeouts::NSS_JOURNAL_READY,
     )?;
 
-    create_config(
-        data_blob_storage,
-        data_blob_bucket,
-        nss_endpoint,
-        remote_az,
-        rss_ha_enabled,
-    )?;
+    create_config(config, nss_endpoint)?;
 
     info!("Creating directories for api_server");
     run_cmd!(mkdir -p "/data/local/stats")?;
 
     if for_bench {
         // Try to download tools for micro-benchmarking
-        download_binaries(&["rewrk_rpc", "test_fractal_art"])?;
+        let _ = download_binaries(config, &["rewrk_rpc", "test_fractal_art"]);
     }
 
-    create_ena_irq_affinity_service()?;
+    if config.global.target == VpcTarget::Aws {
+        create_ena_irq_affinity_service()?;
+    }
 
     // setup_cloudwatch_agent()?;
     create_systemd_unit_file("api_server", true)?;
-    create_ddb_register_and_deregister_service("api-server")?;
+    register_service(config, "api-server")?;
 
     // Signal that API server is ready
     barrier.complete_stage(stages::SERVICES_READY, None)?;
@@ -59,19 +55,21 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     Ok(())
 }
 
-pub fn create_config(
-    data_blob_storage: &str,
-    data_blob_bucket: Option<&str>,
-    nss_endpoint: &str,
-    remote_az: Option<&str>,
-    rss_ha_enabled: bool,
-) -> CmdResult {
-    let aws_region = get_current_aws_region()?;
+pub fn create_config(config: &BootstrapConfig, nss_endpoint: &str) -> CmdResult {
+    let data_blob_storage = &config.global.data_blob_storage;
+    let data_blob_bucket = config.aws.as_ref().map(|aws| aws.data_blob_bucket.as_str());
+    let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
+    let rss_ha_enabled = config.global.rss_ha_enabled;
+
+    let region = match config.global.target {
+        VpcTarget::Aws => get_current_aws_region()?,
+        VpcTarget::OnPrem => "on-prem".to_string(),
+    };
     let num_cores = num_cpus()?;
 
-    // Query DDB for RSS instance IPs
+    // Query service discovery for RSS instance IPs
     let expected_rss_count = if rss_ha_enabled { 2 } else { 1 };
-    let rss_ips = get_service_ips("root-server", expected_rss_count);
+    let rss_ips = get_service_ips_with_backend(config, "root-server", expected_rss_count);
     let rss_addrs_toml = rss_ips
         .iter()
         .map(|ip| format!("\"{}:8088\"", ip))
@@ -81,6 +79,7 @@ pub fn create_config(
     let config_content = if data_blob_storage == "s3_express_multi_az" {
         let remote_az =
             remote_az.ok_or_else(|| Error::other("remote_az required for s3_express_multi_az"))?;
+        let aws_region = get_current_aws_region()?;
         // S3 Express Multi-AZ configuration
         let local_az = get_current_aws_az_id()?;
         let local_bucket = get_s3_express_bucket_name(&local_az)?;
@@ -141,7 +140,8 @@ backoff_multiplier = 1.0
 "##
         )
     } else if let Some(bucket_name) = data_blob_bucket {
-        // S3 Hybrid single-az configuration
+        // S3 Hybrid single-az configuration (AWS only)
+        let aws_region = get_current_aws_region()?;
         format!(
             r##"nss_addr = "{nss_endpoint}:8088"
 rss_addrs = [{rss_addrs_toml}]
@@ -196,7 +196,7 @@ backoff_multiplier = 1.8
         format!(
             r##"nss_addr = "{nss_endpoint}:8088"
 rss_addrs = [{rss_addrs_toml}]
-region = "{aws_region}"
+region = "{region}"
 port = 80
 mgmt_port = 18088
 root_domain = ".localhost"

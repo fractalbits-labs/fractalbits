@@ -19,7 +19,6 @@ pub enum VpcTarget {
 /// Check if we're running in an cloud/on-prem environment (as a system service)
 pub fn is_vpc_environment() -> bool {
     Path::new("/opt/fractalbits/bin/fractalbits-bootstrap").exists()
-        || Path::new("/opt/fractalbits/bin/fractalbits-bootstrap-ec2").exists()
 }
 
 // Support GenUuids only for now

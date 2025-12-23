@@ -3,8 +3,8 @@ mod yaml_mixed;
 mod yaml_put;
 
 use super::common::*;
-use crate::config::BootstrapConfig;
-use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
+use crate::config::{BootstrapConfig, VpcTarget};
+use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use std::time::Duration;
 use {yaml_get::*, yaml_mixed::*, yaml_put::*};
@@ -39,12 +39,26 @@ pub fn bootstrap(
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Bench)?;
     barrier.complete_stage(stages::INSTANCES_READY, None)?;
 
-    download_binaries(&["warp"])?;
+    let mut binaries = vec!["warp"];
+    if config.is_etcd_backend() {
+        binaries.push("etcdctl");
+    }
+    download_binaries(config, &binaries)?;
     setup_serial_console_password()?;
 
-    let client_ips = get_service_ips("bench-client", bench_client_num);
+    // When using etcd backend, wait for etcd cluster to be ready before service discovery
+    if config.is_etcd_backend() {
+        info!("Waiting for etcd cluster to be ready...");
+        barrier.wait_for_global(stages::ETCD_READY, timeouts::ETCD_READY)?;
+        info!("etcd cluster is ready");
+    }
 
-    let region = get_current_aws_region()?;
+    let client_ips = get_service_ips_with_backend(config, "bench-client", bench_client_num);
+
+    let region = match config.global.target {
+        VpcTarget::Aws => get_current_aws_region()?,
+        VpcTarget::OnPrem => "on-prem".to_string(),
+    };
     let mut warp_client_ips = String::new();
     for ip in client_ips.iter() {
         warp_client_ips.push_str(&format!("  - {ip}:7761\n"));

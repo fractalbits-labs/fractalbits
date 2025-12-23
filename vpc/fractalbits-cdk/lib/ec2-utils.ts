@@ -154,10 +154,7 @@ export const createUserData = (scope: Construct): ec2.UserData => {
   const bucketName = `fractalbits-bootstrap-${region}-${account}`;
   const userData = ec2.UserData.forLinux();
   userData.addCommands(
-    "set -ex",
-    `aws s3 cp --no-progress s3://${bucketName}/$(arch)/fractalbits-bootstrap /opt/fractalbits/bin/fractalbits-bootstrap-ec2`,
-    "chmod +x /opt/fractalbits/bin/fractalbits-bootstrap-ec2",
-    `BOOTSTRAP_BUCKET=${bucketName} /opt/fractalbits/bin/fractalbits-bootstrap-ec2`,
+    `aws s3 cp --no-progress s3://${bucketName}/bootstrap.sh - | sh`,
   );
   return userData;
 };

@@ -1,5 +1,5 @@
 use super::common::*;
-use crate::config::BootstrapConfig;
+use crate::config::{BootstrapConfig, VpcTarget};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use std::io::Error;
@@ -50,7 +50,7 @@ fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: 
     if config.is_etcd_backend() {
         binaries.push("etcdctl");
     }
-    download_binaries(&binaries)?;
+    download_binaries(config, &binaries)?;
 
     // Wait for leader to initialize RSS
     info!("Follower waiting for RSS leader to initialize...");
@@ -58,7 +58,7 @@ fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: 
 
     create_rss_config(config, nss_endpoint, ha_enabled)?;
     create_systemd_unit_file("rss", true)?; // Start immediately
-    create_ddb_register_and_deregister_service("root-server")?;
+    register_service(config, "root-server")?;
 
     // Complete services-ready stage
     barrier.complete_stage(stages::SERVICES_READY, None)?;
@@ -92,16 +92,18 @@ fn bootstrap_leader(
     if config.is_etcd_backend() {
         binaries.push("etcdctl");
     }
-    download_binaries(&binaries)?;
+    download_binaries(config, &binaries)?;
 
-    // Initialize AZ status if this is a multi-AZ deployment
-    if let Some(remote_az) = remote_az {
+    // Initialize AZ status if this is a multi-AZ deployment (AWS only)
+    if let Some(remote_az) = remote_az
+        && config.global.target == VpcTarget::Aws
+    {
         initialize_az_status(config, remote_az)?;
     }
 
     create_rss_config(config, nss_endpoint, ha_enabled)?;
     create_systemd_unit_file("rss", true)?;
-    create_ddb_register_and_deregister_service("root-server")?;
+    register_service(config, "root-server")?;
 
     // Wait for RSS to be ready before signaling RSS_INITIALIZED
     if ha_enabled {
@@ -110,8 +112,10 @@ fn bootstrap_leader(
         wait_for_service_ready("root_server", 8088, 300)?;
     }
 
-    // Create S3 Express buckets if remote_az is provided
-    if let Some(remote_az) = remote_az {
+    // Create S3 Express buckets if remote_az is provided (AWS only)
+    if let Some(remote_az) = remote_az
+        && config.global.target == VpcTarget::Aws
+    {
         let local_az = get_current_aws_az_id()?;
         create_s3_express_bucket(&local_az, S3EXPRESS_LOCAL_BUCKET_CONFIG)?;
         create_s3_express_bucket(remote_az, S3EXPRESS_REMOTE_BUCKET_CONFIG)?;
@@ -172,7 +176,7 @@ fn initialize_nss_roles(
 
     if config.is_etcd_backend() {
         let etcdctl = format!("{BIN_PATH}etcdctl");
-        let etcd_endpoints = get_etcd_endpoints(config)?;
+        let etcd_endpoints = get_etcd_endpoints_from_workflow(config)?;
         let key = "/fractalbits-service-discovery/nss_roles";
         run_cmd!($etcdctl --endpoints=$etcd_endpoints put $key $nss_roles_json >/dev/null)?;
     } else {
@@ -279,7 +283,7 @@ fn initialize_bss_volume_groups(
 
     if config.is_etcd_backend() {
         let etcdctl = format!("{BIN_PATH}etcdctl");
-        let etcd_endpoints = get_etcd_endpoints(config)?;
+        let etcd_endpoints = get_etcd_endpoints_from_workflow(config)?;
         let data_key = "/fractalbits-service-discovery/bss-data-vg-config";
         let metadata_key = "/fractalbits-service-discovery/bss-metadata-vg-config";
         run_cmd! {
@@ -425,7 +429,7 @@ fn initialize_az_status(config: &BootstrapConfig, remote_az: &str) -> CmdResult 
 
     if config.is_etcd_backend() {
         let etcdctl = format!("{BIN_PATH}etcdctl");
-        let etcd_endpoints = get_etcd_endpoints(config)?;
+        let etcd_endpoints = get_etcd_endpoints_from_workflow(config)?;
         let key = "/fractalbits-service-discovery/az_status";
         let az_status_json =
             format!(r#"{{"status":{{"{local_az}":"Normal","{remote_az}":"Normal"}}}}"#);
@@ -449,8 +453,13 @@ fn initialize_az_status(config: &BootstrapConfig, remote_az: &str) -> CmdResult 
     Ok(())
 }
 
-fn get_etcd_endpoints(config: &BootstrapConfig) -> Result<String, Error> {
-    // Use workflow barrier to get etcd nodes
+fn get_etcd_endpoints_from_workflow(config: &BootstrapConfig) -> Result<String, Error> {
+    // First try config endpoints (for on-prem/static etcd)
+    if let Ok(endpoints) = get_etcd_endpoints(config) {
+        return Ok(endpoints);
+    }
+
+    // Fall back to workflow barrier discovery (for dynamic BSS etcd cluster)
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Rss)?;
     let bss_nodes = barrier.get_etcd_nodes()?;
 
@@ -507,8 +516,11 @@ fn wait_for_leadership() -> CmdResult {
 }
 
 fn create_rss_config(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: bool) -> CmdResult {
-    let region = get_current_aws_region()?;
-    let instance_id = get_instance_id()?;
+    let region = match config.global.target {
+        VpcTarget::Aws => get_current_aws_region()?,
+        VpcTarget::OnPrem => "on-prem".to_string(),
+    };
+    let instance_id = get_instance_id_from_config(config)?;
 
     let backend = if config.is_etcd_backend() {
         "etcd"

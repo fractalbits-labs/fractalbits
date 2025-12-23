@@ -302,7 +302,10 @@ pub enum DeployCommand {
     DestroyVpc,
 
     #[clap(about = "Show bootstrap progress for a VPC deployment")]
-    BootstrapProgress,
+    BootstrapProgress {
+        #[clap(long, value_enum, default_value = "aws")]
+        vpc_target: xtask_common::VpcTarget,
+    },
 }
 
 #[derive(Clone, AsRefStr, EnumString, clap::ValueEnum)]
@@ -681,7 +684,9 @@ async fn main() -> CmdResult {
                 rss_backend,
             })?,
             DeployCommand::DestroyVpc => cmd_deploy::destroy_vpc()?,
-            DeployCommand::BootstrapProgress => deploy_bootstrap::show_progress()?,
+            DeployCommand::BootstrapProgress { vpc_target } => {
+                deploy_bootstrap::show_progress(vpc_target)?
+            }
         },
         Cmd::RunTests { test_type } => {
             let test_type = test_type.unwrap_or(TestType::All);

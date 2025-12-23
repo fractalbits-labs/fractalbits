@@ -1,4 +1,5 @@
 use crate::common::*;
+use crate::config::BootstrapConfig;
 use cmd_lib::*;
 
 const ETCD_DATA_DIR: &str = "/data/local/etcd";
@@ -6,12 +7,13 @@ const ETCD_CLIENT_PORT: u16 = 2379;
 const ETCD_PEER_PORT: u16 = 2380;
 const ETCD_CONFIG_FILE: &str = "etcd.yaml";
 
-pub fn bootstrap_new_cluster(initial_cluster: &str) -> CmdResult {
+pub fn bootstrap_new_cluster(config: &BootstrapConfig, initial_cluster: &str) -> CmdResult {
     info!("Starting etcd bootstrap with dynamic cluster");
 
-    download_etcd_binaries()?;
+    download_etcd_binaries(config)?;
 
-    let my_ip = get_private_ip()?;
+    let instance_id = get_instance_id_from_config(config)?;
+    let my_ip = get_private_ip_from_config(config, &instance_id)?;
     let member_name = format!("bss-{}", my_ip.replace('.', "-"));
 
     info!("Member name: {member_name}, IP: {my_ip}");
@@ -25,9 +27,9 @@ pub fn bootstrap_new_cluster(initial_cluster: &str) -> CmdResult {
     Ok(())
 }
 
-fn download_etcd_binaries() -> CmdResult {
+fn download_etcd_binaries(config: &BootstrapConfig) -> CmdResult {
     info!("Downloading etcd binaries");
-    download_binaries(&["etcd", "etcdctl"])
+    download_binaries(config, &["etcd", "etcdctl"])
 }
 
 fn create_etcd_data_dir() -> CmdResult {

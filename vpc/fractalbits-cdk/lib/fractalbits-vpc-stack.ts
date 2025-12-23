@@ -525,6 +525,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
     const workflowClusterId = `fractalbits-${Date.now()}`;
 
     const bootstrapConfigContent = createConfigWithCfnTokens({
+      target: "aws", // AWS deployment (default)
       forBench: !!props.benchType,
       dataBlobStorage: dataBlobStorage,
       rssHaEnabled: props.rootServerHa,
@@ -542,22 +543,29 @@ export class FractalbitsVpcStack extends cdk.Stack {
           ? mirrordPrivateLink.endpointDns
           : undefined,
       apiServerEndpoint: nlb.loadBalancerDnsName,
-      nssAId: instances["nss-A"].instanceId,
-      nssBId: instances["nss-B"]?.instanceId,
+      nssA: { id: instances["nss-A"].instanceId },
+      nssB: instances["nss-B"]
+        ? { id: instances["nss-B"].instanceId }
+        : undefined,
       volumeAId: ebsVolumeAId,
       volumeBId: ebsVolumeBId || undefined,
-      rssAId: instances["rss-A"].instanceId,
-      rssBId: props.rootServerHa ? instances["rss-B"]?.instanceId : undefined,
-      guiServerId: props.browserIp
-        ? instances["gui_server"]?.instanceId
-        : undefined,
-      benchServerId:
-        props.benchType === "external"
-          ? instances["bench_server"]?.instanceId
+      rssA: { id: instances["rss-A"].instanceId },
+      rssB:
+        props.rootServerHa && instances["rss-B"]
+          ? { id: instances["rss-B"].instanceId }
+          : undefined,
+      guiServer:
+        props.browserIp && instances["gui_server"]
+          ? { id: instances["gui_server"].instanceId }
+          : undefined,
+      benchServer:
+        props.benchType === "external" && instances["bench_server"]
+          ? { id: instances["bench_server"].instanceId }
           : undefined,
       benchClientNum:
         props.benchType === "external" ? props.numBenchClients : undefined,
       workflowClusterId: workflowClusterId,
+      bootstrapBucket: bootstrapBucket,
     });
 
     new cr.AwsCustomResource(this, "UploadBootstrapConfig", {

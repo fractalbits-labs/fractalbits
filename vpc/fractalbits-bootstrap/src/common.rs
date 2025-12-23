@@ -1,4 +1,4 @@
-use crate::config::JournalType;
+use crate::config::{BootstrapConfig, JournalType, VpcTarget};
 use cmd_lib::*;
 use std::io::Error;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -31,22 +31,28 @@ pub const CLOUDWATCH_AGENT_CONFIG: &str = "cloudwatch_agent_config.json";
 pub const S3EXPRESS_LOCAL_BUCKET_CONFIG: &str = "s3express-local-bucket-config.json";
 pub const S3EXPRESS_REMOTE_BUCKET_CONFIG: &str = "s3express-remote-bucket-config.json";
 
-pub fn common_setup() -> CmdResult {
+pub fn common_setup(target: VpcTarget) -> CmdResult {
     create_network_tuning_sysctl_file()?;
     create_storage_tuning_sysctl_file()?;
-    install_rpms(&["amazon-cloudwatch-agent", "perf", "lldb"])?;
-    // setup_serial_console_password()?;
-    Ok(())
-}
-
-pub fn download_binaries(file_list: &[&str]) -> CmdResult {
-    for file_name in file_list {
-        download_binary(file_name)?;
+    match target {
+        VpcTarget::Aws => {
+            install_rpms(&["amazon-cloudwatch-agent", "perf", "lldb"])?;
+        }
+        VpcTarget::OnPrem => {
+            install_rpms(&["perf", "lldb"])?;
+        }
     }
     Ok(())
 }
 
-fn download_binary(file_name: &str) -> CmdResult {
+pub fn download_binaries(config: &BootstrapConfig, file_list: &[&str]) -> CmdResult {
+    for file_name in file_list {
+        download_binary(config, file_name)?;
+    }
+    Ok(())
+}
+
+fn download_binary(config: &BootstrapConfig, file_name: &str) -> CmdResult {
     let bootstrap_bucket = get_bootstrap_bucket();
     let cpu_arch = run_fun!(arch)?;
 
@@ -56,8 +62,7 @@ fn download_binary(file_name: &str) -> CmdResult {
     ) {
         format!("{bootstrap_bucket}/{cpu_arch}/{file_name}")
     } else {
-        let instance_type = get_ec2_instance_type()?;
-        let cpu_target = get_cpu_target_from_instance_type(&instance_type);
+        let cpu_target = get_cpu_target_from_config(config)?;
         format!("{bootstrap_bucket}/{cpu_arch}/{cpu_target}/{file_name}")
     };
 
@@ -294,6 +299,38 @@ pub fn get_cpu_target_from_instance_type(instance_type: &str) -> &'static str {
         _ => {
             let arch = run_fun!(arch).unwrap_or_default();
             if arch == "aarch64" { "graviton3" } else { "i3" }
+        }
+    }
+}
+
+pub fn get_instance_id_from_config(config: &BootstrapConfig) -> FunResult {
+    match config.global.target {
+        VpcTarget::OnPrem => run_fun!(hostname),
+        VpcTarget::Aws => get_instance_id(),
+    }
+}
+
+pub fn get_private_ip_from_config(config: &BootstrapConfig, instance_id: &str) -> FunResult {
+    if let Some(instance_config) = config.instances.get(instance_id)
+        && let Some(ip) = &instance_config.private_ip
+    {
+        return Ok(ip.clone());
+    }
+    match config.global.target {
+        VpcTarget::OnPrem => run_fun!(hostname -I | awk r"{print $1}"),
+        VpcTarget::Aws => get_private_ip(),
+    }
+}
+
+pub fn get_cpu_target_from_config(config: &BootstrapConfig) -> FunResult {
+    if let Some(cpu_target) = &config.global.cpu_target {
+        return Ok(cpu_target.clone());
+    }
+    match config.global.target {
+        VpcTarget::OnPrem => Err(Error::other("cpu_target must be set in config for on-prem")),
+        VpcTarget::Aws => {
+            let instance_type = get_ec2_instance_type()?;
+            Ok(get_cpu_target_from_instance_type(&instance_type).to_string())
         }
     }
 }
@@ -791,6 +828,248 @@ pub fn get_service_ips(service_id: &str, expected_min_count: usize) -> Vec<Strin
             }
             _ => std::thread::sleep(std::time::Duration::from_secs(1)),
         }
+    }
+}
+
+pub fn get_etcd_endpoints(config: &BootstrapConfig) -> FunResult {
+    // First try static endpoints from config (for on-prem/static etcd)
+    if let Some(etcd_config) = &config.etcd
+        && let Some(endpoints) = &etcd_config.endpoints
+    {
+        return Ok(endpoints.clone());
+    }
+
+    // Fall back to workflow barrier discovery (for dynamic BSS etcd cluster)
+    let cluster_id = config
+        .global
+        .workflow_cluster_id
+        .as_ref()
+        .ok_or_else(|| Error::other("workflow_cluster_id not configured"))?;
+    let bucket = get_bootstrap_bucket()
+        .trim_start_matches("s3://")
+        .to_string();
+    let instance_id = match config.global.target {
+        VpcTarget::OnPrem => run_fun!(hostname)?,
+        VpcTarget::Aws => get_instance_id()?,
+    };
+
+    let barrier =
+        crate::workflow::WorkflowBarrier::new(&bucket, cluster_id, &instance_id, "bss_server");
+    let bss_nodes = barrier.get_etcd_nodes()?;
+
+    if bss_nodes.is_empty() {
+        return Err(Error::other(
+            "No BSS nodes registered in workflow for etcd endpoints",
+        ));
+    }
+
+    Ok(bss_nodes
+        .iter()
+        .map(|node| format!("http://{}:2379", node.ip))
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+pub fn create_etcd_register_and_deregister_service(
+    config: &BootstrapConfig,
+    service_id: &str,
+) -> CmdResult {
+    let endpoints = get_etcd_endpoints(config)?;
+    create_etcd_register_service(config, &endpoints, service_id)?;
+    create_etcd_deregister_service(config, &endpoints, service_id)?;
+    Ok(())
+}
+
+fn create_etcd_register_service(
+    config: &BootstrapConfig,
+    endpoints: &str,
+    service_id: &str,
+) -> CmdResult {
+    let etcd_register_script = format!("{BIN_PATH}etcd-register.sh");
+
+    let get_instance_id_cmd = match config.global.target {
+        VpcTarget::OnPrem => "hostname".to_string(),
+        VpcTarget::Aws => "ec2-metadata -i | awk '{print $2}'".to_string(),
+    };
+
+    let get_private_ip_cmd = match config.global.target {
+        VpcTarget::OnPrem => "hostname -I | awk '{print $1}'".to_string(),
+        VpcTarget::Aws => "ec2-metadata -o | awk '{print $2}'".to_string(),
+    };
+
+    let systemd_unit_content = format!(
+        r##"[Unit]
+Description=etcd Service Registration
+After=network-online.target etcd.service
+
+[Service]
+Type=oneshot
+ExecStart={etcd_register_script}
+
+[Install]
+WantedBy=multi-user.target
+"##
+    );
+
+    let register_script_content = format!(
+        r##"#!/bin/bash
+set -e
+service_id={service_id}
+endpoints="{endpoints}"
+instance_id=$({get_instance_id_cmd})
+private_ip=$({get_private_ip_cmd})
+
+echo "Registering itself ($instance_id,$private_ip) to etcd with service_id $service_id" >&2
+
+MAX_RETRIES=30
+retry_count=0
+success=false
+
+while [ $retry_count -lt $MAX_RETRIES ] && [ "$success" = "false" ]; do
+    retry_count=$((retry_count + 1))
+
+    if {BIN_PATH}etcdctl --endpoints="$endpoints" put "/services/$service_id/$instance_id" "$private_ip" 2>/dev/null; then
+        echo "Registered service on attempt $retry_count" >&2
+        success=true
+    else
+        echo "Registration failed on attempt $retry_count, retrying..." >&2
+        sleep 2
+    fi
+done
+
+if [ "$success" = "false" ]; then
+    echo "FATAL: Failed to register service $service_id after $MAX_RETRIES attempts" >&2
+    exit 1
+fi
+
+echo "Done" >&2
+"##
+    );
+
+    run_cmd! {
+        echo $register_script_content > $etcd_register_script;
+        chmod +x $etcd_register_script;
+
+        echo $systemd_unit_content > ${ETC_PATH}etcd-register.service;
+        systemctl enable --now ${ETC_PATH}etcd-register.service;
+    }?;
+    Ok(())
+}
+
+fn create_etcd_deregister_service(
+    config: &BootstrapConfig,
+    endpoints: &str,
+    service_id: &str,
+) -> CmdResult {
+    let etcd_deregister_script = format!("{BIN_PATH}etcd-deregister.sh");
+
+    let get_instance_id_cmd = match config.global.target {
+        VpcTarget::OnPrem => "hostname".to_string(),
+        VpcTarget::Aws => "ec2-metadata -i | awk '{print $2}'".to_string(),
+    };
+
+    let systemd_unit_content = format!(
+        r##"[Unit]
+Description=etcd Service Deregistration
+After=network-online.target
+Before=reboot.target halt.target poweroff.target kexec.target
+
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={etcd_deregister_script}
+
+[Install]
+WantedBy=reboot.target halt.target poweroff.target kexec.target
+"##
+    );
+
+    let deregister_script_content = format!(
+        r##"#!/bin/bash
+set -e
+service_id={service_id}
+endpoints="{endpoints}"
+instance_id=$({get_instance_id_cmd})
+
+echo "Deregistering itself ($instance_id) from etcd with service_id $service_id" >&2
+{BIN_PATH}etcdctl --endpoints="$endpoints" del "/services/$service_id/$instance_id" 2>/dev/null || true
+echo "Done" >&2
+"##
+    );
+
+    run_cmd! {
+        echo $deregister_script_content > $etcd_deregister_script;
+        chmod +x $etcd_deregister_script;
+
+        echo $systemd_unit_content > ${ETC_PATH}etcd-deregister.service;
+        systemctl enable ${ETC_PATH}etcd-deregister.service;
+    }?;
+    Ok(())
+}
+
+pub fn get_service_ips_etcd(
+    endpoints: &str,
+    service_id: &str,
+    expected_min_count: usize,
+) -> Vec<String> {
+    info!("Waiting for {expected_min_count} {service_id} service(s) via etcd");
+    let start_time = Instant::now();
+    let timeout = Duration::from_secs(300);
+    let etcdctl = format!("{BIN_PATH}etcdctl");
+    let key_prefix = format!("/services/{service_id}");
+    loop {
+        if start_time.elapsed() > timeout {
+            cmd_die!("Timeout waiting for {service_id} service(s) via etcd");
+        }
+
+        let res: Result<String, _> = run_fun! {
+            $etcdctl --endpoints=$endpoints get $key_prefix --prefix --print-value-only 2>/dev/null
+        };
+
+        match res {
+            Ok(ref output) if !output.trim().is_empty() => {
+                let ips: Vec<String> = output
+                    .lines()
+                    .filter(|line: &&str| !line.is_empty())
+                    .map(|s: &str| s.to_string())
+                    .collect();
+
+                if ips.len() >= expected_min_count {
+                    info!("Found a list of {service_id} services via etcd: {ips:?}");
+                    return ips;
+                }
+                info!(
+                    "Found {} of {} {service_id} services, waiting...",
+                    ips.len(),
+                    expected_min_count
+                );
+            }
+            _ => {}
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+pub fn register_service(config: &BootstrapConfig, service_id: &str) -> CmdResult {
+    if config.is_etcd_backend() {
+        create_etcd_register_and_deregister_service(config, service_id)
+    } else {
+        create_ddb_register_and_deregister_service(service_id)
+    }
+}
+
+pub fn get_service_ips_with_backend(
+    config: &BootstrapConfig,
+    service_id: &str,
+    expected_count: usize,
+) -> Vec<String> {
+    if config.is_etcd_backend() {
+        let endpoints = get_etcd_endpoints(config).expect("etcd endpoints required");
+        get_service_ips_etcd(&endpoints, service_id, expected_count)
+    } else {
+        get_service_ips(service_id, expected_count)
     }
 }
 

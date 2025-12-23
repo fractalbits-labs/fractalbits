@@ -64,7 +64,7 @@ fn generic_bootstrap() -> CmdResult {
     let for_bench = config.global.for_bench;
     let service_type = discover_service_type(&config)?;
 
-    common_setup()?;
+    common_setup(config.global.target)?;
 
     let service_name = match &service_type {
         ServiceType::RootServer { is_leader } => {
