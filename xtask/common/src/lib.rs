@@ -46,10 +46,10 @@ pub enum RssBackend {
     Ddb,
 }
 
+/// Node entry within a service type group
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClusterNodeConfig {
+pub struct NodeEntry {
     pub id: String,
-    pub service_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_ip: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -58,6 +58,30 @@ pub struct ClusterNodeConfig {
     pub volume_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bench_client_num: Option<usize>,
+}
+
+/// Node config with service_type (for iteration/lookup convenience)
+#[derive(Debug, Clone)]
+pub struct ClusterNodeConfig {
+    pub id: String,
+    pub service_type: String,
+    pub private_ip: Option<String>,
+    pub role: Option<String>,
+    pub volume_id: Option<String>,
+    pub bench_client_num: Option<usize>,
+}
+
+impl ClusterNodeConfig {
+    pub fn from_entry(service_type: &str, entry: &NodeEntry) -> Self {
+        Self {
+            id: entry.id.clone(),
+            service_type: service_type.to_string(),
+            private_ip: entry.private_ip.clone(),
+            role: entry.role.clone(),
+            volume_id: entry.volume_id.clone(),
+            bench_client_num: entry.bench_client_num,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +107,8 @@ pub struct ClusterGlobalConfig {
     pub workflow_cluster_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_bucket: Option<String>,
+    #[serde(default)]
+    pub meta_stack_testing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,7 +158,9 @@ pub struct BootstrapClusterConfig {
     pub resources: Option<ClusterResourcesConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etcd: Option<ClusterEtcdConfig>,
-    pub nodes: Vec<ClusterNodeConfig>,
+    /// Nodes grouped by service type: nodes.root_server, nodes.nss_server, etc.
+    #[serde(default)]
+    pub nodes: HashMap<String, Vec<NodeEntry>>,
 }
 
 impl BootstrapClusterConfig {
@@ -144,19 +172,67 @@ impl BootstrapClusterConfig {
         toml::from_str(s)
     }
 
-    pub fn get_node(&self, id: &str) -> Option<&ClusterNodeConfig> {
-        self.nodes.iter().find(|n| n.id == id)
+    pub fn is_etcd_backend(&self) -> bool {
+        self.global.rss_backend == RssBackend::Etcd
     }
 
-    pub fn contains_node(&self, id: &str) -> bool {
-        self.nodes.iter().any(|n| n.id == id)
-    }
-
-    pub fn nodes_as_instances(&self) -> HashMap<String, ClusterNodeConfig> {
+    /// Get all nodes as a flat list with service_type
+    pub fn all_nodes(&self) -> Vec<ClusterNodeConfig> {
         self.nodes
             .iter()
-            .map(|n| (n.id.clone(), n.clone()))
+            .flat_map(|(service_type, entries)| {
+                entries
+                    .iter()
+                    .map(|e| ClusterNodeConfig::from_entry(service_type, e))
+            })
             .collect()
+    }
+
+    /// Get nodes by service type
+    pub fn get_nodes(&self, service_type: &str) -> Vec<ClusterNodeConfig> {
+        self.nodes
+            .get(service_type)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|e| ClusterNodeConfig::from_entry(service_type, e))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get node entries by service type (without cloning)
+    pub fn get_node_entries(&self, service_type: &str) -> Option<&Vec<NodeEntry>> {
+        self.nodes.get(service_type)
+    }
+
+    /// Get instance config by ID (searches all service types)
+    pub fn get_instance(&self, id: &str) -> Option<ClusterNodeConfig> {
+        for (service_type, entries) in &self.nodes {
+            if let Some(entry) = entries.iter().find(|e| e.id == id) {
+                return Some(ClusterNodeConfig::from_entry(service_type, entry));
+            }
+        }
+        None
+    }
+
+    /// Check if instance exists in any service type
+    pub fn contains_instance(&self, id: &str) -> bool {
+        self.nodes
+            .values()
+            .any(|entries| entries.iter().any(|e| e.id == id))
+    }
+
+    pub fn get_resources(&self) -> ClusterResourcesConfig {
+        self.resources.clone().unwrap_or_default()
+    }
+
+    /// Add a node to a service type group
+    pub fn add_node(&mut self, service_type: &str, entry: NodeEntry) {
+        self.nodes
+            .entry(service_type.to_string())
+            .or_default()
+            .push(entry);
     }
 }
 

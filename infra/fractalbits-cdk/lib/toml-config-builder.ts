@@ -146,18 +146,17 @@ export function createConfigWithCfnTokens(props: {
     }
   }
 
-  // Helper function to add a node entry with [[nodes]] format
+  // Helper function to add a node entry with [[nodes.service_type]] format
   const addNode = (
     instance: InstanceProps,
     serviceType: string,
     role?: string,
     volumeId?: string,
-    benchClientNum?: number
+    benchClientNum?: number,
   ) => {
     lines.push("");
-    lines.push("[[nodes]]");
+    lines.push(`[[nodes.${serviceType}]]`);
     lines.push(cdk.Fn.join("", ['id = "', instance.id, '"']));
-    lines.push(`service_type = "${serviceType}"`);
     if (role) {
       lines.push(`role = "${role}"`);
     }
@@ -179,10 +178,12 @@ export function createConfigWithCfnTokens(props: {
   }
 
   // Add NSS nodes
-  const nssAVolumeId = props.journalType === "ebs" ? props.volumeAId : undefined;
+  const nssAVolumeId =
+    props.journalType === "ebs" ? props.volumeAId : undefined;
   addNode(props.nssA, "nss_server", undefined, nssAVolumeId);
   if (props.nssB) {
-    const nssBVolumeId = props.journalType === "ebs" ? props.volumeBId : undefined;
+    const nssBVolumeId =
+      props.journalType === "ebs" ? props.volumeBId : undefined;
     addNode(props.nssB, "nss_server", undefined, nssBVolumeId);
   }
 
@@ -193,7 +194,13 @@ export function createConfigWithCfnTokens(props: {
 
   // Add Bench server
   if (props.benchServer && props.benchClientNum !== undefined) {
-    addNode(props.benchServer, "bench_server", undefined, undefined, props.benchClientNum);
+    addNode(
+      props.benchServer,
+      "bench_server",
+      undefined,
+      undefined,
+      props.benchClientNum,
+    );
   }
 
   lines.push("");

@@ -1,4 +1,4 @@
-use crate::config::{BootstrapConfig, DeployTarget};
+use crate::config::{BootstrapConfig, DataBlobStorage, DeployTarget};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use crate::*;
 use std::io::Error;
@@ -76,7 +76,7 @@ pub fn create_config(config: &BootstrapConfig, nss_endpoint: &str) -> CmdResult 
         .collect::<Vec<_>>()
         .join(", ");
 
-    let config_content = if data_blob_storage == "s3_express_multi_az" {
+    let config_content = if *data_blob_storage == DataBlobStorage::S3ExpressMultiAz {
         let remote_az =
             remote_az.ok_or_else(|| Error::other("remote_az required for s3_express_multi_az"))?;
         let aws_region = get_current_aws_region()?;

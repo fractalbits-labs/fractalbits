@@ -13,7 +13,6 @@ mod workflow;
 
 use cmd_lib::*;
 use common::*;
-use config::BootstrapConfig;
 use discovery::{ServiceType, discover_service_type};
 use std::io::{self, Write};
 
@@ -54,7 +53,7 @@ fn main() -> CmdResult {
 fn generic_bootstrap() -> CmdResult {
     info!("Starting config-based bootstrap mode");
 
-    let config = BootstrapConfig::download_and_parse()?;
+    let config = config::download_and_parse()?;
 
     // Backup config to workflow directory for progress tracking
     if let Some(cluster_id) = &config.global.workflow_cluster_id {

@@ -1,11 +1,12 @@
 use crate::CmdResult;
 use cmd_lib::*;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::io::Error;
 use std::path::Path;
 use xtask_common::{
     BOOTSTRAP_CLUSTER_CONFIG, BootstrapClusterConfig, ClusterEndpointsConfig, ClusterEtcdConfig,
-    ClusterGlobalConfig, ClusterNodeConfig, DataBlobStorage, DeployTarget, JournalType, RssBackend,
+    ClusterGlobalConfig, DataBlobStorage, DeployTarget, JournalType, NodeEntry, RssBackend,
 };
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +142,7 @@ impl InputClusterConfig {
             cpu_target: self.global.cpu_target.clone(),
             workflow_cluster_id: Some(cluster_id),
             bootstrap_bucket: None,
+            meta_stack_testing: false,
         };
 
         let nss_endpoint = self
@@ -174,18 +176,21 @@ impl InputClusterConfig {
             None
         };
 
-        let nodes: Vec<ClusterNodeConfig> = self
-            .nodes
-            .iter()
-            .map(|node| ClusterNodeConfig {
+        // Group nodes by service_type
+        let mut nodes: HashMap<String, Vec<NodeEntry>> = HashMap::new();
+        for node in &self.nodes {
+            let entry = NodeEntry {
                 id: node.hostname.clone().unwrap_or_else(|| node.ip.clone()),
-                service_type: node.service_type.clone(),
                 private_ip: Some(node.ip.clone()),
                 role: node.role.clone(),
                 volume_id: node.volume_id.clone(),
                 bench_client_num: node.bench_client_num,
-            })
-            .collect();
+            };
+            nodes
+                .entry(node.service_type.clone())
+                .or_default()
+                .push(entry);
+        }
 
         let config = BootstrapClusterConfig {
             global,
