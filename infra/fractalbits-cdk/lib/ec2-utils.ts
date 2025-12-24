@@ -183,6 +183,7 @@ export const createEc2Asg = (
   minCapacity: number,
   maxCapacity: number,
   serviceType?: string,
+  skipUserData?: boolean,
 ): autoscaling.AutoScalingGroup => {
   if (instanceTypeNames.length === 0) {
     throw new Error("instanceTypeNames must not be empty.");
@@ -215,7 +216,7 @@ export const createEc2Asg = (
     machineImage: machineImage,
     securityGroup: sg,
     role: role,
-    userData: createUserData(scope),
+    userData: skipUserData ? undefined : createUserData(scope),
   });
 
   if (serviceType) {

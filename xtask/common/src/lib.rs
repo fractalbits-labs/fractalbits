@@ -1,5 +1,7 @@
 use cmd_lib::*;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::net::TcpStream;
 use std::path::Path;
@@ -9,16 +11,153 @@ use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
-#[derive(Clone, Copy, PartialEq, Default, clap::ValueEnum)]
-pub enum VpcTarget {
+pub const BOOTSTRAP_CLUSTER_CONFIG: &str = "bootstrap_cluster.toml";
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployTarget {
     OnPrem,
     #[default]
     Aws,
 }
 
-/// Check if we're running in an cloud/on-prem environment (as a system service)
-pub fn is_vpc_environment() -> bool {
-    Path::new("/opt/fractalbits/bin/fractalbits-bootstrap").exists()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalType {
+    #[default]
+    Ebs,
+    Nvme,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DataBlobStorage {
+    #[default]
+    AllInBssSingleAz,
+    S3HybridSingleAz,
+    S3ExpressMultiAz,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RssBackend {
+    Etcd,
+    #[default]
+    Ddb,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterNodeConfig {
+    pub id: String,
+    pub service_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bench_client_num: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterGlobalConfig {
+    #[serde(default)]
+    pub deploy_target: DeployTarget,
+    pub region: String,
+    pub for_bench: bool,
+    pub data_blob_storage: DataBlobStorage,
+    pub rss_ha_enabled: bool,
+    pub rss_backend: RssBackend,
+    #[serde(default)]
+    pub journal_type: JournalType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_bss_nodes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_api_servers: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_bench_clients: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_cluster_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_bucket: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterAwsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_blob_bucket: Option<String>,
+    pub local_az: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_az: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterEndpointsConfig {
+    pub nss_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirrord_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_server_endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClusterResourcesConfig {
+    pub nss_a_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nss_b_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_a_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_b_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterEtcdConfig {
+    pub enabled: bool,
+    pub cluster_size: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoints: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapClusterConfig {
+    pub global: ClusterGlobalConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws: Option<ClusterAwsConfig>,
+    pub endpoints: ClusterEndpointsConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ClusterResourcesConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etcd: Option<ClusterEtcdConfig>,
+    pub nodes: Vec<ClusterNodeConfig>,
+}
+
+impl BootstrapClusterConfig {
+    pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(self)
+    }
+
+    pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(s)
+    }
+
+    pub fn get_node(&self, id: &str) -> Option<&ClusterNodeConfig> {
+        self.nodes.iter().find(|n| n.id == id)
+    }
+
+    pub fn contains_node(&self, id: &str) -> bool {
+        self.nodes.iter().any(|n| n.id == id)
+    }
+
+    pub fn nodes_as_instances(&self) -> HashMap<String, ClusterNodeConfig> {
+        self.nodes
+            .iter()
+            .map(|n| (n.id.clone(), n.clone()))
+            .collect()
+    }
 }
 
 // Support GenUuids only for now

@@ -1,5 +1,5 @@
 use super::common::*;
-use crate::config::{BootstrapConfig, VpcTarget};
+use crate::config::{BootstrapConfig, DeployTarget};
 use crate::workflow::{EtcdNodeInfo, WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use rayon::prelude::*;
@@ -72,7 +72,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     }
 
     create_logrotate_for_stats()?;
-    if config.global.target == VpcTarget::Aws {
+    if config.global.deploy_target == DeployTarget::Aws {
         create_ena_irq_affinity_service()?;
     }
     create_nvme_tuning_service()?;

@@ -137,7 +137,7 @@ export class FractalbitsBenchVpcStack extends cdk.Stack {
     ]);
 
     new s3deploy.BucketDeployment(this, "ConfigDeployment", {
-      sources: [s3deploy.Source.data("bootstrap.toml", configContent)],
+      sources: [s3deploy.Source.data("bootstrap_cluster.toml", configContent)],
       destinationBucket: buildsBucket,
     });
 

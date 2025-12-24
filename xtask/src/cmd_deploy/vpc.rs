@@ -4,7 +4,8 @@ use dialoguer::Input;
 use std::path::Path;
 
 use super::bootstrap;
-use super::common::{VpcConfig, VpcTarget};
+use super::common::{DeployTarget, VpcConfig};
+use super::ssm_bootstrap;
 use super::upload::get_bootstrap_bucket_name;
 
 pub fn create_vpc(config: VpcConfig) -> CmdResult {
@@ -20,6 +21,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         az,
         root_server_ha,
         rss_backend,
+        ssm_bootstrap,
     } = config;
 
     // Note: Template-based configuration is handled in CDK (vpc/fractalbits-cdk/bin/fractalbits-vpc.ts)
@@ -82,18 +84,38 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     }
     add_context("rssBackend", rss_backend.as_ref().to_string());
 
+    // Add skipUserData context for SSM-based bootstrap
+    if ssm_bootstrap {
+        add_context("skipUserData", "true".to_string());
+    }
+
     // Deploy the VPC stack
-    run_cmd! {
-        info "Deploying FractalbitsVpcStack...";
-        cd $cdk_dir;
-        npx cdk deploy FractalbitsVpcStack
-            $[context_params]
-            --require-approval never 2>&1;
-        info "VPC deployment completed successfully";
-    }?;
+    if ssm_bootstrap {
+        run_cmd! {
+            info "Deploying FractalbitsVpcStack (SSM bootstrap mode)...";
+            cd $cdk_dir;
+            npx cdk deploy FractalbitsVpcStack
+                $[context_params]
+                --outputs-file /tmp/cdk-outputs.json
+                --require-approval never 2>&1;
+            info "VPC deployment completed successfully";
+        }?;
+
+        // Bootstrap via SSM
+        ssm_bootstrap::ssm_bootstrap_cluster()?;
+    } else {
+        run_cmd! {
+            info "Deploying FractalbitsVpcStack...";
+            cd $cdk_dir;
+            npx cdk deploy FractalbitsVpcStack
+                $[context_params]
+                --require-approval never 2>&1;
+            info "VPC deployment completed successfully";
+        }?;
+    }
 
     // Show bootstrap progress
-    bootstrap::show_progress(VpcTarget::Aws)?;
+    bootstrap::show_progress(DeployTarget::Aws)?;
 
     Ok(())
 }
@@ -138,7 +160,7 @@ pub fn destroy_vpc() -> CmdResult {
 }
 
 fn cleanup_bootstrap_bucket() -> CmdResult {
-    let bucket_name = get_bootstrap_bucket_name(VpcTarget::Aws)?;
+    let bucket_name = get_bootstrap_bucket_name(DeployTarget::Aws)?;
     let bucket = format!("s3://{bucket_name}");
 
     // Check if the bucket exists

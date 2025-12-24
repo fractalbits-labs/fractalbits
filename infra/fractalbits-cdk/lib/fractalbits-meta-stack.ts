@@ -137,7 +137,7 @@ export class FractalbitsMetaStack extends cdk.Stack {
 
       const configContent = buildMetaStackConfig(instanceEntries);
       new s3deploy.BucketDeployment(this, "ConfigDeployment", {
-        sources: [s3deploy.Source.data("bootstrap.toml", configContent)],
+        sources: [s3deploy.Source.data("bootstrap_cluster.toml", configContent)],
         destinationBucket: buildsBucket,
       });
 
@@ -159,7 +159,7 @@ export class FractalbitsMetaStack extends cdk.Stack {
       // For BSS ASG, instances discover their role from EC2 tags
       const configContent = buildMetaStackConfig([]);
       new s3deploy.BucketDeployment(this, "ConfigDeployment", {
-        sources: [s3deploy.Source.data("bootstrap.toml", configContent)],
+        sources: [s3deploy.Source.data("bootstrap_cluster.toml", configContent)],
         destinationBucket: buildsBucket,
       });
 

@@ -5,7 +5,7 @@ use std::io::Error;
 use std::time::{Duration, Instant};
 
 use crate::common::{
-    BOOTSTRAP_CONFIG, ETC_PATH, download_from_s3, get_bootstrap_bucket, get_instance_id,
+    BOOTSTRAP_CLUSTER_CONFIG, ETC_PATH, download_from_s3, get_bootstrap_bucket, get_instance_id,
 };
 
 const CONFIG_RETRY_TIMEOUT_SECS: u64 = 120;
@@ -16,9 +16,12 @@ pub struct BootstrapConfig {
     #[serde(default)]
     pub aws: Option<AwsConfig>,
     pub endpoints: EndpointsConfig,
-    pub resources: ResourcesConfig,
+    #[serde(default)]
+    pub resources: Option<ResourcesConfig>,
     #[serde(default)]
     pub etcd: Option<EtcdConfig>,
+    #[serde(default)]
+    pub nodes: Vec<NodeConfig>,
     #[serde(default)]
     pub instances: HashMap<String, InstanceConfig>,
 }
@@ -33,7 +36,7 @@ pub enum JournalType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum VpcTarget {
+pub enum DeployTarget {
     #[default]
     Aws,
     OnPrem,
@@ -42,7 +45,8 @@ pub enum VpcTarget {
 #[derive(Debug, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default)]
-    pub target: VpcTarget,
+    pub deploy_target: DeployTarget,
+    pub region: String,
     pub for_bench: bool,
     pub data_blob_storage: String,
     pub rss_ha_enabled: bool,
@@ -70,9 +74,8 @@ pub struct EtcdConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct AwsConfig {
-    pub data_blob_bucket: String,
-    #[allow(dead_code)]
-    pub local_az: String,
+    #[serde(default)]
+    pub data_blob_bucket: Option<String>,
     #[serde(default)]
     pub remote_az: Option<String>,
 }
@@ -86,11 +89,26 @@ pub struct EndpointsConfig {
     pub api_server_endpoint: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct ResourcesConfig {
+    #[serde(default)]
     pub nss_a_id: String,
     #[serde(default)]
     pub nss_b_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeConfig {
+    pub id: String,
+    pub service_type: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub volume_id: Option<String>,
+    #[serde(default)]
+    pub bench_client_num: Option<usize>,
+    #[serde(default)]
+    pub private_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,8 +127,8 @@ pub struct InstanceConfig {
 impl BootstrapConfig {
     pub fn download_and_parse() -> Result<Self, Error> {
         let bootstrap_bucket = get_bootstrap_bucket();
-        let s3_path = format!("{bootstrap_bucket}/{BOOTSTRAP_CONFIG}");
-        let local_path = format!("{ETC_PATH}{BOOTSTRAP_CONFIG}");
+        let s3_path = format!("{bootstrap_bucket}/{BOOTSTRAP_CLUSTER_CONFIG}");
+        let local_path = format!("{ETC_PATH}{BOOTSTRAP_CLUSTER_CONFIG}");
 
         let start_time = Instant::now();
         let timeout = Duration::from_secs(CONFIG_RETRY_TIMEOUT_SECS);
@@ -134,13 +152,12 @@ impl BootstrapConfig {
             let config: BootstrapConfig = toml::from_str(&content)
                 .map_err(|e| Error::other(format!("TOML parse error: {e}")))?;
 
-            // Get instance_id based on target (hostname for on-prem, EC2 metadata for AWS)
-            let instance_id = match config.global.target {
-                VpcTarget::OnPrem => run_fun!(hostname)?,
-                VpcTarget::Aws => get_instance_id()?,
+            let instance_id = match config.global.deploy_target {
+                DeployTarget::OnPrem => run_fun!(hostname)?,
+                DeployTarget::Aws => get_instance_id()?,
             };
 
-            if config.instances.contains_key(&instance_id) {
+            if config.contains_instance(&instance_id) {
                 info!("Found instance {instance_id} in bootstrap config");
                 return Ok(config);
             }
@@ -159,5 +176,26 @@ impl BootstrapConfig {
 
     pub fn is_etcd_backend(&self) -> bool {
         self.global.rss_backend == "etcd"
+    }
+
+    pub fn get_instance(&self, id: &str) -> Option<InstanceConfig> {
+        if let Some(node) = self.nodes.iter().find(|n| n.id == id) {
+            return Some(InstanceConfig {
+                service_type: node.service_type.clone(),
+                role: node.role.clone(),
+                volume_id: node.volume_id.clone(),
+                bench_client_num: node.bench_client_num,
+                private_ip: node.private_ip.clone(),
+            });
+        }
+        self.instances.get(id).cloned()
+    }
+
+    pub fn contains_instance(&self, id: &str) -> bool {
+        self.nodes.iter().any(|n| n.id == id) || self.instances.contains_key(id)
+    }
+
+    pub fn get_resources(&self) -> ResourcesConfig {
+        self.resources.clone().unwrap_or_default()
     }
 }

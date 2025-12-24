@@ -1,4 +1,4 @@
-use crate::config::{BootstrapConfig, VpcTarget};
+use crate::config::{BootstrapConfig, DeployTarget};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use crate::*;
 use std::io::Error;
@@ -41,7 +41,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
         let _ = download_binaries(config, &["rewrk_rpc", "test_fractal_art"]);
     }
 
-    if config.global.target == VpcTarget::Aws {
+    if config.global.deploy_target == DeployTarget::Aws {
         create_ena_irq_affinity_service()?;
     }
 
@@ -57,14 +57,14 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
 
 pub fn create_config(config: &BootstrapConfig, nss_endpoint: &str) -> CmdResult {
     let data_blob_storage = &config.global.data_blob_storage;
-    let data_blob_bucket = config.aws.as_ref().map(|aws| aws.data_blob_bucket.as_str());
+    let data_blob_bucket = config
+        .aws
+        .as_ref()
+        .and_then(|aws| aws.data_blob_bucket.as_deref());
     let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     let rss_ha_enabled = config.global.rss_ha_enabled;
 
-    let region = match config.global.target {
-        VpcTarget::Aws => get_current_aws_region()?,
-        VpcTarget::OnPrem => "on-prem".to_string(),
-    };
+    let region = &config.global.region;
     let num_cores = num_cpus()?;
 
     // Query service discovery for RSS instance IPs

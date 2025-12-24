@@ -1,8 +1,8 @@
 use crate::*;
 
-use super::common::VpcTarget;
+use super::common::DeployTarget;
 
-pub fn upload(vpc_target: VpcTarget) -> CmdResult {
+pub fn upload(vpc_target: DeployTarget) -> CmdResult {
     // Check/create S3 bucket and sync
     let bucket_name = get_bootstrap_bucket_name(vpc_target)?;
 
@@ -32,10 +32,10 @@ BOOTSTRAP_BUCKET={bucket_name} /opt/fractalbits/bin/fractalbits-bootstrap"#
     Ok(())
 }
 
-pub fn get_bootstrap_bucket_name(vpc_target: VpcTarget) -> FunResult {
+pub fn get_bootstrap_bucket_name(vpc_target: DeployTarget) -> FunResult {
     match vpc_target {
-        VpcTarget::OnPrem => Ok("fractalbits-bootstrap".to_string()),
-        VpcTarget::Aws => {
+        DeployTarget::OnPrem => Ok("fractalbits-bootstrap".to_string()),
+        DeployTarget::Aws => {
             let region = run_fun!(aws configure get region)?;
             let account_id = run_fun!(aws sts get-caller-identity --query Account --output text)?;
             Ok(format!("fractalbits-bootstrap-{region}-{account_id}"))

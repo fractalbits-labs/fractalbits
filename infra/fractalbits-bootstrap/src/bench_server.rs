@@ -3,7 +3,7 @@ mod yaml_mixed;
 mod yaml_put;
 
 use super::common::*;
-use crate::config::{BootstrapConfig, VpcTarget};
+use crate::config::BootstrapConfig;
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use std::time::Duration;
@@ -55,10 +55,7 @@ pub fn bootstrap(
 
     let client_ips = get_service_ips_with_backend(config, "bench-client", bench_client_num);
 
-    let region = match config.global.target {
-        VpcTarget::Aws => get_current_aws_region()?,
-        VpcTarget::OnPrem => "on-prem".to_string(),
-    };
+    let region = config.global.region.as_str();
     let mut warp_client_ips = String::new();
     for ip in client_ips.iter() {
         warp_client_ips.push_str(&format!("  - {ip}:7761\n"));
@@ -67,7 +64,7 @@ pub fn bootstrap(
     for wl_config in WORKLOAD_CONFIGS {
         create_put_workload_config(
             &warp_client_ips,
-            &region,
+            region,
             &api_server_endpoint,
             "2m",
             wl_config.size_kb,
@@ -75,7 +72,7 @@ pub fn bootstrap(
         )?;
         create_get_workload_config(
             &warp_client_ips,
-            &region,
+            region,
             &api_server_endpoint,
             "2m",
             wl_config.size_kb,
@@ -83,7 +80,7 @@ pub fn bootstrap(
         )?;
         create_mixed_workload_config(
             &warp_client_ips,
-            &region,
+            region,
             &api_server_endpoint,
             "2m",
             wl_config.size_kb,
@@ -103,7 +100,7 @@ pub fn bootstrap(
         api_server_endpoint
     );
 
-    create_bench_start_script(&region, &api_server_endpoint)?;
+    create_bench_start_script(region, &api_server_endpoint)?;
 
     barrier.complete_stage(stages::SERVICES_READY, None)?;
 

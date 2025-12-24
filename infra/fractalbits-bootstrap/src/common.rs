@@ -1,4 +1,4 @@
-use crate::config::{BootstrapConfig, JournalType, VpcTarget};
+use crate::config::{BootstrapConfig, DeployTarget, JournalType};
 use cmd_lib::*;
 use std::io::Error;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -14,7 +14,7 @@ pub const MIRRORD_CONFIG: &str = "mirrord_cloud_config.toml";
 pub const ROOT_SERVER_CONFIG: &str = "root_server_cloud_config.toml";
 pub const NSS_ROLE_AGENT_CONFIG: &str = "nss_role_agent_cloud_config.toml";
 pub const BENCH_SERVER_BENCH_START_SCRIPT: &str = "bench_start.sh";
-pub const BOOTSTRAP_CONFIG: &str = "bootstrap.toml";
+pub const BOOTSTRAP_CLUSTER_CONFIG: &str = "bootstrap_cluster.toml";
 pub const BOOTSTRAP_DONE_FILE: &str = "/opt/fractalbits/.bootstrap_done";
 pub const DDB_SERVICE_DISCOVERY_TABLE: &str = "fractalbits-service-discovery";
 pub const NETWORK_TUNING_SYS_CONFIG: &str = "99-network-tuning.conf";
@@ -31,14 +31,14 @@ pub const CLOUDWATCH_AGENT_CONFIG: &str = "cloudwatch_agent_config.json";
 pub const S3EXPRESS_LOCAL_BUCKET_CONFIG: &str = "s3express-local-bucket-config.json";
 pub const S3EXPRESS_REMOTE_BUCKET_CONFIG: &str = "s3express-remote-bucket-config.json";
 
-pub fn common_setup(target: VpcTarget) -> CmdResult {
+pub fn common_setup(target: DeployTarget) -> CmdResult {
     create_network_tuning_sysctl_file()?;
     create_storage_tuning_sysctl_file()?;
     match target {
-        VpcTarget::Aws => {
+        DeployTarget::Aws => {
             install_rpms(&["amazon-cloudwatch-agent", "perf", "lldb"])?;
         }
-        VpcTarget::OnPrem => {
+        DeployTarget::OnPrem => {
             install_rpms(&["perf", "lldb"])?;
         }
     }
@@ -86,8 +86,8 @@ pub fn get_bootstrap_bucket() -> String {
 
 pub fn backup_config_to_workflow(cluster_id: &str) -> CmdResult {
     let bucket = get_bootstrap_bucket();
-    let local_path = format!("{ETC_PATH}{BOOTSTRAP_CONFIG}");
-    let workflow_path = format!("{bucket}/workflow/{cluster_id}/{BOOTSTRAP_CONFIG}");
+    let local_path = format!("{ETC_PATH}{BOOTSTRAP_CLUSTER_CONFIG}");
+    let workflow_path = format!("{bucket}/workflow/{cluster_id}/{BOOTSTRAP_CLUSTER_CONFIG}");
 
     // Check if already backed up (only first instance needs to do this)
     let exists = run_fun!(aws s3 ls $workflow_path 2>/dev/null);
@@ -304,21 +304,21 @@ pub fn get_cpu_target_from_instance_type(instance_type: &str) -> &'static str {
 }
 
 pub fn get_instance_id_from_config(config: &BootstrapConfig) -> FunResult {
-    match config.global.target {
-        VpcTarget::OnPrem => run_fun!(hostname),
-        VpcTarget::Aws => get_instance_id(),
+    match config.global.deploy_target {
+        DeployTarget::OnPrem => run_fun!(hostname),
+        DeployTarget::Aws => get_instance_id(),
     }
 }
 
 pub fn get_private_ip_from_config(config: &BootstrapConfig, instance_id: &str) -> FunResult {
-    if let Some(instance_config) = config.instances.get(instance_id)
+    if let Some(instance_config) = config.get_instance(instance_id)
         && let Some(ip) = &instance_config.private_ip
     {
         return Ok(ip.clone());
     }
-    match config.global.target {
-        VpcTarget::OnPrem => run_fun!(hostname -I | awk r"{print $1}"),
-        VpcTarget::Aws => get_private_ip(),
+    match config.global.deploy_target {
+        DeployTarget::OnPrem => run_fun!(hostname -I | awk r"{print $1}"),
+        DeployTarget::Aws => get_private_ip(),
     }
 }
 
@@ -326,9 +326,9 @@ pub fn get_cpu_target_from_config(config: &BootstrapConfig) -> FunResult {
     if let Some(cpu_target) = &config.global.cpu_target {
         return Ok(cpu_target.clone());
     }
-    match config.global.target {
-        VpcTarget::OnPrem => Err(Error::other("cpu_target must be set in config for on-prem")),
-        VpcTarget::Aws => {
+    match config.global.deploy_target {
+        DeployTarget::OnPrem => Err(Error::other("cpu_target must be set in config for on-prem")),
+        DeployTarget::Aws => {
             let instance_type = get_ec2_instance_type()?;
             Ok(get_cpu_target_from_instance_type(&instance_type).to_string())
         }
@@ -848,9 +848,9 @@ pub fn get_etcd_endpoints(config: &BootstrapConfig) -> FunResult {
     let bucket = get_bootstrap_bucket()
         .trim_start_matches("s3://")
         .to_string();
-    let instance_id = match config.global.target {
-        VpcTarget::OnPrem => run_fun!(hostname)?,
-        VpcTarget::Aws => get_instance_id()?,
+    let instance_id = match config.global.deploy_target {
+        DeployTarget::OnPrem => run_fun!(hostname)?,
+        DeployTarget::Aws => get_instance_id()?,
     };
 
     let barrier =
@@ -887,14 +887,14 @@ fn create_etcd_register_service(
 ) -> CmdResult {
     let etcd_register_script = format!("{BIN_PATH}etcd-register.sh");
 
-    let get_instance_id_cmd = match config.global.target {
-        VpcTarget::OnPrem => "hostname".to_string(),
-        VpcTarget::Aws => "ec2-metadata -i | awk '{print $2}'".to_string(),
+    let get_instance_id_cmd = match config.global.deploy_target {
+        DeployTarget::OnPrem => "hostname".to_string(),
+        DeployTarget::Aws => "ec2-metadata -i | awk '{print $2}'".to_string(),
     };
 
-    let get_private_ip_cmd = match config.global.target {
-        VpcTarget::OnPrem => "hostname -I | awk '{print $1}'".to_string(),
-        VpcTarget::Aws => "ec2-metadata -o | awk '{print $2}'".to_string(),
+    let get_private_ip_cmd = match config.global.deploy_target {
+        DeployTarget::OnPrem => "hostname -I | awk '{print $1}'".to_string(),
+        DeployTarget::Aws => "ec2-metadata -o | awk '{print $2}'".to_string(),
     };
 
     let systemd_unit_content = format!(
@@ -963,9 +963,9 @@ fn create_etcd_deregister_service(
 ) -> CmdResult {
     let etcd_deregister_script = format!("{BIN_PATH}etcd-deregister.sh");
 
-    let get_instance_id_cmd = match config.global.target {
-        VpcTarget::OnPrem => "hostname".to_string(),
-        VpcTarget::Aws => "ec2-metadata -i | awk '{print $2}'".to_string(),
+    let get_instance_id_cmd = match config.global.deploy_target {
+        DeployTarget::OnPrem => "hostname".to_string(),
+        DeployTarget::Aws => "ec2-metadata -i | awk '{print $2}'".to_string(),
     };
 
     let systemd_unit_content = format!(

@@ -1,5 +1,5 @@
 use super::common::*;
-use crate::config::{BootstrapConfig, VpcTarget};
+use crate::config::{BootstrapConfig, DeployTarget};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use std::io::Error;
@@ -18,8 +18,9 @@ const META_DATA_VG_QUORUM_W: usize = 4;
 
 pub fn bootstrap(config: &BootstrapConfig, is_leader: bool, for_bench: bool) -> CmdResult {
     let nss_endpoint = &config.endpoints.nss_endpoint;
-    let nss_a_id = &config.resources.nss_a_id;
-    let nss_b_id = config.resources.nss_b_id.as_deref();
+    let resources = config.get_resources();
+    let nss_a_id = &resources.nss_a_id;
+    let nss_b_id = resources.nss_b_id.as_deref();
     let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     let num_bss_nodes = config.global.num_bss_nodes;
     let ha_enabled = config.global.rss_ha_enabled;
@@ -96,7 +97,7 @@ fn bootstrap_leader(
 
     // Initialize AZ status if this is a multi-AZ deployment (AWS only)
     if let Some(remote_az) = remote_az
-        && config.global.target == VpcTarget::Aws
+        && config.global.deploy_target == DeployTarget::Aws
     {
         initialize_az_status(config, remote_az)?;
     }
@@ -114,7 +115,7 @@ fn bootstrap_leader(
 
     // Create S3 Express buckets if remote_az is provided (AWS only)
     if let Some(remote_az) = remote_az
-        && config.global.target == VpcTarget::Aws
+        && config.global.deploy_target == DeployTarget::Aws
     {
         let local_az = get_current_aws_az_id()?;
         create_s3_express_bucket(&local_az, S3EXPRESS_LOCAL_BUCKET_CONFIG)?;
@@ -516,10 +517,7 @@ fn wait_for_leadership() -> CmdResult {
 }
 
 fn create_rss_config(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: bool) -> CmdResult {
-    let region = match config.global.target {
-        VpcTarget::Aws => get_current_aws_region()?,
-        VpcTarget::OnPrem => "on-prem".to_string(),
-    };
+    let region = &config.global.region;
     let instance_id = get_instance_id_from_config(config)?;
 
     let backend = if config.is_etcd_backend() {

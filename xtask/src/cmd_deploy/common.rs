@@ -1,4 +1,4 @@
-pub use xtask_common::VpcTarget;
+pub use xtask_common::DeployTarget;
 
 pub struct VpcConfig {
     pub template: Option<crate::VpcTemplate>,
@@ -12,6 +12,7 @@ pub struct VpcConfig {
     pub az: Option<String>,
     pub root_server_ha: bool,
     pub rss_backend: crate::RssBackend,
+    pub ssm_bootstrap: bool,
 }
 
 #[derive(Clone)]

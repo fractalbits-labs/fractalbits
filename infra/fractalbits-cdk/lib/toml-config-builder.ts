@@ -6,16 +6,11 @@ export type DataBlobStorage =
   | "s3_hybrid_single_az"
   | "s3_express_multi_az";
 
-export type VpcTarget = "aws" | "on_prem";
+export type DeployTarget = "aws" | "on_prem";
 
 // Helper to create a TOML key-value line with a CFN token value
 function tomlLine(key: string, value: string): string {
   return cdk.Fn.join("", [key, ' = "', value, '"']);
-}
-
-// Helper to create a TOML instance section header with CFN token
-function instanceHeader(instanceId: string): string {
-  return cdk.Fn.join("", ['[instances."', instanceId, '"]']);
 }
 
 // Instance configuration with optional private IP
@@ -26,8 +21,10 @@ export interface InstanceProps {
 
 // Build config with CFN tokens (hybrid approach)
 // Static parts use TOML.stringify, dynamic parts use cdk.Fn.join
+// Uses new [[nodes]] format instead of [instances."id"]
 export function createConfigWithCfnTokens(props: {
-  target?: VpcTarget; // defaults to "aws"
+  deployTarget?: DeployTarget; // defaults to "aws"
+  region: string; // AWS region or custom region identifier
   forBench: boolean;
   dataBlobStorage: DataBlobStorage;
   rssHaEnabled: boolean;
@@ -57,10 +54,11 @@ export function createConfigWithCfnTokens(props: {
   bootstrapBucket?: string; // S3 bucket name for bootstrap files
 }): string {
   // Build static config using TOML library
-  const target = props.target ?? "aws";
+  const deployTarget = props.deployTarget ?? "aws";
   const staticConfig: Record<string, TOML.JsonMap> = {
     global: {
-      target: target,
+      deploy_target: deployTarget,
+      region: props.region,
       for_bench: props.forBench,
       data_blob_storage: props.dataBlobStorage,
       rss_ha_enabled: props.rssHaEnabled,
@@ -148,61 +146,54 @@ export function createConfigWithCfnTokens(props: {
     }
   }
 
-  // Helper to add private_ip if present
-  const addPrivateIp = (instance: InstanceProps) => {
+  // Helper function to add a node entry with [[nodes]] format
+  const addNode = (
+    instance: InstanceProps,
+    serviceType: string,
+    role?: string,
+    volumeId?: string,
+    benchClientNum?: number
+  ) => {
+    lines.push("");
+    lines.push("[[nodes]]");
+    lines.push(cdk.Fn.join("", ['id = "', instance.id, '"']));
+    lines.push(`service_type = "${serviceType}"`);
+    if (role) {
+      lines.push(`role = "${role}"`);
+    }
     if (instance.privateIp) {
-      lines.push(tomlLine("private_ip", instance.privateIp));
+      lines.push(cdk.Fn.join("", ['private_ip = "', instance.privateIp, '"']));
+    }
+    if (volumeId) {
+      lines.push(cdk.Fn.join("", ['volume_id = "', volumeId, '"']));
+    }
+    if (benchClientNum !== undefined) {
+      lines.push(`bench_client_num = ${benchClientNum}`);
     }
   };
 
-  // Instance sections with CFN tokens
-  lines.push("");
-  lines.push(instanceHeader(props.rssA.id));
-  lines.push('service_type = "root_server"');
-  lines.push('role = "leader"');
-  addPrivateIp(props.rssA);
-
+  // Add RSS nodes
+  addNode(props.rssA, "root_server", "leader");
   if (props.rssB) {
-    lines.push("");
-    lines.push(instanceHeader(props.rssB.id));
-    lines.push('service_type = "root_server"');
-    lines.push('role = "follower"');
-    addPrivateIp(props.rssB);
+    addNode(props.rssB, "root_server", "follower");
   }
 
-  lines.push("");
-  lines.push(instanceHeader(props.nssA.id));
-  lines.push('service_type = "nss_server"');
-  // Only include volume_id for ebs journal type
-  if (props.journalType === "ebs" && props.volumeAId) {
-    lines.push(tomlLine("volume_id", props.volumeAId));
-  }
-  addPrivateIp(props.nssA);
-
+  // Add NSS nodes
+  const nssAVolumeId = props.journalType === "ebs" ? props.volumeAId : undefined;
+  addNode(props.nssA, "nss_server", undefined, nssAVolumeId);
   if (props.nssB) {
-    lines.push("");
-    lines.push(instanceHeader(props.nssB.id));
-    lines.push('service_type = "nss_server"');
-    // Only include volume_id for ebs journal type
-    if (props.journalType === "ebs" && props.volumeBId) {
-      lines.push(tomlLine("volume_id", props.volumeBId));
-    }
-    addPrivateIp(props.nssB);
+    const nssBVolumeId = props.journalType === "ebs" ? props.volumeBId : undefined;
+    addNode(props.nssB, "nss_server", undefined, nssBVolumeId);
   }
 
+  // Add GUI server
   if (props.guiServer) {
-    lines.push("");
-    lines.push(instanceHeader(props.guiServer.id));
-    lines.push('service_type = "gui_server"');
-    addPrivateIp(props.guiServer);
+    addNode(props.guiServer, "gui_server");
   }
 
+  // Add Bench server
   if (props.benchServer && props.benchClientNum !== undefined) {
-    lines.push("");
-    lines.push(instanceHeader(props.benchServer.id));
-    lines.push('service_type = "bench_server"');
-    lines.push(`bench_client_num = ${props.benchClientNum}`);
-    addPrivateIp(props.benchServer);
+    addNode(props.benchServer, "bench_server", undefined, undefined, props.benchClientNum);
   }
 
   lines.push("");

@@ -2,7 +2,7 @@ use log::info;
 use std::io::Error;
 
 use crate::common::{get_current_aws_region, get_ec2_tag, get_instance_id_from_config};
-use crate::config::{BootstrapConfig, InstanceConfig, JournalType, VpcTarget};
+use crate::config::{BootstrapConfig, DeployTarget, InstanceConfig, JournalType};
 
 pub const SERVICE_TYPE_TAG: &str = "fractalbits:ServiceType";
 
@@ -21,16 +21,16 @@ pub fn discover_service_type(config: &BootstrapConfig) -> Result<ServiceType, Er
     let instance_id = get_instance_id_from_config(config)?;
     info!("Discovering service type for instance: {instance_id}");
 
-    if let Some(instance_config) = config.instances.get(&instance_id) {
+    if let Some(instance_config) = config.get_instance(&instance_id) {
         info!(
             "Found instance config in TOML: {:?}",
             instance_config.service_type
         );
-        return parse_instance_config(config, instance_config);
+        return parse_instance_config(config, &instance_config);
     }
 
     // For on-prem, instance MUST be in TOML config (no EC2 tag fallback)
-    if config.global.target == VpcTarget::OnPrem {
+    if config.global.deploy_target == DeployTarget::OnPrem {
         return Err(Error::other(format!(
             "Instance '{instance_id}' not found in config. On-prem requires all instances in TOML."
         )));

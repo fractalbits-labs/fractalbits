@@ -2,7 +2,7 @@ pub mod ebs_journal;
 pub mod nvme_journal;
 
 use super::common::*;
-use crate::config::{BootstrapConfig, JournalType, VpcTarget};
+use crate::config::{BootstrapConfig, DeployTarget, JournalType};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use rayon::prelude::*;
@@ -111,7 +111,7 @@ fn setup_configs(
     create_systemd_unit_file_with_journal_type(service_name, false, Some(journal_type))?;
 
     create_logrotate_for_stats()?;
-    if config.global.target == VpcTarget::Aws {
+    if config.global.deploy_target == DeployTarget::Aws {
         create_ena_irq_affinity_service()?;
     }
     create_nvme_tuning_service()?;

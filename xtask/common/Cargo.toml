@@ -9,5 +9,7 @@ clap.workspace = true
 num_cpus.workspace = true
 rayon.workspace = true
 uuid.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 tracing.workspace = true

@@ -273,6 +273,9 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
+    // Read skipUserData context for ASGs (SSM-based bootstrap)
+    const skipUserDataCtx = this.node.tryGetContext("skipUserData") === "true";
+
     let benchClientAsg: autoscaling.AutoScalingGroup | undefined;
     if (props.benchType === "external") {
       // Create bench_server
@@ -294,6 +297,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         props.numBenchClients,
         props.numBenchClients,
         "bench_client",
+        skipUserDataCtx,
       );
       // Add lifecycle hook for bench_client ASG
       addAsgDynamoDbDeregistrationLifecycleHook(
@@ -331,6 +335,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         props.numBssNodes,
         props.numBssNodes,
         "bss_server",
+        skipUserDataCtx,
       );
     }
 
@@ -381,6 +386,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       props.numApiServers,
       props.numApiServers,
       "api_server",
+      skipUserDataCtx,
     );
 
     // Add lifecycle hook for api_server ASG
@@ -441,8 +447,12 @@ export class FractalbitsVpcStack extends cdk.Stack {
     }
 
     // Add UserData to all instances - they will discover their role from TOML config
-    for (const instance of Object.values(instances)) {
-      instance.addUserData(createUserData(this).render());
+    // Skip if skipUserData context is set (for SSM-based bootstrap)
+    const skipUserData = this.node.tryGetContext("skipUserData") === "true";
+    if (!skipUserData) {
+      for (const instance of Object.values(instances)) {
+        instance.addUserData(createUserData(this).render());
+      }
     }
 
     // Outputs
@@ -525,7 +535,8 @@ export class FractalbitsVpcStack extends cdk.Stack {
     const workflowClusterId = `fractalbits-${Date.now()}`;
 
     const bootstrapConfigContent = createConfigWithCfnTokens({
-      target: "aws", // AWS deployment (default)
+      deployTarget: "aws",
+      region: cdk.Stack.of(this).region,
       forBench: !!props.benchType,
       dataBlobStorage: dataBlobStorage,
       rssHaEnabled: props.rootServerHa,
@@ -574,7 +585,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         action: "putObject",
         parameters: {
           Bucket: bootstrapBucket,
-          Key: "bootstrap.toml",
+          Key: "bootstrap_cluster.toml",
           Body: bootstrapConfigContent,
           ContentType: "text/plain",
         },
@@ -585,7 +596,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         action: "putObject",
         parameters: {
           Bucket: bootstrapBucket,
-          Key: "bootstrap.toml",
+          Key: "bootstrap_cluster.toml",
           Body: bootstrapConfigContent,
           ContentType: "text/plain",
         },

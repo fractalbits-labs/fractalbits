@@ -1,4 +1,4 @@
-use super::common::VpcTarget;
+use super::common::DeployTarget;
 use super::upload::get_bootstrap_bucket_name;
 use crate::CmdResult;
 use cmd_lib::*;
@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Error;
 use std::time::{Duration, Instant};
+use xtask_common::BOOTSTRAP_CLUSTER_CONFIG;
 
 #[derive(Debug, Deserialize)]
 struct BootstrapConfigGlobal {
@@ -94,7 +95,7 @@ struct WorkflowConfig {
 
 fn parse_workflow_config(content: &str) -> Result<WorkflowConfig, Error> {
     let config: BootstrapConfig = toml::from_str(content)
-        .map_err(|e| Error::other(format!("Failed to parse bootstrap.toml: {e}")))?;
+        .map_err(|e| Error::other(format!("Failed to parse {BOOTSTRAP_CLUSTER_CONFIG}: {e}")))?;
 
     let cluster_id = config
         .global
@@ -137,18 +138,24 @@ fn parse_workflow_config(content: &str) -> Result<WorkflowConfig, Error> {
 }
 
 fn get_workflow_config(bucket: &str) -> Result<WorkflowConfig, Error> {
-    let s3_path = format!("s3://{bucket}/bootstrap.toml");
-    let content = run_fun!(aws s3 cp $s3_path - 2>/dev/null)
-        .map_err(|e| Error::other(format!("Failed to download bootstrap.toml: {e}")))?;
+    let s3_path = format!("s3://{bucket}/{BOOTSTRAP_CLUSTER_CONFIG}");
+    let content = run_fun!(aws s3 cp $s3_path - 2>/dev/null).map_err(|e| {
+        Error::other(format!(
+            "Failed to download {BOOTSTRAP_CLUSTER_CONFIG}: {e}"
+        ))
+    })?;
 
     parse_workflow_config(&content)
 }
 
 #[allow(dead_code)]
 fn get_workflow_config_by_id(bucket: &str, cluster_id: &str) -> Result<WorkflowConfig, Error> {
-    let s3_path = format!("s3://{bucket}/workflow/{cluster_id}/bootstrap.toml");
-    let content = run_fun!(aws s3 cp $s3_path - 2>/dev/null)
-        .map_err(|e| Error::other(format!("Failed to download workflow config: {e}")))?;
+    let s3_path = format!("s3://{bucket}/workflow/{cluster_id}/{BOOTSTRAP_CLUSTER_CONFIG}");
+    let content = run_fun!(aws s3 cp $s3_path - 2>/dev/null).map_err(|e| {
+        Error::other(format!(
+            "Failed to download {BOOTSTRAP_CLUSTER_CONFIG}: {e}"
+        ))
+    })?;
 
     parse_workflow_config(&content)
 }
@@ -181,7 +188,7 @@ impl StageCache {
     }
 }
 
-pub fn show_progress(target: VpcTarget) -> CmdResult {
+pub fn show_progress(target: DeployTarget) -> CmdResult {
     let bucket = get_bootstrap_bucket_name(target)?;
 
     let spinner = ProgressBar::new_spinner();

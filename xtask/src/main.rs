@@ -238,7 +238,7 @@ pub enum DeployCommand {
     #[clap(about = "Upload prebuilt binaries to s3 builds bucket")]
     Upload {
         #[clap(long, value_enum, default_value = "aws")]
-        vpc_target: xtask_common::VpcTarget,
+        vpc_target: xtask_common::DeployTarget,
     },
 
     #[clap(about = "Create VPC infrastructure using CDK")]
@@ -295,6 +295,9 @@ pub enum DeployCommand {
             default_value = "ddb"
         )]
         rss_backend: RssBackend,
+
+        #[clap(long, long_help = "Bootstrap via SSM instead of userData")]
+        ssm_bootstrap: bool,
     },
 
     #[clap(about = "Destroy VPC infrastructure (including s3 builds bucket cleanup)")]
@@ -303,7 +306,16 @@ pub enum DeployCommand {
     #[clap(about = "Show bootstrap progress for a VPC deployment")]
     BootstrapProgress {
         #[clap(long, value_enum, default_value = "aws")]
-        vpc_target: xtask_common::VpcTarget,
+        vpc_target: xtask_common::DeployTarget,
+    },
+
+    #[clap(about = "Create cluster from a cluster.toml config file")]
+    CreateCluster {
+        #[clap(long, long_help = "Path to cluster.toml config file")]
+        config: String,
+
+        #[clap(long, long_help = "Bootstrap S3 endpoint URL (e.g., 10.0.0.1:8080)")]
+        bootstrap_s3_url: String,
     },
 }
 
@@ -669,6 +681,7 @@ async fn main() -> CmdResult {
                 az,
                 root_server_ha,
                 rss_backend,
+                ssm_bootstrap,
             } => cmd_deploy::create_vpc(cmd_deploy::VpcConfig {
                 template,
                 num_api_servers,
@@ -681,11 +694,16 @@ async fn main() -> CmdResult {
                 az,
                 root_server_ha,
                 rss_backend,
+                ssm_bootstrap,
             })?,
             DeployCommand::DestroyVpc => cmd_deploy::destroy_vpc()?,
             DeployCommand::BootstrapProgress { vpc_target } => {
                 cmd_deploy::bootstrap::show_progress(vpc_target)?
             }
+            DeployCommand::CreateCluster {
+                config,
+                bootstrap_s3_url,
+            } => cmd_deploy::create_cluster(&config, &bootstrap_s3_url)?,
         },
         Cmd::RunTests { test_type } => {
             let test_type = test_type.unwrap_or(TestType::All);
