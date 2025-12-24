@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "crates/**",
-    "vpc/fractalbits-bootstrap",
+    "infra/fractalbits-bootstrap",
     "xtask",
 ]
 # workaround due to cargo's limitations

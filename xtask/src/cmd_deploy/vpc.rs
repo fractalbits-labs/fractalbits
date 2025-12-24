@@ -24,7 +24,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
 
     // Note: Template-based configuration is handled in CDK (vpc/fractalbits-cdk/bin/fractalbits-vpc.ts)
     // The values passed here may be overridden by the template in CDK
-    let cdk_dir = "vpc/fractalbits-cdk";
+    let cdk_dir = "infra/fractalbits-cdk";
 
     // Check if node_modules exists, if not run npm install
     let node_modules_path = format!("{}/node_modules/", cdk_dir);
@@ -125,7 +125,7 @@ pub fn destroy_vpc() -> CmdResult {
     // First destroy the CDK stack
     run_cmd! {
         info "Destroying CDK stack...";
-        cd vpc/fractalbits-cdk;
+        cd infra/fractalbits-cdk;
         npx cdk destroy FractalbitsVpcStack 2>&1;
         info "CDK stack destroyed successfully";
     }?;
