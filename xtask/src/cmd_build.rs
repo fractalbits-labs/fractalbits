@@ -268,6 +268,7 @@ pub fn build_prebuilt(_release: bool) -> CmdResult {
         "root_server",
         "rss_admin",
         "zig-out/bin/bss_server",
+        "zig-out/bin/mirrord",
         "zig-out/bin/nss_server",
     ] {
         run_cmd!(cp -f $build_dir/$bin prebuilt/)?;
