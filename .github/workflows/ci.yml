@@ -12,6 +12,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   build:
