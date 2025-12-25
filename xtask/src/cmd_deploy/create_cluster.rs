@@ -11,17 +11,12 @@ use xtask_common::{
 
 #[derive(Debug, Deserialize)]
 pub struct InputClusterGlobal {
+    #[serde(default = "default_region")]
     pub region: String,
     #[serde(default)]
     pub for_bench: bool,
-    #[serde(default = "default_data_blob_storage")]
-    pub data_blob_storage: String,
     #[serde(default)]
     pub rss_ha_enabled: bool,
-    #[serde(default = "default_rss_backend")]
-    pub rss_backend: String,
-    #[serde(default = "default_journal_type")]
-    pub journal_type: String,
     #[serde(default = "default_num_bss_nodes")]
     pub num_bss_nodes: usize,
     #[serde(default)]
@@ -32,16 +27,8 @@ pub struct InputClusterGlobal {
     pub cpu_target: Option<String>,
 }
 
-fn default_data_blob_storage() -> String {
-    "all_in_bss_single_az".to_string()
-}
-
-fn default_rss_backend() -> String {
-    "etcd".to_string()
-}
-
-fn default_journal_type() -> String {
-    "nvme".to_string()
+fn default_region() -> String {
+    "on-prem".to_string()
 }
 
 fn default_num_bss_nodes() -> usize {
@@ -57,11 +44,10 @@ pub struct InputClusterEndpoints {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct InputNodeConfig {
+pub struct InputNodeEntry {
     pub ip: String,
     #[serde(default)]
     pub hostname: Option<String>,
-    pub service_type: String,
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
@@ -75,29 +61,7 @@ pub struct InputClusterConfig {
     pub global: InputClusterGlobal,
     #[serde(default)]
     pub endpoints: Option<InputClusterEndpoints>,
-    pub nodes: Vec<InputNodeConfig>,
-}
-
-fn parse_data_blob_storage(s: &str) -> DataBlobStorage {
-    match s {
-        "s3_hybrid_single_az" => DataBlobStorage::S3HybridSingleAz,
-        "s3_express_multi_az" => DataBlobStorage::S3ExpressMultiAz,
-        _ => DataBlobStorage::AllInBssSingleAz,
-    }
-}
-
-fn parse_rss_backend(s: &str) -> RssBackend {
-    match s {
-        "ddb" => RssBackend::Ddb,
-        _ => RssBackend::Etcd,
-    }
-}
-
-fn parse_journal_type(s: &str) -> JournalType {
-    match s {
-        "ebs" => JournalType::Ebs,
-        _ => JournalType::Nvme,
-    }
+    pub nodes: HashMap<String, Vec<InputNodeEntry>>,
 }
 
 impl InputClusterConfig {
@@ -128,14 +92,15 @@ impl InputClusterConfig {
                 .as_millis()
         );
 
+        // On-prem always uses these fixed settings
         let global = ClusterGlobalConfig {
             deploy_target: DeployTarget::OnPrem,
             region: self.global.region.clone(),
             for_bench: self.global.for_bench,
-            data_blob_storage: parse_data_blob_storage(&self.global.data_blob_storage),
+            data_blob_storage: DataBlobStorage::AllInBssSingleAz,
             rss_ha_enabled: self.global.rss_ha_enabled,
-            rss_backend: parse_rss_backend(&self.global.rss_backend),
-            journal_type: parse_journal_type(&self.global.journal_type),
+            rss_backend: RssBackend::Etcd,
+            journal_type: JournalType::Nvme,
             num_bss_nodes: Some(self.global.num_bss_nodes),
             num_api_servers: self.global.num_api_servers,
             num_bench_clients: self.global.num_bench_clients,
@@ -151,8 +116,8 @@ impl InputClusterConfig {
             .and_then(|e| e.nss_endpoint.clone())
             .or_else(|| {
                 self.nodes
-                    .iter()
-                    .find(|n| n.service_type == "nss_server")
+                    .get("nss_server")
+                    .and_then(|nodes| nodes.first())
                     .map(|n| n.ip.clone())
             })
             .unwrap_or_default();
@@ -166,31 +131,31 @@ impl InputClusterConfig {
                 .and_then(|e| e.api_server_endpoint.clone()),
         };
 
-        let etcd = if parse_rss_backend(&self.global.rss_backend) == RssBackend::Etcd {
-            Some(ClusterEtcdConfig {
-                enabled: true,
-                cluster_size: self.global.num_bss_nodes,
-                endpoints: None,
-            })
-        } else {
-            None
-        };
+        // On-prem always uses etcd
+        let etcd = Some(ClusterEtcdConfig {
+            enabled: true,
+            cluster_size: self.global.num_bss_nodes,
+            endpoints: None,
+        });
 
-        // Group nodes by service_type
-        let mut nodes: HashMap<String, Vec<NodeEntry>> = HashMap::new();
-        for node in &self.nodes {
-            let entry = NodeEntry {
-                id: node.hostname.clone().unwrap_or_else(|| node.ip.clone()),
-                private_ip: Some(node.ip.clone()),
-                role: node.role.clone(),
-                volume_id: node.volume_id.clone(),
-                bench_client_num: node.bench_client_num,
-            };
-            nodes
-                .entry(node.service_type.clone())
-                .or_default()
-                .push(entry);
-        }
+        // Convert input nodes to output format (already grouped by service_type)
+        let nodes: HashMap<String, Vec<NodeEntry>> = self
+            .nodes
+            .iter()
+            .map(|(service_type, entries)| {
+                let node_entries: Vec<NodeEntry> = entries
+                    .iter()
+                    .map(|node| NodeEntry {
+                        id: node.hostname.clone().unwrap_or_else(|| node.ip.clone()),
+                        private_ip: Some(node.ip.clone()),
+                        role: node.role.clone(),
+                        volume_id: node.volume_id.clone(),
+                        bench_client_num: node.bench_client_num,
+                    })
+                    .collect();
+                (service_type.clone(), node_entries)
+            })
+            .collect();
 
         let config = BootstrapClusterConfig {
             global,
@@ -210,10 +175,10 @@ impl InputClusterConfig {
 pub fn create_cluster(cluster_config_path: &str, bootstrap_s3_url: &str) -> CmdResult {
     let config = InputClusterConfig::from_file(cluster_config_path)?;
 
+    let total_nodes: usize = config.nodes.values().map(|v| v.len()).sum();
     info!(
         "Creating cluster with {} nodes, bootstrap S3 URL: {}",
-        config.nodes.len(),
-        bootstrap_s3_url
+        total_nodes, bootstrap_s3_url
     );
 
     let bootstrap_toml = config.to_bootstrap_cluster_toml()?;
@@ -241,28 +206,27 @@ pub fn create_cluster(cluster_config_path: &str, bootstrap_s3_url: &str) -> CmdR
 
     info!("{} uploaded successfully", BOOTSTRAP_CLUSTER_CONFIG);
 
-    for node in &config.nodes {
-        let node_ip = &node.ip;
-        let service_type = &node.service_type;
-        info!("Bootstrapping node {} (service: {})", node_ip, service_type);
+    for (service_type, nodes) in &config.nodes {
+        for node in nodes {
+            let node_ip = &node.ip;
+            info!("Bootstrapping node {} (service: {})", node_ip, service_type);
 
-        let bootstrap_cmd = format!(
-            "export AWS_DEFAULT_REGION=localdev && \
-             export AWS_ENDPOINT_URL_S3=http://{bootstrap_s3_url} && \
-             export AWS_ACCESS_KEY_ID=test_api_key && \
-             export AWS_SECRET_ACCESS_KEY=test_api_secret && \
-             aws s3 cp --no-progress s3://fractalbits-bootstrap/bootstrap.sh - | sh"
-        );
+            let bootstrap_cmd = format!(
+                "export AWS_DEFAULT_REGION=localdev && \
+                 export AWS_ENDPOINT_URL_S3=http://{bootstrap_s3_url} && \
+                 export AWS_ACCESS_KEY_ID=test_api_key && \
+                 export AWS_SECRET_ACCESS_KEY=test_api_secret && \
+                 aws s3 cp --no-progress s3://fractalbits-bootstrap/bootstrap.sh - | sh"
+            );
 
-        run_cmd!(ssh $node_ip $bootstrap_cmd)
-            .map_err(|e| Error::other(format!("Failed to bootstrap node {}: {}", node_ip, e)))?;
+            run_cmd!(ssh $node_ip $bootstrap_cmd).map_err(|e| {
+                Error::other(format!("Failed to bootstrap node {}: {}", node_ip, e))
+            })?;
 
-        info!("Node {} bootstrapped successfully", node_ip);
+            info!("Node {} bootstrapped successfully", node_ip);
+        }
     }
 
-    info!(
-        "Cluster creation completed for {} nodes",
-        config.nodes.len()
-    );
+    info!("Cluster creation completed for {} nodes", total_nodes);
     Ok(())
 }
