@@ -172,7 +172,11 @@ impl InputClusterConfig {
     }
 }
 
-pub fn create_cluster(cluster_config_path: &str, bootstrap_s3_url: &str) -> CmdResult {
+pub fn create_cluster(
+    cluster_config_path: &str,
+    bootstrap_s3_url: &str,
+    watch_bootstrap: bool,
+) -> CmdResult {
     let config = InputClusterConfig::from_file(cluster_config_path)?;
 
     let total_nodes: usize = config.nodes.values().map(|v| v.len()).sum();
@@ -228,5 +232,13 @@ pub fn create_cluster(cluster_config_path: &str, bootstrap_s3_url: &str) -> CmdR
     }
 
     info!("Cluster creation completed for {} nodes", total_nodes);
+
+    if watch_bootstrap {
+        super::bootstrap::show_progress(xtask_common::DeployTarget::OnPrem)?;
+    } else {
+        info!("To monitor bootstrap progress, run:");
+        info!("  cargo xtask deploy bootstrap-progress --vpc-target on-prem");
+    }
+
     Ok(())
 }

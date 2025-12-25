@@ -23,6 +23,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         rss_backend,
         ssm_bootstrap,
         journal_type,
+        watch_bootstrap,
     } = config;
 
     // Note: Template-based configuration is handled in CDK (vpc/fractalbits-cdk/bin/fractalbits-vpc.ts)
@@ -116,8 +117,12 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         }?;
     }
 
-    // Show bootstrap progress
-    bootstrap::show_progress(DeployTarget::Aws)?;
+    if watch_bootstrap {
+        bootstrap::show_progress(DeployTarget::Aws)?;
+    } else {
+        info!("To monitor bootstrap progress, run:");
+        info!("  cargo xtask deploy bootstrap-progress");
+    }
 
     Ok(())
 }

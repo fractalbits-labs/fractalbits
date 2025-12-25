@@ -306,6 +306,9 @@ pub enum DeployCommand {
             default_value = "ebs"
         )]
         journal_type: JournalType,
+
+        #[clap(long, long_help = "Watch bootstrap progress inline after VPC creation")]
+        watch_bootstrap: bool,
     },
 
     #[clap(about = "Destroy VPC infrastructure (including s3 builds bucket cleanup)")]
@@ -324,6 +327,12 @@ pub enum DeployCommand {
 
         #[clap(long, long_help = "Bootstrap S3 endpoint URL (e.g., 10.0.0.1:8080)")]
         bootstrap_s3_url: String,
+
+        #[clap(
+            long,
+            long_help = "Watch bootstrap progress inline after cluster creation"
+        )]
+        watch_bootstrap: bool,
     },
 }
 
@@ -708,6 +717,7 @@ async fn main() -> CmdResult {
                 rss_backend,
                 ssm_bootstrap,
                 journal_type,
+                watch_bootstrap,
             } => cmd_deploy::create_vpc(cmd_deploy::VpcConfig {
                 template,
                 num_api_servers,
@@ -722,6 +732,7 @@ async fn main() -> CmdResult {
                 rss_backend,
                 ssm_bootstrap,
                 journal_type,
+                watch_bootstrap,
             })?,
             DeployCommand::DestroyVpc => cmd_deploy::destroy_vpc()?,
             DeployCommand::BootstrapProgress { vpc_target } => {
@@ -730,7 +741,8 @@ async fn main() -> CmdResult {
             DeployCommand::CreateCluster {
                 config,
                 bootstrap_s3_url,
-            } => cmd_deploy::create_cluster(&config, &bootstrap_s3_url)?,
+                watch_bootstrap,
+            } => cmd_deploy::create_cluster(&config, &bootstrap_s3_url, watch_bootstrap)?,
         },
         Cmd::RunTests { test_type } => {
             let test_type = test_type.unwrap_or(TestType::All);
