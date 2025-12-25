@@ -17,6 +17,12 @@ pub fn init_service(
 ) -> CmdResult {
     stop_service(service)?;
 
+    // Clean up previous service files to prevent stale configuration detection
+    // (e.g., nss_role_agent_b.service from previous NVMe runs affecting EBS mode)
+    if matches!(service, ServiceName::All) {
+        run_cmd!(rm -rf data/etc)?;
+    }
+
     // We are using minio to test large blob IO
     ensure_minio()?;
 
@@ -1230,10 +1236,10 @@ fn register_local_api_server() -> CmdResult {
             }
         }
         RssBackend::Etcd => {
+            // Use individual keys per instance: /fractalbits-service-discovery/api-server/<id> -> <ip>
             let etcdctl = resolve_etcd_bin("etcdctl");
-            let instances_json = r#"{"local-dev":"127.0.0.1:8080"}"#;
             run_cmd!(
-                $etcdctl put /fractalbits-service-discovery/api-server $instances_json >/dev/null
+                $etcdctl put /fractalbits-service-discovery/api-server/local-dev "127.0.0.1" >/dev/null
             )?;
         }
     }

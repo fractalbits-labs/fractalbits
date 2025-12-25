@@ -911,15 +911,18 @@ WantedBy=multi-user.target
 "##
     );
 
+    // Use individual keys per instance: /fractalbits-service-discovery/<service_id>/<instance_id> -> <ip>
+    // This allows simple put/del operations and prefix scanning for discovery
     let register_script_content = format!(
-        r##"#!/bin/bash
+        r###"#!/bin/bash
 set -e
 service_id={service_id}
 endpoints="{endpoints}"
 instance_id=$({get_instance_id_cmd})
 private_ip=$({get_private_ip_cmd})
+etcd_key="/fractalbits-service-discovery/$service_id/$instance_id"
 
-echo "Registering itself ($instance_id,$private_ip) to etcd with service_id $service_id" >&2
+echo "Registering itself ($instance_id,$private_ip) to etcd at $etcd_key" >&2
 
 MAX_RETRIES=30
 retry_count=0
@@ -928,7 +931,7 @@ success=false
 while [ $retry_count -lt $MAX_RETRIES ] && [ "$success" = "false" ]; do
     retry_count=$((retry_count + 1))
 
-    if {BIN_PATH}etcdctl --endpoints="$endpoints" put "/services/$service_id/$instance_id" "$private_ip" 2>/dev/null; then
+    if {BIN_PATH}etcdctl --endpoints="$endpoints" put "$etcd_key" "$private_ip" 2>/dev/null; then
         echo "Registered service on attempt $retry_count" >&2
         success=true
     else
@@ -943,7 +946,7 @@ if [ "$success" = "false" ]; then
 fi
 
 echo "Done" >&2
-"##
+"###
     );
 
     run_cmd! {
@@ -986,17 +989,19 @@ WantedBy=reboot.target halt.target poweroff.target kexec.target
 "##
     );
 
+    // Use individual keys per instance - just delete the key
     let deregister_script_content = format!(
-        r##"#!/bin/bash
+        r###"#!/bin/bash
 set -e
 service_id={service_id}
 endpoints="{endpoints}"
 instance_id=$({get_instance_id_cmd})
+etcd_key="/fractalbits-service-discovery/$service_id/$instance_id"
 
-echo "Deregistering itself ($instance_id) from etcd with service_id $service_id" >&2
-{BIN_PATH}etcdctl --endpoints="$endpoints" del "/services/$service_id/$instance_id" 2>/dev/null || true
+echo "Deregistering itself ($instance_id) from etcd at $etcd_key" >&2
+{BIN_PATH}etcdctl --endpoints="$endpoints" del "$etcd_key" 2>/dev/null || true
 echo "Done" >&2
-"##
+"###
     );
 
     run_cmd! {
@@ -1018,22 +1023,24 @@ pub fn get_service_ips_etcd(
     let start_time = Instant::now();
     let timeout = Duration::from_secs(300);
     let etcdctl = format!("{BIN_PATH}etcdctl");
-    let key_prefix = format!("/services/{service_id}");
+    // Use prefix scan: /fractalbits-service-discovery/<service_id>/<instance_id> -> <ip>
+    let etcd_prefix = format!("/fractalbits-service-discovery/{service_id}/");
     loop {
         if start_time.elapsed() > timeout {
             cmd_die!("Timeout waiting for {service_id} service(s) via etcd");
         }
 
         let res: Result<String, _> = run_fun! {
-            $etcdctl --endpoints=$endpoints get $key_prefix --prefix --print-value-only 2>/dev/null
+            $etcdctl --endpoints=$endpoints get $etcd_prefix --prefix --print-value-only 2>/dev/null
         };
 
         match res {
             Ok(ref output) if !output.trim().is_empty() => {
+                // Each line is an IP address
                 let ips: Vec<String> = output
                     .lines()
-                    .filter(|line: &&str| !line.is_empty())
-                    .map(|s: &str| s.to_string())
+                    .filter(|line| !line.is_empty())
+                    .map(|s| s.to_string())
                     .collect();
 
                 if ips.len() >= expected_min_count {
