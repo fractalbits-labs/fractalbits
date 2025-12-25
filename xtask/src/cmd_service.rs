@@ -167,7 +167,9 @@ pub fn init_service(
     let init_minio = |data_dir: &str| -> CmdResult { run_cmd!(mkdir -p $data_dir) };
     let init_etcd = || -> CmdResult {
         ensure_etcd_local()?;
+        // Clean existing etcd data to prevent stale keys from previous runs
         run_cmd! {
+            rm -rf data/etcd;
             mkdir -p data/etcd;
         }?;
         start_service(ServiceName::Etcd)?;
@@ -1134,41 +1136,41 @@ pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdRes
     let timeout = Duration::from_secs(timeout_secs as u64);
     let service_name = service.as_ref();
 
-    info!("Waiting for {service_name} to be ready (timeout: {timeout_secs}s)");
+    // Get port info for logging
+    let (port_desc, ports): (&str, Vec<u16>) = match service {
+        ServiceName::DdbLocal => ("port 8000", vec![8000]),
+        ServiceName::Minio => ("port 9000", vec![9000]),
+        ServiceName::MinioAz1 => ("port 9001", vec![9001]),
+        ServiceName::MinioAz2 => ("port 9002", vec![9002]),
+        ServiceName::Rss => ("port 8086", vec![8086]),
+        ServiceName::Bss => {
+            let bss_count = get_bss_count_from_config();
+            let ports: Vec<u16> = (0..bss_count).map(|id| 8088 + id as u16).collect();
+            ("BSS ports", ports)
+        }
+        ServiceName::Nss => ("port 8087", vec![8087]),
+        ServiceName::Mirrord => ("port 9999", vec![9999]),
+        ServiceName::ApiServer | ServiceName::GuiServer => ("port 8080", vec![8080]),
+        ServiceName::NssRoleAgentA => ("managed nss port 8087", vec![8087]),
+        ServiceName::NssRoleAgentB => ("managed mirrord port 9999", vec![9999]),
+        ServiceName::Etcd => ("port 2379", vec![2379]),
+        ServiceName::All => unreachable!("Should not check readiness for All"),
+    };
+
+    info!("Waiting for {service_name} to be ready ({port_desc}, timeout: {timeout_secs}s)");
 
     while start.elapsed() < timeout {
         // Check if systemd reports service as active
         if run_cmd!(systemctl --user is-active --quiet $service_name.service).is_ok() {
             // For network services, also check port availability
-            let port_ready = match service {
-                ServiceName::DdbLocal => check_port_ready(8000),
-                ServiceName::Minio => check_port_ready(9000),
-                ServiceName::MinioAz1 => check_port_ready(9001),
-                ServiceName::MinioAz2 => check_port_ready(9002),
-                ServiceName::Rss => check_port_ready(8086),
-                ServiceName::Bss => {
-                    // Check all BSS instances
-                    let bss_count = get_bss_count_from_config();
-                    if bss_count == 0 {
-                        true // No BSS services to check, consider ready
-                    } else {
-                        (0..bss_count).all(|id| {
-                            let port = 8088 + id as u16;
-                            check_port_ready(port)
-                        })
-                    }
-                }
-                ServiceName::Nss => check_port_ready(8087),
-                ServiceName::Mirrord => check_port_ready(9999),
-                ServiceName::ApiServer | ServiceName::GuiServer => check_port_ready(8080),
-                ServiceName::NssRoleAgentA => check_port_ready(8087), // Check managed nss_server
-                ServiceName::NssRoleAgentB => check_port_ready(9999), // check managed mirrord
-                ServiceName::Etcd => check_port_ready(2379),
-                ServiceName::All => unreachable!("Should not check readiness for All"),
+            let port_ready = if ports.is_empty() {
+                true
+            } else {
+                ports.iter().all(|&port| check_port_ready(port))
             };
 
             if port_ready {
-                info!("{service_name} is ready");
+                info!("{service_name} is ready ({port_desc})");
                 return Ok(());
             }
         }

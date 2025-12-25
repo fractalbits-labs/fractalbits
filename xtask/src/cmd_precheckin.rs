@@ -125,7 +125,6 @@ fn run_s3_api_tests(init_config: InitConfig, debug_api_server: bool) -> CmdResul
     info!("Testing with DDB backend...");
     cmd_service::init_service(ServiceName::All, BuildMode::Debug, ddb_config)?;
     cmd_service::start_service(ServiceName::All)?;
-
     run_cmd! {
         info "Run cargo tests (s3 api tests - DDB backend)";
         cargo test --package api_server;
@@ -140,13 +139,6 @@ fn run_s3_api_tests(init_config: InitConfig, debug_api_server: bool) -> CmdResul
 
     cmd_service::stop_service(ServiceName::All)?;
 
-    // Clean up data directories to ensure fresh state for etcd backend test.
-    // NSS data from DDB run is incompatible and causes crashes when switching backends.
-    run_cmd! {
-        info "Cleaning up data directories before etcd backend test";
-        rm -rf data;
-    }?;
-
     // Test with etcd backend
     let etcd_config = InitConfig {
         rss_backend: RssBackend::Etcd,
@@ -155,10 +147,6 @@ fn run_s3_api_tests(init_config: InitConfig, debug_api_server: bool) -> CmdResul
     info!("Testing with etcd backend...");
     cmd_service::init_service(ServiceName::All, BuildMode::Debug, etcd_config)?;
     cmd_service::start_service(ServiceName::All)?;
-
-    // Wait for NSS to fully initialize (port check may pass before full init)
-    std::thread::sleep(std::time::Duration::from_secs(3));
-
     run_cmd! {
         info "Run cargo tests (s3 api tests - etcd backend)";
         cargo test --package api_server;
