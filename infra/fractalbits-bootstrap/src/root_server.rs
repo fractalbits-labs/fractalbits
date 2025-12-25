@@ -1,5 +1,5 @@
 use super::common::*;
-use crate::config::{BootstrapConfig, DeployTarget};
+use crate::config::{BootstrapConfig, DeployTarget, JournalType};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use std::io::Error;
@@ -141,13 +141,18 @@ fn bootstrap_leader(
     info!("All NSS instances have completed formatting");
 
     // Wait for NSS journal to be ready via workflow barriers
-    info!("Waiting for {expected_nss} NSS instance(s) to have journal ready...");
+    // For NVMe journal, only active (nss-A) publishes journal-ready; standby runs mirrord
+    let expected_journal_ready = if config.global.journal_type == JournalType::Nvme {
+        1
+    } else {
+        expected_nss
+    };
+    info!("Waiting for {expected_journal_ready} NSS journal(s) to be ready...");
     barrier.wait_for_nodes(
         stages::NSS_JOURNAL_READY,
-        expected_nss,
+        expected_journal_ready,
         timeouts::NSS_JOURNAL_READY,
     )?;
-    info!("All NSS instances have journal ready");
 
     if for_bench {
         run_cmd!($BIN_PATH/rss_admin --rss-addr=127.0.0.1:8088 api-key init-test)?;

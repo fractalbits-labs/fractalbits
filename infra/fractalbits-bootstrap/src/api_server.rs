@@ -1,4 +1,4 @@
-use crate::config::{BootstrapConfig, DataBlobStorage, DeployTarget};
+use crate::config::{BootstrapConfig, DataBlobStorage, DeployTarget, JournalType};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use crate::*;
 use std::io::Error;
@@ -22,12 +22,17 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
 
     // Wait for NSS journals to be ready before we can serve requests
-    info!("Waiting for NSS journals to be ready...");
-    // Determine expected NSS count (1 for single-AZ, 2 for multi-AZ)
-    let expected_nss = if remote_az.is_some() { 2 } else { 1 };
+    // For NVMe journal, only active (nss-A) publishes journal-ready; standby runs mirrord
+    let expected_journal_ready =
+        if remote_az.is_some() && config.global.journal_type != JournalType::Nvme {
+            2
+        } else {
+            1
+        };
+    info!("Waiting for {expected_journal_ready} NSS journal(s) to be ready...");
     barrier.wait_for_nodes(
         stages::NSS_JOURNAL_READY,
-        expected_nss,
+        expected_journal_ready,
         timeouts::NSS_JOURNAL_READY,
     )?;
 

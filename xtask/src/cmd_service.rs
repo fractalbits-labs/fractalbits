@@ -497,7 +497,9 @@ pub fn stop_service(service: ServiceName) -> CmdResult {
     for service in services {
         if service == ServiceName::Nss || service == ServiceName::Mirrord {
             let service_name = service.as_ref();
-            cmd_die!("$service_name is managed by nss_role_agent service - stop nss_role_agent instead");
+            cmd_die!(
+                "$service_name is managed by nss_role_agent service - stop nss_role_agent instead"
+            );
         } else if service == ServiceName::Bss {
             // Handle BSS template instances using helper function
             for_each_bss_service(|service_name| {

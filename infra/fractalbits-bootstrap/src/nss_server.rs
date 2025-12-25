@@ -31,6 +31,10 @@ pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: b
     if config.is_etcd_backend() {
         binaries.push("etcdctl");
     }
+    // Download mirrord for NVMe journal type (active/standby mode)
+    if journal_type == JournalType::Nvme {
+        binaries.push("mirrord");
+    }
     download_binaries(config, &binaries)?;
 
     // When using etcd backend, wait for etcd cluster to be ready first
@@ -62,17 +66,57 @@ pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: b
     // Signal that formatting is complete
     barrier.complete_stage(stages::NSS_FORMATTED, None)?;
 
-    // Start nss_role_agent after formatting
-    run_cmd!(systemctl start nss_role_agent.service)?;
+    // For NVMe journal type, coordinate active/standby startup
+    // Standby (nss_b) must start mirrord first, then active (nss_a) can start nss_server
+    if journal_type == JournalType::Nvme {
+        let resources = config.get_resources();
+        let instance_id = get_instance_id_from_config(config)?;
+        let is_standby = resources.nss_b_id.as_ref() == Some(&instance_id);
 
-    // Wait for nss_server to be ready before signaling
-    wait_for_service_ready("nss_server", 8088, 120)?;
+        if is_standby {
+            // Standby: start mirrord first
+            info!("Starting as standby NSS (mirrord)");
+            run_cmd!(systemctl start nss_role_agent.service)?;
 
-    // Signal that journal is ready and nss_server is accepting connections
-    barrier.complete_stage(stages::NSS_JOURNAL_READY, None)?;
+            // Wait for mirrord to be ready
+            wait_for_service_ready("mirrord", 9999, 120)?;
 
-    // Complete services-ready stage
-    barrier.complete_stage(stages::SERVICES_READY, None)?;
+            // Signal that mirrord is ready
+            barrier.complete_stage(stages::MIRRORD_READY, None)?;
+            info!("Mirrord is ready, signaled MIRRORD_READY");
+
+            // Complete services-ready stage
+            barrier.complete_stage(stages::SERVICES_READY, None)?;
+        } else {
+            // Active: wait for mirrord to be ready first
+            info!("Starting as active NSS, waiting for mirrord to be ready...");
+            barrier.wait_for_nodes(stages::MIRRORD_READY, 1, timeouts::MIRRORD_READY)?;
+            info!("Mirrord is ready, starting nss_role_agent");
+
+            run_cmd!(systemctl start nss_role_agent.service)?;
+
+            // Wait for nss_server to be ready before signaling
+            wait_for_service_ready("nss_server", 8088, 120)?;
+
+            // Signal that journal is ready and nss_server is accepting connections
+            barrier.complete_stage(stages::NSS_JOURNAL_READY, None)?;
+
+            // Complete services-ready stage
+            barrier.complete_stage(stages::SERVICES_READY, None)?;
+        }
+    } else {
+        // EBS journal type: no active/standby coordination needed
+        run_cmd!(systemctl start nss_role_agent.service)?;
+
+        // Wait for nss_server to be ready before signaling
+        wait_for_service_ready("nss_server", 8088, 120)?;
+
+        // Signal that journal is ready and nss_server is accepting connections
+        barrier.complete_stage(stages::NSS_JOURNAL_READY, None)?;
+
+        // Complete services-ready stage
+        barrier.complete_stage(stages::SERVICES_READY, None)?;
+    }
 
     Ok(())
 }

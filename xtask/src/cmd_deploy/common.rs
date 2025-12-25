@@ -13,6 +13,7 @@ pub struct VpcConfig {
     pub root_server_ha: bool,
     pub rss_backend: crate::RssBackend,
     pub ssm_bootstrap: bool,
+    pub journal_type: crate::JournalType,
 }
 
 #[derive(Clone)]

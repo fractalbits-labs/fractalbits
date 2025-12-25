@@ -22,6 +22,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         root_server_ha,
         rss_backend,
         ssm_bootstrap,
+        journal_type,
     } = config;
 
     // Note: Template-based configuration is handled in CDK (vpc/fractalbits-cdk/bin/fractalbits-vpc.ts)
@@ -83,6 +84,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         add_context("rootServerHa", "true".to_string());
     }
     add_context("rssBackend", rss_backend.as_ref().to_string());
+    add_context("journalType", journal_type.as_ref().to_string());
 
     // Add skipUserData context for SSM-based bootstrap
     if ssm_bootstrap {

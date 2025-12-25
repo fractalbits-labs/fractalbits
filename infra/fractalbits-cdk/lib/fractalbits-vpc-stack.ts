@@ -243,12 +243,13 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
-    // Only create nss-B for multiAz mode
-    if (multiAz) {
+    // Create nss-B for multiAz mode OR when using nvme journal type (active/standby)
+    if (multiAz || props.journalType === "nvme") {
       instanceConfigs.push({
         id: "nss-B",
         instanceType: nssInstanceType,
-        specificSubnet: subnet2,
+        // For single-AZ nvme, place nss-B in same subnet as nss-A
+        specificSubnet: multiAz ? subnet2 : subnet1,
         sg: privateSg,
       });
     }
@@ -357,7 +358,8 @@ export class FractalbitsVpcStack extends cdk.Stack {
       );
     }
 
-    // Only create mirrord for multiAz mode
+    // Create mirrord PrivateLink only for multiAz mode
+    // For single-AZ nvme, use direct IP instead
     let mirrordPrivateLink: any;
     if (multiAz) {
       mirrordPrivateLink = createPrivateLinkNlb(
@@ -373,6 +375,15 @@ export class FractalbitsVpcStack extends cdk.Stack {
     const nssEndpoint = multiAz
       ? nssPrivateLink.endpointDns
       : `${instances["nss-A"].instancePrivateIp}`;
+
+    // Determine mirrord endpoint based on mode
+    // For single-AZ nvme, use direct IP of nss-B
+    const mirrordEndpoint =
+      multiAz && mirrordPrivateLink
+        ? mirrordPrivateLink.endpointDns
+        : props.journalType === "nvme" && instances["nss-B"]
+          ? `${instances["nss-B"].instancePrivateIp}`
+          : undefined;
 
     // Create api_server(s) in a ASG group
     const apiServerAsg = createEc2Asg(
@@ -475,11 +486,11 @@ export class FractalbitsVpcStack extends cdk.Stack {
       description: "DNS name of the API NLB",
     });
 
-    // Only output mirrord endpoint for multiAz mode
-    if (multiAz && mirrordPrivateLink) {
+    // Output mirrord endpoint for multiAz mode or nvme journal type
+    if (mirrordEndpoint) {
       new cdk.CfnOutput(this, "MirrordEndpointDns", {
-        value: mirrordPrivateLink.endpointDns,
-        description: "VPC Endpoint DNS for Mirrord service",
+        value: mirrordEndpoint,
+        description: "Mirrord service endpoint",
       });
     }
 
@@ -549,10 +560,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       localAz: azArray[0],
       remoteAz: multiAz ? azArray[1] : undefined,
       nssEndpoint: nssEndpoint,
-      mirrordEndpoint:
-        multiAz && mirrordPrivateLink
-          ? mirrordPrivateLink.endpointDns
-          : undefined,
+      mirrordEndpoint: mirrordEndpoint,
       apiServerEndpoint: nlb.loadBalancerDnsName,
       nssA: { id: instances["nss-A"].instanceId },
       nssB: instances["nss-B"]

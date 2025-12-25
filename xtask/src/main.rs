@@ -298,6 +298,14 @@ pub enum DeployCommand {
 
         #[clap(long, long_help = "Bootstrap via SSM instead of userData")]
         ssm_bootstrap: bool,
+
+        #[clap(
+            long,
+            value_enum,
+            long_help = "Journal type (ebs or nvme)",
+            default_value = "ebs"
+        )]
+        journal_type: JournalType,
     },
 
     #[clap(about = "Destroy VPC infrastructure (including s3 builds bucket cleanup)")]
@@ -699,6 +707,7 @@ async fn main() -> CmdResult {
                 root_server_ha,
                 rss_backend,
                 ssm_bootstrap,
+                journal_type,
             } => cmd_deploy::create_vpc(cmd_deploy::VpcConfig {
                 template,
                 num_api_servers,
@@ -712,6 +721,7 @@ async fn main() -> CmdResult {
                 root_server_ha,
                 rss_backend,
                 ssm_bootstrap,
+                journal_type,
             })?,
             DeployCommand::DestroyVpc => cmd_deploy::destroy_vpc()?,
             DeployCommand::BootstrapProgress { vpc_target } => {

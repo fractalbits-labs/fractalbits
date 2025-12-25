@@ -3,38 +3,9 @@ use super::upload::get_bootstrap_bucket_name;
 use crate::CmdResult;
 use cmd_lib::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use serde::Deserialize;
-use std::collections::HashMap;
 use std::io::Error;
 use std::time::{Duration, Instant};
-use xtask_common::BOOTSTRAP_CLUSTER_CONFIG;
-
-#[derive(Debug, Deserialize)]
-struct BootstrapConfigGlobal {
-    workflow_cluster_id: Option<String>,
-    #[serde(default)]
-    num_bss_nodes: Option<usize>,
-    #[serde(default)]
-    num_api_servers: Option<usize>,
-    #[serde(default)]
-    num_bench_clients: Option<usize>,
-    #[serde(default)]
-    rss_ha_enabled: bool,
-    #[serde(default)]
-    rss_backend: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct InstanceConfig {
-    service_type: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BootstrapConfig {
-    global: BootstrapConfigGlobal,
-    #[serde(default)]
-    instances: HashMap<String, InstanceConfig>,
-}
+use xtask_common::{BOOTSTRAP_CLUSTER_CONFIG, BootstrapClusterConfig, RssBackend};
 
 const POLL_INTERVAL_SECS: u64 = 2;
 const TIMEOUT_SECS: u64 = 600; // 10 minutes
@@ -67,6 +38,11 @@ const STAGES: &[StageInfo] = &[
         is_global: false,
     },
     StageInfo {
+        name: "35-mirrord-ready",
+        desc: "Mirrord ready",
+        is_global: false,
+    },
+    StageInfo {
         name: "40-nss-journal-ready",
         desc: "NSS journal ready",
         is_global: false,
@@ -91,40 +67,40 @@ struct WorkflowConfig {
     num_api: usize,
     num_bench: usize,
     use_etcd: bool,
+    use_nvme_journal: bool,
 }
 
 fn parse_workflow_config(content: &str) -> Result<WorkflowConfig, Error> {
-    let config: BootstrapConfig = toml::from_str(content)
+    let config: BootstrapClusterConfig = toml::from_str(content)
         .map_err(|e| Error::other(format!("Failed to parse {BOOTSTRAP_CLUSTER_CONFIG}: {e}")))?;
 
     let cluster_id = config
         .global
         .workflow_cluster_id
+        .clone()
         .ok_or_else(|| Error::other("workflow_cluster_id not found in config"))?;
 
     let num_bss = config.global.num_bss_nodes.unwrap_or(1);
     let num_rss = if config.global.rss_ha_enabled { 2 } else { 1 };
-    let use_etcd = config.global.rss_backend == "etcd";
+    let use_etcd = config.global.rss_backend == RssBackend::Etcd;
+    let use_nvme_journal = config.global.journal_type == xtask_common::JournalType::Nvme;
 
-    // Get num_api from config, fallback to counting instances
-    let num_api = config.global.num_api_servers.unwrap_or_else(|| {
-        config
-            .instances
-            .values()
-            .filter(|i| i.service_type == "api_server")
-            .count()
-    });
+    // Get num_api from config, fallback to counting nodes
+    let num_api = config
+        .global
+        .num_api_servers
+        .unwrap_or_else(|| config.nodes.get("api_server").map(|v| v.len()).unwrap_or(0));
 
     // Get num_bench from config (bench clients + 1 bench server if present)
-    let num_bench = config.global.num_bench_clients.map(|n| n + 1).unwrap_or(0);
+    // Only count if for_bench is true
+    let num_bench = if config.global.for_bench {
+        config.global.num_bench_clients.map(|n| n + 1).unwrap_or(0)
+    } else {
+        0
+    };
 
-    // Count NSS from instances
-    let num_nss = config
-        .instances
-        .values()
-        .filter(|i| i.service_type == "nss_server")
-        .count()
-        .max(1);
+    // Count NSS from nodes
+    let num_nss = config.nodes.get("nss_server").map(|v| v.len()).unwrap_or(1);
 
     Ok(WorkflowConfig {
         cluster_id,
@@ -134,6 +110,7 @@ fn parse_workflow_config(content: &str) -> Result<WorkflowConfig, Error> {
         num_api,
         num_bench,
         use_etcd,
+        use_nvme_journal,
     })
 }
 
@@ -218,6 +195,7 @@ pub fn show_progress(target: DeployTarget) -> CmdResult {
         num_api,
         num_bench,
         use_etcd,
+        use_nvme_journal,
     } = config;
     let total_nodes = num_bss + num_nss + num_rss + num_api + num_bench;
 
@@ -254,11 +232,21 @@ pub fn show_progress(target: DeployTarget) -> CmdResult {
         if stage.name == "10-etcd-ready" && !use_etcd {
             continue;
         }
+        // Skip mirrord stage when not using NVMe journal
+        if stage.name == "35-mirrord-ready" && !use_nvme_journal {
+            continue;
+        }
 
         let expected = if stage.is_global {
             1
-        } else if stage.name == "30-nss-formatted" || stage.name == "40-nss-journal-ready" {
+        } else if stage.name == "30-nss-formatted" {
             num_nss
+        } else if stage.name == "35-mirrord-ready" {
+            // Only standby (nss-B) publishes mirrord-ready
+            1
+        } else if stage.name == "40-nss-journal-ready" {
+            // For NVMe, only active (nss-A) publishes journal-ready
+            if use_nvme_journal { 1 } else { num_nss }
         } else if stage.name == "50-bss-configured" {
             num_bss
         } else {
