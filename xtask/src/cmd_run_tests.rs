@@ -48,6 +48,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
                 bss_count: 6,
                 nss_disable_restart_limit: false,
                 rss_backend: Default::default(),
+                journal_type: Default::default(),
             },
         )?;
         cmd_service::start_service(ServiceName::All)?;

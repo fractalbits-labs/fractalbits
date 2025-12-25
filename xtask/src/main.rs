@@ -366,7 +366,7 @@ impl ServiceName {
     }
 }
 
-#[derive(AsRefStr, EnumString, Copy, Clone, Default, clap::ValueEnum)]
+#[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
 #[strum(serialize_all = "snake_case")]
 #[clap(rename_all = "snake_case")]
 pub enum DataBlobStorage {
@@ -410,6 +410,15 @@ pub enum NssRole {
     Solo,
 }
 
+#[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
+#[strum(serialize_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum JournalType {
+    #[default]
+    Ebs,
+    Nvme,
+}
+
 #[derive(Copy, Clone)]
 pub struct InitConfig {
     pub for_gui: bool,
@@ -418,6 +427,7 @@ pub struct InitConfig {
     pub bss_count: u32,
     pub nss_disable_restart_limit: bool,
     pub rss_backend: RssBackend,
+    pub journal_type: JournalType,
 }
 
 impl Default for InitConfig {
@@ -429,6 +439,7 @@ impl Default for InitConfig {
             bss_count: 1,
             nss_disable_restart_limit: false,
             rss_backend: Default::default(),
+            journal_type: Default::default(),
         }
     }
 }
@@ -465,6 +476,10 @@ pub enum ServiceCommand {
         #[clap(long, value_enum)]
         #[arg(default_value_t)]
         rss_backend: RssBackend,
+
+        #[clap(long, value_enum, long_help = "journal type (ebs or nvme)")]
+        #[arg(default_value_t)]
+        journal_type: JournalType,
     },
     Stop {
         #[clap(default_value = "all", value_enum)]
@@ -632,6 +647,7 @@ async fn main() -> CmdResult {
                 bss_count,
                 nss_disable_restart_limit,
                 rss_backend,
+                journal_type,
             } => {
                 if bss_count != 1 && bss_count != 6 {
                     cmd_die!("bss_count must be either 1 or 6, got $bss_count");
@@ -643,6 +659,7 @@ async fn main() -> CmdResult {
                     bss_count,
                     nss_disable_restart_limit,
                     rss_backend,
+                    journal_type,
                 };
                 cmd_service::init_service(service, cmd_build::build_mode(release), init_config)?;
             }

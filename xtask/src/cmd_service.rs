@@ -77,12 +77,17 @@ pub fn init_service(
         }?;
 
         // Initialize NSS role states in service-discovery table
-        let nss_roles_item = match init_config.data_blob_storage {
-            DataBlobStorage::S3HybridSingleAz | DataBlobStorage::AllInBssSingleAz => {
-                r#"{"service_id":{"S":"nss_roles"},"states":{"M":{"nss-A":{"S":"solo"}}}}"#
-            }
-            DataBlobStorage::S3ExpressMultiAz => {
-                r#"{"service_id":{"S":"nss_roles"},"states":{"M":{"nss-A":{"S":"active"},"nss-B":{"S":"standby"}}}}"#
+        // When journal_type is Nvme, we use active/standby mode with mirrord
+        let nss_roles_item = if init_config.journal_type == JournalType::Nvme {
+            r#"{"service_id":{"S":"nss_roles"},"states":{"M":{"nss-A":{"S":"active"},"nss-B":{"S":"standby"}}}}"#
+        } else {
+            match init_config.data_blob_storage {
+                DataBlobStorage::S3HybridSingleAz | DataBlobStorage::AllInBssSingleAz => {
+                    r#"{"service_id":{"S":"nss_roles"},"states":{"M":{"nss-A":{"S":"solo"}}}}"#
+                }
+                DataBlobStorage::S3ExpressMultiAz => {
+                    r#"{"service_id":{"S":"nss_roles"},"states":{"M":{"nss-A":{"S":"active"},"nss-B":{"S":"standby"}}}}"#
+                }
             }
         };
 
@@ -162,13 +167,18 @@ pub fn init_service(
         start_service(ServiceName::Etcd)?;
 
         // Initialize service-discovery keys using etcdctl
+        // When journal_type is Nvme, we use active/standby mode with mirrord
         let etcdctl = resolve_etcd_bin("etcdctl");
-        let nss_roles_json = match init_config.data_blob_storage {
-            DataBlobStorage::S3HybridSingleAz | DataBlobStorage::AllInBssSingleAz => {
-                r#"{"states":{"nss-A":"solo"}}"#
-            }
-            DataBlobStorage::S3ExpressMultiAz => {
-                r#"{"states":{"nss-A":"active","nss-B":"standby"}}"#
+        let nss_roles_json = if init_config.journal_type == JournalType::Nvme {
+            r#"{"states":{"nss-A":"active","nss-B":"standby"}}"#
+        } else {
+            match init_config.data_blob_storage {
+                DataBlobStorage::S3HybridSingleAz | DataBlobStorage::AllInBssSingleAz => {
+                    r#"{"states":{"nss-A":"solo"}}"#
+                }
+                DataBlobStorage::S3ExpressMultiAz => {
+                    r#"{"states":{"nss-A":"active","nss-B":"standby"}}"#
+                }
             }
         };
 
@@ -254,6 +264,11 @@ pub fn init_service(
         let format_log = "data/logs/format_mirrord.log";
         create_dirs_for_mirrord_server()?;
         let nss_binary = resolve_binary_path("nss_server", build_mode);
+        let journal_type = init_config.journal_type;
+        info!(
+            "Initializing mirrord with journal_type={:?}",
+            journal_type.as_ref()
+        );
         match build_mode {
             BuildMode::Debug => run_cmd! {
                 info "formatting mirrord with default configs";
@@ -463,6 +478,7 @@ pub fn stop_service(service: ServiceName) -> CmdResult {
         ServiceName::All => all_services(
             get_data_blob_storage_setting(),
             get_rss_backend_setting(),
+            get_journal_type_setting(),
             false,
             false,
         ),
@@ -480,11 +496,8 @@ pub fn stop_service(service: ServiceName) -> CmdResult {
     );
     for service in services {
         if service == ServiceName::Nss || service == ServiceName::Mirrord {
-            // skip stopping managed services directly
-            warn!(
-                "{} is managed by nss_role_agent service, please stop the agent service instead",
-                service.as_ref()
-            );
+            let service_name = service.as_ref();
+            cmd_die!("$service_name is managed by nss_role_agent service - stop nss_role_agent instead");
         } else if service == ServiceName::Bss {
             // Handle BSS template instances using helper function
             for_each_bss_service(|service_name| {
@@ -534,6 +547,7 @@ pub fn stop_service(service: ServiceName) -> CmdResult {
 fn all_services(
     data_blob_storage: DataBlobStorage,
     rss_backend: RssBackend,
+    journal_type: JournalType,
     with_managed_service: bool,
     sort: bool,
 ) -> Vec<ServiceName> {
@@ -541,6 +555,10 @@ fn all_services(
         RssBackend::Ddb => ServiceName::DdbLocal,
         RssBackend::Etcd => ServiceName::Etcd,
     };
+    // When journal_type is Nvme, we always need NssRoleAgentB and Mirrord
+    let with_mirrord =
+        journal_type == JournalType::Nvme || data_blob_storage == DataBlobStorage::S3ExpressMultiAz;
+
     let mut services = match data_blob_storage {
         DataBlobStorage::S3HybridSingleAz => {
             let mut services = vec![
@@ -551,8 +569,14 @@ fn all_services(
                 rss_backend_service,
                 ServiceName::Minio,
             ];
+            if with_mirrord {
+                services.push(ServiceName::NssRoleAgentB);
+            }
             if with_managed_service {
                 services.push(ServiceName::Nss);
+                if with_mirrord {
+                    services.push(ServiceName::Mirrord);
+                }
             }
             services
         }
@@ -581,8 +605,14 @@ fn all_services(
                 ServiceName::Rss,
                 rss_backend_service,
             ];
+            if with_mirrord {
+                services.push(ServiceName::NssRoleAgentB);
+            }
             if with_managed_service {
                 services.push(ServiceName::Nss);
+                if with_mirrord {
+                    services.push(ServiceName::Mirrord);
+                }
             }
             services
         }
@@ -612,6 +642,15 @@ fn get_data_blob_storage_setting() -> DataBlobStorage {
     }
 }
 
+fn get_journal_type_setting() -> JournalType {
+    // Check if nss_role_agent_b.service exists (indicates nvme/mirrord mode)
+    if Path::new("data/etc/nss_role_agent_b.service").exists() {
+        JournalType::Nvme
+    } else {
+        JournalType::Ebs
+    }
+}
+
 pub fn show_service_status(service: ServiceName) -> CmdResult {
     match service {
         ServiceName::All => {
@@ -621,6 +660,7 @@ pub fn show_service_status(service: ServiceName) -> CmdResult {
             for svc in all_services(
                 get_data_blob_storage_setting(),
                 get_rss_backend_setting(),
+                get_journal_type_setting(),
                 true,
                 true,
             ) {
@@ -756,6 +796,11 @@ fn start_all_services() -> CmdResult {
     // Start supporting services first based on backend configuration
     let rss_backend = get_rss_backend_setting();
     let data_blob_storage = get_data_blob_storage_setting();
+    let journal_type = get_journal_type_setting();
+
+    // When journal_type is Nvme, we need mirrord running before nss active
+    let with_mirrord =
+        journal_type == JournalType::Nvme || data_blob_storage == DataBlobStorage::S3ExpressMultiAz;
 
     match rss_backend {
         RssBackend::Ddb => {
@@ -792,6 +837,10 @@ fn start_all_services() -> CmdResult {
             let bss_count = get_bss_count_from_config();
             for id in 0..bss_count {
                 start_bss_instance(id)?;
+            }
+            // When using mirrord, start NssRoleAgentB first
+            if with_mirrord {
+                start_service(ServiceName::NssRoleAgentB)?;
             }
             start_service(ServiceName::NssRoleAgentA)?;
             start_service(ServiceName::ApiServer)?;
@@ -840,6 +889,7 @@ fn create_systemd_unit_files_for_init(
             for service in all_services(
                 init_config.data_blob_storage,
                 init_config.rss_backend,
+                init_config.journal_type,
                 true,
                 false,
             ) {
@@ -892,6 +942,7 @@ Environment="BSS_WORKING_DIR=./data/bss%i""##;
         }
         ServiceName::Mirrord => {
             managed_service = true;
+            env_settings += "\nEnvironment=\"WORKING_DIR=./data/nss-B\"";
             resolve_binary_path("mirrord", build_mode)
         }
         ServiceName::NssRoleAgentA => {

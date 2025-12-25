@@ -59,6 +59,7 @@ pub fn run_cmd_bench(
                     bss_count: 1,
                     nss_disable_restart_limit: false,
                     rss_backend: Default::default(),
+                    journal_type: Default::default(),
                 },
             )?;
             cmd_service::start_bss_instance(0)?;

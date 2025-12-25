@@ -17,6 +17,7 @@ pub async fn run_multi_az_tests(test_type: MultiAzTestType) -> CmdResult {
                 bss_count: 0, // No BSS services in multi-AZ mode
                 nss_disable_restart_limit: false,
                 rss_backend: Default::default(),
+                journal_type: Default::default(),
             },
         )?;
         cmd_service::start_service(ServiceName::All)
