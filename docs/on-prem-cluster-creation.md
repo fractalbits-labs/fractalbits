@@ -50,11 +50,11 @@ aws s3 mb s3://fractalbits-bootstrap
 
 ## Step 2: Build and Upload Bootstrap Artifacts
 
-Build the fractalbits binaries for your target architecture:
+Build the fractalbits binaries for both architectures (x86_64 and aarch64):
 
 ```bash
-# Build for on-prem (use appropriate CPU target)
-cargo xtask build --cpu-target i3  # or graviton3 for ARM
+# Build for on-prem deployment (builds for both x86_64 and aarch64)
+cargo xtask deploy build
 
 # Upload bootstrap artifacts to the bootstrap container
 cargo xtask deploy upload --deploy-target on-prem
@@ -73,9 +73,6 @@ num_bss_nodes = 6
 
 # Enable RSS high availability (requires 2 root_server nodes)
 rss_ha_enabled = true
-
-# CPU target for binary selection (must match build target)
-# cpu_target = "i3"
 
 # Enable benchmarking mode (deploys bench_server and bench_client nodes)
 # for_bench = false

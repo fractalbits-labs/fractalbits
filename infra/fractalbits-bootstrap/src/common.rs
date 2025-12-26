@@ -52,19 +52,12 @@ pub fn download_binaries(config: &BootstrapConfig, file_list: &[&str]) -> CmdRes
     Ok(())
 }
 
-fn download_binary(config: &BootstrapConfig, file_name: &str) -> CmdResult {
+fn download_binary(_config: &BootstrapConfig, file_name: &str) -> CmdResult {
     let bootstrap_bucket = get_bootstrap_bucket();
     let cpu_arch = run_fun!(arch)?;
 
-    let s3_path = if matches!(
-        file_name,
-        "fractalbits-bootstrap" | "warp" | "etcd" | "etcdctl"
-    ) {
-        format!("{bootstrap_bucket}/{cpu_arch}/{file_name}")
-    } else {
-        let cpu_target = get_cpu_target_from_config(config)?;
-        format!("{bootstrap_bucket}/{cpu_arch}/{cpu_target}/{file_name}")
-    };
+    // All binaries stored at: s3://bucket/{arch}/{binary}
+    let s3_path = format!("{bootstrap_bucket}/{cpu_arch}/{file_name}");
 
     let local_path = format!("{BIN_PATH}{file_name}");
     download_from_s3(&s3_path, &local_path)?;
@@ -280,27 +273,8 @@ pub fn get_instance_id() -> FunResult {
     run_fun!(ec2-metadata --instance-id | awk r"{print $2}")
 }
 
-pub fn get_ec2_instance_type() -> FunResult {
-    run_fun!(ec2-metadata --instance-type | awk r"{print $2}")
-}
-
 pub fn get_private_ip() -> FunResult {
     run_fun!(ec2-metadata --local-ipv4 | awk r"{print $2}")
-}
-
-pub fn get_cpu_target_from_instance_type(instance_type: &str) -> &'static str {
-    let family = instance_type.split('.').next().unwrap_or("");
-
-    match family {
-        "i3" => "i3",
-        "i3en" => "i3en",
-        "7g" => "graviton3",
-        "8g" => "graviton4",
-        _ => {
-            let arch = run_fun!(arch).unwrap_or_default();
-            if arch == "aarch64" { "graviton3" } else { "i3" }
-        }
-    }
 }
 
 pub fn get_instance_id_from_config(config: &BootstrapConfig) -> FunResult {
@@ -319,19 +293,6 @@ pub fn get_private_ip_from_config(config: &BootstrapConfig, instance_id: &str) -
     match config.global.deploy_target {
         DeployTarget::OnPrem => run_fun!(hostname -I | awk r"{print $1}"),
         DeployTarget::Aws => get_private_ip(),
-    }
-}
-
-pub fn get_cpu_target_from_config(config: &BootstrapConfig) -> FunResult {
-    if let Some(cpu_target) = &config.global.cpu_target {
-        return Ok(cpu_target.clone());
-    }
-    match config.global.deploy_target {
-        DeployTarget::OnPrem => Err(Error::other("cpu_target must be set in config for on-prem")),
-        DeployTarget::Aws => {
-            let instance_type = get_ec2_instance_type()?;
-            Ok(get_cpu_target_from_instance_type(&instance_type).to_string())
-        }
     }
 }
 

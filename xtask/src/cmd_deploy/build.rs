@@ -2,7 +2,7 @@ use crate::etcd_utils::download_etcd_for_deploy;
 use crate::*;
 use std::path::Path;
 
-use super::common::{CPU_TARGETS, CpuTarget, RUST_BINS, ZIG_BINS};
+use super::common::{ARCH_TARGETS, ArchTarget, RUST_BINS, ZIG_BINS};
 
 pub fn build(
     deploy_target: DeployTarget,
@@ -32,9 +32,9 @@ pub fn build(
         rustup target add aarch64-unknown-linux-gnu;
     }?;
 
-    // Create deploy directories for all CPU targets
-    for target in CPU_TARGETS {
-        let deploy_dir = format!("prebuilt/deploy/{}/{}", target.arch, target.name);
+    // Create deploy directories for all arch targets
+    for target in ARCH_TARGETS {
+        let deploy_dir = format!("prebuilt/deploy/{}", target.arch);
         run_cmd!(mkdir -p $deploy_dir)?;
     }
 
@@ -97,20 +97,23 @@ fn build_bootstrap(rust_build_opt: &str, build_dir: &str) -> CmdResult {
     Ok(())
 }
 
+/// Get deploy directory for an arch target: prebuilt/deploy/{arch}/
+fn get_deploy_dir(target: &ArchTarget) -> String {
+    format!("prebuilt/deploy/{}", target.arch)
+}
+
 fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[String]) -> CmdResult {
-    info!("Building Rust projects for all CPU targets");
+    info!("Building Rust projects for all arch targets");
     let build_envs = cmd_build::get_build_envs();
 
-    for target in CPU_TARGETS {
+    for target in ARCH_TARGETS {
         let rust_cpu = target.rust_cpu;
         let rust_target = target.rust_target;
+        let arch = target.arch;
 
-        if rust_cpu.is_empty() {
-            continue;
-        }
         if api_server_build_env.is_empty() {
             run_cmd! {
-                info "Building Rust projects for $rust_target ($rust_cpu)";
+                info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu)";
                 RUSTFLAGS="-C target-cpu=$rust_cpu"
                 $[build_envs] cargo zigbuild
                     --target $rust_target $rust_build_opt --workspace
@@ -119,7 +122,7 @@ fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[Str
             }?;
         } else {
             run_cmd! {
-                info "Building Rust projects for $rust_target ($rust_cpu)";
+                info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu)";
                 RUSTFLAGS="-C target-cpu=$rust_cpu"
                 $[build_envs] cargo zigbuild
                     --target $rust_target $rust_build_opt --workspace
@@ -141,8 +144,8 @@ fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[Str
     Ok(())
 }
 
-fn copy_rust_binaries(target: &CpuTarget, rust_target: &str, build_dir: &str) -> CmdResult {
-    let deploy_dir = format!("prebuilt/deploy/{}/{}", target.arch, target.name);
+fn copy_rust_binaries(target: &ArchTarget, rust_target: &str, build_dir: &str) -> CmdResult {
+    let deploy_dir = get_deploy_dir(target);
     for bin in RUST_BINS {
         if *bin != "fractalbits-bootstrap" {
             let src_path = format!("target/{}/{}/{}", rust_target, build_dir, bin);
@@ -156,20 +159,20 @@ fn copy_rust_binaries(target: &CpuTarget, rust_target: &str, build_dir: &str) ->
 }
 
 fn build_zig(zig_build_opt: &str, build_dir: &str, zig_extra_opts: &Vec<String>) -> CmdResult {
-    info!("Building Zig projects for all CPU targets");
+    info!("Building Zig projects for all arch targets");
     let build_envs = cmd_build::get_build_envs();
 
-    for target in CPU_TARGETS {
-        let zig_out_dir = if target.arch == "aarch64" {
-            format!("target/aarch64-unknown-linux-gnu/{build_dir}/zig-out")
-        } else {
-            format!("target/x86_64-unknown-linux-gnu/{build_dir}/zig-out")
-        };
+    for target in ARCH_TARGETS {
+        let zig_out_dir = format!(
+            "target/{}/{build_dir}/zig-out-{}",
+            target.rust_target, target.arch
+        );
 
         let zig_target = target.zig_target;
         let zig_cpu = target.zig_cpu;
+        let arch = target.arch;
         run_cmd! {
-            info "Building Zig projects for $zig_target ($zig_cpu)";
+            info "Building Zig projects for $zig_target ($arch, cpu=$zig_cpu)";
             cd $ZIG_REPO_PATH;
             $[build_envs] zig build
                 -p ../$zig_out_dir
@@ -182,8 +185,8 @@ fn build_zig(zig_build_opt: &str, build_dir: &str, zig_extra_opts: &Vec<String>)
     Ok(())
 }
 
-fn copy_zig_binaries(target: &CpuTarget, zig_out_dir: &str) -> CmdResult {
-    let deploy_dir = format!("prebuilt/deploy/{}/{}", target.arch, target.name);
+fn copy_zig_binaries(target: &ArchTarget, zig_out_dir: &str) -> CmdResult {
+    let deploy_dir = get_deploy_dir(target);
     for bin in ZIG_BINS {
         let src_path = format!("{}/bin/{}", zig_out_dir, bin);
         let dst_path = format!("{}/{}", deploy_dir, bin);

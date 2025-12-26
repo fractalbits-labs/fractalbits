@@ -18,8 +18,7 @@ pub struct VpcConfig {
 }
 
 #[derive(Clone)]
-pub(super) struct CpuTarget {
-    pub name: &'static str,
+pub(super) struct ArchTarget {
     pub arch: &'static str,
     pub rust_target: &'static str,
     pub rust_cpu: &'static str,
@@ -27,38 +26,23 @@ pub(super) struct CpuTarget {
     pub zig_cpu: &'static str,
 }
 
-pub(super) const CPU_TARGETS: &[CpuTarget] = &[
-    CpuTarget {
-        name: "graviton3",
+pub(super) const ARCH_TARGETS: &[ArchTarget] = &[
+    // aarch64: Neoverse N1 baseline - covers Graviton2/3/4, Ampere Altra, and most modern ARM servers
+    // Includes: NEON SIMD, LSE atomics, crypto extensions (AES/SHA), CRC32
+    ArchTarget {
         arch: "aarch64",
         rust_target: "aarch64-unknown-linux-gnu",
-        rust_cpu: "neoverse-v1",
+        rust_cpu: "neoverse-n1",
         zig_target: "aarch64-linux-gnu",
-        zig_cpu: "neoverse_v1",
+        zig_cpu: "neoverse_n1",
     },
-    CpuTarget {
-        name: "graviton4",
-        arch: "aarch64",
-        rust_target: "aarch64-unknown-linux-gnu",
-        rust_cpu: "neoverse-v2",
-        zig_target: "aarch64-linux-gnu",
-        zig_cpu: "neoverse_v2",
-    },
-    CpuTarget {
-        name: "i3",
+    // x86_64: x86-64-v3 (AVX2, FMA, BMI1/2) - Haswell+ (2013), Excavator+ (2015)
+    ArchTarget {
         arch: "x86_64",
         rust_target: "x86_64-unknown-linux-gnu",
-        rust_cpu: "", // for bss only, no rust binaries
+        rust_cpu: "x86-64-v3",
         zig_target: "x86_64-linux-gnu",
-        zig_cpu: "broadwell",
-    },
-    CpuTarget {
-        name: "i3en",
-        arch: "x86_64",
-        rust_target: "x86_64-unknown-linux-gnu",
-        rust_cpu: "", // for bss only, no rust binaries
-        zig_target: "x86_64-linux-gnu",
-        zig_cpu: "skylake",
+        zig_cpu: "x86_64_v3",
     },
 ];
 
