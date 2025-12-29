@@ -2,9 +2,7 @@ use cmd_lib::*;
 use std::io::Error;
 use std::time::{Duration, Instant};
 
-use crate::common::{
-    BOOTSTRAP_CLUSTER_CONFIG, ETC_PATH, download_from_s3, get_bootstrap_bucket, get_instance_id,
-};
+use crate::common::{BOOTSTRAP_CLUSTER_CONFIG, ETC_PATH, download_from_s3, get_instance_id};
 
 // Re-export types from xtask_common
 pub use xtask_common::{
@@ -19,8 +17,8 @@ pub type InstanceConfig = ClusterNodeConfig;
 
 const CONFIG_RETRY_TIMEOUT_SECS: u64 = 120;
 
-pub fn download_and_parse() -> Result<BootstrapClusterConfig, Error> {
-    let bootstrap_bucket = get_bootstrap_bucket();
+pub fn download_and_parse(bucket_name: &str) -> Result<BootstrapClusterConfig, Error> {
+    let bootstrap_bucket = format!("s3://{bucket_name}");
     let s3_path = format!("{bootstrap_bucket}/{BOOTSTRAP_CLUSTER_CONFIG}");
     let local_path = format!("{ETC_PATH}{BOOTSTRAP_CLUSTER_CONFIG}");
 

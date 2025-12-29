@@ -35,6 +35,7 @@ exclude = [
     "crates/root_server/admin/src",
     "crates/root_server/src",
     "crates/root_server/.git",
+    "crates/root_server/test_observer/src",
 ]
 resolver = "2"
 

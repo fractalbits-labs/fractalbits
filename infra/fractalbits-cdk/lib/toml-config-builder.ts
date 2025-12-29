@@ -67,11 +67,6 @@ export function createConfigWithCfnTokens(props: {
     },
   };
 
-  if (props.bootstrapBucket) {
-    (staticConfig.global as TOML.JsonMap).bootstrap_bucket =
-      props.bootstrapBucket;
-  }
-
   if (props.numBssNodes !== undefined) {
     (staticConfig.global as TOML.JsonMap).num_bss_nodes = props.numBssNodes;
   }
@@ -105,6 +100,10 @@ export function createConfigWithCfnTokens(props: {
 
   // Dynamic parts with CFN tokens
   const lines: string[] = [staticPart.trimEnd()];
+
+  if (props.bootstrapBucket) {
+    lines.push(`bootstrap_bucket = "${props.bootstrapBucket}"`);
+  }
 
   if (props.dataBlobBucket) {
     lines.push(tomlLine("data_blob_bucket", props.dataBlobBucket));

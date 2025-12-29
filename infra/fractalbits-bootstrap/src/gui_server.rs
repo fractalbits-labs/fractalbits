@@ -10,7 +10,7 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     barrier.complete_stage(stages::INSTANCES_READY, None)?;
 
     download_binaries(config, &["api_server"])?;
-    let bootstrap_bucket = get_bootstrap_bucket();
+    let bootstrap_bucket = config.get_bootstrap_bucket();
     run_cmd!(aws s3 cp --no-progress $bootstrap_bucket/ui $GUI_WEB_ROOT --recursive)?;
 
     api_server::create_config(config, nss_endpoint)?;

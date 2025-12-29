@@ -51,13 +51,18 @@ fn main() -> CmdResult {
 }
 
 fn generic_bootstrap() -> CmdResult {
-    info!("Starting config-based bootstrap mode");
+    let args: Vec<String> = std::env::args().collect();
+    let bucket_name = args
+        .get(1)
+        .ok_or_else(|| io::Error::other("Usage: fractalbits-bootstrap <bucket_name>"))?;
 
-    let config = config::download_and_parse()?;
+    info!("Starting config-based bootstrap mode (bucket: {bucket_name})");
+
+    let config = config::download_and_parse(bucket_name)?;
 
     // Backup config to workflow directory for progress tracking
     if let Some(cluster_id) = &config.global.workflow_cluster_id {
-        let _ = backup_config_to_workflow(cluster_id);
+        let _ = backup_config_to_workflow(&config, cluster_id);
     }
 
     let for_bench = config.global.for_bench;

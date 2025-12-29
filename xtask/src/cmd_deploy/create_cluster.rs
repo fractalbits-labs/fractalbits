@@ -106,7 +106,6 @@ impl InputClusterConfig {
             num_bench_clients: self.global.num_bench_clients,
             cpu_target: self.global.cpu_target.clone(),
             workflow_cluster_id: Some(cluster_id),
-            bootstrap_bucket: None,
             meta_stack_testing: false,
         };
 
@@ -164,6 +163,7 @@ impl InputClusterConfig {
             resources: None,
             etcd,
             nodes,
+            bootstrap_bucket: "fractalbits-bootstrap".to_string(),
         };
 
         config

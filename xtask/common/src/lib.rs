@@ -105,8 +105,6 @@ pub struct ClusterGlobalConfig {
     pub cpu_target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_cluster_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bootstrap_bucket: Option<String>,
     #[serde(default)]
     pub meta_stack_testing: bool,
 }
@@ -158,9 +156,10 @@ pub struct BootstrapClusterConfig {
     pub resources: Option<ClusterResourcesConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etcd: Option<ClusterEtcdConfig>,
-    /// Nodes grouped by service type: nodes.root_server, nodes.nss_server, etc.
     #[serde(default)]
     pub nodes: HashMap<String, Vec<NodeEntry>>,
+    #[serde(default)]
+    pub bootstrap_bucket: String,
 }
 
 impl BootstrapClusterConfig {
@@ -174,6 +173,10 @@ impl BootstrapClusterConfig {
 
     pub fn is_etcd_backend(&self) -> bool {
         self.global.rss_backend == RssBackend::Etcd
+    }
+
+    pub fn get_bootstrap_bucket(&self) -> String {
+        format!("s3://{}", self.bootstrap_bucket)
     }
 
     /// Get all nodes as a flat list with service_type

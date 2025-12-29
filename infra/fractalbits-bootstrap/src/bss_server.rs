@@ -263,11 +263,9 @@ fn get_etcd_config(config: &BootstrapConfig, service_key: &str) -> FunResult {
         .as_ref()
         .ok_or_else(|| Error::other("workflow_cluster_id not configured"))?;
 
-    let bucket = get_bootstrap_bucket()
-        .trim_start_matches("s3://")
-        .to_string();
+    let bucket = &config.bootstrap_bucket;
     let instance_id = get_instance_id_from_config(config)?;
-    let barrier = WorkflowBarrier::new(&bucket, cluster_id, &instance_id, "bss_server");
+    let barrier = WorkflowBarrier::new(bucket, cluster_id, &instance_id, "bss_server");
 
     let nodes = barrier.get_etcd_nodes()?;
     let etcd_endpoints = nodes

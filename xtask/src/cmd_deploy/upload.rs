@@ -20,7 +20,7 @@ pub fn upload(vpc_target: DeployTarget) -> CmdResult {
 set -ex
 aws s3 cp --no-progress s3://{bucket_name}/$(arch)/fractalbits-bootstrap /opt/fractalbits/bin/fractalbits-bootstrap
 chmod +x /opt/fractalbits/bin/fractalbits-bootstrap
-BOOTSTRAP_BUCKET={bucket_name} /opt/fractalbits/bin/fractalbits-bootstrap"#
+/opt/fractalbits/bin/fractalbits-bootstrap {bucket_name}"#
     );
 
     run_cmd! {

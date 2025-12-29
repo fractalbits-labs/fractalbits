@@ -52,8 +52,8 @@ pub fn download_binaries(config: &BootstrapConfig, file_list: &[&str]) -> CmdRes
     Ok(())
 }
 
-fn download_binary(_config: &BootstrapConfig, file_name: &str) -> CmdResult {
-    let bootstrap_bucket = get_bootstrap_bucket();
+fn download_binary(config: &BootstrapConfig, file_name: &str) -> CmdResult {
+    let bootstrap_bucket = config.get_bootstrap_bucket();
     let cpu_arch = run_fun!(arch)?;
 
     // All binaries stored at: s3://bucket/{arch}/{binary}
@@ -71,14 +71,8 @@ pub fn download_from_s3(s3_path: &str, local_path: &str) -> CmdResult {
     )
 }
 
-pub fn get_bootstrap_bucket() -> String {
-    let bucket_name =
-        std::env::var("BOOTSTRAP_BUCKET").unwrap_or_else(|_| "fractalbits-bootstrap".to_string());
-    format!("s3://{bucket_name}")
-}
-
-pub fn backup_config_to_workflow(cluster_id: &str) -> CmdResult {
-    let bucket = get_bootstrap_bucket();
+pub fn backup_config_to_workflow(config: &BootstrapConfig, cluster_id: &str) -> CmdResult {
+    let bucket = config.get_bootstrap_bucket();
     let local_path = format!("{ETC_PATH}{BOOTSTRAP_CLUSTER_CONFIG}");
     let workflow_path = format!("{bucket}/workflow/{cluster_id}/{BOOTSTRAP_CLUSTER_CONFIG}");
 
@@ -806,16 +800,14 @@ pub fn get_etcd_endpoints(config: &BootstrapConfig) -> FunResult {
         .workflow_cluster_id
         .as_ref()
         .ok_or_else(|| Error::other("workflow_cluster_id not configured"))?;
-    let bucket = get_bootstrap_bucket()
-        .trim_start_matches("s3://")
-        .to_string();
+    let bucket = &config.bootstrap_bucket;
     let instance_id = match config.global.deploy_target {
         DeployTarget::OnPrem => run_fun!(hostname)?,
         DeployTarget::Aws => get_instance_id()?,
     };
 
     let barrier =
-        crate::workflow::WorkflowBarrier::new(&bucket, cluster_id, &instance_id, "bss_server");
+        crate::workflow::WorkflowBarrier::new(bucket, cluster_id, &instance_id, "bss_server");
     let bss_nodes = barrier.get_etcd_nodes()?;
 
     if bss_nodes.is_empty() {
