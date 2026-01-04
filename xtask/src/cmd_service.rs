@@ -67,6 +67,21 @@ pub fn init_service(
                 --provisioned-throughput ReadCapacityUnits=1,WriteCapacityUnits=1 >/dev/null;
         }?;
 
+        // Create observer leader election table
+        const OBSERVER_LEADER_TABLE_NAME: &str = "fractalbits-leader-election-observer";
+        run_cmd! {
+            info "Initializing observer leader election table: $OBSERVER_LEADER_TABLE_NAME ...";
+            AWS_DEFAULT_REGION=fakeRegion
+            AWS_ACCESS_KEY_ID=fakeMyKeyId
+            AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
+            AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
+            aws dynamodb create-table
+                --table-name $OBSERVER_LEADER_TABLE_NAME
+                --attribute-definitions AttributeName=key,AttributeType=S
+                --key-schema AttributeName=key,KeyType=HASH
+                --provisioned-throughput ReadCapacityUnits=1,WriteCapacityUnits=1 >/dev/null;
+        }?;
+
         // Create service-discovery table for NSS role states
         const SERVICE_DISCOVERY_TABLE: &str = "fractalbits-service-discovery";
         run_cmd! {
@@ -82,30 +97,27 @@ pub fn init_service(
                 --provisioned-throughput ReadCapacityUnits=1,WriteCapacityUnits=1 >/dev/null;
         }?;
 
-        // Initialize NSS role states in service-discovery table
-        // When journal_type is Nvme, we use active/standby mode with mirrord
-        let nss_roles_item = if init_config.journal_type == JournalType::Nvme {
-            r#"{"service_id":{"S":"nss_roles"},"states":{"M":{"nss-A":{"S":"active"},"nss-B":{"S":"standby"}}}}"#
+        // Initialize observer_state in service-discovery table
+        // Active/standby mode when JournalType::Nvme, solo mode otherwise
+        let observer_state_json = if init_config.journal_type == JournalType::Nvme {
+            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","service_status":"failure","health_port":18077,"consecutive_failures":0},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","service_status":"failure","health_port":18099,"consecutive_failures":0},"version":1,"last_updated":0}"#
         } else {
-            match init_config.data_blob_storage {
-                DataBlobStorage::S3HybridSingleAz | DataBlobStorage::AllInBssSingleAz => {
-                    r#"{"service_id":{"S":"nss_roles"},"states":{"M":{"nss-A":{"S":"solo"}}}}"#
-                }
-                DataBlobStorage::S3ExpressMultiAz => {
-                    r#"{"service_id":{"S":"nss_roles"},"states":{"M":{"nss-A":{"S":"active"},"nss-B":{"S":"standby"}}}}"#
-                }
-            }
+            r#"{"observer_state":"solo_degraded","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo","service_status":"failure","health_port":18077,"consecutive_failures":0},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","service_status":"failure","health_port":18099,"consecutive_failures":0},"version":1,"last_updated":0}"#
         };
+        let observer_state_item = format!(
+            r#"{{"service_id":{{"S":"observer_state"}},"state":{{"S":"{}"}}}}"#,
+            observer_state_json.replace('"', "\\\"")
+        );
 
         run_cmd! {
-            info "Initializing NSS role states in service-discovery table ...";
+            info "Initializing observer_state in service-discovery table ...";
             AWS_DEFAULT_REGION=fakeRegion
             AWS_ACCESS_KEY_ID=fakeMyKeyId
             AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
             AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
             aws dynamodb put-item
                 --table-name $SERVICE_DISCOVERY_TABLE
-                --item $nss_roles_item >/dev/null;
+                --item $observer_state_item >/dev/null;
         }?;
 
         // Initialize AZ status in service-discovery table (using mock AZ names for local testing)
@@ -175,19 +187,14 @@ pub fn init_service(
         start_service(ServiceName::Etcd)?;
 
         // Initialize service-discovery keys using etcdctl
-        // When journal_type is Nvme, we use active/standby mode with mirrord
         let etcdctl = resolve_etcd_bin("etcdctl");
-        let nss_roles_json = if init_config.journal_type == JournalType::Nvme {
-            r#"{"states":{"nss-A":"active","nss-B":"standby"}}"#
+
+        // Always use observer_state for role management
+        // Active/standby mode when JournalType::Nvme, solo mode otherwise
+        let observer_state_json = if init_config.journal_type == JournalType::Nvme {
+            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","service_status":"failure","health_port":18077,"consecutive_failures":0},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","service_status":"failure","health_port":18099,"consecutive_failures":0},"version":1,"last_updated":0}"#
         } else {
-            match init_config.data_blob_storage {
-                DataBlobStorage::S3HybridSingleAz | DataBlobStorage::AllInBssSingleAz => {
-                    r#"{"states":{"nss-A":"solo"}}"#
-                }
-                DataBlobStorage::S3ExpressMultiAz => {
-                    r#"{"states":{"nss-A":"active","nss-B":"standby"}}"#
-                }
-            }
+            r#"{"observer_state":"solo_degraded","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo","service_status":"failure","health_port":18077,"consecutive_failures":0},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","service_status":"failure","health_port":18099,"consecutive_failures":0},"version":1,"last_updated":0}"#
         };
 
         let az_status_json = r#"{"status":{"localdev-az1":"Normal","localdev-az2":"Normal"}}"#;
@@ -196,7 +203,7 @@ pub fn init_service(
 
         run_cmd! {
             info "Initializing etcd service-discovery keys...";
-            $etcdctl put /fractalbits-service-discovery/nss_roles $nss_roles_json >/dev/null;
+            $etcdctl put /fractalbits-service-discovery/observer_state $observer_state_json >/dev/null;
             $etcdctl put /fractalbits-service-discovery/az_status $az_status_json >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-data-vg-config $bss_data_vg_config >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-metadata-vg-config $bss_metadata_vg_config >/dev/null;
@@ -425,6 +432,46 @@ fn get_bss_service_status(service_name: &str) -> String {
     }
 }
 
+fn get_nss_service_names() -> Vec<&'static str> {
+    vec!["nss@A", "nss@B"]
+}
+
+fn get_nss_service_status(service_name: &str) -> String {
+    match run_fun!(systemctl --user is-active $service_name.service 2>/dev/null) {
+        Ok(output) => match output.trim() {
+            "active" => "active".green().to_string(),
+            status => status.yellow().to_string(),
+        },
+        Err(_) => {
+            if run_cmd!(systemctl --user is-failed --quiet $service_name.service).is_ok() {
+                "failed".red().to_string()
+            } else {
+                "inactive (dead)".bright_black().to_string()
+            }
+        }
+    }
+}
+
+fn get_mirrord_service_names() -> Vec<&'static str> {
+    vec!["mirrord@A", "mirrord@B"]
+}
+
+fn get_mirrord_service_status(service_name: &str) -> String {
+    match run_fun!(systemctl --user is-active $service_name.service 2>/dev/null) {
+        Ok(output) => match output.trim() {
+            "active" => "active".green().to_string(),
+            status => status.yellow().to_string(),
+        },
+        Err(_) => {
+            if run_cmd!(systemctl --user is-failed --quiet $service_name.service).is_ok() {
+                "failed".red().to_string()
+            } else {
+                "inactive (dead)".bright_black().to_string()
+            }
+        }
+    }
+}
+
 fn create_bss_service_symlinks(bss_count: u32) -> CmdResult {
     // Remove any existing BSS service symlinks using glob
     if let Ok(paths) = glob::glob("data/etc/bss@[0-9]*.service") {
@@ -534,8 +581,8 @@ pub fn stop_service(service: ServiceName) -> CmdResult {
             }
 
             if service == ServiceName::NssRoleAgentB {
-                while run_cmd!(systemctl --user is-active --quiet nss.service).is_ok() {
-                    // waiting for nss to stop at first, or it may crash nss due to journal mirroring failure
+                // Wait for nss@A to stop first, or it may crash due to journal mirroring failure
+                while run_cmd!(systemctl --user is-active --quiet "nss@A.service").is_ok() {
                     std::thread::sleep(Duration::from_secs(1));
                 }
             }
@@ -680,6 +727,18 @@ pub fn show_service_status(service: ServiceName) -> CmdResult {
                         let status = get_bss_service_status(&bss_service_name);
                         println!("{bss_service_name:<16}: {status}");
                     }
+                } else if svc == ServiceName::Nss {
+                    // Handle NSS template instances
+                    for nss_service_name in get_nss_service_names() {
+                        let status = get_nss_service_status(nss_service_name);
+                        println!("{nss_service_name:<16}: {status}");
+                    }
+                } else if svc == ServiceName::Mirrord {
+                    // Handle Mirrord template instances
+                    for mirrord_service_name in get_mirrord_service_names() {
+                        let status = get_mirrord_service_status(mirrord_service_name);
+                        println!("{mirrord_service_name:<16}: {status}");
+                    }
                 } else {
                     let service_name = svc.as_ref();
                     let status = if run_cmd!(systemctl --user list-unit-files --quiet $service_name.service | grep -q $service_name).is_ok() {
@@ -714,7 +773,27 @@ pub fn show_service_status(service: ServiceName) -> CmdResult {
                     println!("=== {} ===", service_name);
                     run_cmd!(systemctl --user status $service_name.service --no-pager)?;
                     if i < bss_services.len() - 1 {
-                        println!(); // Add spacing between services
+                        println!();
+                    }
+                }
+            } else if single_service == ServiceName::Nss {
+                // Show all NSS template instances
+                let nss_services = get_nss_service_names();
+                for (i, service_name) in nss_services.iter().enumerate() {
+                    println!("=== {} ===", service_name);
+                    let _ = run_cmd!(systemctl --user status $service_name.service --no-pager);
+                    if i < nss_services.len() - 1 {
+                        println!();
+                    }
+                }
+            } else if single_service == ServiceName::Mirrord {
+                // Show all Mirrord template instances
+                let mirrord_services = get_mirrord_service_names();
+                for (i, service_name) in mirrord_services.iter().enumerate() {
+                    println!("=== {} ===", service_name);
+                    let _ = run_cmd!(systemctl --user status $service_name.service --no-pager);
+                    if i < mirrord_services.len() - 1 {
+                        println!();
                     }
                 }
             } else {
@@ -947,13 +1026,23 @@ Environment="BSS_WORKING_DIR=./data/bss%i""##;
         }
         ServiceName::Nss => {
             managed_service = true;
+            // Use template-based service with instance suffix (A or B)
+            // WORKING_DIR and HEALTH_PORT are set based on instance
+            env_settings += "\nEnvironment=\"WORKING_DIR=./data/nss-%i\"";
             let nss_binary = resolve_binary_path("nss_server", build_mode);
-            format!("{nss_binary} serve")
+            format!(
+                "/bin/bash -c 'if [ \"%i\" = \"A\" ]; then HEALTH_PORT=29999; else HEALTH_PORT=29998; fi; export HEALTH_PORT; {nss_binary} serve'"
+            )
         }
         ServiceName::Mirrord => {
             managed_service = true;
-            env_settings += "\nEnvironment=\"WORKING_DIR=./data/nss-B\"";
-            resolve_binary_path("mirrord", build_mode)
+            // Use template-based service with instance suffix (A or B)
+            // WORKING_DIR and HEALTH_PORT are set based on instance
+            env_settings += "\nEnvironment=\"WORKING_DIR=./data/nss-%i\"";
+            let mirrord_binary = resolve_binary_path("mirrord", build_mode);
+            format!(
+                "/bin/bash -c 'if [ \"%i\" = \"A\" ]; then HEALTH_PORT=19999; else HEALTH_PORT=19998; fi; export HEALTH_PORT; {mirrord_binary}'"
+            )
         }
         ServiceName::NssRoleAgentA => {
             env_settings += env_rust_log(build_mode);
@@ -985,6 +1074,12 @@ Environment="AWS_ENDPOINT_URL_DYNAMODB=http://localhost:8000""##
                 "\nEnvironment=\"RSS_BACKEND={}\"",
                 init_config.rss_backend.as_ref()
             );
+            // Observer leader election configuration
+            env_settings +=
+                "\nEnvironment=\"LEADER_TABLE_NAME=fractalbits-leader-election-observer\"";
+            env_settings += "\nEnvironment=\"INSTANCE_ID=rss-local\"";
+            // Give services time to start before observer starts triggering failovers
+            env_settings += "\nEnvironment=\"OBSERVER_INITIAL_GRACE_PERIOD_SECS=30\"";
             resolve_binary_path("root_server", build_mode)
         }
         ServiceName::ApiServer => {
@@ -1061,10 +1156,10 @@ Environment="MINIO_REGION=localdev""##
         ServiceName::ApiServer | ServiceName::GuiServer => {
             match init_config.data_blob_storage {
                 DataBlobStorage::AllInBssSingleAz => {
-                    "After=rss.service nss.service\nWants=rss.service nss.service\n".to_string()
+                    "After=rss.service nss_role_agent_a.service\nWants=rss.service nss_role_agent_a.service\n".to_string()
                 }
                 _ => {
-                    "After=rss.service nss.service minio.service\nWants=rss.service nss.service minio.service\n".to_string()
+                    "After=rss.service nss_role_agent_a.service minio.service\nWants=rss.service nss_role_agent_a.service minio.service\n".to_string()
                 }
             }
         }
@@ -1105,6 +1200,8 @@ WantedBy=multi-user.target
     let service_file = match service {
         ServiceName::GuiServer => "api_server.service".to_string(),
         ServiceName::Bss => "bss@.service".to_string(),
+        ServiceName::Nss => "nss@.service".to_string(),
+        ServiceName::Mirrord => "mirrord@.service".to_string(),
         _ => format!("{service_name}.service"),
     };
 

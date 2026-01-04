@@ -525,6 +525,7 @@ pub enum TestType {
     },
     LeaderElection,
     BssNodeFailure,
+    NssHaFailover,
 }
 
 #[derive(Parser, Clone, EnumString)]

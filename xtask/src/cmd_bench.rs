@@ -54,12 +54,8 @@ pub fn run_cmd_bench(
                 build_mode,
                 InitConfig {
                     data_blob_storage: DataBlobStorage::S3HybridSingleAz,
-                    for_gui: false,
-                    with_https: false,
                     bss_count: 1,
-                    nss_disable_restart_limit: false,
-                    rss_backend: Default::default(),
-                    journal_type: Default::default(),
+                    ..Default::default()
                 },
             )?;
             cmd_service::start_bss_instance(0)?;

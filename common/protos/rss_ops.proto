@@ -161,11 +161,20 @@ message HeartbeatResponse {
 // GetNssRole - Query NSS instance role from service-discovery table
 message GetNssRoleRequest {
   string instance_id = 1;  // "nss-A" or "nss-B"
+  optional NssAgentHealthReport health_report = 2;  // Agent reports its managed service health
+}
+
+// Health report pushed by nss_role_agent when calling GetNssRole
+message NssAgentHealthReport {
+  string service_type = 1;    // "nss" or "mirrord"
+  string status = 2;          // "active", "solo", "standby", "degraded", "failure"
+  bool is_running = 3;
+  uint64 timestamp_ms = 4;    // When health was last checked
 }
 
 message GetNssRoleResponse {
   oneof result {
-    string role = 1;  // "active", "standby", "solo", or "dead"
+    string role = 1;  // "active", "standby", "solo", or "degraded"
     string error = 2;
   }
 }

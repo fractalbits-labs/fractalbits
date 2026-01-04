@@ -172,6 +172,7 @@ impl RpcClient {
     pub async fn get_nss_role(
         &self,
         instance_id: &str,
+        health_report: Option<NssAgentHealthReport>,
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
@@ -180,6 +181,7 @@ impl RpcClient {
         let start = Instant::now();
         let body = GetNssRoleRequest {
             instance_id: instance_id.to_string(),
+            health_report,
         };
 
         let mut header = MessageHeader::default();
