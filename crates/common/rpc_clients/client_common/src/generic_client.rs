@@ -242,8 +242,7 @@ where
         rpc_type: &'static str,
     ) -> Result<(), RpcError> {
         let header_size = size_of::<Header>();
-        assert!(header_size <= 96);
-        let mut header_buf = [0u8; 96];
+        let mut header_buf = vec![0u8; header_size];
 
         loop {
             // Read fixed-size header into stack buffer

@@ -15,7 +15,7 @@ const EMPTY_BODY_CHECKSUM: u64 = 0x2d06800538d394c2;
 pub struct MessageHeader {
     /// A checksum covering only the remainder of this header.
     /// This allows the header to be trusted without having to recv() or read() the associated body.
-    checksum: u64,
+    pub checksum: u64,
     /// The current protocol version, note the position should never be changed
     /// so that we can upgrade proto version in the future.
     pub proto_version: u8,
@@ -52,8 +52,13 @@ pub struct MessageHeader {
     pub errno: i32,
     /// Flag to indicate if this is a new metadata blob (vs update)
     pub is_new: u8,
+    /// Flag to indicate whether this blob is deleted
+    pub is_deleted: u8,
     /// Reserved parts for padding
-    reserved: [u8; 3],
+    /// TODO: will add device id, fence_token, nss-active-id, for meta-blob use
+    pub reserved2: [u8; 2],
+    pub reserved1: [u8; 32],
+    pub reserved0: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -102,13 +107,16 @@ impl Default for MessageHeader {
             volume_id: 0,
             retry_count: 0,
             is_new: 0,
-            reserved: [0u8; 3],
+            is_deleted: 0,
+            reserved2: [0u8; 2],
+            reserved1: [0u8; 32],
+            reserved0: [0u8; 32],
         }
     }
 }
 
 impl MessageHeader {
-    const _SIZE_OK: () = assert!(size_of::<Self>() == 96);
+    const _SIZE_OK: () = assert!(size_of::<Self>() == 160);
     pub const PROTO_VERSION: u8 = 1;
 
     /// Calculate and set the body checksum field.
