@@ -99,10 +99,11 @@ pub fn init_service(
 
         // Initialize observer_state in service-discovery table
         // Active/standby mode when JournalType::Nvme, solo mode otherwise
+        // Fields match root_server's ObserverPersistentState and MachineState structs
         let observer_state_json = if init_config.journal_type == JournalType::Nvme {
-            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","service_status":"failure","health_port":18077,"consecutive_failures":0},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","service_status":"failure","health_port":18099,"consecutive_failures":0},"version":1,"last_updated":0}"#
+            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby"},"version":1,"last_updated":0}"#
         } else {
-            r#"{"observer_state":"solo_degraded","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo","service_status":"failure","health_port":18077,"consecutive_failures":0},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","service_status":"failure","health_port":18099,"consecutive_failures":0},"version":1,"last_updated":0}"#
+            r#"{"observer_state":"solo_degraded","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby"},"version":1,"last_updated":0}"#
         };
         let observer_state_item = format!(
             r#"{{"service_id":{{"S":"observer_state"}},"state":{{"S":"{}"}}}}"#,
@@ -191,10 +192,11 @@ pub fn init_service(
 
         // Always use observer_state for role management
         // Active/standby mode when JournalType::Nvme, solo mode otherwise
+        // Fields match root_server's ObserverPersistentState and MachineState structs
         let observer_state_json = if init_config.journal_type == JournalType::Nvme {
-            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","service_status":"failure","health_port":18077,"consecutive_failures":0},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","service_status":"failure","health_port":18099,"consecutive_failures":0},"version":1,"last_updated":0}"#
+            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby"},"version":1,"last_updated":0}"#
         } else {
-            r#"{"observer_state":"solo_degraded","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo","service_status":"failure","health_port":18077,"consecutive_failures":0},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","service_status":"failure","health_port":18099,"consecutive_failures":0},"version":1,"last_updated":0}"#
+            r#"{"observer_state":"solo_degraded","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby"},"version":1,"last_updated":0}"#
         };
 
         let az_status_json = r#"{"status":{"localdev-az1":"Normal","localdev-az2":"Normal"}}"#;

@@ -4,6 +4,7 @@ use crate::etcd_utils::resolve_etcd_bin;
 use crate::{CmdResult, DataBlobStorage, InitConfig, JournalType, RssBackend, ServiceName};
 use cmd_lib::*;
 use colored::*;
+use std::io::Error;
 use std::time::Duration;
 
 const ETCD_SERVICE_DISCOVERY_PREFIX: &str = "/fractalbits-service-discovery/";
@@ -23,9 +24,6 @@ struct MachineState {
     machine_id: String,
     running_service: String,
     expected_role: String,
-    service_status: String,
-    health_port: u16,
-    consecutive_failures: u32,
 }
 
 fn get_observer_state_from_etcd() -> Option<ObserverState> {
@@ -91,8 +89,9 @@ fn seed_initial_observer_state() -> CmdResult {
         .as_secs_f64();
 
     // Initial state: nss-A runs NSS (active), nss-B runs mirrord (standby)
+    // Fields match root_server's ObserverPersistentState and MachineState structs
     let initial_state = format!(
-        r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"nss-A","running_service":"nss","expected_role":"active","service_status":"failure","health_port":18077,"consecutive_failures":0}},"mirrord_machine":{{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","service_status":"failure","health_port":18099,"consecutive_failures":0}},"version":1,"last_updated":{}}}"#,
+        r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"nss-A","running_service":"nss","expected_role":"active"}},"mirrord_machine":{{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby"}},"version":1,"last_updated":{}}}"#,
         now
     );
 
@@ -190,10 +189,10 @@ async fn test_full_stack_initialization() -> CmdResult {
 
     // Verify processes are running
     if !verify_process_running("nss_server") {
-        return Err(std::io::Error::other("nss_server is not running"));
+        return Err(Error::other("nss_server is not running"));
     }
     if !verify_process_running("mirrord") {
-        return Err(std::io::Error::other("mirrord is not running"));
+        return Err(Error::other("mirrord is not running"));
     }
 
     // Wait for observer to update machine statuses based on health checks
@@ -204,7 +203,7 @@ async fn test_full_stack_initialization() -> CmdResult {
     let state = wait_for_observer_state("active_standby", 15);
     if state.is_none() {
         let current = get_observer_state_from_etcd();
-        return Err(std::io::Error::other(format!(
+        return Err(Error::other(format!(
             "Observer did not create initial active_standby state. Current state: {:?}",
             current.map(|s| s.observer_state)
         )));
@@ -218,7 +217,7 @@ async fn test_full_stack_initialization() -> CmdResult {
 
     // Verify nss-A is running NSS
     if state.nss_machine.machine_id != "nss-A" {
-        return Err(std::io::Error::other(format!(
+        return Err(Error::other(format!(
             "Expected nss-A to be NSS machine, got {}",
             state.nss_machine.machine_id
         )));
@@ -226,7 +225,7 @@ async fn test_full_stack_initialization() -> CmdResult {
 
     // Verify nss-B is running mirrord
     if state.mirrord_machine.machine_id != "nss-B" {
-        return Err(std::io::Error::other(format!(
+        return Err(Error::other(format!(
             "Expected nss-B to be mirrord machine, got {}",
             state.mirrord_machine.machine_id
         )));
@@ -245,9 +244,19 @@ async fn test_nss_failure_failover() -> CmdResult {
     // Verify we're in active_standby state
     let state = get_observer_state_from_etcd();
     if state.is_none() || state.as_ref().unwrap().observer_state != "active_standby" {
-        return Err(std::io::Error::other(
+        return Err(Error::other(
             "Expected active_standby state before testing failover",
         ));
+    }
+
+    // Verify services are running before testing failover
+    if !verify_process_running("nss_server") {
+        return Err(Error::other(
+            "nss_server is not running before failover test",
+        ));
+    }
+    if !verify_process_running("mirrord") {
+        return Err(Error::other("mirrord is not running before failover test"));
     }
 
     info!("Killing NSS process to simulate failure...");
@@ -266,7 +275,7 @@ async fn test_nss_failure_failover() -> CmdResult {
     let state = wait_for_observer_state("solo_degraded", 20);
     if state.is_none() {
         let current = get_observer_state_from_etcd();
-        return Err(std::io::Error::other(format!(
+        return Err(Error::other(format!(
             "Observer did not transition to solo_degraded. Current state: {:?}",
             current.map(|s| format!("{} (version {})", s.observer_state, s.version))
         )));
@@ -284,7 +293,7 @@ async fn test_nss_failure_failover() -> CmdResult {
 
     // After failover, nss-B should be promoted to NSS with solo role
     if state.nss_machine.expected_role != "solo" {
-        return Err(std::io::Error::other(format!(
+        return Err(Error::other(format!(
             "Expected NSS machine to have solo role, got {}",
             state.nss_machine.expected_role
         )));
@@ -303,7 +312,7 @@ async fn test_mirrord_recovery() -> CmdResult {
     // Verify we're in solo_degraded state
     let state = get_observer_state_from_etcd();
     if state.is_none() || state.as_ref().unwrap().observer_state != "solo_degraded" {
-        return Err(std::io::Error::other(
+        return Err(Error::other(
             "Expected solo_degraded state before testing recovery",
         ));
     }
@@ -332,7 +341,7 @@ async fn test_mirrord_recovery() -> CmdResult {
     }
 
     if !recovered {
-        return Err(std::io::Error::other(
+        return Err(Error::other(
             "Failed to recover both nss and mirrord processes",
         ));
     }
@@ -342,7 +351,7 @@ async fn test_mirrord_recovery() -> CmdResult {
     let state = wait_for_observer_state("active_standby", 30);
     if state.is_none() {
         let current = get_observer_state_from_etcd();
-        return Err(std::io::Error::other(format!(
+        return Err(Error::other(format!(
             "Observer did not recover to active_standby. Current state: {:?}",
             current.map(|s| format!("{} (version {})", s.observer_state, s.version))
         )));
@@ -371,7 +380,7 @@ async fn test_observer_restart() -> CmdResult {
     // Get current state version
     let state_before = get_observer_state_from_etcd();
     if state_before.is_none() {
-        return Err(std::io::Error::other("No observer state found in etcd"));
+        return Err(Error::other("No observer state found in etcd"));
     }
     let version_before = state_before.as_ref().unwrap().version;
     let state_name_before = state_before.as_ref().unwrap().observer_state.clone();
@@ -395,9 +404,7 @@ async fn test_observer_restart() -> CmdResult {
     // Verify state is still valid
     let state_after = get_observer_state_from_etcd();
     if state_after.is_none() {
-        return Err(std::io::Error::other(
-            "Observer state missing after restart",
-        ));
+        return Err(Error::other("Observer state missing after restart"));
     }
 
     let state_after = state_after.unwrap();
@@ -417,7 +424,7 @@ async fn test_observer_restart() -> CmdResult {
 
     // Version should be >= previous (observer continues from persisted state)
     if state_after.version < version_before {
-        return Err(std::io::Error::other(format!(
+        return Err(Error::other(format!(
             "State version decreased after restart: {} -> {}",
             version_before, state_after.version
         )));
