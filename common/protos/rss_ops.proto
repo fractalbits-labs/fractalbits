@@ -13,9 +13,6 @@ enum Command {
   Delete = 18;
   List = 19;
 
-  // Health agent commands
-  Heartbeat = 20;
-
   // NSS role management
   GetNssRole = 21;
 
@@ -96,67 +93,6 @@ message ListResponse {
 message ListKeyValues {
   repeated string kvs = 3;
 }
-
-// Health agent commands
-// message RegisterInstanceRequest {
-//   string instance_id = 1;
-//   string ip_address = 2;
-//   uint32 port = 3;
-//   string peer_instance_id = 4;
-//   string ec2_instance_id = 5;
-//   string availability_zone = 6;
-// }
-
-// message RegisterInstanceResponse {
-//   oneof result {
-//     google.protobuf.Empty ok = 1;
-//     string error = 2;
-//   }
-// }
-
-message HeartbeatRequest {
-  string instance_id = 1;
-}
-
-message HeartbeatResponse {
-  oneof result {
-    google.protobuf.Empty ok = 1;
-    string error = 2;
-  }
-}
-
-// message GetStateRequest {
-//   string instance_id = 1;
-// }
-
-// message GetStateResponse {
-//   oneof result {
-//     string state = 1;
-//     string error = 2;
-//   }
-// }
-
-// message PromoteToActiveRequest {
-//   string instance_id = 1;
-// }
-
-// message PromoteToActiveResponse {
-//   oneof result {
-//     google.protobuf.Empty ok = 1;
-//     string error = 2;
-//   }
-// }
-
-// message DemoteToStandbyRequest {
-//   string instance_id = 1;
-// }
-
-// message DemoteToStandbyResponse {
-//   oneof result {
-//     google.protobuf.Empty ok = 1;
-//     string error = 2;
-//   }
-// }
 
 // GetNssRole - Query NSS instance role from service-discovery table
 message GetNssRoleRequest {

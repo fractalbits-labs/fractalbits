@@ -267,56 +267,6 @@ impl RpcClient {
         }
     }
 
-    //== Health agent commands
-
-    pub async fn send_heartbeat(
-        &self,
-        instance_id: &str,
-        timeout: Option<Duration>,
-        trace_id: &TraceId,
-        retry_count: u32,
-    ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "send_heartbeat");
-        let start = Instant::now();
-        let body = HeartbeatRequest {
-            instance_id: instance_id.to_string(),
-        };
-
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::Heartbeat;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc=%"list", %request_id, %instance_id, error=?e, "rss rpc failed");
-            }
-            e
-        })?;
-        let resp: HeartbeatResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
-        let duration = start.elapsed();
-        match resp.result.unwrap() {
-            rss_codec::heartbeat_response::Result::Ok(()) => {
-                histogram!("rss_rpc_nanos", "status" => "Heartbeat_Ok")
-                    .record(duration.as_nanos() as f64);
-                Ok(())
-            }
-            rss_codec::heartbeat_response::Result::Error(resp) => {
-                histogram!("rss_rpc_nanos", "status" => "Heartbeat_Error")
-                    .record(duration.as_nanos() as f64);
-                error!(rpc=%"put", %instance_id, "rss rpc failed: {resp}");
-                Err(RpcError::InternalResponseError(resp))
-            }
-        }
-    }
-
     pub async fn get_az_status(
         &self,
         timeout: Option<Duration>,

@@ -304,7 +304,6 @@ mirrord_port = 9999
     let config_content = format!(
         r##"rss_addrs = [{rss_addrs_toml}]
 rpc_timeout_seconds = 4
-heartbeat_interval_seconds = 10
 state_check_interval_seconds = 1
 instance_id = "{instance_id}"
 service_type = "unknown"
