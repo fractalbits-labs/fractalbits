@@ -1,11 +1,13 @@
 use crate::cmd_build::BuildMode;
-use crate::cmd_service::{init_service, start_service, stop_service};
+use crate::cmd_service::{init_service, start_service, stop_service, wait_for_port_ready};
 use crate::etcd_utils::resolve_etcd_bin;
 use crate::{CmdResult, DataBlobStorage, InitConfig, JournalType, RssBackend, ServiceName};
+use aws_sdk_s3::primitives::ByteStream;
 use cmd_lib::*;
 use colored::*;
 use std::io::Error;
 use std::time::Duration;
+use test_common::*;
 
 const ETCD_SERVICE_DISCOVERY_PREFIX: &str = "/fractalbits-service-discovery/";
 
@@ -120,17 +122,27 @@ pub async fn run_nss_ha_failover_tests() -> CmdResult {
         return Err(e);
     }
 
-    println!("{}", "=== Test 3: Mirrord Recovery ===".bold());
-    if let Err(e) = test_mirrord_recovery().await {
+    println!(
+        "{}",
+        "=== Test 3: api_server During NSS Failover ===".bold()
+    );
+    if let Err(e) = test_api_server_during_nss_failover().await {
         let _ = stop_service(ServiceName::All);
         eprintln!("{}: {}", "Test 3 FAILED".red().bold(), e);
         return Err(e);
     }
 
-    println!("{}", "=== Test 4: Observer Restart ===".bold());
-    if let Err(e) = test_observer_restart().await {
+    println!("{}", "=== Test 4: Mirrord Recovery ===".bold());
+    if let Err(e) = test_mirrord_recovery().await {
         let _ = stop_service(ServiceName::All);
         eprintln!("{}: {}", "Test 4 FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!("{}", "=== Test 5: Observer Restart ===".bold());
+    if let Err(e) = test_observer_restart().await {
+        let _ = stop_service(ServiceName::All);
+        eprintln!("{}: {}", "Test 5 FAILED".red().bold(), e);
         return Err(e);
     }
 
@@ -187,12 +199,19 @@ async fn test_full_stack_initialization() -> CmdResult {
     info!("Starting NssRoleAgentA (nss/active)...");
     start_service(ServiceName::NssRoleAgentA)?;
 
+    // Start api_server - it will fetch NSS address from RSS
+    info!("Starting api_server...");
+    start_service(ServiceName::ApiServer)?;
+
     // Verify processes are running
     if !verify_process_running("nss_server") {
         return Err(Error::other("nss_server is not running"));
     }
     if !verify_process_running("mirrord") {
         return Err(Error::other("mirrord is not running"));
+    }
+    if !verify_process_running("api_server") {
+        return Err(Error::other("api_server is not running"));
     }
 
     // Wait for observer to update machine statuses based on health checks
@@ -433,6 +452,129 @@ async fn test_observer_restart() -> CmdResult {
     println!(
         "{}",
         "SUCCESS: RSS/observer restarted and state is preserved!".green()
+    );
+    Ok(())
+}
+
+async fn test_api_server_during_nss_failover() -> CmdResult {
+    info!("Testing api_server continues working during NSS failover...");
+
+    // Test is run after test_nss_failure_failover, so we're in solo_degraded state
+    // with nss-B now running as the active NSS
+
+    // Wait for the new NSS (nss-B on port 8087) to be healthy before proceeding
+    wait_for_port_ready(8087, 30)?;
+
+    // Step 1: Create a bucket and upload an object via api_server
+    info!("Step 1: Creating bucket and uploading object via api_server...");
+    let ctx = context();
+    let bucket_name = "test-nss-failover-bucket";
+    let object_key = "test-failover-object";
+    let object_data = b"Test data for NSS failover verification";
+
+    // Create bucket
+    match ctx.client.create_bucket().bucket(bucket_name).send().await {
+        Ok(_) => info!("Bucket created: {}", bucket_name),
+        Err(e) => {
+            let service_error = e.into_service_error();
+            if !service_error.is_bucket_already_owned_by_you() {
+                return Err(Error::other(format!(
+                    "Failed to create bucket: {:?}",
+                    service_error
+                )));
+            }
+            info!("Bucket already exists: {}", bucket_name);
+        }
+    }
+
+    // Upload object
+    ctx.client
+        .put_object()
+        .bucket(bucket_name)
+        .key(object_key)
+        .body(ByteStream::from_static(object_data))
+        .send()
+        .await
+        .map_err(|e| Error::other(format!("Failed to upload object: {e}")))?;
+    info!("Object uploaded: {}/{}", bucket_name, object_key);
+
+    // Step 2: Verify the object can be retrieved
+    info!("Step 2: Verifying object can be retrieved...");
+    let get_result = ctx
+        .client
+        .get_object()
+        .bucket(bucket_name)
+        .key(object_key)
+        .send()
+        .await
+        .map_err(|e| Error::other(format!("Failed to get object: {e}")))?;
+
+    let body = get_result
+        .body
+        .collect()
+        .await
+        .map_err(|e| Error::other(format!("Failed to read body: {e}")))?;
+    if body.into_bytes().as_ref() != object_data {
+        return Err(Error::other("Object data mismatch before failover"));
+    }
+    info!("Object verified before any failover");
+
+    // Step 3: Upload another object to ensure write path works
+    let object_key2 = "test-failover-object-2";
+    let object_data2 = b"Second test object for write path verification";
+
+    ctx.client
+        .put_object()
+        .bucket(bucket_name)
+        .key(object_key2)
+        .body(ByteStream::from_static(object_data2))
+        .send()
+        .await
+        .map_err(|e| Error::other(format!("Failed to upload second object: {e}")))?;
+    info!("Second object uploaded: {}/{}", bucket_name, object_key2);
+
+    // Step 4: Verify both objects can be retrieved
+    info!("Step 4: Verifying both objects can still be retrieved...");
+
+    let get_result1 = ctx
+        .client
+        .get_object()
+        .bucket(bucket_name)
+        .key(object_key)
+        .send()
+        .await
+        .map_err(|e| Error::other(format!("Failed to get first object after failover: {e}")))?;
+    let body1 = get_result1
+        .body
+        .collect()
+        .await
+        .map_err(|e| Error::other(format!("Failed to read first object body: {e}")))?;
+    if body1.into_bytes().as_ref() != object_data {
+        return Err(Error::other("First object data mismatch"));
+    }
+    info!("First object verified");
+
+    let get_result2 = ctx
+        .client
+        .get_object()
+        .bucket(bucket_name)
+        .key(object_key2)
+        .send()
+        .await
+        .map_err(|e| Error::other(format!("Failed to get second object: {e}")))?;
+    let body2 = get_result2
+        .body
+        .collect()
+        .await
+        .map_err(|e| Error::other(format!("Failed to read second object body: {e}")))?;
+    if body2.into_bytes().as_ref() != object_data2 {
+        return Err(Error::other("Second object data mismatch"));
+    }
+    info!("Second object verified");
+
+    println!(
+        "{}",
+        "SUCCESS: api_server continues working after NSS failover!".green()
     );
     Ok(())
 }

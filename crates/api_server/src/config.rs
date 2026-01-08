@@ -94,7 +94,6 @@ impl Default for HttpsConfig {
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Config {
-    pub nss_addr: String,
     pub rss_addrs: Vec<String>,
 
     pub port: u16,
@@ -159,7 +158,6 @@ impl Default for Config {
 impl Config {
     pub fn s3_express_multi_az() -> Self {
         Self {
-            nss_addr: "127.0.0.1:8087".to_string(),
             rss_addrs: vec!["127.0.0.1:8086".to_string()],
             port: 8080,
             mgmt_port: 18080,
@@ -187,7 +185,6 @@ impl Config {
 
     pub fn s3_hybrid_single_az() -> Self {
         Self {
-            nss_addr: "127.0.0.1:8087".to_string(),
             rss_addrs: vec!["127.0.0.1:8086".to_string()],
             port: 8080,
             mgmt_port: 18080,
@@ -222,7 +219,6 @@ impl Config {
 
     pub fn all_in_bss_single_az() -> Self {
         Self {
-            nss_addr: "127.0.0.1:8087".to_string(),
             rss_addrs: vec!["127.0.0.1:8086".to_string()],
             port: 8080,
             mgmt_port: 18080,

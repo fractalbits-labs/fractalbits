@@ -259,7 +259,11 @@ fn main() -> std::io::Result<()> {
                                         "/cache/update/az_status/{id}",
                                         web::post().to(cache_mgmt::update_az_status),
                                     )
-                                    .route("/cache/clear", web::post().to(cache_mgmt::clear_cache)),
+                                    .route("/cache/clear", web::post().to(cache_mgmt::clear_cache))
+                                    .route(
+                                        "/nss/update_address",
+                                        web::post().to(cache_mgmt::update_nss_address),
+                                    ),
                             )
                             .service(
                                 web::scope("/api_keys")

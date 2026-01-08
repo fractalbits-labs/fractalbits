@@ -4,7 +4,6 @@ use crate::*;
 use std::io::Error;
 
 pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
-    let nss_endpoint = &config.endpoints.nss_endpoint;
     let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
 
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Api)?;
@@ -36,7 +35,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
         timeouts::NSS_JOURNAL_READY,
     )?;
 
-    create_config(config, nss_endpoint)?;
+    create_config(config)?;
 
     info!("Creating directories for api_server");
     run_cmd!(mkdir -p "/data/local/stats")?;
@@ -60,7 +59,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     Ok(())
 }
 
-pub fn create_config(config: &BootstrapConfig, nss_endpoint: &str) -> CmdResult {
+pub fn create_config(config: &BootstrapConfig) -> CmdResult {
     let data_blob_storage = &config.global.data_blob_storage;
     let data_blob_bucket = config
         .aws
@@ -91,8 +90,7 @@ pub fn create_config(config: &BootstrapConfig, nss_endpoint: &str) -> CmdResult 
         let remote_bucket = get_s3_express_bucket_name(remote_az)?;
 
         format!(
-            r##"nss_addr = "{nss_endpoint}:8088"
-rss_addrs = [{rss_addrs_toml}]
+            r##"rss_addrs = [{rss_addrs_toml}]
 region = "{aws_region}"
 port = 80
 mgmt_port = 18088
@@ -148,8 +146,7 @@ backoff_multiplier = 1.0
         // S3 Hybrid single-az configuration (AWS only)
         let aws_region = get_current_aws_region()?;
         format!(
-            r##"nss_addr = "{nss_endpoint}:8088"
-rss_addrs = [{rss_addrs_toml}]
+            r##"rss_addrs = [{rss_addrs_toml}]
 region = "{aws_region}"
 port = 80
 mgmt_port = 18088
@@ -199,8 +196,7 @@ backoff_multiplier = 1.8
     } else {
         // AllInBss single-az configuration
         format!(
-            r##"nss_addr = "{nss_endpoint}:8088"
-rss_addrs = [{rss_addrs_toml}]
+            r##"rss_addrs = [{rss_addrs_toml}]
 region = "{region}"
 port = 80
 mgmt_port = 18088

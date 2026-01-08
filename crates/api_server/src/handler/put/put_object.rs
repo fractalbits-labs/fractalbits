@@ -451,7 +451,7 @@ async fn put_object_streaming_internal(
         .into();
 
     // Store object metadata in NSS
-    let nss_client = ctx.app.get_nss_rpc_client();
+    let nss_client = ctx.app.get_nss_rpc_client().await?;
     let resp = nss_rpc_retry!(
         nss_client,
         put_inode(
@@ -669,7 +669,7 @@ async fn put_object_with_no_trailer(
         .into();
 
     // Store object metadata in NSS using the resolved bucket
-    let nss_client = ctx.app.get_nss_rpc_client();
+    let nss_client = ctx.app.get_nss_rpc_client().await?;
     let resp = nss_rpc_retry!(
         nss_client,
         put_inode(

@@ -67,7 +67,7 @@ pub async fn get_raw_object(
     key: &str,
     trace_id: &TraceId,
 ) -> Result<ObjectLayout, S3Error> {
-    let nss_client = app.get_nss_rpc_client();
+    let nss_client = app.get_nss_rpc_client().await?;
     let resp = nss_rpc_retry!(
         nss_client,
         get_inode(
@@ -105,7 +105,7 @@ pub async fn list_raw_objects(
     skip_mpu_parts: bool,
     trace_id: &TraceId,
 ) -> Result<Vec<(String, ObjectLayout)>, S3Error> {
-    let nss_client = app.get_nss_rpc_client();
+    let nss_client = app.get_nss_rpc_client().await?;
     let resp = nss_rpc_retry!(
         nss_client,
         list_inodes(

@@ -101,9 +101,9 @@ pub fn init_service(
         // Active/standby mode when JournalType::Nvme, solo mode otherwise
         // Fields match root_server's ObserverPersistentState and MachineState structs
         let observer_state_json = if init_config.journal_type == JournalType::Nvme {
-            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby"},"version":1,"last_updated":0}"#
+            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0}"#
         } else {
-            r#"{"observer_state":"solo_degraded","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby"},"version":1,"last_updated":0}"#
+            r#"{"observer_state":"solo_degraded","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0}"#
         };
         let observer_state_item = format!(
             r#"{{"service_id":{{"S":"observer_state"}},"state":{{"S":"{}"}}}}"#,
@@ -194,9 +194,9 @@ pub fn init_service(
         // Active/standby mode when JournalType::Nvme, solo mode otherwise
         // Fields match root_server's ObserverPersistentState and MachineState structs
         let observer_state_json = if init_config.journal_type == JournalType::Nvme {
-            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby"},"version":1,"last_updated":0}"#
+            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0}"#
         } else {
-            r#"{"observer_state":"solo_degraded","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby"},"version":1,"last_updated":0}"#
+            r#"{"observer_state":"solo_degraded","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0}"#
         };
 
         let az_status_json = r#"{"status":{"localdev-az1":"Normal","localdev-az2":"Normal"}}"#;
@@ -508,7 +508,7 @@ pub fn start_bss_instance(id: u32) -> CmdResult {
     Ok(())
 }
 
-fn wait_for_port_ready(port: u16, timeout_secs: u32) -> CmdResult {
+pub fn wait_for_port_ready(port: u16, timeout_secs: u32) -> CmdResult {
     use std::time::{Duration, Instant};
 
     let start = Instant::now();

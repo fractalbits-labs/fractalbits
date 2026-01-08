@@ -20,6 +20,11 @@ pub struct AzStatusUpdateRequest {
     pub status: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NssAddressUpdateRequest {
+    pub address: String,
+}
+
 /// Invalidate a specific bucket from the cache
 pub async fn invalidate_bucket(
     app: Data<Arc<AppState>>,
@@ -108,6 +113,23 @@ pub async fn clear_cache(app: Data<Arc<AppState>>) -> Result<HttpResponse> {
     let response = CacheInvalidationResponse {
         status: "success".to_string(),
         message: "All cache entries cleared".to_string(),
+    };
+
+    Ok(HttpResponse::Ok().json(response))
+}
+
+/// Update NSS address for this api_server instance
+pub async fn update_nss_address(
+    app: Data<Arc<AppState>>,
+    request: Json<NssAddressUpdateRequest>,
+) -> Result<HttpResponse> {
+    info!("Received NSS address update request: {}", request.address);
+
+    app.update_nss_address(request.address.clone()).await;
+
+    let response = CacheInvalidationResponse {
+        status: "success".to_string(),
+        message: format!("NSS address updated to '{}'", request.address),
     };
 
     Ok(HttpResponse::Ok().json(response))

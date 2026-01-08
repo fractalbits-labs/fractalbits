@@ -298,7 +298,7 @@ pub async fn list_objects(
         start_after
     );
 
-    let nss_client = app.get_nss_rpc_client();
+    let nss_client = app.get_nss_rpc_client().await?;
     let resp = nss_rpc_retry!(
         nss_client,
         list_inodes(

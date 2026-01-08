@@ -29,6 +29,9 @@ enum Command {
 
   // Metadata Volume Group management
   GetMetadataVgInfo = 27;
+
+  // Active NSS address query
+  GetActiveNssAddress = 28;
 }
 
 // Put
@@ -106,6 +109,7 @@ message NssAgentHealthReport {
   string status = 2;          // "active", "solo", "standby", "degraded", "failure"
   bool is_running = 3;
   uint64 timestamp_ms = 4;    // When health was last checked
+  string network_address = 5; // "ip:port" of the NSS service
 }
 
 message GetNssRoleResponse {
@@ -190,6 +194,17 @@ message GetMetadataVgInfoRequest {
 message GetMetadataVgInfoResponse {
   oneof result {
     string info_json = 1;
+    string error = 2;
+  }
+}
+
+// GetActiveNssAddress - Query the active NSS network address from observer state
+message GetActiveNssAddressRequest {
+}
+
+message GetActiveNssAddressResponse {
+  oneof result {
+    string address = 1;  // "ip:port" of active NSS
     string error = 2;
   }
 }

@@ -4,8 +4,6 @@ use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use crate::*;
 
 pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
-    let nss_endpoint = &config.endpoints.nss_endpoint;
-
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Api)?;
     barrier.complete_stage(stages::INSTANCES_READY, None)?;
 
@@ -13,7 +11,7 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     let bootstrap_bucket = config.get_bootstrap_bucket();
     run_cmd!(aws s3 cp --no-progress $bootstrap_bucket/ui $GUI_WEB_ROOT --recursive)?;
 
-    api_server::create_config(config, nss_endpoint)?;
+    api_server::create_config(config)?;
     // setup_cloudwatch_agent()?;
     create_systemd_unit_file("gui_server", true)?;
 

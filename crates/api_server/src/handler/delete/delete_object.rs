@@ -19,7 +19,7 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
     let bucket = ctx.resolve_bucket().await?;
     let blob_deletion = ctx.app.get_blob_deletion();
     let rpc_timeout = ctx.app.config.rpc_request_timeout();
-    let nss_client = ctx.app.get_nss_rpc_client();
+    let nss_client = ctx.app.get_nss_rpc_client().await?;
     let resp = nss_rpc_retry!(
         nss_client,
         delete_inode(

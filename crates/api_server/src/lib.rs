@@ -14,6 +14,7 @@ use blob_client::BlobDeletionRequest;
 pub use config::{BlobStorageBackend, BlobStorageConfig, Config, S3HybridSingleAzConfig};
 pub use data_blob_tracking::{DataBlobTracker, DataBlobTrackingError};
 use data_types::{ApiKey, Bucket, TraceId, Versioned};
+use handler::common::s3_error::S3Error;
 use metrics_wrapper::counter;
 use moka::future::Cache;
 use rpc_client_common::{RpcError, rss_rpc_retry};
@@ -26,7 +27,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{
-    Mutex, OnceCell,
+    Mutex, OnceCell, RwLock, RwLockReadGuard,
     mpsc::{self, Receiver, Sender},
 };
 use tracing::debug;
@@ -43,7 +44,8 @@ pub struct AppState {
     pub az_status_enabled: AtomicBool,
     pub worker_id: u16,
 
-    rpc_client_nss: RpcClientNss,
+    // NSS client is lazily initialized - set when we receive address from RSS
+    rpc_client_nss: Arc<RwLock<Option<RpcClientNss>>>,
     rpc_client_rss: RpcClientRss,
 
     blob_client: OnceCell<Arc<BlobClient>>,
@@ -75,10 +77,8 @@ impl AppState {
 
         debug!("Per-core AppState initialized with lazy BlobClient initialization");
 
-        let rpc_client_nss = RpcClientNss::new_from_address(
-            config.nss_addr.clone(),
-            config.rpc_connection_timeout(),
-        );
+        // NSS client starts uninitialized - will be set when we receive address from RSS
+        let rpc_client_nss = Arc::new(RwLock::new(None));
         let rpc_client_rss = RpcClientRss::new_from_addresses(
             config.rss_addrs.clone(),
             config.rpc_connection_timeout(),
@@ -100,8 +100,50 @@ impl AppState {
         }
     }
 
-    pub fn get_nss_rpc_client(&self) -> &RpcClientNss {
-        &self.rpc_client_nss
+    /// Returns a read guard to the NSS client, or ServiceUnavailable error if not initialized
+    pub async fn get_nss_rpc_client(&self) -> Result<RwLockReadGuard<'_, RpcClientNss>, S3Error> {
+        let guard = self.rpc_client_nss.read().await;
+        RwLockReadGuard::try_map(guard, |opt| opt.as_ref()).map_err(|_| S3Error::ServiceUnavailable)
+    }
+
+    pub async fn update_nss_address(&self, new_address: String) {
+        tracing::info!("Updating NSS address to: {}", new_address);
+        let new_client =
+            RpcClientNss::new_from_address(new_address, self.config.rpc_connection_timeout());
+        *self.rpc_client_nss.write().await = Some(new_client);
+        tracing::info!("NSS client updated successfully");
+    }
+
+    /// Ensures NSS client is initialized by fetching address from RSS if needed
+    pub async fn ensure_nss_client_initialized(&self, trace_id: &TraceId) -> bool {
+        // Fast path: check if already initialized
+        if self.get_nss_rpc_client().await.is_ok() {
+            return true;
+        }
+
+        // Fetch NSS address from RSS
+        tracing::info!("NSS client not initialized, fetching address from RSS");
+        let rss_client = self.get_rss_rpc_client();
+        match rss_rpc_retry!(
+            rss_client,
+            get_active_nss_address(Some(self.config.rss_rpc_timeout()), trace_id)
+        )
+        .await
+        {
+            Ok(addr) => {
+                if !addr.is_empty() {
+                    self.update_nss_address(addr).await;
+                    true
+                } else {
+                    tracing::warn!("RSS returned empty NSS address");
+                    false
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch NSS address from RSS: {}", e);
+                false
+            }
+        }
     }
 
     pub fn get_rss_rpc_client(&self) -> &RpcClientRss {
