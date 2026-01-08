@@ -315,10 +315,14 @@ pub async fn list_objects(
     .await?;
 
     // Process results
-    let inodes = match resp.result.unwrap() {
+    let (inodes, has_more) = match resp.result.unwrap() {
         list_inodes_response::Result::Ok(res) => {
-            tracing::debug!("NSS returned {} inodes", res.inodes.len());
-            res.inodes
+            tracing::debug!(
+                "NSS returned {} inodes, has_more={}",
+                res.inodes.len(),
+                res.has_more
+            );
+            (res.inodes, res.has_more)
         }
         list_inodes_response::Result::Err(e) => {
             tracing::error!("NSS list_inodes error: {}", e);
@@ -350,7 +354,7 @@ pub async fn list_objects(
         }
     }
 
-    let next_continuation_token = if inodes.len() < max_keys as usize {
+    let next_continuation_token = if !has_more {
         None
     } else {
         inodes
