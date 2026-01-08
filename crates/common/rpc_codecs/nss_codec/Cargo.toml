@@ -13,6 +13,5 @@ prost.workspace = true
 xxhash-rust.workspace = true
 
 [build-dependencies]
-cmd_lib.workspace = true
 prost-build.workspace = true
 

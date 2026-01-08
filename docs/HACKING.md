@@ -15,17 +15,17 @@ This guide covers the prerequisites and setup required for developing FractalBit
 
 #### Basic Build Tools
 
-Install build tools, git, OpenSSL development libraries, and Java runtime. Java is required to run DynamoDB Local, which is used by the RSS (Root Service Server) for cluster coordination during local development. We also install [`just`](https://github.com/casey/just), a command runner that provides convenient shortcuts for common development tasks (e.g., `just build` instead of `cargo xtask build`).
+Install build tools, git, OpenSSL development libraries, Protocol Buffers compiler, and Java runtime. Java is required to run DynamoDB Local, which is used by the RSS (Root Service Server) for cluster coordination during local development. We also install [`just`](https://github.com/casey/just), a command runner that provides convenient shortcuts for common development tasks (e.g., `just build` instead of `cargo xtask build`).
 
 ```bash
 # Debian/Ubuntu
-sudo apt-get update && sudo apt-get install git just build-essential moreutils libssl-dev pkg-config default-jre
+sudo apt-get update && sudo apt-get install git just build-essential moreutils libssl-dev pkg-config default-jre protobuf-compiler
 
 # Fedora
-sudo dnf install git just gcc moreutils openssl-devel java-latest-openjdk
+sudo dnf install git just gcc moreutils openssl-devel java-latest-openjdk protobuf-compiler
 
 # Arch Linux
-sudo pacman -S --needed base-devel git just moreutils openssl pkg-config jre-openjdk
+sudo pacman -S --needed base-devel git just moreutils openssl pkg-config jre-openjdk protobuf
 ```
 
 #### AWS CLI
