@@ -61,13 +61,14 @@ message ListInodesResponse {
     string err = 2;
   }
 
-  message Inodes {
-    repeated Inode inodes = 3;
+  message Inode {
+    string key = 3;
+    bytes inode = 4;
   }
 
-  message Inode {
-    string key = 4;
-    bytes inode = 5;
+  message Inodes {
+    repeated Inode inodes = 5;
+    bool has_more = 6;
   }
 }
 
