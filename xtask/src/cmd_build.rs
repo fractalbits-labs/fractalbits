@@ -99,14 +99,14 @@ pub fn build_zig_servers(mode: BuildMode) -> CmdResult {
     }
 
     let build_envs = get_build_envs();
-    let opts = match mode {
-        BuildMode::Debug => "",
-        BuildMode::Release => "--release=safe",
+    let (opts, zig_out) = match mode {
+        BuildMode::Debug => ("", ZIG_DEBUG_OUT),
+        BuildMode::Release => ("--release=safe", ZIG_RELEASE_OUT),
     };
     run_cmd! {
         info "Building zig-based servers ...";
         cd $ZIG_REPO_PATH;
-        $[build_envs] zig build -p ../$ZIG_DEBUG_OUT $opts 2>&1;
+        $[build_envs] zig build -p ../$zig_out $opts 2>&1;
         info "Building bss and nss server done";
     }
 }
