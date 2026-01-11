@@ -157,6 +157,34 @@ pub fn build_all(release: bool) -> CmdResult {
     Ok(())
 }
 
+/// Build only what's needed for Docker container (api_server, root_server, rss_admin, zig servers)
+pub fn build_for_docker(release: bool) -> CmdResult {
+    let build_envs = get_build_envs();
+    let build_flag = if release { "--release" } else { "" };
+
+    // Build packages that always exist
+    run_cmd! {
+        info "Building rust binaries for Docker...";
+        $[build_envs] cargo build $build_flag
+            -p api_server
+            -p container-all-in-one;
+    }?;
+
+    // Build root_server packages if they exist
+    if Path::new("crates/root_server").exists() {
+        run_cmd! {
+            $[build_envs] cargo build $build_flag
+                -p root_server
+                -p rss_admin;
+        }?;
+    }
+
+    // Build zig servers if core repo exists
+    build_zig_servers(build_mode(release))?;
+
+    Ok(())
+}
+
 pub fn build_prebuilt(_release: bool) -> CmdResult {
     let build_target = "x86_64-unknown-linux-gnu";
     let build_dir = format!("target/{build_target}/release");

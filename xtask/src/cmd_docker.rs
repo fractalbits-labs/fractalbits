@@ -44,11 +44,8 @@ fn build_docker_image(
     let bin_staging = format!("{staging_dir}/bin");
 
     if all_from_source {
-        info!("Building all binaries from source...");
-        cmd_build::build_all(release)?;
-
-        info!("Building container-all-in-one...");
-        run_cmd!($[build_envs] cargo build $build_flag -p container-all-in-one)?;
+        info!("Building binaries for Docker...");
+        cmd_build::build_for_docker(release)?;
     } else {
         info!("Using prebuilt binaries from prebuilt/ directory");
         run_cmd!($[build_envs] cargo build $build_flag -p api_server -p container-all-in-one)?;
