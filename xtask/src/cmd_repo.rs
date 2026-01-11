@@ -56,6 +56,7 @@ pub fn run_cmd_repo(repo_cmd: RepoCommand) -> CmdResult {
         RepoCommand::Status => show_repos_status()?,
         RepoCommand::Init { all } => init_repos(all)?,
         RepoCommand::Foreach { command } => run_foreach_repo(&command)?,
+        RepoCommand::Manifest => show_manifest()?,
     }
     Ok(())
 }
@@ -161,14 +162,14 @@ fn show_repos_status() -> CmdResult {
 
         // Create cells with appropriate colors
         let status_cell = match status {
-            "clean" => Cell::new(status).fg(Color::Green),
-            "modified" => Cell::new(status).fg(Color::Cyan),
-            "committed" => Cell::new(status).fg(Color::Yellow),
+            "clean" => Cell::new(status).fg(Color::DarkGreen),
+            "modified" => Cell::new(status).fg(Color::DarkCyan),
+            "committed" => Cell::new(status).fg(Color::DarkYellow),
             _ => Cell::new(status),
         };
 
         let branch_cell = if branch != "main" {
-            Cell::new(&branch).fg(Color::Yellow)
+            Cell::new(&branch).fg(Color::DarkYellow)
         } else {
             Cell::new(&branch)
         };
@@ -234,4 +235,31 @@ fn run_foreach_repo(command: &[String]) -> CmdResult {
     }
 
     Ok(())
+}
+
+fn show_manifest() -> CmdResult {
+    print!("{}", format_manifest()?);
+    Ok(())
+}
+
+pub fn format_manifest() -> Result<String, std::io::Error> {
+    let mut repos = Vec::new();
+    for repo in all_repos() {
+        let path = repo.path;
+        let commit = if path == "." {
+            run_fun!(git rev-parse --short HEAD)?
+        } else {
+            run_fun!(cd $path; git rev-parse --short HEAD)?
+        };
+        let display_name = if path == "." { "main" } else { path };
+        repos.push((display_name.to_string(), commit.trim().to_string()));
+    }
+
+    let max_len = repos.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+    let mut output = String::new();
+    for (name, commit) in &repos {
+        output.push_str(&format!("{:width$} {}\n", name, commit, width = max_len));
+    }
+
+    Ok(output)
 }

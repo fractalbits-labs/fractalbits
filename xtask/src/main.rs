@@ -557,6 +557,9 @@ pub enum RepoCommand {
         #[clap(required = true, num_args = 1.., value_name = "COMMAND", allow_hyphen_values = true)]
         command: Vec<String>,
     },
+
+    #[clap(about = "Show manifest of all repos (commit hashes)")]
+    Manifest,
 }
 
 #[derive(Parser, Clone)]

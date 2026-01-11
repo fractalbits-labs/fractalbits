@@ -1,4 +1,4 @@
-use crate::cmd_repo::{PREBUILT_REPO, all_repos, repo_has_changes};
+use crate::cmd_repo::{PREBUILT_REPO, all_repos, format_manifest, repo_has_changes};
 use crate::{DeployTarget, PrebuiltCommand};
 use cmd_lib::*;
 use serde::Serialize;
@@ -74,7 +74,7 @@ fn publish(skip_build: bool, dry_run: bool, allow_dirty: bool) -> CmdResult {
     info!("Wrote manifest to {manifest_path}");
 
     // Generate commit message
-    let commit_message = generate_commit_message(&manifest);
+    let commit_message = generate_commit_message()?;
 
     // Commit and push
     commit_and_push(&commit_message)?;
@@ -124,22 +124,10 @@ fn generate_manifest() -> Result<Manifest, std::io::Error> {
     Ok(Manifest { build_time, repos })
 }
 
-fn generate_commit_message(manifest: &Manifest) -> String {
+fn generate_commit_message() -> Result<String, std::io::Error> {
     let mut msg = String::from("Update prebuilt binaries\n\n");
-
-    // Find the max path length for alignment
-    let max_len = manifest.repos.keys().map(|k| k.len()).max().unwrap_or(0);
-
-    for (path, info) in &manifest.repos {
-        msg.push_str(&format!(
-            "{:width$} {}\n",
-            path,
-            info.commit,
-            width = max_len
-        ));
-    }
-
-    msg
+    msg.push_str(&format_manifest()?);
+    Ok(msg)
 }
 
 fn commit_and_push(commit_message: &str) -> CmdResult {
