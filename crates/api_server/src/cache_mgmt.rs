@@ -136,9 +136,22 @@ pub async fn update_nss_address(
 }
 
 /// Health check endpoint for management API
-pub async fn mgmt_health() -> Result<HttpResponse> {
-    Ok(HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "api_server_cache_management"
-    })))
+pub async fn mgmt_health(app: Data<Arc<AppState>>) -> Result<HttpResponse> {
+    let trace_id = data_types::TraceId::new();
+    let nss_ready = app.ensure_nss_client_initialized(&trace_id).await;
+
+    if nss_ready {
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "status": "healthy",
+            "service": "api_server",
+            "nss_connected": true
+        })))
+    } else {
+        Ok(HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "status": "unhealthy",
+            "service": "api_server",
+            "nss_connected": false,
+            "message": "NSS client not initialized"
+        })))
+    }
 }

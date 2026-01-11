@@ -70,14 +70,28 @@ fn build_docker_image(
     }
 
     if all_from_source {
-        // Use freshly built binaries
+        // Use freshly built binaries, fall back to prebuilt if not found
         let rust_binaries = ["root_server", "rss_admin"];
         for bin in &rust_binaries {
-            run_cmd!(cp $target_dir/$bin $bin_staging/)?;
+            let bin_path = format!("{target_dir}/{bin}");
+            if std::path::Path::new(&bin_path).exists() {
+                run_cmd!(cp $bin_path $bin_staging/)?;
+            } else {
+                info!("{} not found, using prebuilt", bin);
+                run_cmd!(cp prebuilt/$bin $bin_staging/)?;
+            }
         }
+
+        let zig_bin_dir = format!("{target_dir}/zig-out/bin");
         let zig_binaries = ["bss_server", "nss_server"];
         for zig_bin in &zig_binaries {
-            run_cmd!(cp $target_dir/zig-out/bin/$zig_bin $bin_staging/)?;
+            let bin_path = format!("{zig_bin_dir}/{zig_bin}");
+            if std::path::Path::new(&bin_path).exists() {
+                run_cmd!(cp $bin_path $bin_staging/)?;
+            } else {
+                info!("{} not found, using prebuilt", zig_bin);
+                run_cmd!(cp prebuilt/$zig_bin $bin_staging/)?;
+            }
         }
     } else {
         // Use prebuilt binaries for external repos
@@ -96,7 +110,7 @@ fn build_docker_image(
 
     let dockerfile_path = format!("{}/Dockerfile", staging_dir);
     let image_id = run_fun! {
-        docker build -q -t "${image_name}:${tag}" -f $dockerfile_path $staging_dir
+        docker build --no-cache -q -t "${image_name}:${tag}" -f $dockerfile_path $staging_dir
     }?;
     let short_id = image_id
         .trim()

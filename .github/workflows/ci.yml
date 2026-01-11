@@ -76,26 +76,8 @@ jobs:
     - name: Run repo init
       run: cargo xtask repo init
 
-    - name: Build Docker image
-      run: cargo xtask docker build --release
-
-    - name: Test Docker container
-      run: |
-        cargo xtask docker run --detach
-        for i in {1..60}; do
-          if curl -sf http://localhost:18080/mgmt/health > /dev/null 2>&1; then
-            echo "Container ready after ${i}s"
-            break
-          fi
-          if [ $i -eq 60 ]; then
-            echo "Container failed to start"
-            docker logs fractalbits-dev
-            exit 1
-          fi
-          sleep 1
-        done
-        cargo test -p api_server || (docker logs fractalbits-dev && exit 1)
-        cargo xtask docker stop
+    - name: Run Docker tests
+      run: cargo xtask precheckin --docker
 
     - name: Log in to Container Registry
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'

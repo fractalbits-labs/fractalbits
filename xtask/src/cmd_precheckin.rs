@@ -6,7 +6,11 @@ pub fn run_cmd_precheckin(
     zig_unit_tests_only: bool,
     debug_api_server: bool,
     with_fractal_art_tests: bool,
+    docker: bool,
 ) -> CmdResult {
+    if docker {
+        return run_docker_tests();
+    }
     if debug_api_server {
         cmd_service::stop_service(ServiceName::ApiServer)?;
         run_cmd! {
@@ -192,5 +196,63 @@ pub fn run_zig_unit_tests(init_config: InitConfig) -> CmdResult {
     cmd_service::stop_service(ServiceName::Bss)?;
 
     info!("Zig unit tests completed successfully");
+    Ok(())
+}
+
+fn run_docker_tests() -> CmdResult {
+    // Clean up any stale data from previous runs
+    let _ = run_cmd!(docker volume rm fractalbits-data 2>/dev/null);
+
+    info!("Building Docker image...");
+    cmd_docker::run_cmd_docker(DockerCommand::Build {
+        release: true,
+        all_from_source: true,
+        image_name: "fractalbits".to_string(),
+        tag: "latest".to_string(),
+    })?;
+
+    info!("Starting Docker container...");
+    cmd_docker::run_cmd_docker(DockerCommand::Run {
+        image_name: "fractalbits".to_string(),
+        tag: "latest".to_string(),
+        port: 8080,
+        name: None,
+        detach: true,
+    })?;
+
+    let result = (|| -> CmdResult {
+        info!("Waiting for container to be ready...");
+        let health_url = "http://localhost:18080/mgmt/health";
+        for i in 1..=60 {
+            let health_check = run_fun!(curl -sf $health_url);
+            if health_check.is_ok() {
+                info!("Container ready after {}s", i);
+                break;
+            }
+            if i == 60 {
+                run_cmd!(docker logs fractalbits-dev)?;
+                cmd_die!("Container failed to start within 60 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+
+        info!("Running api_server tests against Docker container...");
+        let test_result = run_cmd!(cargo test --package api_server);
+        if test_result.is_err() {
+            info!("Tests failed, showing container logs...");
+            let _ = run_cmd!(docker logs fractalbits-dev 2>&1 | tail -200);
+        }
+        test_result?;
+
+        Ok(())
+    })();
+
+    info!("Stopping Docker container...");
+    let stop_result = cmd_docker::run_cmd_docker(DockerCommand::Stop { name: None });
+
+    result?;
+    stop_result?;
+
+    info!("Docker tests completed successfully");
     Ok(())
 }

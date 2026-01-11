@@ -72,6 +72,9 @@ enum Cmd {
         #[clap(long, value_enum)]
         #[arg(default_value_t)]
         data_blob_storage: DataBlobStorage,
+
+        #[clap(long, long_help = "Run Docker container tests only")]
+        docker: bool,
     },
 
     #[clap(about = "Build the whole project")]
@@ -620,6 +623,7 @@ async fn main() -> CmdResult {
             with_fractal_art_tests,
             with_https,
             data_blob_storage,
+            docker,
         } => {
             let init_config = InitConfig {
                 with_https,
@@ -633,6 +637,7 @@ async fn main() -> CmdResult {
                 zig_unit_tests_only,
                 debug_api_server,
                 with_fractal_art_tests,
+                docker,
             )?;
         }
         Cmd::Nightly => cmd_nightly::run_cmd_nightly()?,
