@@ -36,18 +36,23 @@ impl Orchestrator {
     }
 
     pub async fn start_all(&mut self) -> Result<()> {
+        let total_start = Instant::now();
+
         info!("Initializing directories");
         self.init_directories()?;
 
         // Phase 1: Start etcd (must be first)
+        let phase_start = Instant::now();
         info!("Starting etcd");
         self.start_etcd()?;
         self.wait_for_port(self.etcd_port, 30).await?;
+        info!("Phase 1 (etcd ready): {:?}", phase_start.elapsed());
 
         info!("Initializing etcd service-discovery keys");
         self.init_etcd_keys()?;
 
         // Phase 2: Start BSS and RSS in parallel (both depend on etcd)
+        let phase_start = Instant::now();
         info!("Starting bss_server and root_server in parallel");
         self.start_bss()?;
         self.start_rss()?;
@@ -56,28 +61,39 @@ impl Orchestrator {
             tokio::join!(wait_for_port_async(8088, 30), wait_for_port_async(8086, 30));
         bss_result?;
         rss_result?;
+        info!("Phase 2 (bss+rss ready): {:?}", phase_start.elapsed());
 
         // Phase 3: Init API key and format+start NSS in parallel
         // - init_test_api_key needs RSS
         // - format_nss + start_nss needs BSS
+        let phase_start = Instant::now();
         info!("Initializing API key and starting nss_server in parallel");
 
         let bin_dir = self.bin_dir.clone();
         let api_key_task = tokio::task::spawn_blocking(move || init_test_api_key_static(&bin_dir));
 
+        let format_start = Instant::now();
         self.format_nss()?;
+        info!("format_nss completed in {:?}", format_start.elapsed());
+
         self.start_nss()?;
 
         let (api_key_res, nss_result) = tokio::join!(api_key_task, wait_for_port_async(8087, 30));
         api_key_res.context("API key init task panicked")??;
         nss_result?;
+        info!("Phase 3 (api_key+nss ready): {:?}", phase_start.elapsed());
 
         // Phase 4: Start api_server (depends on RSS and NSS)
+        let phase_start = Instant::now();
         info!("Starting api_server");
         self.start_api_server()?;
         self.wait_for_port(self.api_port, 30).await?;
+        info!("Phase 4 (api_server ready): {:?}", phase_start.elapsed());
 
-        info!("All services started successfully");
+        info!(
+            "All services started successfully in {:?}",
+            total_start.elapsed()
+        );
         Ok(())
     }
 
@@ -176,8 +192,15 @@ impl Orchestrator {
         let nss_bin = self.bin_dir.join("nss_server");
         let working_dir = self.data_dir.join("nss-A");
 
+        // Skip formatting if journal file already exists (data already formatted)
+        let journal_file = working_dir.join("local/journal/journal.data");
+        if journal_file.exists() {
+            info!("NSS data already formatted, skipping format_nss");
+            return Ok(());
+        }
+
         run_cmd! {
-            WORKING_DIR=$working_dir $nss_bin format --init_test_tree;
+            WORKING_DIR=$working_dir $nss_bin format;
         }?;
 
         Ok(())
