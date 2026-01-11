@@ -582,12 +582,6 @@ pub fn stop_service(service: ServiceName) -> CmdResult {
                 continue;
             }
 
-            if service == ServiceName::NssRoleAgentB {
-                // Wait for nss@A to stop first, or it may crash due to journal mirroring failure
-                while run_cmd!(systemctl --user is-active --quiet "nss@A.service").is_ok() {
-                    std::thread::sleep(Duration::from_secs(1));
-                }
-            }
             run_cmd! {
                 info "Stopping service: $service_name";
                 systemctl --user stop $service_name.service
