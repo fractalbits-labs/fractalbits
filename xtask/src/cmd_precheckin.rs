@@ -200,7 +200,8 @@ pub fn run_zig_unit_tests(init_config: InitConfig) -> CmdResult {
 }
 
 fn run_docker_tests() -> CmdResult {
-    // Clean up any stale data from previous runs
+    // Clean up any stale container and data from previous runs
+    let _ = run_cmd!(docker rm -f fractalbits-dev 2>/dev/null);
     let _ = run_cmd!(docker volume rm fractalbits-data 2>/dev/null);
 
     info!("Building Docker image...");
