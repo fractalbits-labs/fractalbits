@@ -117,6 +117,7 @@ message GetNssRoleResponse {
     string role = 1;  // "active", "standby", "solo", or "degraded"
     string error = 2;
   }
+  uint64 version = 3;
 }
 
 // GetAzStatus - Query AZ availability status from service-discovery table
