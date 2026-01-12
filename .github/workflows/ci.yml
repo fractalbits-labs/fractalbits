@@ -17,6 +17,37 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y moreutils protobuf-compiler
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /usr/local/share/boost
+
+    - name: Load Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: false
+
+    - name: Run repo init
+      run: cargo xtask repo init
+
+    - name: Run precheckin
+      run: cargo xtask precheckin --docker=excluded
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: build
     permissions:
       contents: read
       packages: write
@@ -45,8 +76,8 @@ jobs:
     - name: Run repo init
       run: cargo xtask repo init
 
-    - name: Run precheckin
-      run: cargo xtask precheckin
+    - name: Run Docker tests
+      run: cargo xtask precheckin --docker=only
 
     - name: Log in to Container Registry
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'

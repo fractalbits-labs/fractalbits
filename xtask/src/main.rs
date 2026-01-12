@@ -73,8 +73,13 @@ enum Cmd {
         #[arg(default_value_t)]
         data_blob_storage: DataBlobStorage,
 
-        #[clap(long, long_help = "Run Docker container tests only")]
-        docker_only: bool,
+        #[clap(
+            long,
+            value_enum,
+            long_help = "Docker test mode: included (default), excluded, or only"
+        )]
+        #[arg(default_value_t)]
+        docker: DockerTestMode,
     },
 
     #[clap(about = "Build the whole project")]
@@ -397,6 +402,16 @@ pub enum DataBlobStorage {
 }
 
 #[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
+#[strum(serialize_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
+pub enum DockerTestMode {
+    #[default]
+    Included,
+    Excluded,
+    Only,
+}
+
+#[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
 #[strum(serialize_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum RssBackend {
@@ -626,7 +641,7 @@ async fn main() -> CmdResult {
             with_fractal_art_tests,
             with_https,
             data_blob_storage,
-            docker_only,
+            docker,
         } => {
             let init_config = InitConfig {
                 with_https,
@@ -640,7 +655,7 @@ async fn main() -> CmdResult {
                 zig_unit_tests_only,
                 debug_api_server,
                 with_fractal_art_tests,
-                docker_only,
+                docker,
             )?;
         }
         Cmd::Nightly => cmd_nightly::run_cmd_nightly()?,

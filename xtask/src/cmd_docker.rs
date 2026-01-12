@@ -130,10 +130,14 @@ fn run_docker_container(
     let container_name = name.unwrap_or(DEFAULT_CONTAINER_NAME);
     let image = format!("{}:{}", image_name, tag);
 
-    info!(
-        "Running Docker container: {} (port: {})",
-        container_name, port
-    );
+    info!("=== Running Docker container: {container_name} (port: {port}) ===");
+
+    run_cmd! {
+        info "Clean up any existing container and volume";
+        ignore docker stop $container_name 2>/dev/null;
+        ignore docker rm -f $container_name 2>/dev/null;
+        ignore docker volume rm -f fractalbits-data 2>/dev/null;
+    }?;
 
     let port_mapping = format!("{}:8080", port);
     let mgmt_port_mapping = "18080:18080";

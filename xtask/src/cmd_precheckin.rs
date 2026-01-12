@@ -6,11 +6,12 @@ pub fn run_cmd_precheckin(
     zig_unit_tests_only: bool,
     debug_api_server: bool,
     with_fractal_art_tests: bool,
-    docker_only: bool,
+    docker: DockerTestMode,
 ) -> CmdResult {
-    if docker_only {
+    if docker == DockerTestMode::Only {
         return run_docker_tests();
     }
+
     if debug_api_server {
         cmd_service::stop_service(ServiceName::ApiServer)?;
         run_cmd! {
@@ -48,7 +49,9 @@ pub fn run_cmd_precheckin(
         cmd_die!("Found core file(s) in directory ./data: ${core_files:?}");
     }
 
-    run_docker_tests()?;
+    if docker == DockerTestMode::Included {
+        run_docker_tests()?;
+    }
 
     info!("Precheckin is OK");
     Ok(())
