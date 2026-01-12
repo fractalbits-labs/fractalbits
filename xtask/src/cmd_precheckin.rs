@@ -6,9 +6,9 @@ pub fn run_cmd_precheckin(
     zig_unit_tests_only: bool,
     debug_api_server: bool,
     with_fractal_art_tests: bool,
-    docker: bool,
+    docker_only: bool,
 ) -> CmdResult {
-    if docker {
+    if docker_only {
         return run_docker_tests();
     }
     if debug_api_server {
@@ -47,6 +47,8 @@ pub fn run_cmd_precheckin(
         let core_files: Vec<&str> = core_file.split("\n").collect();
         cmd_die!("Found core file(s) in directory ./data: ${core_files:?}");
     }
+
+    run_docker_tests()?;
 
     info!("Precheckin is OK");
     Ok(())
@@ -200,28 +202,6 @@ pub fn run_zig_unit_tests(init_config: InitConfig) -> CmdResult {
 }
 
 fn run_docker_tests() -> CmdResult {
-    // Clean up any stale container and data from previous runs
-    let _ = run_cmd!(docker rm -f fractalbits-dev 2>/dev/null);
-
-    // Wait briefly for container removal to complete before removing volume
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    // Retry volume removal - it may fail if container cleanup hasn't completed
-    for attempt in 1..=3 {
-        let _ = run_cmd!(docker volume rm fractalbits-data 2>/dev/null);
-        // Check if volume still exists
-        let volume_exists =
-            run_fun!(docker volume ls -q --filter name=fractalbits-data).unwrap_or_default();
-        if volume_exists.trim().is_empty() {
-            break;
-        }
-        if attempt < 3 {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        } else {
-            cmd_die!("Failed to remove stale docker volume 'fractalbits-data'");
-        }
-    }
-
     info!("Building Docker image...");
     cmd_docker::run_cmd_docker(DockerCommand::Build {
         release: true,
