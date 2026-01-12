@@ -14,7 +14,11 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
     let test_leader_election = || {
         // Test with DDB backend
         info!("Testing leader election with DDB backend...");
-        cmd_service::init_service(ServiceName::All, BuildMode::Debug, InitConfig::default())?;
+        let ddb_config = InitConfig {
+            rss_backend: RssBackend::Ddb,
+            ..Default::default()
+        };
+        cmd_service::init_service(ServiceName::All, BuildMode::Debug, ddb_config)?;
         cmd_service::start_service(ServiceName::DdbLocal)?;
         leader_election::run_leader_election_tests(RssBackend::Ddb)?;
         leader_election::cleanup_test_root_server_instances()?;

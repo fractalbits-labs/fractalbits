@@ -5,6 +5,7 @@ use colored::*;
 use std::collections::HashMap;
 use std::thread::sleep;
 use std::time::Duration;
+use xtask_common::LOCAL_DDB_ENVS;
 
 pub fn run_leader_election_tests(backend: RssBackend) -> CmdResult {
     let backend_name = match backend {
@@ -77,7 +78,6 @@ fn get_etcd_key_prefix(test_name: &str) -> String {
 }
 
 const LEADER_KEY: &str = "test-leader";
-const DDB_ENDPOINT: &str = "http://localhost:8000";
 
 // Process tracker for test instances
 struct TestProcessTracker {
@@ -134,23 +134,24 @@ fn setup_test_table(table_name: &str, backend: RssBackend) -> CmdResult {
     match backend {
         RssBackend::Ddb => {
             // Clean up any existing table
-            let _ = run_cmd!(
-                aws dynamodb delete-table --table-name $table_name --endpoint-url $DDB_ENDPOINT 2>/dev/null
-            );
+            let _ = run_cmd! {
+                $[LOCAL_DDB_ENVS]
+                aws dynamodb delete-table --table-name $table_name 2>/dev/null
+            };
 
             // Wait longer for deletion to complete - DDB Local can be slow
             sleep(Duration::from_secs(3));
 
             // Create test table using AWS CLI with compact JSON output
-            run_cmd!(
+            run_cmd! {
+                $[LOCAL_DDB_ENVS]
                 aws dynamodb create-table
                     --table-name $table_name
                     --attribute-definitions AttributeName=key,AttributeType=S
                     --key-schema AttributeName=key,KeyType=HASH
                     --provisioned-throughput ReadCapacityUnits=1,WriteCapacityUnits=1
-                    --endpoint-url $DDB_ENDPOINT
                     --output json | jq -c
-            )?;
+            }?;
 
             // Wait longer for table to be ready
             sleep(Duration::from_secs(2));
@@ -172,19 +173,19 @@ fn cleanup_test_table(table_name: &str, backend: RssBackend) -> CmdResult {
     match backend {
         RssBackend::Ddb => {
             // First try to clear any remaining items
-            let _ = run_cmd!(
+            let _ = run_cmd! {
+                $[LOCAL_DDB_ENVS]
                 aws dynamodb delete-item
                     --table-name $table_name
                     --key "{\"key\":{\"S\":\"$LEADER_KEY\"}}"
-                    --endpoint-url $DDB_ENDPOINT
                     --output json | jq -c
-            );
+            };
 
             // Then delete the table
-            let _ = run_cmd!(
-                aws dynamodb delete-table --table-name $table_name --endpoint-url $DDB_ENDPOINT
-                    --output json | jq -c
-            );
+            let _ = run_cmd! {
+                $[LOCAL_DDB_ENVS]
+                aws dynamodb delete-table --table-name $table_name --output json | jq -c
+            };
 
             // Wait for cleanup to complete
             sleep(Duration::from_secs(2));
@@ -210,13 +211,13 @@ fn get_current_leader(table_name: &str, backend: RssBackend) -> Option<String> {
 
 fn get_current_leader_ddb(table_name: &str) -> Option<String> {
     // Get the full item using AWS CLI with compact JSON
-    let result = run_fun!(
+    let result = run_fun! {
+        $[LOCAL_DDB_ENVS]
         aws dynamodb get-item
             --table-name $table_name
             --key "{\"key\":{\"S\":\"$LEADER_KEY\"}}"
-            --endpoint-url $DDB_ENDPOINT
             --output json | jq -c
-    );
+    };
 
     match result {
         Ok(output) => {
@@ -228,14 +229,14 @@ fn get_current_leader_ddb(table_name: &str) -> Option<String> {
             println!("DDB item found: {}", output.trim());
 
             // Extract instance_id using AWS CLI query
-            let instance_id_result = run_fun!(
-            aws dynamodb get-item
-                --table-name $table_name
-                --key "{\"key\":{\"S\":\"$LEADER_KEY\"}}"
-                --query "Item.instance_id.S"
-                --output text
-                --endpoint-url $DDB_ENDPOINT
-                );
+            let instance_id_result = run_fun! {
+                $[LOCAL_DDB_ENVS]
+                aws dynamodb get-item
+                    --table-name $table_name
+                    --key "{\"key\":{\"S\":\"$LEADER_KEY\"}}"
+                    --query "Item.instance_id.S"
+                    --output text
+            };
 
             if let Ok(instance_id) = instance_id_result {
                 let instance_id = instance_id.trim();
@@ -245,14 +246,14 @@ fn get_current_leader_ddb(table_name: &str) -> Option<String> {
                 }
 
                 // Check if lease is still valid by getting lease_expiry
-                let lease_expiry_result = run_fun!(
-                aws dynamodb get-item
-                    --table-name $table_name
-                    --key "{\"key\":{\"S\":\"$LEADER_KEY\"}}"
-                    --query "Item.lease_expiry.N"
-                    --output text
-                    --endpoint-url $DDB_ENDPOINT
-                        );
+                let lease_expiry_result = run_fun! {
+                    $[LOCAL_DDB_ENVS]
+                    aws dynamodb get-item
+                        --table-name $table_name
+                        --key "{\"key\":{\"S\":\"$LEADER_KEY\"}}"
+                        --query "Item.lease_expiry.N"
+                        --output text
+                };
 
                 if let Ok(expiry_str) = lease_expiry_result {
                     let expiry_str = expiry_str.trim();
@@ -511,7 +512,8 @@ fn test_fence_token_prevents_split_brain(backend: RssBackend) -> CmdResult {
 
     match backend {
         RssBackend::Ddb => {
-            run_cmd!(
+            run_cmd! {
+                $[LOCAL_DDB_ENVS]
                 aws dynamodb put-item
                     --table-name $table_name
                     --item "{
@@ -524,9 +526,8 @@ fn test_fence_token_prevents_split_brain(backend: RssBackend) -> CmdResult {
                         \"renewal_count\": {\"N\": \"1\"},
                         \"last_heartbeat\": {\"N\": \"$now\"}
                     }"
-                    --endpoint-url $DDB_ENDPOINT
-                    --output json | jq -c
-            )
+                --output json | jq -c
+            }
             .expect("Failed to create manual leader");
         }
         RssBackend::Etcd => {
@@ -591,7 +592,8 @@ fn test_clock_skew_detection(backend: RssBackend) -> CmdResult {
 
     match backend {
         RssBackend::Ddb => {
-            run_cmd!(
+            run_cmd! {
+                $[LOCAL_DDB_ENVS]
                 aws dynamodb put-item
                     --table-name $table_name
                     --item "{
@@ -604,9 +606,8 @@ fn test_clock_skew_detection(backend: RssBackend) -> CmdResult {
                         \"renewal_count\": {\"N\": \"1\"},
                         \"last_heartbeat\": {\"N\": \"$skewed_time\"}
                     }"
-                    --endpoint-url $DDB_ENDPOINT
-                    --output json | jq -c
-            )
+                --output json | jq -c
+            }
             .expect("Failed to create skewed leader");
         }
         RssBackend::Etcd => {

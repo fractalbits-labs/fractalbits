@@ -7,7 +7,8 @@ use crate::etcd_utils::{ensure_etcd_local, resolve_etcd_bin};
 use crate::*;
 use colored::*;
 use xtask_common::{
-    create_bss_dirs, create_nss_dirs, generate_bss_data_vg_config, generate_bss_metadata_vg_config,
+    LOCAL_DDB_ENVS, LOCAL_DDB_ENVS_SYSTEMD, create_bss_dirs, create_nss_dirs,
+    generate_bss_data_vg_config, generate_bss_metadata_vg_config,
 };
 
 pub fn init_service(
@@ -41,10 +42,7 @@ pub fn init_service(
         const DDB_TABLE_NAME: &str = "fractalbits-api-keys-and-buckets";
         run_cmd! {
             info "Initializing table: $DDB_TABLE_NAME ...";
-            AWS_DEFAULT_REGION=fakeRegion
-            AWS_ACCESS_KEY_ID=fakeMyKeyId
-            AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
-            AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
+            $[LOCAL_DDB_ENVS]
             aws dynamodb create-table
                 --table-name $DDB_TABLE_NAME
                 --attribute-definitions AttributeName=id,AttributeType=S
@@ -56,10 +54,7 @@ pub fn init_service(
         const LEADER_TABLE_NAME: &str = "fractalbits-leader-election";
         run_cmd! {
             info "Initializing leader election table: $LEADER_TABLE_NAME ...";
-            AWS_DEFAULT_REGION=fakeRegion
-            AWS_ACCESS_KEY_ID=fakeMyKeyId
-            AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
-            AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
+            $[LOCAL_DDB_ENVS]
             aws dynamodb create-table
                 --table-name $LEADER_TABLE_NAME
                 --attribute-definitions AttributeName=key,AttributeType=S
@@ -71,10 +66,7 @@ pub fn init_service(
         const OBSERVER_LEADER_TABLE_NAME: &str = "fractalbits-leader-election-observer";
         run_cmd! {
             info "Initializing observer leader election table: $OBSERVER_LEADER_TABLE_NAME ...";
-            AWS_DEFAULT_REGION=fakeRegion
-            AWS_ACCESS_KEY_ID=fakeMyKeyId
-            AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
-            AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
+            $[LOCAL_DDB_ENVS]
             aws dynamodb create-table
                 --table-name $OBSERVER_LEADER_TABLE_NAME
                 --attribute-definitions AttributeName=key,AttributeType=S
@@ -86,10 +78,7 @@ pub fn init_service(
         const SERVICE_DISCOVERY_TABLE: &str = "fractalbits-service-discovery";
         run_cmd! {
             info "Creating service-discovery table: $SERVICE_DISCOVERY_TABLE ...";
-            AWS_DEFAULT_REGION=fakeRegion
-            AWS_ACCESS_KEY_ID=fakeMyKeyId
-            AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
-            AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
+            $[LOCAL_DDB_ENVS]
             aws dynamodb create-table
                 --table-name $SERVICE_DISCOVERY_TABLE
                 --attribute-definitions AttributeName=service_id,AttributeType=S
@@ -112,10 +101,7 @@ pub fn init_service(
 
         run_cmd! {
             info "Initializing observer_state in service-discovery table ...";
-            AWS_DEFAULT_REGION=fakeRegion
-            AWS_ACCESS_KEY_ID=fakeMyKeyId
-            AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
-            AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
+            $[LOCAL_DDB_ENVS]
             aws dynamodb put-item
                 --table-name $SERVICE_DISCOVERY_TABLE
                 --item $observer_state_item >/dev/null;
@@ -126,10 +112,7 @@ pub fn init_service(
 
         run_cmd! {
             info "Initializing AZ status in service-discovery table ...";
-            AWS_DEFAULT_REGION=fakeRegion
-            AWS_ACCESS_KEY_ID=fakeMyKeyId
-            AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
-            AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
+            $[LOCAL_DDB_ENVS]
             aws dynamodb put-item
                 --table-name $SERVICE_DISCOVERY_TABLE
                 --item $az_status_item >/dev/null;
@@ -146,10 +129,7 @@ pub fn init_service(
 
         run_cmd! {
             info "Initializing BSS data volume group configuration in service-discovery table ...";
-            AWS_DEFAULT_REGION=fakeRegion
-            AWS_ACCESS_KEY_ID=fakeMyKeyId
-            AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
-            AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
+            $[LOCAL_DDB_ENVS]
             aws dynamodb put-item
                 --table-name $SERVICE_DISCOVERY_TABLE
                 --item $bss_data_vg_config_item >/dev/null;
@@ -166,10 +146,7 @@ pub fn init_service(
 
         run_cmd! {
             info "Initializing BSS metadata volume group configuration in service-discovery table ...";
-            AWS_DEFAULT_REGION=fakeRegion
-            AWS_ACCESS_KEY_ID=fakeMyKeyId
-            AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
-            AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
+            $[LOCAL_DDB_ENVS]
             aws dynamodb put-item
                 --table-name $SERVICE_DISCOVERY_TABLE
                 --item $bss_metadata_vg_config_item >/dev/null;
@@ -1059,12 +1036,7 @@ Environment="BSS_WORKING_DIR=./data/bss%i""##;
             resolve_binary_path("nss_role_agent", build_mode)
         }
         ServiceName::Rss => {
-            env_settings = r##"
-Environment="AWS_DEFAULT_REGION=fakeRegion"
-Environment="AWS_ACCESS_KEY_ID=fakeMyKeyId"
-Environment="AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey"
-Environment="AWS_ENDPOINT_URL_DYNAMODB=http://localhost:8000""##
-                .to_string();
+            env_settings = LOCAL_DDB_ENVS_SYSTEMD.to_string();
             env_settings += env_rust_log(build_mode);
             env_settings += &format!(
                 "\nEnvironment=\"RSS_BACKEND={}\"",
@@ -1303,11 +1275,8 @@ fn register_local_api_server() -> CmdResult {
             let attr_names = "{\"#instances\": \"instances\", \"#local\": \"local-dev\"}";
             let attr_values = "{\":ip\": {\"S\": \"127.0.0.1:8080\"}}";
 
-            if run_cmd!(
-                AWS_DEFAULT_REGION=fakeRegion
-                AWS_ACCESS_KEY_ID=fakeMyKeyId
-                AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
-                AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
+            if run_cmd! {
+                $[LOCAL_DDB_ENVS]
                 aws dynamodb update-item
                     --table-name fractalbits-service-discovery
                     --key $key_json
@@ -1315,19 +1284,16 @@ fn register_local_api_server() -> CmdResult {
                     --expression-attribute-names $attr_names
                     --expression-attribute-values $attr_values
                     --condition-expression "attribute_exists(service_id)" 2>/dev/null
-            )
+            }
             .is_err()
             {
                 // Item doesn't exist, create it
-                run_cmd!(
-                    AWS_DEFAULT_REGION=fakeRegion
-                    AWS_ACCESS_KEY_ID=fakeMyKeyId
-                    AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
-                    AWS_ENDPOINT_URL_DYNAMODB="http://localhost:8000"
+                run_cmd! {
+                    $[LOCAL_DDB_ENVS]
                     aws dynamodb put-item
                         --table-name fractalbits-service-discovery
                         --item $item_json
-                )?;
+                }?;
             }
         }
         RssBackend::Etcd => {

@@ -13,6 +13,21 @@ use uuid::Uuid;
 
 pub const BOOTSTRAP_CLUSTER_CONFIG: &str = "bootstrap_cluster.toml";
 
+/// AWS credentials + endpoint for DynamoDB Local (used in tests and local development)
+pub const LOCAL_DDB_ENVS: &[&str] = &[
+    "AWS_DEFAULT_REGION=fakeRegion",
+    "AWS_ACCESS_KEY_ID=fakeMyKeyId",
+    "AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey",
+    "AWS_ENDPOINT_URL_DYNAMODB=http://localhost:8000",
+];
+
+/// AWS credentials + endpoint for DynamoDB Local in systemd Environment format
+pub const LOCAL_DDB_ENVS_SYSTEMD: &str = r#"
+Environment="AWS_DEFAULT_REGION=fakeRegion"
+Environment="AWS_ACCESS_KEY_ID=fakeMyKeyId"
+Environment="AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey"
+Environment="AWS_ENDPOINT_URL_DYNAMODB=http://localhost:8000""#;
+
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeployTarget {
@@ -275,16 +290,7 @@ pub fn gen_uuids(num: usize, file: &str) -> CmdResult {
 
 pub fn dump_vg_config(localdev: bool) -> CmdResult {
     // AWS cli environment variables based on localdev flag
-    let env_vars: &[&str] = if localdev {
-        &[
-            "AWS_DEFAULT_REGION=fakeRegion",
-            "AWS_ACCESS_KEY_ID=fakeMyKeyId",
-            "AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey",
-            "AWS_ENDPOINT_URL_DYNAMODB=http://localhost:8000",
-        ]
-    } else {
-        &[]
-    };
+    let env_vars: &[&str] = if localdev { LOCAL_DDB_ENVS } else { &[] };
 
     // Query BSS data volume group configuration
     let data_vg_result = run_fun! {
