@@ -2,6 +2,7 @@ mod api_key;
 mod blob_guid;
 mod bucket;
 pub mod hash;
+pub mod observer_types;
 mod permission;
 mod trace_id;
 mod volume;
@@ -13,6 +14,11 @@ pub use bucket::Bucket;
 pub use permission::BucketKeyPerm;
 pub use trace_id::TraceId;
 pub use volume::{BssNode, DataVgInfo, DataVolume, QuorumConfig};
+
+pub use observer_types::{
+    HealthCheckResponse, MachineState, ObserverPersistentState, ObserverState, ServiceStatus,
+    ServiceType,
+};
 
 #[derive(Clone)]
 pub struct Versioned<T: Sized> {

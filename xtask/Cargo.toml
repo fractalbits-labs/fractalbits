@@ -12,6 +12,7 @@ strum.workspace = true
 xtask_common.workspace = true
 colored.workspace = true
 test_common.workspace = true
+data_types.workspace = true
 aws-sdk-s3.workspace = true
 aws-config.workspace = true
 tokio.workspace = true

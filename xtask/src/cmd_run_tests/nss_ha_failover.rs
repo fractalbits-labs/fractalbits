@@ -5,6 +5,7 @@ use crate::{CmdResult, DataBlobStorage, InitConfig, JournalType, RssBackend, Ser
 use aws_sdk_s3::primitives::ByteStream;
 use cmd_lib::*;
 use colored::*;
+use data_types::{ObserverPersistentState, ObserverState};
 use std::io::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,24 +14,7 @@ use test_common::*;
 
 const ETCD_SERVICE_DISCOVERY_PREFIX: &str = "/fractalbits-service-discovery/";
 
-#[derive(Debug, Clone, serde::Deserialize)]
-#[allow(dead_code)]
-struct ObserverState {
-    observer_state: String,
-    nss_machine: MachineState,
-    mirrord_machine: MachineState,
-    version: u64,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[allow(dead_code)]
-struct MachineState {
-    machine_id: String,
-    running_service: String,
-    expected_role: String,
-}
-
-fn get_observer_state_from_etcd() -> Option<ObserverState> {
+fn get_observer_state_from_etcd() -> Option<ObserverPersistentState> {
     let etcdctl = resolve_etcd_bin("etcdctl");
     let key = format!("{}observer_state", ETCD_SERVICE_DISCOVERY_PREFIX);
 
@@ -47,7 +31,10 @@ fn get_observer_state_from_etcd() -> Option<ObserverState> {
     }
 }
 
-fn wait_for_observer_state(expected_state: &str, timeout_secs: u64) -> Option<ObserverState> {
+fn wait_for_observer_state(
+    expected_state: ObserverState,
+    timeout_secs: u64,
+) -> Option<ObserverPersistentState> {
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(timeout_secs) {
         let state = get_observer_state_from_etcd();
@@ -137,7 +124,7 @@ async fn test_full_stack_initialization() -> CmdResult {
     start_service(ServiceName::All)?;
 
     // Verify initial state is active_standby
-    let state = wait_for_observer_state("active_standby", 15);
+    let state = wait_for_observer_state(ObserverState::ActiveStandby, 15);
     if state.is_none() {
         let current = get_observer_state_from_etcd();
         return Err(Error::other(format!(
@@ -180,20 +167,22 @@ async fn test_mirrord_recovery() -> CmdResult {
 
     // Wait for state to stabilize (active_degraded is transient)
     info!("Waiting for observer state to stabilize...");
-    let mut stable_state: Option<ObserverState> = None;
+    let mut stable_state: Option<ObserverPersistentState> = None;
     for i in 0..30 {
         let state = get_observer_state_from_etcd();
         if let Some(s) = state {
-            let state_name = &s.observer_state;
+            let state_name = s.observer_state;
             info!("Attempt {}: observer state = {}", i + 1, state_name);
 
             // These are stable states we can proceed with
-            if state_name == "active_standby" || state_name == "solo_degraded" {
+            if state_name == ObserverState::ActiveStandby
+                || state_name == ObserverState::SoloDegraded
+            {
                 stable_state = Some(s);
                 break;
             }
             // active_degraded is transient, keep waiting
-            if state_name == "active_degraded" {
+            if state_name == ObserverState::ActiveDegraded {
                 info!("State is transient (active_degraded), waiting...");
             }
         }
@@ -211,11 +200,11 @@ async fn test_mirrord_recovery() -> CmdResult {
         }
     };
 
-    let current_state = state.observer_state.clone();
+    let current_state = state.observer_state;
     info!("Stable observer state: {}", current_state);
 
     // If already active_standby, the automatic recovery already happened - that's success!
-    if current_state == "active_standby" {
+    if current_state == ObserverState::ActiveStandby {
         info!("System already recovered to active_standby automatically!");
         // Verify both processes are running
         if !verify_process_running("nss_server") {
@@ -266,7 +255,7 @@ async fn test_mirrord_recovery() -> CmdResult {
 
     // Wait for observer to detect recovery and transition back to active_standby
     info!("Waiting for observer to detect recovery and transition to active_standby...");
-    let state = wait_for_observer_state("active_standby", 30);
+    let state = wait_for_observer_state(ObserverState::ActiveStandby, 30);
     if state.is_none() {
         let current = get_observer_state_from_etcd();
         return Err(Error::other(format!(
@@ -301,7 +290,7 @@ async fn test_observer_restart() -> CmdResult {
         return Err(Error::other("No observer state found in etcd"));
     }
     let version_before = state_before.as_ref().unwrap().version;
-    let state_name_before = state_before.as_ref().unwrap().observer_state.clone();
+    let state_name_before = state_before.as_ref().unwrap().observer_state;
     info!(
         "State before restart: {} (version {})",
         state_name_before, version_before
@@ -361,7 +350,7 @@ async fn test_api_server_during_nss_failover() -> CmdResult {
     // Step 1: Verify starting state is active_standby
     info!("Step 1: Verifying active_standby state...");
     let state = get_observer_state_from_etcd();
-    if state.is_none() || state.as_ref().unwrap().observer_state != "active_standby" {
+    if state.is_none() || state.as_ref().unwrap().observer_state != ObserverState::ActiveStandby {
         return Err(Error::other(
             "Expected active_standby state before testing failover",
         ));
@@ -505,7 +494,7 @@ async fn test_api_server_during_nss_failover() -> CmdResult {
 
     // Step 5: Wait for failover to complete
     info!("Step 5: Waiting for failover to solo_degraded...");
-    let state = wait_for_observer_state("solo_degraded", 30);
+    let state = wait_for_observer_state(ObserverState::SoloDegraded, 30);
     if state.is_none() {
         let current = get_observer_state_from_etcd();
         return Err(Error::other(format!(
