@@ -133,10 +133,9 @@ fn run_docker_container(
     info!("=== Running Docker container: {container_name} (port: {port}) ===");
 
     run_cmd! {
-        info "Clean up any existing container and volume";
+        info "Clean up any existing container";
         ignore docker stop $container_name 2>/dev/null;
         ignore docker rm -f $container_name 2>/dev/null;
-        ignore docker volume rm -f fractalbits-data 2>/dev/null;
     }?;
 
     let port_mapping = format!("{}:8080", port);
