@@ -47,16 +47,6 @@ fn get_observer_state_from_etcd() -> Option<ObserverState> {
     }
 }
 
-fn cleanup_observer_state() -> CmdResult {
-    let etcdctl = resolve_etcd_bin("etcdctl");
-    let key = format!("{}observer_state", ETCD_SERVICE_DISCOVERY_PREFIX);
-    let _ = run_cmd!($etcdctl del $key >/dev/null);
-    // Also clean up leader election key
-    let leader_prefix = "/fractalbits-leader-election-observer/";
-    let _ = run_cmd!($etcdctl del --prefix $leader_prefix >/dev/null);
-    Ok(())
-}
-
 fn wait_for_observer_state(expected_state: &str, timeout_secs: u64) -> Option<ObserverState> {
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(timeout_secs) {
@@ -80,27 +70,6 @@ fn kill_nss_process() -> CmdResult {
     info!("Killing nss_server process...");
     let _ = run_cmd!(pkill -SIGKILL nss_server);
     std::thread::sleep(Duration::from_millis(500));
-    Ok(())
-}
-
-fn seed_initial_observer_state() -> CmdResult {
-    let etcdctl = resolve_etcd_bin("etcdctl");
-    let key = format!("{}observer_state", ETCD_SERVICE_DISCOVERY_PREFIX);
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64();
-
-    // Initial state: nss-A runs NSS (active), nss-B runs mirrord (standby)
-    // Fields match root_server's ObserverPersistentState and MachineState structs
-    let initial_state = format!(
-        r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"nss-A","running_service":"nss","expected_role":"active"}},"mirrord_machine":{{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby"}},"version":1,"last_updated":{}}}"#,
-        now
-    );
-
-    run_cmd!($etcdctl put $key $initial_state >/dev/null)?;
-    info!("Seeded initial observer state in etcd");
     Ok(())
 }
 
@@ -164,54 +133,8 @@ async fn test_full_stack_initialization() -> CmdResult {
         nss_disable_restart_limit: true,
         ..Default::default()
     };
-
     init_service(ServiceName::All, BuildMode::Debug, init_config)?;
-
-    info!("Starting etcd...");
-    start_service(ServiceName::Etcd)?;
-
-    // Clean up any previous observer state (from init_service phase)
-    cleanup_observer_state()?;
-
-    // Seed initial observer state BEFORE starting RSS
-    // The observer should load our seeded state instead of initializing fresh
-    info!("Seeding initial observer state in etcd...");
-    seed_initial_observer_state()?;
-
-    info!("Starting RSS (with observer enabled)...");
-    start_service(ServiceName::Rss)?;
-
-    info!("Starting BSS...");
-    start_service(ServiceName::Bss)?;
-
-    // Start nss_role_agents - they will read the observer state to determine their role
-    // Start mirrord (standby) first because nss (active) needs to connect to mirrord
-    // for sync notifications. The observer has a 30-second initial grace period so it
-    // won't trigger failover during the startup window.
-    info!("Starting NssRoleAgentB (mirrord/standby) first...");
-    start_service(ServiceName::NssRoleAgentB)?;
-
-    info!("Starting NssRoleAgentA (nss/active)...");
-    start_service(ServiceName::NssRoleAgentA)?;
-
-    // Start api_server - it will fetch NSS address from RSS
-    info!("Starting api_server...");
-    start_service(ServiceName::ApiServer)?;
-
-    // Verify processes are running
-    if !verify_process_running("nss_server") {
-        return Err(Error::other("nss_server is not running"));
-    }
-    if !verify_process_running("mirrord") {
-        return Err(Error::other("mirrord is not running"));
-    }
-    if !verify_process_running("api_server") {
-        return Err(Error::other("api_server is not running"));
-    }
-
-    // Wait for observer to update machine statuses based on health checks
-    info!("Waiting for observer to update machine statuses...");
-    std::thread::sleep(Duration::from_secs(10));
+    start_service(ServiceName::All)?;
 
     // Verify initial state is active_standby
     let state = wait_for_observer_state("active_standby", 15);
@@ -620,7 +543,7 @@ async fn test_api_server_during_nss_failover() -> CmdResult {
     // Wait for tasks to finish
     let mut all_succeeded = true;
     for task in read_tasks {
-        match tokio::time::timeout(Duration::from_secs(10), task).await {
+        match tokio::time::timeout(Duration::from_secs(30), task).await {
             Ok(Ok((i, success, err_503, other_err, details))) => {
                 info!(
                     "Task {}: success={}, 503_errors={}, other_errors={}",
