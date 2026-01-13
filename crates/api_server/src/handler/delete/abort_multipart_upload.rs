@@ -31,7 +31,9 @@ pub async fn abort_multipart_upload_handler(
             &ctx.key,
             Some(rpc_timeout),
             &ctx.trace_id
-        )
+        ),
+        ctx.app,
+        &ctx.trace_id
     )
     .await?;
 
@@ -63,7 +65,9 @@ pub async fn abort_multipart_upload_handler(
             new_object_bytes.clone(),
             Some(ctx.app.config.rpc_request_timeout()),
             &ctx.trace_id
-        )
+        ),
+        ctx.app,
+        &ctx.trace_id
     )
     .await?;
 

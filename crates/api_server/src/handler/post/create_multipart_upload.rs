@@ -65,7 +65,9 @@ pub async fn create_multipart_upload_handler(
             object_layout_bytes.clone(),
             Some(ctx.app.config.rpc_request_timeout()),
             &ctx.trace_id
-        )
+        ),
+        ctx.app,
+        &ctx.trace_id
     )
     .await?;
 

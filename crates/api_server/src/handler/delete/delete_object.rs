@@ -27,7 +27,9 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
             &ctx.key,
             Some(rpc_timeout),
             &ctx.trace_id
-        )
+        ),
+        ctx.app,
+        &ctx.trace_id
     )
     .await?;
 
@@ -111,7 +113,9 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
                                 &mpu_key,
                                 Some(rpc_timeout),
                                 &ctx.trace_id
-                            )
+                            ),
+                            ctx.app,
+                            &ctx.trace_id
                         )
                         .await?;
                         // Delete blob for each multipart upload part

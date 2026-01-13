@@ -222,7 +222,7 @@ macro_rules! rpc_retry {
     ($rpc_type:expr, $client:expr, $method:ident($($args:expr),*)) => {
         async {
             let mut retries = 3;
-            let mut backoff = std::time::Duration::from_millis(5);
+            let mut backoff = std::time::Duration::from_millis(2);
             let mut retry_count = 0u32;
             loop {
                 match $client.$method($($args,)* retry_count).await {
@@ -260,8 +260,73 @@ macro_rules! bss_rpc_retry {
     };
 }
 
+/// NSS RPC retry macro with automatic address refresh on connection failure.
+/// When all retries are exhausted due to connection errors, it will enter a
+/// failover retry loop that keeps trying for up to 30 seconds, periodically
+/// checking for NSS address changes from RSS.
+///
+/// Use the 4-argument version (with app and trace_id) for api_server handlers
+/// to get automatic NSS address refresh on failover.
 #[macro_export]
 macro_rules! nss_rpc_retry {
+    // Version with automatic NSS address refresh (use in api_server handlers)
+    ($client:expr, $method:ident($($args:expr),*), $app:expr, $trace_id:expr) => {
+        async {
+            let failover_timeout = std::time::Duration::from_secs(30);
+            let failover_start = std::time::Instant::now();
+            let mut refresh_attempt = 0u32;
+
+            // Initial attempt with provided client
+            let initial_result = $crate::rpc_retry!("nss", $client, $method($($args),*)).await;
+
+            // If success or non-retryable error, return immediately
+            if initial_result.is_ok() || !initial_result.as_ref().err().map(|e| e.retryable()).unwrap_or(false) {
+                return initial_result;
+            }
+
+            // Enter failover retry loop
+            loop {
+                // Check if we've exceeded failover timeout
+                if failover_start.elapsed() > failover_timeout {
+                    ::tracing::warn!(
+                        "NSS RPC failed after {}s failover timeout",
+                        failover_start.elapsed().as_secs()
+                    );
+                    // Return the last error
+                    return $crate::rpc_retry!("nss", $client, $method($($args),*)).await;
+                }
+
+                // Try to refresh NSS address from RSS
+                if $app.try_refresh_nss_address($trace_id).await {
+                    // Address changed - get new client and retry
+                    ::tracing::info!(
+                        "NSS address refreshed after {}ms, retrying with new address",
+                        failover_start.elapsed().as_millis()
+                    );
+                    if let Ok(new_client) = $app.get_nss_rpc_client().await {
+                        let result = $crate::rpc_retry!("nss", new_client, $method($($args),*)).await;
+                        if result.is_ok() || !result.as_ref().err().map(|e| e.retryable()).unwrap_or(false) {
+                            return result;
+                        }
+                    }
+                    refresh_attempt = 0;
+                }
+
+                // Wait before next refresh attempt
+                // Exponential backoff: 200ms, 400ms, 800ms, 1000ms (capped)
+                let backoff_ms = std::cmp::min(200 * (1u64 << refresh_attempt.min(3)), 1000);
+                ::tracing::debug!(
+                    "NSS failover: waiting {}ms before retry (attempt {}, elapsed {}ms)",
+                    backoff_ms,
+                    refresh_attempt + 1,
+                    failover_start.elapsed().as_millis()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                refresh_attempt = refresh_attempt.saturating_add(1);
+            }
+        }
+    };
+    // Simple version without refresh (for use outside api_server)
     ($client:expr, $method:ident($($args:expr),*)) => {
         $crate::rpc_retry!("nss", $client, $method($($args),*))
     };

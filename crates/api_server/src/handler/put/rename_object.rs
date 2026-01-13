@@ -30,7 +30,9 @@ pub async fn rename_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
             &dst_path,
             Some(ctx.app.config.rpc_request_timeout()),
             &ctx.trace_id
-        )
+        ),
+        ctx.app,
+        &ctx.trace_id
     )
     .await
     .map_err(|e| {

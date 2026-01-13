@@ -75,7 +75,9 @@ pub async fn get_raw_object(
             key,
             Some(app.config.rpc_request_timeout()),
             trace_id
-        )
+        ),
+        app,
+        trace_id
     )
     .await?;
 
@@ -117,7 +119,9 @@ pub async fn list_raw_objects(
             skip_mpu_parts,
             Some(app.config.rpc_request_timeout()),
             trace_id
-        )
+        ),
+        app,
+        trace_id
     )
     .await?;
 

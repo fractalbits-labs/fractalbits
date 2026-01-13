@@ -460,12 +460,14 @@ async fn put_object_streaming_internal(
             object_layout_bytes.clone(),
             Some(ctx.app.config.rpc_request_timeout()),
             &ctx.trace_id
-        )
+        ),
+        ctx.app,
+        &ctx.trace_id
     )
     .await
     .map_err(|e| {
         tracing::error!("Failed to store object metadata: {e}");
-        S3Error::InternalError
+        S3Error::from(e)
     })?;
 
     // Delete old object if it is an overwrite request
@@ -678,12 +680,14 @@ async fn put_object_with_no_trailer(
             object_layout_bytes.clone(),
             Some(ctx.app.config.rpc_request_timeout()),
             &ctx.trace_id
-        )
+        ),
+        ctx.app,
+        &ctx.trace_id
     )
     .await
     .map_err(|e| {
         tracing::error!("Failed to store object metadata: {e}");
-        S3Error::InternalError
+        S3Error::from(e)
     })?;
 
     // Delete old object if it is an overwrite request

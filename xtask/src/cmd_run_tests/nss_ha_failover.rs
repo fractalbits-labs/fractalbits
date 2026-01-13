@@ -6,6 +6,8 @@ use aws_sdk_s3::primitives::ByteStream;
 use cmd_lib::*;
 use colored::*;
 use std::io::Error;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use test_common::*;
 
@@ -115,34 +117,27 @@ pub async fn run_nss_ha_failover_tests() -> CmdResult {
         return Err(e);
     }
 
-    println!("{}", "=== Test 2: NSS Failure and Failover ===".bold());
-    if let Err(e) = test_nss_failure_failover().await {
+    println!(
+        "{}",
+        "=== Test 2: api_server During NSS Failover (Concurrent Operations) ===".bold()
+    );
+    if let Err(e) = test_api_server_during_nss_failover().await {
         let _ = stop_service(ServiceName::All);
         eprintln!("{}: {}", "Test 2 FAILED".red().bold(), e);
         return Err(e);
     }
 
-    println!(
-        "{}",
-        "=== Test 3: api_server During NSS Failover ===".bold()
-    );
-    if let Err(e) = test_api_server_during_nss_failover().await {
+    println!("{}", "=== Test 3: Mirrord Recovery ===".bold());
+    if let Err(e) = test_mirrord_recovery().await {
         let _ = stop_service(ServiceName::All);
         eprintln!("{}: {}", "Test 3 FAILED".red().bold(), e);
         return Err(e);
     }
 
-    println!("{}", "=== Test 4: Mirrord Recovery ===".bold());
-    if let Err(e) = test_mirrord_recovery().await {
-        let _ = stop_service(ServiceName::All);
-        eprintln!("{}: {}", "Test 4 FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("{}", "=== Test 5: Observer Restart ===".bold());
+    println!("{}", "=== Test 4: Observer Restart ===".bold());
     if let Err(e) = test_observer_restart().await {
         let _ = stop_service(ServiceName::All);
-        eprintln!("{}: {}", "Test 5 FAILED".red().bold(), e);
+        eprintln!("{}: {}", "Test 4 FAILED".red().bold(), e);
         return Err(e);
     }
 
@@ -257,84 +252,65 @@ async fn test_full_stack_initialization() -> CmdResult {
     Ok(())
 }
 
-async fn test_nss_failure_failover() -> CmdResult {
-    info!("Testing NSS failure and failover...");
-
-    // Verify we're in active_standby state
-    let state = get_observer_state_from_etcd();
-    if state.is_none() || state.as_ref().unwrap().observer_state != "active_standby" {
-        return Err(Error::other(
-            "Expected active_standby state before testing failover",
-        ));
-    }
-
-    // Verify services are running before testing failover
-    if !verify_process_running("nss_server") {
-        return Err(Error::other(
-            "nss_server is not running before failover test",
-        ));
-    }
-    if !verify_process_running("mirrord") {
-        return Err(Error::other("mirrord is not running before failover test"));
-    }
-
-    info!("Killing NSS process to simulate failure...");
-    kill_nss_process()?;
-
-    // Verify nss_server is dead
-    std::thread::sleep(Duration::from_secs(1));
-    if verify_process_running("nss_server") {
-        info!("nss_server still running, trying again...");
-        kill_nss_process()?;
-    }
-
-    // Wait for observer to detect failure and transition to solo_degraded
-    // max_failures=3 * heartbeat=1s = ~5s + margin
-    info!("Waiting for observer to detect failure and transition to solo_degraded...");
-    let state = wait_for_observer_state("solo_degraded", 20);
-    if state.is_none() {
-        let current = get_observer_state_from_etcd();
-        return Err(Error::other(format!(
-            "Observer did not transition to solo_degraded. Current state: {:?}",
-            current.map(|s| format!("{} (version {})", s.observer_state, s.version))
-        )));
-    }
-
-    let state = state.unwrap();
-    info!(
-        "Failover detected: state={}, nss={} (role={}), mirrord={} (role={})",
-        state.observer_state,
-        state.nss_machine.machine_id,
-        state.nss_machine.expected_role,
-        state.mirrord_machine.machine_id,
-        state.mirrord_machine.expected_role
-    );
-
-    // After failover, nss-B should be promoted to NSS with solo role
-    if state.nss_machine.expected_role != "solo" {
-        return Err(Error::other(format!(
-            "Expected NSS machine to have solo role, got {}",
-            state.nss_machine.expected_role
-        )));
-    }
-
-    println!(
-        "{}",
-        "SUCCESS: NSS failure detected and failover to solo_degraded!".green()
-    );
-    Ok(())
-}
-
 async fn test_mirrord_recovery() -> CmdResult {
     info!("Testing mirrord recovery to active_standby...");
 
-    // Verify we're in solo_degraded state
-    let state = get_observer_state_from_etcd();
-    if state.is_none() || state.as_ref().unwrap().observer_state != "solo_degraded" {
-        return Err(Error::other(
-            "Expected solo_degraded state before testing recovery",
-        ));
+    // Wait for state to stabilize (active_degraded is transient)
+    info!("Waiting for observer state to stabilize...");
+    let mut stable_state: Option<ObserverState> = None;
+    for i in 0..30 {
+        let state = get_observer_state_from_etcd();
+        if let Some(s) = state {
+            let state_name = &s.observer_state;
+            info!("Attempt {}: observer state = {}", i + 1, state_name);
+
+            // These are stable states we can proceed with
+            if state_name == "active_standby" || state_name == "solo_degraded" {
+                stable_state = Some(s);
+                break;
+            }
+            // active_degraded is transient, keep waiting
+            if state_name == "active_degraded" {
+                info!("State is transient (active_degraded), waiting...");
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
+
+    let state = match stable_state {
+        Some(s) => s,
+        None => {
+            let current = get_observer_state_from_etcd();
+            return Err(Error::other(format!(
+                "Observer state did not stabilize. Current: {:?}",
+                current.map(|s| s.observer_state)
+            )));
+        }
+    };
+
+    let current_state = state.observer_state.clone();
+    info!("Stable observer state: {}", current_state);
+
+    // If already active_standby, the automatic recovery already happened - that's success!
+    if current_state == "active_standby" {
+        info!("System already recovered to active_standby automatically!");
+        // Verify both processes are running
+        if !verify_process_running("nss_server") {
+            return Err(Error::other(
+                "nss_server not running in active_standby state",
+            ));
+        }
+        if !verify_process_running("mirrord") {
+            return Err(Error::other("mirrord not running in active_standby state"));
+        }
+        println!(
+            "{}",
+            "SUCCESS: System automatically recovered to active_standby!".green()
+        );
+        return Ok(());
+    }
+
+    // Otherwise we're in solo_degraded, wait for recovery
 
     // The nss_role_agent should automatically restart the failed service
     // Wait for mirrord to restart on the degraded machine
@@ -457,22 +433,32 @@ async fn test_observer_restart() -> CmdResult {
 }
 
 async fn test_api_server_during_nss_failover() -> CmdResult {
-    info!("Testing api_server continues working during NSS failover...");
+    info!("Testing api_server with continuous GET requests during NSS failover...");
 
-    // Test is run after test_nss_failure_failover, so we're in solo_degraded state
-    // with nss-B now running as the active NSS
+    // Step 1: Verify starting state is active_standby
+    info!("Step 1: Verifying active_standby state...");
+    let state = get_observer_state_from_etcd();
+    if state.is_none() || state.as_ref().unwrap().observer_state != "active_standby" {
+        return Err(Error::other(
+            "Expected active_standby state before testing failover",
+        ));
+    }
 
-    // Wait for the new NSS (nss-B on port 8087) to be healthy before proceeding
-    wait_for_port_ready(8087, 30)?;
+    // Verify services are running
+    if !verify_process_running("nss_server") {
+        return Err(Error::other(
+            "nss_server is not running before failover test",
+        ));
+    }
+    if !verify_process_running("mirrord") {
+        return Err(Error::other("mirrord is not running before failover test"));
+    }
 
-    // Step 1: Create a bucket and upload an object via api_server
-    info!("Step 1: Creating bucket and uploading object via api_server...");
+    // Step 2: Create bucket and upload multiple test objects
+    info!("Step 2: Creating bucket and uploading test objects...");
     let ctx = context();
-    let bucket_name = "test-nss-failover-bucket";
-    let object_key = "test-failover-object";
-    let object_data = b"Test data for NSS failover verification";
+    let bucket_name = "test-failover-concurrent";
 
-    // Create bucket
     match ctx.client.create_bucket().bucket(bucket_name).send().await {
         Ok(_) => info!("Bucket created: {}", bucket_name),
         Err(e) => {
@@ -487,94 +473,264 @@ async fn test_api_server_during_nss_failover() -> CmdResult {
         }
     }
 
-    // Upload object
-    ctx.client
-        .put_object()
-        .bucket(bucket_name)
-        .key(object_key)
-        .body(ByteStream::from_static(object_data))
-        .send()
-        .await
-        .map_err(|e| Error::other(format!("Failed to upload object: {e}")))?;
-    info!("Object uploaded: {}/{}", bucket_name, object_key);
+    // Upload multiple objects before failover
+    for i in 0..5 {
+        let key = format!("obj-{}", i);
+        let data = format!("Test data for object {}", i);
+        ctx.client
+            .put_object()
+            .bucket(bucket_name)
+            .key(&key)
+            .body(ByteStream::from(data.into_bytes()))
+            .send()
+            .await
+            .map_err(|e| Error::other(format!("Failed to upload {}: {}", key, e)))?;
+    }
+    info!("Uploaded 5 test objects");
 
-    // Step 2: Verify the object can be retrieved
-    info!("Step 2: Verifying object can be retrieved...");
+    // Step 3: Spawn continuous read tasks that run throughout the entire failover
+    info!("Step 3: Spawning continuous GET request tasks...");
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let client = ctx.client.clone();
+
+    let read_tasks: Vec<_> = (0..5)
+        .map(|i| {
+            let client = client.clone();
+            let bucket = bucket_name.to_string();
+            let stop = stop_signal.clone();
+
+            tokio::spawn(async move {
+                let key = format!("obj-{}", i);
+                let expected_data = format!("Test data for object {}", i);
+                let mut success_count: u32 = 0;
+                let mut error_503_count: u32 = 0;
+                let mut other_error_count: u32 = 0;
+                let mut other_error_details: Option<String> = None;
+
+                // Continuously send GET requests until stop signal
+                while !stop.load(Ordering::Relaxed) {
+                    match client.get_object().bucket(&bucket).key(&key).send().await {
+                        Ok(result) => {
+                            let body = result.body.collect().await;
+                            match body {
+                                Ok(data) => {
+                                    if data.into_bytes().as_ref() == expected_data.as_bytes() {
+                                        success_count += 1;
+                                    } else {
+                                        other_error_count += 1;
+                                        if other_error_details.is_none() {
+                                            other_error_details =
+                                                Some(format!("obj-{}: data mismatch", i));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    other_error_count += 1;
+                                    if other_error_details.is_none() {
+                                        other_error_details =
+                                            Some(format!("obj-{}: body read error: {}", i, e));
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let is_503 = e
+                                .raw_response()
+                                .map(|r| r.status().as_u16() == 503)
+                                .unwrap_or(false);
+
+                            if is_503 {
+                                error_503_count += 1;
+                            } else {
+                                other_error_count += 1;
+                                if other_error_details.is_none() {
+                                    let status = e.raw_response().map(|r| r.status().as_u16());
+                                    other_error_details = Some(format!(
+                                        "obj-{}: unexpected error (status={:?}): {}",
+                                        i, status, e
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    // Small delay between requests
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+
+                (
+                    i,
+                    success_count,
+                    error_503_count,
+                    other_error_count,
+                    other_error_details,
+                )
+            })
+        })
+        .collect();
+
+    // Step 4: Wait a bit then kill NSS to trigger failover
+    info!("Step 4: Waiting 500ms then killing NSS process...");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    kill_nss_process()?;
+
+    // Verify nss_server is dead
+    std::thread::sleep(Duration::from_secs(1));
+    if verify_process_running("nss_server") {
+        info!("nss_server still running, trying again...");
+        kill_nss_process()?;
+    }
+
+    // Step 5: Wait for failover to complete
+    info!("Step 5: Waiting for failover to solo_degraded...");
+    let state = wait_for_observer_state("solo_degraded", 30);
+    if state.is_none() {
+        let current = get_observer_state_from_etcd();
+        return Err(Error::other(format!(
+            "Observer did not transition to solo_degraded. Current state: {:?}",
+            current.map(|s| format!("{} (version {})", s.observer_state, s.version))
+        )));
+    }
+
+    let state = state.unwrap();
+    info!(
+        "Failover detected: state={}, nss={} (role={})",
+        state.observer_state, state.nss_machine.machine_id, state.nss_machine.expected_role
+    );
+
+    // Verify solo role
+    if state.nss_machine.expected_role != "solo" {
+        return Err(Error::other(format!(
+            "Expected NSS machine to have solo role, got {}",
+            state.nss_machine.expected_role
+        )));
+    }
+
+    // Step 6: Wait for new NSS to be ready
+    info!("Step 6: Waiting for new NSS to be ready on port 8087...");
+    wait_for_port_ready(8087, 30)?;
+
+    // Step 7: Give some time for requests to succeed after failover completes
+    info!("Step 7: Letting continuous GET requests run for 5 more seconds after failover...");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Step 8: Stop the continuous reads and collect results
+    info!("Step 8: Stopping continuous GET requests and collecting results...");
+    stop_signal.store(true, Ordering::Relaxed);
+
+    // Wait for tasks to finish
+    let mut all_succeeded = true;
+    for task in read_tasks {
+        match tokio::time::timeout(Duration::from_secs(10), task).await {
+            Ok(Ok((i, success, err_503, other_err, details))) => {
+                info!(
+                    "Task {}: success={}, 503_errors={}, other_errors={}",
+                    i, success, err_503, other_err
+                );
+
+                // Must have at least some successes after failover
+                if success == 0 {
+                    eprintln!("Task {} had no successful reads!", i);
+                    all_succeeded = false;
+                }
+
+                // Non-503 errors are not acceptable
+                if other_err > 0 {
+                    eprintln!(
+                        "Task {} had {} unexpected errors: {:?}",
+                        i, other_err, details
+                    );
+                    all_succeeded = false;
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("Read task panicked: {:?}", e);
+                all_succeeded = false;
+            }
+            Err(_) => {
+                eprintln!("Read task timed out waiting to finish");
+                all_succeeded = false;
+            }
+        }
+    }
+
+    if !all_succeeded {
+        return Err(Error::other(
+            "Some continuous GET tasks had failures during failover",
+        ));
+    }
+
+    // Step 9: Verify new writes work with the new NSS
+    // Give api_server a moment to receive updated NSS address from RSS cache notifier
+    info!("Step 9: Verifying new writes work with the new NSS...");
+    let post_failover_key = "post-failover-obj";
+    let post_failover_data = b"Data written after failover";
+
+    // Retry post-failover write with delays (api_server may need time to update NSS address)
+    let mut write_succeeded = false;
+    for attempt in 0..5 {
+        match ctx
+            .client
+            .put_object()
+            .bucket(bucket_name)
+            .key(post_failover_key)
+            .body(ByteStream::from_static(post_failover_data))
+            .send()
+            .await
+        {
+            Ok(_) => {
+                info!("Post-failover write succeeded on attempt {}", attempt + 1);
+                write_succeeded = true;
+                break;
+            }
+            Err(e) => {
+                let is_503 = e
+                    .raw_response()
+                    .map(|r| r.status().as_u16() == 503)
+                    .unwrap_or(false);
+                if is_503 && attempt < 4 {
+                    info!(
+                        "Post-failover write attempt {} got 503, retrying...",
+                        attempt + 1
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                return Err(Error::other(format!(
+                    "Failed to write post-failover object after {} attempts: {e}",
+                    attempt + 1
+                )));
+            }
+        }
+    }
+
+    if !write_succeeded {
+        return Err(Error::other(
+            "Post-failover write did not succeed after retries",
+        ));
+    }
+
     let get_result = ctx
         .client
         .get_object()
         .bucket(bucket_name)
-        .key(object_key)
+        .key(post_failover_key)
         .send()
         .await
-        .map_err(|e| Error::other(format!("Failed to get object: {e}")))?;
+        .map_err(|e| Error::other(format!("Failed to read post-failover object: {e}")))?;
 
     let body = get_result
         .body
         .collect()
         .await
         .map_err(|e| Error::other(format!("Failed to read body: {e}")))?;
-    if body.into_bytes().as_ref() != object_data {
-        return Err(Error::other("Object data mismatch before failover"));
+    if body.into_bytes().as_ref() != post_failover_data {
+        return Err(Error::other("Post-failover object data mismatch"));
     }
-    info!("Object verified before any failover");
-
-    // Step 3: Upload another object to ensure write path works
-    let object_key2 = "test-failover-object-2";
-    let object_data2 = b"Second test object for write path verification";
-
-    ctx.client
-        .put_object()
-        .bucket(bucket_name)
-        .key(object_key2)
-        .body(ByteStream::from_static(object_data2))
-        .send()
-        .await
-        .map_err(|e| Error::other(format!("Failed to upload second object: {e}")))?;
-    info!("Second object uploaded: {}/{}", bucket_name, object_key2);
-
-    // Step 4: Verify both objects can be retrieved
-    info!("Step 4: Verifying both objects can still be retrieved...");
-
-    let get_result1 = ctx
-        .client
-        .get_object()
-        .bucket(bucket_name)
-        .key(object_key)
-        .send()
-        .await
-        .map_err(|e| Error::other(format!("Failed to get first object after failover: {e}")))?;
-    let body1 = get_result1
-        .body
-        .collect()
-        .await
-        .map_err(|e| Error::other(format!("Failed to read first object body: {e}")))?;
-    if body1.into_bytes().as_ref() != object_data {
-        return Err(Error::other("First object data mismatch"));
-    }
-    info!("First object verified");
-
-    let get_result2 = ctx
-        .client
-        .get_object()
-        .bucket(bucket_name)
-        .key(object_key2)
-        .send()
-        .await
-        .map_err(|e| Error::other(format!("Failed to get second object: {e}")))?;
-    let body2 = get_result2
-        .body
-        .collect()
-        .await
-        .map_err(|e| Error::other(format!("Failed to read second object body: {e}")))?;
-    if body2.into_bytes().as_ref() != object_data2 {
-        return Err(Error::other("Second object data mismatch"));
-    }
-    info!("Second object verified");
+    info!("Post-failover write/read verified successfully");
 
     println!(
         "{}",
-        "SUCCESS: api_server continues working after NSS failover!".green()
+        "SUCCESS: api_server handles continuous GET requests during NSS failover!".green()
     );
     Ok(())
 }

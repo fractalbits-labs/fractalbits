@@ -45,7 +45,9 @@ pub struct AppState {
     pub worker_id: u16,
 
     // NSS client is lazily initialized - set when we receive address from RSS
+    // We store both the client and the address for refresh detection
     rpc_client_nss: Arc<RwLock<Option<RpcClientNss>>>,
+    nss_address: Arc<RwLock<Option<String>>>,
     rpc_client_rss: RpcClientRss,
 
     blob_client: OnceCell<Arc<BlobClient>>,
@@ -79,6 +81,7 @@ impl AppState {
 
         // NSS client starts uninitialized - will be set when we receive address from RSS
         let rpc_client_nss = Arc::new(RwLock::new(None));
+        let nss_address = Arc::new(RwLock::new(None));
         let rpc_client_rss = RpcClientRss::new_from_addresses(
             config.rss_addrs.clone(),
             config.rpc_connection_timeout(),
@@ -87,6 +90,7 @@ impl AppState {
         Self {
             config,
             rpc_client_nss,
+            nss_address,
             rpc_client_rss,
             blob_client: OnceCell::new(),
             blob_deletion_tx: tx,
@@ -108,10 +112,52 @@ impl AppState {
 
     pub async fn update_nss_address(&self, new_address: String) {
         tracing::info!("Updating NSS address to: {}", new_address);
-        let new_client =
-            RpcClientNss::new_from_address(new_address, self.config.rpc_connection_timeout());
+        let new_client = RpcClientNss::new_from_address(
+            new_address.clone(),
+            self.config.rpc_connection_timeout(),
+        );
+        *self.nss_address.write().await = Some(new_address);
         *self.rpc_client_nss.write().await = Some(new_client);
         tracing::info!("NSS client updated successfully");
+    }
+
+    /// Get the current NSS address (for comparison during refresh)
+    pub async fn get_nss_address(&self) -> Option<String> {
+        self.nss_address.read().await.clone()
+    }
+
+    /// Try to refresh NSS address from RSS when connection fails.
+    /// Returns true if address was refreshed and caller should retry the operation.
+    pub async fn try_refresh_nss_address(&self, trace_id: &TraceId) -> bool {
+        let current_addr = self.get_nss_address().await;
+
+        // Fetch latest NSS address from RSS
+        let rss_client = self.get_rss_rpc_client();
+        match rss_rpc_retry!(
+            rss_client,
+            get_active_nss_address(Some(self.config.rss_rpc_timeout()), trace_id)
+        )
+        .await
+        {
+            Ok(new_addr) => {
+                if current_addr.as_deref() != Some(&new_addr) {
+                    tracing::info!(
+                        "NSS address changed during refresh: {:?} -> {}",
+                        current_addr,
+                        new_addr
+                    );
+                    self.update_nss_address(new_addr).await;
+                    true
+                } else {
+                    tracing::debug!("NSS address unchanged during refresh: {:?}", current_addr);
+                    false
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch NSS address from RSS during refresh: {}", e);
+                false
+            }
+        }
     }
 
     /// Ensures NSS client is initialized by fetching address from RSS if needed

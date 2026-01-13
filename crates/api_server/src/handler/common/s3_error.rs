@@ -846,7 +846,13 @@ impl From<InvalidUri> for S3Error {
 impl From<RpcError> for S3Error {
     fn from(value: RpcError) -> Self {
         tracing::error!("RpcError: {value}");
-        Self::InternalError
+        // Connection-related errors should return 503 (ServiceUnavailable)
+        // to indicate the client should retry
+        if value.retryable() {
+            Self::ServiceUnavailable
+        } else {
+            Self::InternalError
+        }
     }
 }
 
