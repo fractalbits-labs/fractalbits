@@ -94,16 +94,21 @@ export function createConfigWithCfnTokens(props: {
     }
   }
 
+  // Add bootstrap_bucket at root level (before any sections)
+  const rootConfig: TOML.JsonMap = {};
+  if (props.bootstrapBucket) {
+    rootConfig.bootstrap_bucket = props.bootstrapBucket;
+  }
+
   const staticPart =
     "# Auto-generated bootstrap configuration\n# Do not edit manually\n\n" +
+    (Object.keys(rootConfig).length > 0
+      ? TOML.stringify(rootConfig) + "\n"
+      : "") +
     TOML.stringify(staticConfig as TOML.JsonMap);
 
   // Dynamic parts with CFN tokens
   const lines: string[] = [staticPart.trimEnd()];
-
-  if (props.bootstrapBucket) {
-    lines.push(`bootstrap_bucket = "${props.bootstrapBucket}"`);
-  }
 
   if (props.dataBlobBucket) {
     lines.push(tomlLine("data_blob_bucket", props.dataBlobBucket));
