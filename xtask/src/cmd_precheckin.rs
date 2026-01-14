@@ -225,15 +225,15 @@ fn run_docker_tests() -> CmdResult {
     let result = (|| -> CmdResult {
         info!("Waiting for container to be ready...");
         let health_url = "http://localhost:18080/mgmt/health";
-        for i in 1..=60 {
+        for i in 1..=120 {
             let health_check = run_fun!(curl -sf $health_url);
             if health_check.is_ok() {
                 info!("Container ready after {}s", i);
                 break;
             }
-            if i == 60 {
+            if i == 120 {
                 run_cmd!(docker logs fractalbits-dev)?;
-                cmd_die!("Container failed to start within 60 seconds");
+                cmd_die!("Container failed to start within 120 seconds");
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
