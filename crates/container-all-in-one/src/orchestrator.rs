@@ -132,7 +132,7 @@ impl Orchestrator {
         let bss_metadata_vg = generate_bss_metadata_vg_config(1);
 
         // Initialize observer_state for solo mode (single NSS, no mirrord)
-        let observer_state_json = r#"{"observer_state":"solo_degraded","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-A","running_service":"mirrord","expected_role":"degraded","network_address":null},"last_updated":0.0,"version":0}"#;
+        let observer_state_json = r#"{"observer_state":"solo","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"","running_service":"mirrord","expected_role":"","network_address":null},"last_updated":0.0,"version":0}"#;
 
         run_cmd! {
             $etcdctl put /fractalbits-service-discovery/nss_roles $nss_roles_json >/dev/null;

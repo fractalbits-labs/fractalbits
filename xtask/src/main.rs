@@ -322,7 +322,7 @@ pub enum DeployCommand {
     #[clap(about = "Destroy VPC infrastructure (including s3 builds bucket cleanup)")]
     DestroyVpc,
 
-    #[clap(about = "Show bootstrap progress for a VPC deployment")]
+    #[clap(about = "Show bootstrap progress for a cluster deployment")]
     BootstrapProgress {
         #[clap(long, value_enum, default_value = "aws")]
         deploy_target: xtask_common::DeployTarget,

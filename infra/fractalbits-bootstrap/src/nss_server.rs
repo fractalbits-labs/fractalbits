@@ -281,6 +281,8 @@ fn create_nss_role_agent_config(
 ) -> CmdResult {
     let rss_ha_enabled = config.global.rss_ha_enabled;
     let instance_id = get_instance_id_from_config(config)?;
+    let private_ip = get_private_ip()?;
+    let nss_port = 8088;
 
     // Query service discovery for RSS instance IPs
     let expected_rss_count = if rss_ha_enabled { 2 } else { 1 };
@@ -291,28 +293,19 @@ fn create_nss_role_agent_config(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let mirrord_configs = if let Some(mirrord_endpoint) = mirrord_endpoint {
-        format!(
-            r##"
-mirrord_endpoint = "{mirrord_endpoint}"
-mirrord_port = 9999
-"##
-        )
-    } else {
-        "".to_string()
-    };
+    // mirrord_endpoint is only set in HA mode (NVMe journal with active/standby)
+    let mirrord_endpoint_line = mirrord_endpoint
+        .map(|ep| format!("mirrord_endpoint = \"{ep}\"\n"))
+        .unwrap_or_default();
+
     let config_content = format!(
-        r##"rss_addrs = [{rss_addrs_toml}]
-rpc_timeout_seconds = 4
-state_check_interval_seconds = 1
+        r##"# NSS Role Agent Configuration
+# Role is fetched from RSS at startup, not configured here
+
+rss_addrs = [{rss_addrs_toml}]
 instance_id = "{instance_id}"
-service_type = "unknown"
-nss_port = 8088
-rpc_server_port = 8077
-restart_limit_burst = 3
-restart_limit_interval_seconds = 600
-{mirrord_configs}
-"##
+network_address = "{private_ip}:{nss_port}"
+{mirrord_endpoint_line}"##
     );
 
     run_cmd! {

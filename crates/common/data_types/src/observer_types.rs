@@ -4,14 +4,20 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObserverState {
+    /// Single NSS instance running solo (no HA, no mirrord)
+    Solo,
+    /// Normal HA: NSS active, Mirrord standby
     ActiveStandby,
+    /// Failover mode: NSS solo, Mirrord degraded (recovering)
     SoloDegraded,
+    /// Recovery mode: NSS active, Mirrord degraded/syncing
     ActiveDegraded,
 }
 
 impl fmt::Display for ObserverState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ObserverState::Solo => write!(f, "solo"),
             ObserverState::ActiveStandby => write!(f, "active_standby"),
             ObserverState::SoloDegraded => write!(f, "solo_degraded"),
             ObserverState::ActiveDegraded => write!(f, "active_degraded"),
