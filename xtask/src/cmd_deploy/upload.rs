@@ -2,9 +2,9 @@ use crate::*;
 
 use super::common::DeployTarget;
 
-pub fn upload(vpc_target: DeployTarget) -> CmdResult {
+pub fn upload(deploy_target: DeployTarget) -> CmdResult {
     // Check/create S3 bucket and sync
-    let bucket_name = get_bootstrap_bucket_name(vpc_target)?;
+    let bucket_name = get_bootstrap_bucket_name(deploy_target)?;
 
     // Check if the bucket exists; create if it doesn't
     let bucket_exists = run_cmd!(aws s3api head-bucket --bucket $bucket_name &>/dev/null).is_ok();
@@ -32,8 +32,8 @@ chmod +x /opt/fractalbits/bin/fractalbits-bootstrap
     Ok(())
 }
 
-pub fn get_bootstrap_bucket_name(vpc_target: DeployTarget) -> FunResult {
-    match vpc_target {
+pub fn get_bootstrap_bucket_name(deploy_target: DeployTarget) -> FunResult {
+    match deploy_target {
         DeployTarget::OnPrem => Ok("fractalbits-bootstrap".to_string()),
         DeployTarget::Aws => {
             let region = run_fun!(aws configure get region)?;

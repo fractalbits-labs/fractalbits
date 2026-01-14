@@ -246,7 +246,7 @@ pub enum DeployCommand {
     #[clap(about = "Upload prebuilt binaries to s3 builds bucket")]
     Upload {
         #[clap(long, value_enum, default_value = "aws")]
-        vpc_target: xtask_common::DeployTarget,
+        deploy_target: xtask_common::DeployTarget,
     },
 
     #[clap(about = "Create VPC infrastructure using CDK")]
@@ -325,7 +325,7 @@ pub enum DeployCommand {
     #[clap(about = "Show bootstrap progress for a VPC deployment")]
     BootstrapProgress {
         #[clap(long, value_enum, default_value = "aws")]
-        vpc_target: xtask_common::DeployTarget,
+        deploy_target: xtask_common::DeployTarget,
     },
 
     #[clap(about = "Create cluster from a cluster.toml config file")]
@@ -726,7 +726,7 @@ async fn main() -> CmdResult {
                 zig_extra_build,
                 api_server_build_env,
             } => cmd_deploy::build(target, release, &zig_extra_build, &api_server_build_env)?,
-            DeployCommand::Upload { vpc_target } => cmd_deploy::upload(vpc_target)?,
+            DeployCommand::Upload { deploy_target } => cmd_deploy::upload(deploy_target)?,
             DeployCommand::CreateVpc {
                 template,
                 num_api_servers,
@@ -759,8 +759,8 @@ async fn main() -> CmdResult {
                 watch_bootstrap,
             })?,
             DeployCommand::DestroyVpc => cmd_deploy::destroy_vpc()?,
-            DeployCommand::BootstrapProgress { vpc_target } => {
-                cmd_deploy::bootstrap::show_progress(vpc_target)?
+            DeployCommand::BootstrapProgress { deploy_target } => {
+                cmd_deploy::bootstrap::show_progress(deploy_target)?
             }
             DeployCommand::CreateCluster {
                 config,
