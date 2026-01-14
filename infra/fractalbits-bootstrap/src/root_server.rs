@@ -102,6 +102,10 @@ fn bootstrap_leader(
         initialize_az_status(config, remote_az)?;
     }
 
+    // Initialize NSS role states in service discovery BEFORE starting RSS
+    // This ensures the observer state exists when RSS starts
+    initialize_nss_roles(config, nss_a_id, nss_b_id)?;
+
     create_rss_config(config, nss_endpoint, ha_enabled)?;
     create_systemd_unit_file("rss", true)?;
     register_service(config, "root-server")?;
@@ -121,9 +125,6 @@ fn bootstrap_leader(
         create_s3_express_bucket(&local_az, S3EXPRESS_LOCAL_BUCKET_CONFIG)?;
         create_s3_express_bucket(remote_az, S3EXPRESS_REMOTE_BUCKET_CONFIG)?;
     }
-
-    // Initialize NSS role states in service discovery
-    initialize_nss_roles(config, nss_a_id, nss_b_id)?;
 
     // Complete RSS initialized stage - signals NSS and other services can proceed
     barrier.complete_global_stage(stages::RSS_INITIALIZED, None)?;
@@ -169,45 +170,50 @@ fn initialize_nss_roles(
     nss_a_id: &str,
     nss_b_id: Option<&str>,
 ) -> CmdResult {
-    info!("Initializing NSS role states in service discovery");
+    info!("Initializing observer state in service discovery");
 
-    let nss_roles_json = if let Some(nss_b_id) = nss_b_id {
-        info!("Setting {nss_a_id} as active");
-        info!("Setting {nss_b_id} as standby");
-        format!(r#"{{"states":{{"{nss_a_id}":"active","{nss_b_id}":"standby"}}}}"#)
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+
+    // Create ObserverPersistentState JSON
+    let observer_state_json = if let Some(nss_b_id) = nss_b_id {
+        // HA mode: active/standby
+        info!("HA mode: {nss_a_id} as active NSS, {nss_b_id} as standby mirrord");
+        format!(
+            r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"active","network_address":null}},"mirrord_machine":{{"machine_id":"{nss_b_id}","running_service":"mirrord","expected_role":"standby","network_address":null}},"last_updated":{timestamp},"version":1}}"#
+        )
     } else {
-        info!("Setting {nss_a_id} as solo");
-        format!(r#"{{"states":{{"{nss_a_id}":"solo"}}}}"#)
+        // Solo mode: single NSS
+        info!("Solo mode: {nss_a_id} as solo NSS");
+        format!(
+            r#"{{"observer_state":"solo","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"solo","network_address":null}},"mirrord_machine":{{"machine_id":"","running_service":"mirrord","expected_role":"","network_address":null}},"last_updated":{timestamp},"version":1}}"#
+        )
     };
 
     if config.is_etcd_backend() {
         let etcdctl = format!("{BIN_PATH}etcdctl");
         let etcd_endpoints = get_etcd_endpoints_from_workflow(config)?;
-        let key = "/fractalbits-service-discovery/nss_roles";
-        run_cmd!($etcdctl --endpoints=$etcd_endpoints put $key $nss_roles_json >/dev/null)?;
+        let key = "/fractalbits-service-discovery/observer_state";
+        run_cmd!($etcdctl --endpoints=$etcd_endpoints put $key $observer_state_json >/dev/null)?;
     } else {
         let region = get_current_aws_region()?;
-        let nss_roles_item = if let Some(nss_b_id) = nss_b_id {
-            format!(
-                r#"{{"service_id":{{"S":"{}"}},"states":{{"M":{{"{nss_a_id}":{{"S":"active"}},"{nss_b_id}":{{"S":"standby"}}}}}}}}"#,
-                NSS_ROLES_KEY
-            )
-        } else {
-            format!(
-                r#"{{"service_id":{{"S":"{}"}},"states":{{"M":{{"{nss_a_id}":{{"S":"solo"}}}}}}}}"#,
-                NSS_ROLES_KEY
-            )
-        };
+        // Escape JSON for DynamoDB attribute value
+        let escaped_json = observer_state_json.replace('"', r#"\""#);
+        let observer_state_item = format!(
+            r#"{{"service_id":{{"S":"observer_state"}},"state":{{"S":"{escaped_json}"}},"version":{{"N":"1"}}}}"#
+        );
 
         run_cmd! {
             aws dynamodb put-item
                 --table-name $DDB_SERVICE_DISCOVERY_TABLE
-                --item $nss_roles_item
+                --item $observer_state_item
                 --region $region
         }?;
     }
 
-    info!("NSS roles initialized in service discovery");
+    info!("Observer state initialized in service discovery");
     Ok(())
 }
 
