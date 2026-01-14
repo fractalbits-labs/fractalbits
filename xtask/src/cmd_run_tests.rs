@@ -55,15 +55,14 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
     };
 
     let test_nss_ha_failover = || async {
+        // Test with etcd backend
         info!("Testing NSS HA failover with etcd backend...");
-        let etcd_config = InitConfig {
-            rss_backend: RssBackend::Etcd,
-            ..Default::default()
-        };
-        cmd_service::init_service(ServiceName::All, BuildMode::Debug, etcd_config)?;
-        cmd_service::start_service(ServiceName::Etcd)?;
-        nss_ha_failover::run_nss_ha_failover_tests().await?;
-        cmd_service::stop_service(ServiceName::Etcd)?;
+        nss_ha_failover::run_nss_ha_failover_tests(RssBackend::Etcd).await?;
+
+        // Test with DDB backend
+        info!("Testing NSS HA failover with DDB backend...");
+        nss_ha_failover::run_nss_ha_failover_tests(RssBackend::Ddb).await?;
+
         Ok(())
     };
 

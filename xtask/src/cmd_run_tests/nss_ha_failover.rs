@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use test_common::*;
+use xtask_common::LOCAL_DDB_ENVS;
 
 const ETCD_SERVICE_DISCOVERY_PREFIX: &str = "/fractalbits-service-discovery/";
 
@@ -31,13 +32,45 @@ fn get_observer_state_from_etcd() -> Option<ObserverPersistentState> {
     }
 }
 
+fn get_observer_state_from_ddb() -> Option<ObserverPersistentState> {
+    let key_json = r#"{"service_id": {"S": "observer_state"}}"#;
+    let result = run_fun!(
+        $[LOCAL_DDB_ENVS]
+        aws dynamodb get-item
+            --table-name fractalbits-service-discovery
+            --key $key_json
+            --consistent-read
+            --output json
+    );
+    match result {
+        Ok(output) => {
+            let output = output.trim();
+            if output.is_empty() {
+                return None;
+            }
+            let json: serde_json::Value = serde_json::from_str(output).ok()?;
+            let state_str = json.get("Item")?.get("state")?.get("S")?.as_str()?;
+            serde_json::from_str(state_str).ok()
+        }
+        Err(_) => None,
+    }
+}
+
+fn get_observer_state(backend: RssBackend) -> Option<ObserverPersistentState> {
+    match backend {
+        RssBackend::Etcd => get_observer_state_from_etcd(),
+        RssBackend::Ddb => get_observer_state_from_ddb(),
+    }
+}
+
 fn wait_for_observer_state(
+    backend: RssBackend,
     expected_state: ObserverState,
     timeout_secs: u64,
 ) -> Option<ObserverPersistentState> {
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(timeout_secs) {
-        let state = get_observer_state_from_etcd();
+        let state = get_observer_state(backend);
         if state
             .as_ref()
             .is_some_and(|s| s.observer_state == expected_state)
@@ -60,14 +93,17 @@ fn kill_nss_process() -> CmdResult {
     Ok(())
 }
 
-pub async fn run_nss_ha_failover_tests() -> CmdResult {
-    info!("Running NSS HA failover tests...");
+pub async fn run_nss_ha_failover_tests(backend: RssBackend) -> CmdResult {
+    info!(
+        "Running NSS HA failover tests with {} backend...",
+        backend.as_ref()
+    );
 
     // Clean up any previous runs
     let _ = stop_service(ServiceName::All);
 
     println!("{}", "=== Test 1: Full Stack Initialization ===".bold());
-    if let Err(e) = test_full_stack_initialization().await {
+    if let Err(e) = test_full_stack_initialization(backend).await {
         let _ = stop_service(ServiceName::All);
         eprintln!("{}: {}", "Test 1 FAILED".red().bold(), e);
         return Err(e);
@@ -77,21 +113,21 @@ pub async fn run_nss_ha_failover_tests() -> CmdResult {
         "{}",
         "=== Test 2: api_server During NSS Failover (Concurrent Operations) ===".bold()
     );
-    if let Err(e) = test_api_server_during_nss_failover().await {
+    if let Err(e) = test_api_server_during_nss_failover(backend).await {
         let _ = stop_service(ServiceName::All);
         eprintln!("{}: {}", "Test 2 FAILED".red().bold(), e);
         return Err(e);
     }
 
     println!("{}", "=== Test 3: Mirrord Recovery ===".bold());
-    if let Err(e) = test_mirrord_recovery().await {
+    if let Err(e) = test_mirrord_recovery(backend).await {
         let _ = stop_service(ServiceName::All);
         eprintln!("{}: {}", "Test 3 FAILED".red().bold(), e);
         return Err(e);
     }
 
     println!("{}", "=== Test 4: Observer Restart ===".bold());
-    if let Err(e) = test_observer_restart().await {
+    if let Err(e) = test_observer_restart(backend).await {
         let _ = stop_service(ServiceName::All);
         eprintln!("{}: {}", "Test 4 FAILED".red().bold(), e);
         return Err(e);
@@ -102,19 +138,24 @@ pub async fn run_nss_ha_failover_tests() -> CmdResult {
 
     println!(
         "{}",
-        "=== All NSS HA Failover Tests PASSED ===".green().bold()
+        format!(
+            "=== All NSS HA Failover Tests ({}) PASSED ===",
+            backend.as_ref()
+        )
+        .green()
+        .bold()
     );
     Ok(())
 }
 
-async fn test_full_stack_initialization() -> CmdResult {
+async fn test_full_stack_initialization(backend: RssBackend) -> CmdResult {
     info!("Initializing services with JournalType::Nvme...");
 
     // JournalType::Nvme enables active/standby mode with mirrord
     // Observer is automatically enabled for this journal type
     let init_config = InitConfig {
         journal_type: JournalType::Nvme,
-        rss_backend: RssBackend::Etcd,
+        rss_backend: backend,
         data_blob_storage: DataBlobStorage::AllInBssSingleAz,
         bss_count: 1,
         nss_disable_restart_limit: true,
@@ -124,9 +165,9 @@ async fn test_full_stack_initialization() -> CmdResult {
     start_service(ServiceName::All)?;
 
     // Verify initial state is active_standby
-    let state = wait_for_observer_state(ObserverState::ActiveStandby, 15);
+    let state = wait_for_observer_state(backend, ObserverState::ActiveStandby, 15);
     if state.is_none() {
-        let current = get_observer_state_from_etcd();
+        let current = get_observer_state(backend);
         return Err(Error::other(format!(
             "Observer did not create initial active_standby state. Current state: {:?}",
             current.map(|s| s.observer_state)
@@ -162,14 +203,14 @@ async fn test_full_stack_initialization() -> CmdResult {
     Ok(())
 }
 
-async fn test_mirrord_recovery() -> CmdResult {
+async fn test_mirrord_recovery(backend: RssBackend) -> CmdResult {
     info!("Testing mirrord recovery to active_standby...");
 
     // Wait for state to stabilize (active_degraded is transient)
     info!("Waiting for observer state to stabilize...");
     let mut stable_state: Option<ObserverPersistentState> = None;
     for i in 0..30 {
-        let state = get_observer_state_from_etcd();
+        let state = get_observer_state(backend);
         if let Some(s) = state {
             let state_name = s.observer_state;
             info!("Attempt {}: observer state = {}", i + 1, state_name);
@@ -192,7 +233,7 @@ async fn test_mirrord_recovery() -> CmdResult {
     let state = match stable_state {
         Some(s) => s,
         None => {
-            let current = get_observer_state_from_etcd();
+            let current = get_observer_state(backend);
             return Err(Error::other(format!(
                 "Observer state did not stabilize. Current: {:?}",
                 current.map(|s| s.observer_state)
@@ -255,9 +296,9 @@ async fn test_mirrord_recovery() -> CmdResult {
 
     // Wait for observer to detect recovery and transition back to active_standby
     info!("Waiting for observer to detect recovery and transition to active_standby...");
-    let state = wait_for_observer_state(ObserverState::ActiveStandby, 30);
+    let state = wait_for_observer_state(backend, ObserverState::ActiveStandby, 30);
     if state.is_none() {
-        let current = get_observer_state_from_etcd();
+        let current = get_observer_state(backend);
         return Err(Error::other(format!(
             "Observer did not recover to active_standby. Current state: {:?}",
             current.map(|s| format!("{} (version {})", s.observer_state, s.version))
@@ -281,13 +322,13 @@ async fn test_mirrord_recovery() -> CmdResult {
     Ok(())
 }
 
-async fn test_observer_restart() -> CmdResult {
+async fn test_observer_restart(backend: RssBackend) -> CmdResult {
     info!("Testing RSS/observer restart and state persistence...");
 
     // Get current state version
-    let state_before = get_observer_state_from_etcd();
+    let state_before = get_observer_state(backend);
     if state_before.is_none() {
-        return Err(Error::other("No observer state found in etcd"));
+        return Err(Error::other("No observer state found in backend"));
     }
     let version_before = state_before.as_ref().unwrap().version;
     let state_name_before = state_before.as_ref().unwrap().observer_state;
@@ -301,7 +342,7 @@ async fn test_observer_restart() -> CmdResult {
     stop_service(ServiceName::Rss)?;
     std::thread::sleep(Duration::from_secs(2));
 
-    // Restart RSS (observer should load state from etcd)
+    // Restart RSS (observer should load state from backend)
     info!("Restarting RSS service...");
     start_service(ServiceName::Rss)?;
 
@@ -309,7 +350,7 @@ async fn test_observer_restart() -> CmdResult {
     std::thread::sleep(Duration::from_secs(5));
 
     // Verify state is still valid
-    let state_after = get_observer_state_from_etcd();
+    let state_after = get_observer_state(backend);
     if state_after.is_none() {
         return Err(Error::other("Observer state missing after restart"));
     }
@@ -344,12 +385,12 @@ async fn test_observer_restart() -> CmdResult {
     Ok(())
 }
 
-async fn test_api_server_during_nss_failover() -> CmdResult {
+async fn test_api_server_during_nss_failover(backend: RssBackend) -> CmdResult {
     info!("Testing api_server with continuous GET requests during NSS failover...");
 
     // Step 1: Verify starting state is active_standby
     info!("Step 1: Verifying active_standby state...");
-    let state = get_observer_state_from_etcd();
+    let state = get_observer_state(backend);
     if state.is_none() || state.as_ref().unwrap().observer_state != ObserverState::ActiveStandby {
         return Err(Error::other(
             "Expected active_standby state before testing failover",
@@ -494,9 +535,9 @@ async fn test_api_server_during_nss_failover() -> CmdResult {
 
     // Step 5: Wait for failover to complete
     info!("Step 5: Waiting for failover to solo_degraded...");
-    let state = wait_for_observer_state(ObserverState::SoloDegraded, 30);
+    let state = wait_for_observer_state(backend, ObserverState::SoloDegraded, 30);
     if state.is_none() {
-        let current = get_observer_state_from_etcd();
+        let current = get_observer_state(backend);
         return Err(Error::other(format!(
             "Observer did not transition to solo_degraded. Current state: {:?}",
             current.map(|s| format!("{} (version {})", s.observer_state, s.version))
