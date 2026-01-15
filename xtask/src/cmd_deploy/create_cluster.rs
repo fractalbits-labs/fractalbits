@@ -123,7 +123,6 @@ impl InputClusterConfig {
 
         let endpoints = ClusterEndpointsConfig {
             nss_endpoint,
-            mirrord_endpoint: None,
             api_server_endpoint: self
                 .endpoints
                 .as_ref()

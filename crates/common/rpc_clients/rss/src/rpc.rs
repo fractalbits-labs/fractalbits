@@ -176,7 +176,7 @@ impl RpcClient {
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
-    ) -> Result<(String, u64), RpcError> {
+    ) -> Result<(String, u64, Option<String>), RpcError> {
         let _guard = InflightRpcGuard::new("rss", "get_nss_role");
         let start = Instant::now();
         let body = GetNssRoleRequest {
@@ -205,11 +205,12 @@ impl RpcClient {
             PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
         let duration = start.elapsed();
         let version = resp.version;
+        let mirrord_endpoint = resp.mirrord_endpoint;
         match resp.result.unwrap() {
             rss_codec::get_nss_role_response::Result::Role(role) => {
                 histogram!("rss_rpc_nanos", "status" => "GetNssRole_Ok")
                     .record(duration.as_nanos() as f64);
-                Ok((role, version))
+                Ok((role, version, mirrord_endpoint))
             }
             rss_codec::get_nss_role_response::Result::Error(err) => {
                 histogram!("rss_rpc_nanos", "status" => "GetNssRole_Error")

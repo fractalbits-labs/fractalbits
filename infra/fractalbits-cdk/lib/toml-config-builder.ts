@@ -38,7 +38,6 @@ export function createConfigWithCfnTokens(props: {
   localAz: string;
   remoteAz?: string;
   nssEndpoint: string;
-  mirrordEndpoint?: string;
   apiServerEndpoint: string;
   nssA: InstanceProps;
   nssB?: InstanceProps;
@@ -118,9 +117,6 @@ export function createConfigWithCfnTokens(props: {
   lines.push("");
   lines.push("[endpoints]");
   lines.push(tomlLine("nss_endpoint", props.nssEndpoint));
-  if (props.mirrordEndpoint) {
-    lines.push(tomlLine("mirrord_endpoint", props.mirrordEndpoint));
-  }
   lines.push(tomlLine("api_server_endpoint", props.apiServerEndpoint));
 
   // [resources] section with CFN tokens

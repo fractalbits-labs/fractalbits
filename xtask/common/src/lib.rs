@@ -137,8 +137,6 @@ pub struct ClusterAwsConfig {
 pub struct ClusterEndpointsConfig {
     pub nss_endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mirrord_endpoint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_server_endpoint: Option<String>,
 }
 

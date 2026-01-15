@@ -15,25 +15,6 @@ pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: b
     let meta_stack_testing = config.global.meta_stack_testing;
     let journal_type = config.global.journal_type;
 
-    // Determine the peer's endpoint for this NSS instance
-    // For HA failover to work, each NSS needs to know the OTHER node's IP as mirrord_endpoint
-    let mirrord_endpoint: Option<&str> = if journal_type == JournalType::Nvme {
-        let resources = config.get_resources();
-        let instance_id = get_instance_id_from_config(config)?;
-        let is_standby = resources.nss_b_id.as_ref() == Some(&instance_id);
-
-        if is_standby {
-            // nss-B (standby): peer is nss-A, use nss_endpoint as mirrord target for failover
-            Some(&config.endpoints.nss_endpoint)
-        } else {
-            // nss-A (active): peer is nss-B, use mirrord_endpoint
-            config.endpoints.mirrord_endpoint.as_deref()
-        }
-    } else {
-        // Non-NVMe journal: no HA, no mirrord
-        None
-    };
-
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Nss)?;
 
     // Complete instances-ready stage
@@ -67,7 +48,7 @@ pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: b
     info!("Waiting for RSS to initialize...");
     barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
 
-    setup_configs(config, journal_type, volume_id, "nss", mirrord_endpoint)?;
+    setup_configs(config, journal_type, volume_id, "nss")?;
 
     // Format journal based on type
     match journal_type {
@@ -144,7 +125,6 @@ fn setup_configs(
     journal_type: JournalType,
     volume_id: Option<&str>,
     service_name: &str,
-    mirrord_endpoint: Option<&str>,
 ) -> CmdResult {
     // Journal-type specific config paths
     let (volume_dev, shared_dir) = match journal_type {
@@ -165,7 +145,7 @@ fn setup_configs(
 
     // Common configs
     create_coredump_config()?;
-    create_nss_role_agent_config(config, mirrord_endpoint)?;
+    create_nss_role_agent_config(config)?;
     create_systemd_unit_file("nss_role_agent", false)?;
 
     // Systemd units - NVMe needs journal_type for local mount dependency
@@ -293,10 +273,7 @@ pub(crate) fn format_nss(create_journal_dir: bool) -> CmdResult {
     Ok(())
 }
 
-fn create_nss_role_agent_config(
-    config: &BootstrapConfig,
-    mirrord_endpoint: Option<&str>,
-) -> CmdResult {
+fn create_nss_role_agent_config(config: &BootstrapConfig) -> CmdResult {
     let rss_ha_enabled = config.global.rss_ha_enabled;
     let instance_id = get_instance_id_from_config(config)?;
     let private_ip = get_private_ip()?;
@@ -311,19 +288,15 @@ fn create_nss_role_agent_config(
         .collect::<Vec<_>>()
         .join(", ");
 
-    // mirrord_endpoint is only set in HA mode (NVMe journal with active/standby)
-    let mirrord_endpoint_line = mirrord_endpoint
-        .map(|ep| format!("mirrord_endpoint = \"{ep}\"\n"))
-        .unwrap_or_default();
-
+    // mirrord_endpoint is fetched from RSS at runtime, not configured here
     let config_content = format!(
         r##"# NSS Role Agent Configuration
-# Role is fetched from RSS at startup, not configured here
+# Role and mirrord_endpoint are fetched from RSS at startup
 
 rss_addrs = [{rss_addrs_toml}]
 instance_id = "{instance_id}"
 network_address = "{private_ip}:{nss_port}"
-{mirrord_endpoint_line}"##
+"##
     );
 
     run_cmd! {

@@ -118,6 +118,7 @@ message GetNssRoleResponse {
     string error = 2;
   }
   uint64 version = 3;
+  optional string mirrord_endpoint = 4;  // IP address of mirrord (for active NSS role)
 }
 
 // GetAzStatus - Query AZ availability status from service-discovery table
