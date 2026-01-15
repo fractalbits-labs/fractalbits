@@ -1,5 +1,5 @@
 use crate::cmd_build::get_build_envs;
-use crate::etcd_utils::ensure_etcd_local;
+use crate::etcd_utils::{ensure_etcd_local, resolve_etcd_bin};
 use crate::*;
 use cmd_lib::*;
 use std::io::Error;
@@ -98,10 +98,10 @@ fn build_docker_image(
         }
     }
 
-    run_cmd! {
-        cp third_party/etcd/etcd $bin_staging/;
-        cp third_party/etcd/etcdctl $bin_staging/;
-    }?;
+    for bin in ["etcd", "etcdctl"] {
+        let bin_path = resolve_etcd_bin(bin);
+        run_cmd!(cp $bin_path $bin_staging/)?;
+    }
 
     write_dockerfile(staging_dir)?;
 
