@@ -157,7 +157,7 @@ pub fn build_all(release: bool) -> CmdResult {
     Ok(())
 }
 
-/// Build only what's needed for Docker container (api_server, root_server, rss_admin, zig servers)
+/// Build only what's needed for Docker container (api_server, nss_role_agent, root_server, rss_admin, zig servers)
 pub fn build_for_docker(release: bool) -> CmdResult {
     let build_envs = get_build_envs();
     let build_flag = if release { "--release" } else { "" };
@@ -167,7 +167,8 @@ pub fn build_for_docker(release: bool) -> CmdResult {
         info "Building rust binaries for Docker...";
         $[build_envs] cargo build $build_flag
             -p api_server
-            -p container-all-in-one;
+            -p container-all-in-one
+            -p nss_role_agent;
     }?;
 
     // Build root_server packages if they exist

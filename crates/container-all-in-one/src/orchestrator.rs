@@ -65,9 +65,9 @@ impl Orchestrator {
 
         // Phase 3: Init API key and format+start NSS in parallel
         // - init_test_api_key needs RSS
-        // - format_nss + start_nss needs BSS
+        // - format_nss + start_nss_role_agent needs BSS
         let phase_start = Instant::now();
-        info!("Initializing API key and starting nss_server in parallel");
+        info!("Initializing API key and starting nss_role_agent in parallel");
 
         let bin_dir = self.bin_dir.clone();
         let api_key_task = tokio::task::spawn_blocking(move || init_test_api_key_static(&bin_dir));
@@ -76,7 +76,7 @@ impl Orchestrator {
         self.format_nss()?;
         info!("format_nss completed in {:?}", format_start.elapsed());
 
-        self.start_nss()?;
+        self.start_nss_role_agent()?;
 
         let (api_key_res, nss_result) = tokio::join!(api_key_task, wait_for_port_async(8087, 60));
         api_key_res.context("API key init task panicked")??;
@@ -206,24 +206,24 @@ impl Orchestrator {
         Ok(())
     }
 
-    fn start_nss(&mut self) -> Result<()> {
-        let mut child = Command::new(self.bin_dir.join("nss_server"))
-            .arg("serve")
-            .env("WORKING_DIR", self.data_dir.join("nss-A"))
-            .env("NSS_ROLE", "solo")
-            .env("METADATA_VG_CONFIG", generate_bss_metadata_vg_config(1))
+    fn start_nss_role_agent(&mut self) -> Result<()> {
+        let mut child = Command::new(self.bin_dir.join("nss_role_agent"))
+            .env("INSTANCE_ID", "nss-A")
+            .env("APP_SERVICE_MANAGER_BACKEND", "direct")
+            .env("APP_WORKING_DIR", self.data_dir.join("nss-A"))
+            .env("RUST_LOG", "info")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
 
         if let Some(stdout) = child.stdout.take() {
-            self.spawn_output_streamer("nss_server", stdout);
+            self.spawn_output_streamer("nss_role_agent", stdout);
         }
         if let Some(stderr) = child.stderr.take() {
-            self.spawn_output_streamer("nss_server", stderr);
+            self.spawn_output_streamer("nss_role_agent", stderr);
         }
 
-        self.children.push(("nss_server", child));
+        self.children.push(("nss_role_agent", child));
         Ok(())
     }
 

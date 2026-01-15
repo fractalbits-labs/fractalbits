@@ -48,7 +48,7 @@ fn build_docker_image(
         cmd_build::build_for_docker(release)?;
     } else {
         info!("Using prebuilt binaries from prebuilt/ directory");
-        run_cmd!($[build_envs] cargo build $build_flag -p api_server -p container-all-in-one)?;
+        run_cmd!($[build_envs] cargo build $build_flag -p api_server -p container-all-in-one -p nss_role_agent)?;
     }
 
     info!("Ensuring etcd binary...");
@@ -61,7 +61,7 @@ fn build_docker_image(
     }?;
 
     // Copy binaries built in this repo
-    let local_rust_binaries = ["api_server", "container-all-in-one"];
+    let local_rust_binaries = ["api_server", "container-all-in-one", "nss_role_agent"];
     for rust_bin in &local_rust_binaries {
         run_cmd!(cp $target_dir/$rust_bin $bin_staging/)?;
     }
