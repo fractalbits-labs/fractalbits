@@ -62,9 +62,10 @@ fn download_etcd_for_arch(etcd_arch: &str) -> CmdResult {
 
 fn download_and_extract_to_deploy_dir(arch: &str, etcd_arch: &str) -> CmdResult {
     download_etcd_for_arch(etcd_arch)?;
-    let deploy_dir = format!("prebuilt/deploy/{arch}");
+    let deploy_dir = format!("prebuilt/deploy/generic/{arch}");
     run_cmd! {
         info "Extracting etcd binaries to $deploy_dir for $etcd_arch";
+        mkdir -p $deploy_dir;
         cp third_party/etcd-$ETCD_VERSION-linux-$etcd_arch/etcd $deploy_dir/etcd;
         cp third_party/etcd-$ETCD_VERSION-linux-$etcd_arch/etcdctl $deploy_dir/etcdctl;
     }?;

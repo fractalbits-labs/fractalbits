@@ -55,4 +55,4 @@ pub(super) const RUST_BINS: &[&str] = &[
     "rewrk_rpc",
 ];
 
-pub(super) const ZIG_BINS: &[&str] = &["nss_server", "bss_server", "mirrord", "test_fractal_art"];
+pub(super) const ZIG_BINS: &[&str] = &["nss_server", "bss_server", "mirrord"];

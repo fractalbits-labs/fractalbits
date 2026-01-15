@@ -1,6 +1,7 @@
 use crate::etcd_utils::download_etcd_for_deploy;
 use crate::*;
 use std::path::Path;
+use xtask_common::DeployTarget as UploadTarget;
 
 use super::common::{ARCH_TARGETS, ArchTarget, RUST_BINS, ZIG_BINS};
 
@@ -16,15 +17,6 @@ pub fn build(
         ("", "", "debug")
     };
 
-    // Format Zig extra build options as -Dkey=value
-    // Always include journal_atomic_write_size=16384 (16KB) for deployment
-    let mut zig_build_with_defaults = vec!["journal_atomic_write_size=16384".to_string()];
-    zig_build_with_defaults.extend_from_slice(zig_extra_build);
-    let zig_extra_opts: &Vec<String> = &zig_build_with_defaults
-        .iter()
-        .map(|opt| format!("-D{}", opt))
-        .collect();
-
     // Ensure required Rust targets are installed
     run_cmd! {
         info "Ensuring required Rust targets are installed";
@@ -32,10 +24,12 @@ pub fn build(
         rustup target add aarch64-unknown-linux-gnu;
     }?;
 
-    // Create deploy directories for all arch targets
+    // Create deploy directories: generic (shared), aws, and on_prem
     for target in ARCH_TARGETS {
-        let deploy_dir = format!("prebuilt/deploy/{}", target.arch);
-        run_cmd!(mkdir -p $deploy_dir)?;
+        let generic_dir = get_generic_deploy_dir(target);
+        let aws_dir = get_zig_deploy_dir(UploadTarget::Aws, target);
+        let on_prem_dir = get_zig_deploy_dir(UploadTarget::OnPrem, target);
+        run_cmd!(mkdir -p $generic_dir $aws_dir $on_prem_dir)?;
     }
 
     // Build fractalbits-bootstrap separately for each architecture without CPU flags
@@ -51,11 +45,11 @@ pub fn build(
         build_rust(rust_build_opt, build_dir, api_server_build_env)?;
     }
 
-    // Build Zig projects for all CPU targets
+    // Build Zig projects for all CPU targets (for both aws and on_prem)
     if matches!(deploy_target, DeployTarget::Zig | DeployTarget::All)
         && Path::new(ZIG_REPO_PATH).exists()
     {
-        build_zig(zig_build_opt, build_dir, zig_extra_opts)?;
+        build_zig(zig_build_opt, build_dir, zig_extra_build)?;
     }
 
     // Build and copy UI
@@ -86,20 +80,30 @@ fn build_bootstrap(rust_build_opt: &str, build_dir: &str) -> CmdResult {
                 -p fractalbits-bootstrap --target $rust_target $rust_build_opt;
         }?;
 
-        // Copy fractalbits-bootstrap to arch-level directory
+        // Copy fractalbits-bootstrap to generic directory
         let src_path = format!("target/{}/{}/fractalbits-bootstrap", rust_target, build_dir);
-        let dst_path = format!("prebuilt/deploy/{}/fractalbits-bootstrap", arch);
+        let generic_dir = format!("prebuilt/deploy/generic/{}", arch);
+        let dst_path = format!("{}/fractalbits-bootstrap", generic_dir);
         run_cmd! {
-            mkdir -p prebuilt/deploy/$arch;
+            mkdir -p $generic_dir;
             cp $src_path $dst_path;
         }?;
     }
     Ok(())
 }
 
-/// Get deploy directory for an arch target: prebuilt/deploy/{arch}/
-fn get_deploy_dir(target: &ArchTarget) -> String {
-    format!("prebuilt/deploy/{}", target.arch)
+/// Get generic deploy directory for shared binaries: prebuilt/deploy/generic/{arch}/
+fn get_generic_deploy_dir(target: &ArchTarget) -> String {
+    format!("prebuilt/deploy/generic/{}", target.arch)
+}
+
+/// Get Zig deploy directory for target-specific binaries: prebuilt/deploy/{aws|on_prem}/{arch}/
+fn get_zig_deploy_dir(upload_target: UploadTarget, target: &ArchTarget) -> String {
+    let deploy_name = match upload_target {
+        UploadTarget::Aws => "aws",
+        UploadTarget::OnPrem => "on_prem",
+    };
+    format!("prebuilt/deploy/{}/{}", deploy_name, target.arch)
 }
 
 fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[String]) -> CmdResult {
@@ -145,7 +149,7 @@ fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[Str
 }
 
 fn copy_rust_binaries(target: &ArchTarget, rust_target: &str, build_dir: &str) -> CmdResult {
-    let deploy_dir = get_deploy_dir(target);
+    let deploy_dir = get_generic_deploy_dir(target);
     for bin in RUST_BINS {
         if *bin != "fractalbits-bootstrap" {
             let src_path = format!("target/{}/{}/{}", rust_target, build_dir, bin);
@@ -158,35 +162,57 @@ fn copy_rust_binaries(target: &ArchTarget, rust_target: &str, build_dir: &str) -
     Ok(())
 }
 
-fn build_zig(zig_build_opt: &str, build_dir: &str, zig_extra_opts: &Vec<String>) -> CmdResult {
-    info!("Building Zig projects for all arch targets");
+fn build_zig(zig_build_opt: &str, build_dir: &str, zig_extra_build: &[String]) -> CmdResult {
+    info!("Building Zig projects for all arch targets (aws and on_prem)");
     let build_envs = cmd_build::get_build_envs();
 
-    for target in ARCH_TARGETS {
-        let zig_out_dir = format!(
-            "target/{}/{build_dir}/zig-out-{}",
-            target.rust_target, target.arch
-        );
+    // Build for each deploy target with different atomic_write_size
+    for upload_target in [UploadTarget::Aws, UploadTarget::OnPrem] {
+        let (atomic_write_size, deploy_name) = match upload_target {
+            UploadTarget::Aws => (16384, "aws"),
+            UploadTarget::OnPrem => (4096, "on_prem"),
+        };
 
-        let zig_target = target.zig_target;
-        let zig_cpu = target.zig_cpu;
-        let arch = target.arch;
-        run_cmd! {
-            info "Building Zig projects for $zig_target ($arch, cpu=$zig_cpu)";
-            cd $ZIG_REPO_PATH;
-            $[build_envs] zig build
-                -p ../$zig_out_dir
-                -Dtarget=$zig_target -Dcpu=$zig_cpu $zig_build_opt $[zig_extra_opts] 2>&1;
-        }?;
+        // Format Zig build options with target-specific atomic_write_size
+        let mut zig_build_with_defaults =
+            vec![format!("journal_atomic_write_size={}", atomic_write_size)];
+        zig_build_with_defaults.extend(zig_extra_build.iter().cloned());
+        let zig_extra_opts: Vec<String> = zig_build_with_defaults
+            .iter()
+            .map(|opt| format!("-D{}", opt))
+            .collect();
 
-        // Copy Zig binaries to deploy directory
-        copy_zig_binaries(target, &zig_out_dir)?;
+        for target in ARCH_TARGETS {
+            let zig_out_dir = format!(
+                "target/{}/{build_dir}/zig-out-{}-{}",
+                target.rust_target, deploy_name, target.arch
+            );
+
+            let zig_target = target.zig_target;
+            let zig_cpu = target.zig_cpu;
+            let arch = target.arch;
+            let zig_opts = zig_extra_opts.clone();
+            run_cmd! {
+                info "Building Zig projects for $zig_target ($arch, cpu=$zig_cpu, $deploy_name, atomic_write_size=$atomic_write_size)";
+                cd $ZIG_REPO_PATH;
+                $[build_envs] zig build
+                    -p ../$zig_out_dir
+                    -Dtarget=$zig_target -Dcpu=$zig_cpu $zig_build_opt $[zig_opts] 2>&1;
+            }?;
+
+            // Copy Zig binaries to target-specific deploy directory
+            copy_zig_binaries(upload_target, target, &zig_out_dir)?;
+        }
     }
     Ok(())
 }
 
-fn copy_zig_binaries(target: &ArchTarget, zig_out_dir: &str) -> CmdResult {
-    let deploy_dir = get_deploy_dir(target);
+fn copy_zig_binaries(
+    upload_target: UploadTarget,
+    target: &ArchTarget,
+    zig_out_dir: &str,
+) -> CmdResult {
+    let deploy_dir = get_zig_deploy_dir(upload_target, target);
     for bin in ZIG_BINS {
         let src_path = format!("{}/bin/{}", zig_out_dir, bin);
         let dst_path = format!("{}/{}", deploy_dir, bin);
@@ -234,8 +260,8 @@ fn download_warp_binaries() -> CmdResult {
             rm -f warp_checksums.txt;
         }?;
 
-        // Extract warp to arch-level directory
-        let deploy_dir = format!("prebuilt/deploy/{}", arch);
+        // Extract warp to generic directory
+        let deploy_dir = format!("prebuilt/deploy/generic/{}", arch);
         run_cmd! {
             info "Extracting warp binary to $deploy_dir for $linux_arch";
             tar -xzf third_party/minio/$warp_file -C $deploy_dir warp;

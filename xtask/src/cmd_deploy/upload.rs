@@ -23,12 +23,36 @@ chmod +x /opt/fractalbits/bin/fractalbits-bootstrap
 /opt/fractalbits/bin/fractalbits-bootstrap {bucket_name}"#
     );
 
+    // Determine target-specific directory based on deploy target
+    let target_dir = match deploy_target {
+        DeployTarget::Aws => "aws",
+        DeployTarget::OnPrem => "on_prem",
+    };
+
+    // Upload bootstrap script and sync binaries
+    // First sync generic binaries, then overlay with target-specific Zig binaries
     run_cmd! {
         echo $boostrap_script_content | aws s3 cp - "s3://$bucket_name/bootstrap.sh";
-        info "Syncing all binaries to S3 bucket $bucket_name";
-        aws s3 sync prebuilt/deploy "s3://$bucket_name";
-        info "Syncing all binaries is done";
     }?;
+
+    for arch in ["x86_64", "aarch64"] {
+        run_cmd! {
+            info "Syncing generic binaries for $arch to S3 bucket $bucket_name";
+            aws s3 sync prebuilt/deploy/generic/$arch "s3://$bucket_name/$arch";
+            info "Syncing $target_dir Zig binaries for $arch to S3 bucket $bucket_name";
+            aws s3 sync prebuilt/deploy/$target_dir/$arch "s3://$bucket_name/$arch";
+        }?;
+    }
+
+    // Sync UI if it exists
+    if std::path::Path::new("prebuilt/deploy/ui").exists() {
+        run_cmd! {
+            info "Syncing UI to S3 bucket $bucket_name";
+            aws s3 sync prebuilt/deploy/ui "s3://$bucket_name/ui";
+        }?;
+    }
+
+    info!("Syncing all binaries is done");
     Ok(())
 }
 

@@ -22,7 +22,7 @@ pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: b
 
     install_rpms(&["nvme-cli", "mdadm"])?;
     if meta_stack_testing || for_bench {
-        let _ = download_binaries(config, &["test_fractal_art", "rewrk_rpc"]);
+        let _ = download_binaries(config, &["rewrk_rpc"]);
     }
     format_local_nvme_disks(false)?;
 

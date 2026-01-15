@@ -42,7 +42,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
 
     if for_bench {
         // Try to download tools for micro-benchmarking
-        let _ = download_binaries(config, &["rewrk_rpc", "test_fractal_art"]);
+        let _ = download_binaries(config, &["rewrk_rpc"]);
     }
 
     if config.global.deploy_target == DeployTarget::Aws {
