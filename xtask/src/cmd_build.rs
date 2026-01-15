@@ -167,9 +167,16 @@ pub fn build_for_docker(release: bool) -> CmdResult {
         info "Building rust binaries for Docker...";
         $[build_envs] cargo build $build_flag
             -p api_server
-            -p container-all-in-one
-            -p nss_role_agent;
+            -p container-all-in-one;
     }?;
+
+    // Build ha packages if they exist
+    if Path::new("crates/ha").exists() {
+        run_cmd! {
+            $[build_envs] cargo build $build_flag
+                -p nss_role_agent;
+        }?;
+    }
 
     // Build root_server packages if they exist
     if Path::new("crates/root_server").exists() {

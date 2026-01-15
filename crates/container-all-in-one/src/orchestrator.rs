@@ -78,7 +78,7 @@ impl Orchestrator {
 
         self.start_nss_role_agent()?;
 
-        let (api_key_res, nss_result) = tokio::join!(api_key_task, wait_for_port_async(8087, 60));
+        let (api_key_res, nss_result) = tokio::join!(api_key_task, wait_for_port_async(8087, 120));
         api_key_res.context("API key init task panicked")??;
         nss_result?;
         info!("Phase 3 (api_key+nss ready): {:?}", phase_start.elapsed());

@@ -48,7 +48,7 @@ fn build_docker_image(
         cmd_build::build_for_docker(release)?;
     } else {
         info!("Using prebuilt binaries from prebuilt/ directory");
-        run_cmd!($[build_envs] cargo build $build_flag -p api_server -p container-all-in-one -p nss_role_agent)?;
+        run_cmd!($[build_envs] cargo build $build_flag -p api_server -p container-all-in-one)?;
     }
 
     info!("Ensuring etcd binary...");
@@ -61,14 +61,14 @@ fn build_docker_image(
     }?;
 
     // Copy binaries built in this repo
-    let local_rust_binaries = ["api_server", "container-all-in-one", "nss_role_agent"];
+    let local_rust_binaries = ["api_server", "container-all-in-one"];
     for rust_bin in &local_rust_binaries {
         run_cmd!(cp $target_dir/$rust_bin $bin_staging/)?;
     }
 
     if all_from_source {
         // Use freshly built binaries, fall back to prebuilt if not found
-        let rust_binaries = ["root_server", "rss_admin"];
+        let rust_binaries = ["root_server", "rss_admin", "nss_role_agent"];
         for bin in &rust_binaries {
             let bin_path = format!("{target_dir}/{bin}");
             if std::path::Path::new(&bin_path).exists() {
@@ -92,7 +92,13 @@ fn build_docker_image(
         }
     } else {
         // Use prebuilt binaries for external repos
-        let prebuilt_binaries = ["root_server", "rss_admin", "bss_server", "nss_server"];
+        let prebuilt_binaries = [
+            "root_server",
+            "rss_admin",
+            "bss_server",
+            "nss_server",
+            "nss_role_agent",
+        ];
         for bin in &prebuilt_binaries {
             run_cmd!(cp prebuilt/$bin $bin_staging/)?;
         }
