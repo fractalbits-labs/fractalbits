@@ -12,9 +12,27 @@ const BLOB_DRAM_MEM_PERCENT: f64 = 0.8;
 const NSS_META_CACHE_SHARDS: usize = 256;
 
 pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: bool) -> CmdResult {
-    let mirrord_endpoint = config.endpoints.mirrord_endpoint.as_deref();
     let meta_stack_testing = config.global.meta_stack_testing;
     let journal_type = config.global.journal_type;
+
+    // Determine the peer's endpoint for this NSS instance
+    // For HA failover to work, each NSS needs to know the OTHER node's IP as mirrord_endpoint
+    let mirrord_endpoint: Option<&str> = if journal_type == JournalType::Nvme {
+        let resources = config.get_resources();
+        let instance_id = get_instance_id_from_config(config)?;
+        let is_standby = resources.nss_b_id.as_ref() == Some(&instance_id);
+
+        if is_standby {
+            // nss-B (standby): peer is nss-A, use nss_endpoint as mirrord target for failover
+            Some(&config.endpoints.nss_endpoint)
+        } else {
+            // nss-A (active): peer is nss-B, use mirrord_endpoint
+            config.endpoints.mirrord_endpoint.as_deref()
+        }
+    } else {
+        // Non-NVMe journal: no HA, no mirrord
+        None
+    };
 
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Nss)?;
 

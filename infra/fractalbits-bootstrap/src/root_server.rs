@@ -607,6 +607,18 @@ max_retry_attempts = 5
 
 # Enable monitoring and metrics collection
 enable_monitoring = true
+
+# Observer Configuration
+[observer]
+# Grace period (in seconds) before observer starts making state transitions
+# This should be long enough to allow all services to start during bootstrap
+initial_grace_period_secs = 120.0
+
+# How often to check health and evaluate state transitions (in seconds)
+heartbeat_interval_secs = 0.5
+
+# Health data older than this threshold is considered stale (in seconds)
+health_stale_threshold_secs = 5.0
 "##
     );
     run_cmd! {
