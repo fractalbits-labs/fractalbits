@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use cmd_lib::*;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -98,8 +97,12 @@ impl Orchestrator {
     }
 
     fn init_directories(&self) -> Result<()> {
-        fs::create_dir_all(self.data_dir.join("etcd"))?;
-        fs::create_dir_all(self.data_dir.join("logs"))?;
+        let data_dir = &self.data_dir;
+        run_cmd! {
+            mkdir -p $data_dir/etcd;
+            chmod 700 $data_dir/etcd; // Set restrictive permissions (700) to avoid etcd warning
+            mkdir -p $data_dir/logs;
+        }?;
 
         create_bss_dirs(&self.data_dir, 0, 1)?;
         create_nss_dirs(&self.data_dir, "nss-A")?;
@@ -109,6 +112,8 @@ impl Orchestrator {
 
     fn start_etcd(&mut self) -> Result<()> {
         let child = Command::new(self.bin_dir.join("etcd"))
+            .arg("--name")
+            .arg("fractalbits-etcd")
             .arg("--data-dir")
             .arg(self.data_dir.join("etcd"))
             .arg("--listen-client-urls")
