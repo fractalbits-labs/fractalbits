@@ -376,15 +376,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
       ? nssPrivateLink.endpointDns
       : `${instances["nss-A"].instancePrivateIp}`;
 
-    // Determine mirrord endpoint based on mode
-    // For single-AZ nvme, use direct IP of nss-B
-    const mirrordEndpoint =
-      multiAz && mirrordPrivateLink
-        ? mirrordPrivateLink.endpointDns
-        : props.journalType === "nvme" && instances["nss-B"]
-          ? `${instances["nss-B"].instancePrivateIp}`
-          : undefined;
-
     // Create api_server(s) in a ASG group
     const apiServerAsg = createEc2Asg(
       this,
@@ -486,14 +477,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
       description: "DNS name of the API NLB",
     });
 
-    // Output mirrord endpoint for multiAz mode or nvme journal type
-    if (mirrordEndpoint) {
-      new cdk.CfnOutput(this, "MirrordEndpointDns", {
-        value: mirrordEndpoint,
-        description: "Mirrord service endpoint",
-      });
-    }
-
     this.nlbLoadBalancerDnsName = nlb.loadBalancerDnsName;
 
     // Only output EBS volume IDs when journalType is "ebs"
@@ -560,7 +543,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
       localAz: azArray[0],
       remoteAz: multiAz ? azArray[1] : undefined,
       nssEndpoint: nssEndpoint,
-      mirrordEndpoint: mirrordEndpoint,
       apiServerEndpoint: nlb.loadBalancerDnsName,
       nssA: { id: instances["nss-A"].instanceId },
       nssB: instances["nss-B"]
