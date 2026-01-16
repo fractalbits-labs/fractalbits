@@ -171,11 +171,10 @@ fn create_nss_config(volume_dev: Option<&str>, shared_dir: &str) -> CmdResult {
     // Calculate total memory for blob_dram_kilo_bytes
     let blob_dram_kilo_bytes = (total_mem_kb as f64 * BLOB_DRAM_MEM_PERCENT) as u64;
 
-    // Calculate fa_journal_segment_size based on storage device size
-    let fa_journal_segment_size = if let Some(dev) = volume_dev {
-        ebs_journal::calculate_fa_journal_segment_size(dev)?
+    let fa_journal_segment_size = if volume_dev.is_some() {
+        ebs_journal::FA_JOURNAL_SEGMENT_SIZE
     } else {
-        nvme_journal::calculate_fa_journal_segment_size()?
+        nvme_journal::FA_JOURNAL_SEGMENT_SIZE
     };
 
     let num_cores = num_cpus()?;
@@ -207,11 +206,10 @@ meta_cache_shards = {NSS_META_CACHE_SHARDS}
 
 fn create_mirrord_config(volume_dev: Option<&str>, shared_dir: &str) -> CmdResult {
     let num_cores = run_fun!(nproc)?;
-    // Calculate fa_journal_segment_size based on storage device size
-    let fa_journal_segment_size = if let Some(dev) = volume_dev {
-        ebs_journal::calculate_fa_journal_segment_size(dev)?
+    let fa_journal_segment_size = if volume_dev.is_some() {
+        ebs_journal::FA_JOURNAL_SEGMENT_SIZE
     } else {
-        nvme_journal::calculate_fa_journal_segment_size()?
+        nvme_journal::FA_JOURNAL_SEGMENT_SIZE
     };
     let config_content = format!(
         r##"working_dir = "/data"

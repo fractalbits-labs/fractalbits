@@ -166,16 +166,18 @@ fn build_zig(zig_build_opt: &str, build_dir: &str, zig_extra_build: &[String]) -
     info!("Building Zig projects for all arch targets (aws and on_prem)");
     let build_envs = cmd_build::get_build_envs();
 
-    // Build for each deploy target with different atomic_write_size
+    // Build for each deploy target with different atomic_write_size and sampling_ratio
     for upload_target in [UploadTarget::Aws, UploadTarget::OnPrem] {
-        let (atomic_write_size, deploy_name) = match upload_target {
-            UploadTarget::Aws => (16384, "aws"),
-            UploadTarget::OnPrem => (4096, "on_prem"),
+        let (atomic_write_size, sampling_ratio, deploy_name) = match upload_target {
+            UploadTarget::Aws => (16384, 1, "aws"),
+            UploadTarget::OnPrem => (4096, 4, "on_prem"),
         };
 
-        // Format Zig build options with target-specific atomic_write_size
-        let mut zig_build_with_defaults =
-            vec![format!("journal_atomic_write_size={}", atomic_write_size)];
+        // Format Zig build options with target-specific settings
+        let mut zig_build_with_defaults = vec![
+            format!("journal_atomic_write_size={}", atomic_write_size),
+            format!("journal_sampling_ratio={}", sampling_ratio),
+        ];
         zig_build_with_defaults.extend(zig_extra_build.iter().cloned());
         let zig_extra_opts: Vec<String> = zig_build_with_defaults
             .iter()
