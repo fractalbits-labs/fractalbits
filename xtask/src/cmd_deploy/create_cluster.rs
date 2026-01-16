@@ -9,6 +9,8 @@ use xtask_common::{
     ClusterGlobalConfig, DataBlobStorage, DeployTarget, JournalType, NodeEntry, RssBackend,
 };
 
+use super::upload::upload_with_endpoint;
+
 #[derive(Debug, Deserialize)]
 pub struct InputClusterGlobal {
     #[serde(default = "default_region")]
@@ -175,7 +177,13 @@ pub fn create_cluster(
     cluster_config_path: &str,
     bootstrap_s3_url: &str,
     watch_bootstrap: bool,
+    skip_upload: bool,
 ) -> CmdResult {
+    if !skip_upload {
+        info!("Uploading binaries to S3 bootstrap bucket...");
+        upload_with_endpoint(DeployTarget::OnPrem, Some(bootstrap_s3_url))?;
+    }
+
     let config = InputClusterConfig::from_file(cluster_config_path)?;
 
     let total_nodes: usize = config.nodes.values().map(|v| v.len()).sum();

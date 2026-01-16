@@ -317,6 +317,9 @@ pub enum DeployCommand {
 
         #[clap(long, long_help = "Watch bootstrap progress inline after VPC creation")]
         watch_bootstrap: bool,
+
+        #[clap(long, long_help = "Skip uploading binaries (assume already uploaded)")]
+        skip_upload: bool,
     },
 
     #[clap(about = "Destroy VPC infrastructure (including s3 builds bucket cleanup)")]
@@ -341,6 +344,9 @@ pub enum DeployCommand {
             long_help = "Watch bootstrap progress inline after cluster creation"
         )]
         watch_bootstrap: bool,
+
+        #[clap(long, long_help = "Skip uploading binaries (assume already uploaded)")]
+        skip_upload: bool,
     },
 }
 
@@ -742,6 +748,7 @@ async fn main() -> CmdResult {
                 ssm_bootstrap,
                 journal_type,
                 watch_bootstrap,
+                skip_upload,
             } => cmd_deploy::create_vpc(cmd_deploy::VpcConfig {
                 template,
                 num_api_servers,
@@ -757,6 +764,7 @@ async fn main() -> CmdResult {
                 ssm_bootstrap,
                 journal_type,
                 watch_bootstrap,
+                skip_upload,
             })?,
             DeployCommand::DestroyVpc => cmd_deploy::destroy_vpc()?,
             DeployCommand::BootstrapProgress { deploy_target } => {
@@ -766,7 +774,13 @@ async fn main() -> CmdResult {
                 config,
                 bootstrap_s3_url,
                 watch_bootstrap,
-            } => cmd_deploy::create_cluster(&config, &bootstrap_s3_url, watch_bootstrap)?,
+                skip_upload,
+            } => cmd_deploy::create_cluster(
+                &config,
+                &bootstrap_s3_url,
+                watch_bootstrap,
+                skip_upload,
+            )?,
         },
         Cmd::RunTests { test_type } => {
             let test_type = test_type.unwrap_or(TestType::All);

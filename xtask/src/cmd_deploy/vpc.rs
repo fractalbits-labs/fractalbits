@@ -6,7 +6,7 @@ use std::path::Path;
 use super::bootstrap;
 use super::common::{DeployTarget, VpcConfig};
 use super::ssm_bootstrap;
-use super::upload::get_bootstrap_bucket_name;
+use super::upload::{get_bootstrap_bucket_name, upload};
 
 pub fn create_vpc(config: VpcConfig) -> CmdResult {
     let VpcConfig {
@@ -24,7 +24,13 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         ssm_bootstrap,
         journal_type,
         watch_bootstrap,
+        skip_upload,
     } = config;
+
+    if !skip_upload {
+        info!("Uploading binaries to S3 bootstrap bucket...");
+        upload(DeployTarget::Aws)?;
+    }
 
     // Note: Template-based configuration is handled in CDK (vpc/fractalbits-cdk/bin/fractalbits-vpc.ts)
     // The values passed here may be overridden by the template in CDK

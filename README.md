@@ -224,12 +224,8 @@ just deploy build
 Make sure your [AWS CLI Configuration Settings](https://docs.aws.amazon.com/cli/v1/userguide/cli-configure-files.html) are set up correctly.
 
 ```bash
-# Upload your binaries to S3 builds bucket
-just deploy upload
-
 # Deploy with perf_demo template (14 API servers, 42 bench clients, 6 BSS nodes)
-# or use "mini" template, which includes a single instance for each node type.
-# See more options in the command help.
+# Use "mini" template for a single instance of each node type.
 just deploy create-vpc --template perf_demo --with-bench
 
 # View deployed stack information
