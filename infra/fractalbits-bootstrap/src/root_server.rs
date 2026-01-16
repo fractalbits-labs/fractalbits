@@ -16,6 +16,8 @@ const META_DATA_VG_QUORUM_N: usize = 6;
 const META_DATA_VG_QUORUM_R: usize = 4;
 const META_DATA_VG_QUORUM_W: usize = 4;
 
+const BOOTSTRAP_GRACE_PERIOD_SECS: u64 = 120;
+
 pub fn bootstrap(config: &BootstrapConfig, is_leader: bool, for_bench: bool) -> CmdResult {
     let nss_endpoint = &config.endpoints.nss_endpoint;
     let resources = config.get_resources();
@@ -58,11 +60,15 @@ fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: 
     barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
 
     create_rss_config(config, nss_endpoint, ha_enabled)?;
+    create_rss_bootstrap_env()?;
     create_systemd_unit_file("rss", true)?; // Start immediately
     register_service(config, "root-server")?;
 
     // Complete services-ready stage
     barrier.complete_stage(stages::SERVICES_READY, None)?;
+
+    // Clear bootstrap env so restarts use default grace period
+    clear_rss_bootstrap_env()?;
 
     Ok(())
 }
@@ -107,6 +113,7 @@ fn bootstrap_leader(
     initialize_nss_roles(config, nss_a_id, nss_b_id)?;
 
     create_rss_config(config, nss_endpoint, ha_enabled)?;
+    create_rss_bootstrap_env()?;
     create_systemd_unit_file("rss", true)?;
     register_service(config, "root-server")?;
 
@@ -161,6 +168,9 @@ fn bootstrap_leader(
 
     // Complete services-ready stage
     barrier.complete_stage(stages::SERVICES_READY, None)?;
+
+    // Clear bootstrap env so restarts use default grace period
+    clear_rss_bootstrap_env()?;
 
     Ok(())
 }
@@ -611,8 +621,8 @@ enable_monitoring = true
 # Observer Configuration
 [observer]
 # Grace period (in seconds) before observer starts making state transitions
-# This should be long enough to allow all services to start during bootstrap
-initial_grace_period_secs = 120.0
+# During bootstrap, this is overridden via env var to 120s
+initial_grace_period_secs = 2.0
 
 # How often to check health and evaluate state transitions (in seconds)
 heartbeat_interval_secs = 0.5
@@ -625,5 +635,22 @@ health_stale_threshold_secs = 5.0
         mkdir -p $ETC_PATH;
         echo $config_content > $ETC_PATH/$ROOT_SERVER_CONFIG;
     }?;
+    Ok(())
+}
+
+fn create_rss_bootstrap_env() -> CmdResult {
+    let grace_period = BOOTSTRAP_GRACE_PERIOD_SECS;
+    let content = format!("OBSERVER_INITIAL_GRACE_PERIOD_SECS={grace_period}");
+    run_cmd! {
+        mkdir -p $ETC_PATH;
+        echo $content > ${ETC_PATH}rss.env;
+    }?;
+    info!("Created RSS bootstrap env file with grace period {grace_period}s");
+    Ok(())
+}
+
+fn clear_rss_bootstrap_env() -> CmdResult {
+    run_cmd!(echo -n "" > ${ETC_PATH}rss.env)?;
+    info!("Cleared RSS bootstrap env file");
     Ok(())
 }

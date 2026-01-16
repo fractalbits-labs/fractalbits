@@ -143,9 +143,11 @@ Environment="HOST_ID={instance_id}"
             format!("{BIN_PATH}{service_name} -c {ETC_PATH}{MIRRORD_CONFIG}")
         }
         "rss" => {
-            env_settings = r##"
-Environment="RUST_LOG=info""##
-                .to_string();
+            env_settings = format!(
+                r##"
+Environment="RUST_LOG=info"
+EnvironmentFile=-{ETC_PATH}rss.env"##
+            );
             scheduling = "CPUSchedulingPolicy=fifo
 CPUSchedulingPriority=50
 IOSchedulingClass=realtime
