@@ -75,8 +75,16 @@ fn generic_bootstrap() -> CmdResult {
             root_server::bootstrap(&config, *is_leader, for_bench)?;
             "root_server"
         }
-        ServiceType::NssServer { volume_id } => {
-            nss_server::bootstrap(&config, volume_id.as_deref(), for_bench)?;
+        ServiceType::NssServer {
+            volume_id,
+            journal_uuid,
+        } => {
+            nss_server::bootstrap(
+                &config,
+                volume_id.as_deref(),
+                journal_uuid.as_deref(),
+                for_bench,
+            )?;
             "nss_server"
         }
         ServiceType::ApiServer => {

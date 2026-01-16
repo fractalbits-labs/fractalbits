@@ -150,6 +150,7 @@ impl InputClusterConfig {
                         private_ip: Some(node.ip.clone()),
                         role: node.role.clone(),
                         volume_id: node.volume_id.clone(),
+                        journal_uuid: None,
                         bench_client_num: node.bench_client_num,
                     })
                     .collect();

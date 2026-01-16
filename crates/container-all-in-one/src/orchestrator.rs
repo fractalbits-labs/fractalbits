@@ -105,7 +105,8 @@ impl Orchestrator {
         }?;
 
         create_bss_dirs(&self.data_dir, 0, 1)?;
-        create_nss_dirs(&self.data_dir, "nss-A")?;
+        // Container uses NVMe journal type without journal_uuid for simplicity
+        create_nss_dirs(&self.data_dir, "nss-A", false, None)?;
 
         Ok(())
     }

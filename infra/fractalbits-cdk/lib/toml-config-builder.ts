@@ -43,6 +43,8 @@ export function createConfigWithCfnTokens(props: {
   nssB?: InstanceProps;
   volumeAId: string;
   volumeBId?: string;
+  journalUuidA?: string;
+  journalUuidB?: string;
   rssA: InstanceProps;
   rssB?: InstanceProps;
   guiServer?: InstanceProps;
@@ -153,6 +155,7 @@ export function createConfigWithCfnTokens(props: {
     role?: string,
     volumeId?: string,
     benchClientNum?: number,
+    journalUuid?: string,
   ) => {
     lines.push("");
     lines.push(`[[nodes.${serviceType}]]`);
@@ -165,6 +168,9 @@ export function createConfigWithCfnTokens(props: {
     }
     if (volumeId) {
       lines.push(cdk.Fn.join("", ['volume_id = "', volumeId, '"']));
+    }
+    if (journalUuid) {
+      lines.push(cdk.Fn.join("", ['journal_uuid = "', journalUuid, '"']));
     }
     if (benchClientNum !== undefined) {
       lines.push(`bench_client_num = ${benchClientNum}`);
@@ -180,11 +186,29 @@ export function createConfigWithCfnTokens(props: {
   // Add NSS nodes
   const nssAVolumeId =
     props.journalType === "ebs" ? props.volumeAId : undefined;
-  addNode(props.nssA, "nss_server", undefined, nssAVolumeId);
+  const nssAJournalUuid =
+    props.journalType === "ebs" ? props.journalUuidA : undefined;
+  addNode(
+    props.nssA,
+    "nss_server",
+    undefined,
+    nssAVolumeId,
+    undefined,
+    nssAJournalUuid,
+  );
   if (props.nssB) {
     const nssBVolumeId =
       props.journalType === "ebs" ? props.volumeBId : undefined;
-    addNode(props.nssB, "nss_server", undefined, nssBVolumeId);
+    const nssBJournalUuid =
+      props.journalType === "ebs" ? props.journalUuidB : undefined;
+    addNode(
+      props.nssB,
+      "nss_server",
+      undefined,
+      nssBVolumeId,
+      undefined,
+      nssBJournalUuid,
+    );
   }
 
   // Add GUI server

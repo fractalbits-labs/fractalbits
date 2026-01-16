@@ -187,18 +187,38 @@ fn initialize_nss_roles(
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
 
+    // Get journal_uuid for each NSS from config
+    let nss_nodes = config.get_node_entries("nss_server");
+    let nss_a_uuid = nss_nodes
+        .and_then(|nodes| nodes.iter().find(|n| n.id == nss_a_id))
+        .and_then(|n| n.journal_uuid.as_deref());
+    let nss_b_uuid = nss_b_id.and_then(|b_id| {
+        nss_nodes
+            .and_then(|nodes| nodes.iter().find(|n| n.id == b_id))
+            .and_then(|n| n.journal_uuid.as_deref())
+    });
+
     // Create ObserverPersistentState JSON
     let observer_state_json = if let Some(nss_b_id) = nss_b_id {
         // HA mode: active/standby
         info!("HA mode: {nss_a_id} as active NSS, {nss_b_id} as standby mirrord");
+        let nss_a_uuid_json = nss_a_uuid
+            .map(|u| format!("\"{u}\""))
+            .unwrap_or_else(|| "null".to_string());
+        let nss_b_uuid_json = nss_b_uuid
+            .map(|u| format!("\"{u}\""))
+            .unwrap_or_else(|| "null".to_string());
         format!(
-            r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"active","network_address":null}},"mirrord_machine":{{"machine_id":"{nss_b_id}","running_service":"mirrord","expected_role":"standby","network_address":null}},"last_updated":{timestamp},"version":1}}"#
+            r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"active","network_address":null,"journal_uuid":{nss_a_uuid_json}}},"mirrord_machine":{{"machine_id":"{nss_b_id}","running_service":"mirrord","expected_role":"standby","network_address":null,"journal_uuid":{nss_b_uuid_json}}},"last_updated":{timestamp},"version":1}}"#
         )
     } else {
         // Solo mode: single NSS
         info!("Solo mode: {nss_a_id} as solo NSS");
+        let nss_a_uuid_json = nss_a_uuid
+            .map(|u| format!("\"{u}\""))
+            .unwrap_or_else(|| "null".to_string());
         format!(
-            r#"{{"observer_state":"solo","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"solo","network_address":null}},"mirrord_machine":{{"machine_id":"","running_service":"mirrord","expected_role":"","network_address":null}},"last_updated":{timestamp},"version":1}}"#
+            r#"{{"observer_state":"solo","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"solo","network_address":null,"journal_uuid":{nss_a_uuid_json}}},"mirrord_machine":{{"machine_id":"","running_service":"mirrord","expected_role":"","network_address":null,"journal_uuid":null}},"last_updated":{timestamp},"version":1}}"#
         )
     };
 

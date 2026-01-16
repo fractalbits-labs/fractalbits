@@ -6,6 +6,7 @@ use crate::InitConfig;
 use crate::etcd_utils::{ensure_etcd_local, resolve_etcd_bin};
 use crate::*;
 use colored::*;
+use uuid::Uuid;
 use xtask_common::{
     LOCAL_DDB_ENVS, LOCAL_DDB_ENVS_SYSTEMD, create_bss_dirs, create_nss_dirs,
     generate_bss_data_vg_config, generate_bss_metadata_vg_config,
@@ -152,6 +153,24 @@ pub fn init_service(
                 --item $bss_metadata_vg_config_item >/dev/null;
         }?;
 
+        // Initialize journal UUIDs for NSS instances in service-discovery table
+        for instance in &["nss-A", "nss-B"] {
+            let journal_uuid = get_or_create_journal_uuid(instance)?;
+            let key = format!("journal-uuid-{}", instance);
+            let journal_uuid_item = format!(
+                r#"{{"service_id":{{"S":"{}"}},"value":{{"S":"{}"}}}}"#,
+                key, journal_uuid
+            );
+
+            run_cmd! {
+                info "Initializing journal UUID for $instance in service-discovery table ...";
+                $[LOCAL_DDB_ENVS]
+                aws dynamodb put-item
+                    --table-name $SERVICE_DISCOVERY_TABLE
+                    --item $journal_uuid_item >/dev/null;
+            }?;
+        }
+
         Ok(())
     };
     let init_minio = |data_dir: &str| -> CmdResult { run_cmd!(mkdir -p $data_dir) };
@@ -187,6 +206,16 @@ pub fn init_service(
             $etcdctl put /fractalbits-service-discovery/bss-data-vg-config $bss_data_vg_config >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-metadata-vg-config $bss_metadata_vg_config >/dev/null;
         }?;
+
+        // Initialize journal UUIDs for NSS instances
+        for instance in &["nss-A", "nss-B"] {
+            let journal_uuid = get_or_create_journal_uuid(instance)?;
+            let key = format!("/fractalbits-service-discovery/journal-uuid-{}", instance);
+            run_cmd! {
+                info "Initializing journal UUID for $instance in etcd ...";
+                $etcdctl put $key $journal_uuid >/dev/null;
+            }?;
+        }
 
         stop_service(ServiceName::Etcd)?;
         Ok(())
@@ -236,17 +265,29 @@ pub fn init_service(
         start_service(ServiceName::Bss)?;
 
         let format_log = "data/logs/format.log";
-        create_dirs_for_nss_server()?;
+        let journal_uuid = get_or_create_journal_uuid("nss-A")?;
+        let journal_type = init_config.journal_type;
+        let is_ebs_journal = journal_type == JournalType::Ebs;
+        create_dirs_for_nss_server(is_ebs_journal, &journal_uuid)?;
         let nss_binary = resolve_binary_path("nss_server", build_mode);
+
+        // Compute shared_dir based on journal type (relative to working_dir which is ./data/nss-A)
+        // For EBS: shared_dir is "../ebs/<journal_uuid>" to reach ./data/ebs/<uuid>
+        // For NVMe: shared_dir is "local/journal/<journal_uuid>"
+        let shared_dir = match journal_type {
+            JournalType::Ebs => format!("../ebs/{}", journal_uuid),
+            JournalType::Nvme => format!("local/journal/{}", journal_uuid),
+        };
+
         match build_mode {
             BuildMode::Debug => run_cmd! {
                 info "formatting nss_server with default configs";
-                $nss_binary format --init_test_tree
+                SHARED_DIR=$shared_dir JOURNAL_UUID=$journal_uuid $nss_binary format --init_test_tree
                     |& ts -m $TS_FMT >$format_log;
             }?,
             BuildMode::Release => run_cmd! {
                 info "formatting nss_server for benchmarking";
-                $nss_binary format --init_test_tree
+                SHARED_DIR=$shared_dir JOURNAL_UUID=$journal_uuid $nss_binary format --init_test_tree
                     |& ts -m $TS_FMT >$format_log;
             }?,
         }
@@ -256,22 +297,33 @@ pub fn init_service(
     };
     let init_mirrord = || -> CmdResult {
         let format_log = "data/logs/format_mirrord.log";
-        create_dirs_for_mirrord_server()?;
-        let nss_binary = resolve_binary_path("nss_server", build_mode);
         let journal_type = init_config.journal_type;
+        let journal_uuid = get_or_create_journal_uuid("nss-B")?;
+        let is_ebs_journal = journal_type == JournalType::Ebs;
+        create_dirs_for_mirrord_server(is_ebs_journal, &journal_uuid)?;
+        let nss_binary = resolve_binary_path("nss_server", build_mode);
         info!(
             "Initializing mirrord with journal_type={:?}",
             journal_type.as_ref()
         );
+
+        // Compute shared_dir based on journal type (relative to working_dir which is ./data/nss-B)
+        // For EBS: shared_dir is "../ebs/<journal_uuid>" to reach ./data/ebs/<uuid>
+        // For NVMe: shared_dir is "local/journal/<journal_uuid>"
+        let shared_dir = match journal_type {
+            JournalType::Ebs => format!("../ebs/{}", journal_uuid),
+            JournalType::Nvme => format!("local/journal/{}", journal_uuid),
+        };
+
         match build_mode {
             BuildMode::Debug => run_cmd! {
                 info "formatting mirrord with default configs";
-                WORKING_DIR="./data/nss-B" $nss_binary format
+                WORKING_DIR="./data/nss-B" SHARED_DIR=$shared_dir JOURNAL_UUID=$journal_uuid $nss_binary format
                     |& ts -m $TS_FMT >$format_log;
             }?,
             BuildMode::Release => run_cmd! {
                 info "formatting mirrord for benchmarking";
-                WORKING_DIR="./data/nss-B" $nss_binary format
+                WORKING_DIR="./data/nss-B" SHARED_DIR=$shared_dir JOURNAL_UUID=$journal_uuid $nss_binary format
                     |& ts -m $TS_FMT >$format_log;
             }?,
         }
@@ -1000,21 +1052,37 @@ Environment="BSS_WORKING_DIR=./data/bss%i""##;
         ServiceName::Nss => {
             managed_service = true;
             // Use template-based service with instance suffix (A or B)
-            // WORKING_DIR and HEALTH_PORT are set based on instance
+            // WORKING_DIR, SHARED_DIR, JOURNAL_UUID, and HEALTH_PORT are set based on instance
             env_settings += "\nEnvironment=\"WORKING_DIR=./data/nss-%i\"";
             let nss_binary = resolve_binary_path("nss_server", build_mode);
+            // Read journal_uuid from file and compute SHARED_DIR based on journal type
+            // For EBS: "../ebs/<uuid>" (relative to ./data/nss-%i to reach ./data/ebs/<uuid>)
+            // For NVMe: "local/journal/<uuid>"
+            let journal_type = init_config.journal_type;
+            let shared_dir_prefix = match journal_type {
+                JournalType::Ebs => "../ebs",
+                JournalType::Nvme => "local/journal",
+            };
             format!(
-                "/bin/bash -c 'if [ \"%i\" = \"A\" ]; then HEALTH_PORT=29999; else HEALTH_PORT=29998; fi; export HEALTH_PORT; {nss_binary} serve'"
+                "/bin/bash -c 'JOURNAL_UUID=$(cat ./data/etc/journal_uuid_nss_%i.txt); export JOURNAL_UUID; export SHARED_DIR=\"{shared_dir_prefix}/$JOURNAL_UUID\"; if [ \"%i\" = \"A\" ]; then HEALTH_PORT=29999; else HEALTH_PORT=29998; fi; export HEALTH_PORT; {nss_binary} serve'"
             )
         }
         ServiceName::Mirrord => {
             managed_service = true;
             // Use template-based service with instance suffix (A or B)
-            // WORKING_DIR and HEALTH_PORT are set based on instance
+            // WORKING_DIR, SHARED_DIR, JOURNAL_UUID, and HEALTH_PORT are set based on instance
             env_settings += "\nEnvironment=\"WORKING_DIR=./data/nss-%i\"";
             let mirrord_binary = resolve_binary_path("mirrord", build_mode);
+            // Read journal_uuid from file and compute SHARED_DIR based on journal type
+            // For EBS: "../ebs/<uuid>" (relative to ./data/nss-%i to reach ./data/ebs/<uuid>)
+            // For NVMe: "local/journal/<uuid>"
+            let journal_type = init_config.journal_type;
+            let shared_dir_prefix = match journal_type {
+                JournalType::Ebs => "../ebs",
+                JournalType::Nvme => "local/journal",
+            };
             format!(
-                "/bin/bash -c 'if [ \"%i\" = \"A\" ]; then HEALTH_PORT=19999; else HEALTH_PORT=19998; fi; export HEALTH_PORT; {mirrord_binary}'"
+                "/bin/bash -c 'JOURNAL_UUID=$(cat ./data/etc/journal_uuid_nss_%i.txt); export JOURNAL_UUID; export SHARED_DIR=\"{shared_dir_prefix}/$JOURNAL_UUID\"; if [ \"%i\" = \"A\" ]; then HEALTH_PORT=19999; else HEALTH_PORT=19998; fi; export HEALTH_PORT; {mirrord_binary}'"
             )
         }
         ServiceName::NssRoleAgentA => {
@@ -1183,15 +1251,39 @@ WantedBy=multi-user.target
     Ok(())
 }
 
-fn create_dirs_for_nss_server() -> CmdResult {
+fn create_dirs_for_nss_server(is_ebs_journal: bool, journal_uuid: &str) -> CmdResult {
     info!("Creating necessary directories for nss_server");
     run_cmd!(mkdir -p data/logs)?;
-    create_nss_dirs(Path::new("data"), "nss-A")
+    create_nss_dirs(Path::new("data"), "nss-A", is_ebs_journal, Some(journal_uuid))
 }
 
-fn create_dirs_for_mirrord_server() -> CmdResult {
+fn create_dirs_for_mirrord_server(is_ebs_journal: bool, journal_uuid: &str) -> CmdResult {
     info!("Creating necessary directories for mirrord");
-    create_nss_dirs(Path::new("data"), "nss-B")
+    create_nss_dirs(Path::new("data"), "nss-B", is_ebs_journal, Some(journal_uuid))
+}
+
+fn get_or_create_journal_uuid(instance: &str) -> Result<String, std::io::Error> {
+    let uuid_file = format!("data/etc/journal_uuid_{}.txt", instance.replace('-', "_"));
+    let uuid_path = Path::new(&uuid_file);
+
+    if uuid_path.exists() {
+        let uuid = std::fs::read_to_string(uuid_path)?;
+        let uuid = uuid.trim().to_string();
+        info!("Using existing journal UUID for {}: {}", instance, uuid);
+        return Ok(uuid);
+    }
+
+    // Generate a new UUID
+    let uuid = Uuid::new_v4().to_string();
+
+    // Ensure directory exists
+    std::fs::create_dir_all("data/etc")?;
+
+    // Save the UUID
+    std::fs::write(uuid_path, &uuid)?;
+    info!("Generated new journal UUID for {}: {}", instance, uuid);
+
+    Ok(uuid)
 }
 
 pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdResult {

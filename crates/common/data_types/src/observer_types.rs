@@ -91,6 +91,8 @@ pub struct MachineState {
     pub expected_role: String,
     #[serde(default)]
     pub network_address: Option<String>,
+    #[serde(default)]
+    pub journal_uuid: Option<String>,
 }
 
 impl MachineState {
@@ -100,11 +102,17 @@ impl MachineState {
             running_service,
             expected_role,
             network_address: None,
+            journal_uuid: None,
         }
     }
 
     pub fn with_network_address(mut self, address: Option<String>) -> Self {
         self.network_address = address;
+        self
+    }
+
+    pub fn with_journal_uuid(mut self, journal_uuid: Option<String>) -> Self {
+        self.journal_uuid = journal_uuid;
         self
     }
 }

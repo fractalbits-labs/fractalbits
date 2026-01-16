@@ -11,7 +11,12 @@ use std::io::Error;
 const BLOB_DRAM_MEM_PERCENT: f64 = 0.8;
 const NSS_META_CACHE_SHARDS: usize = 256;
 
-pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: bool) -> CmdResult {
+pub fn bootstrap(
+    config: &BootstrapConfig,
+    volume_id: Option<&str>,
+    journal_uuid: Option<&str>,
+    for_bench: bool,
+) -> CmdResult {
     let meta_stack_testing = config.global.meta_stack_testing;
     let journal_type = config.global.journal_type;
 
@@ -48,7 +53,7 @@ pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: b
     info!("Waiting for RSS to initialize...");
     barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
 
-    setup_configs(config, journal_type, volume_id, "nss")?;
+    setup_configs(config, journal_type, volume_id, journal_uuid, "nss")?;
 
     // Format journal based on type
     match journal_type {
@@ -58,7 +63,9 @@ pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: b
         JournalType::Ebs => {
             let volume_id =
                 volume_id.ok_or_else(|| Error::other("volume_id required for ebs journal type"))?;
-            ebs_journal::format_with_volume_id(volume_id)?;
+            let journal_uuid = journal_uuid
+                .ok_or_else(|| Error::other("journal_uuid required for ebs journal type"))?;
+            ebs_journal::format_with_volume_id(volume_id, journal_uuid)?;
         }
     }
 
@@ -95,7 +102,7 @@ pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: b
             run_cmd!(systemctl start nss_role_agent.service)?;
 
             // Wait for nss_server to be ready before signaling
-            wait_for_service_ready("nss_server", 8088, 120)?;
+            wait_for_service_ready("nss_server", 8088, 360)?;
 
             // Signal that journal is ready and nss_server is accepting connections
             barrier.complete_stage(stages::NSS_JOURNAL_READY, None)?;
@@ -108,7 +115,7 @@ pub fn bootstrap(config: &BootstrapConfig, volume_id: Option<&str>, for_bench: b
         run_cmd!(systemctl start nss_role_agent.service)?;
 
         // Wait for nss_server to be ready before signaling
-        wait_for_service_ready("nss_server", 8088, 120)?;
+        wait_for_service_ready("nss_server", 8088, 360)?;
 
         // Signal that journal is ready and nss_server is accepting connections
         barrier.complete_stage(stages::NSS_JOURNAL_READY, None)?;
@@ -124,23 +131,34 @@ fn setup_configs(
     config: &BootstrapConfig,
     journal_type: JournalType,
     volume_id: Option<&str>,
+    journal_uuid: Option<&str>,
     service_name: &str,
 ) -> CmdResult {
     // Journal-type specific config paths
+    // For EBS: mount at /data/ebs, journal at /data/ebs/{uuid}/
+    // For NVMe: journal at /data/local/journal/
     let (volume_dev, shared_dir) = match journal_type {
         JournalType::Ebs => {
             let vid = volume_id.ok_or_else(|| Error::other("volume_id required for EBS"))?;
-            (Some(ebs_journal::get_volume_dev(vid)), "ebs")
+            let uuid = journal_uuid.ok_or_else(|| Error::other("journal_uuid required for EBS"))?;
+            // shared_dir is relative to /data, so "ebs/{uuid}" means /data/ebs/{uuid}/
+            (
+                Some(ebs_journal::get_volume_dev(vid)),
+                format!("ebs/{uuid}"),
+            )
         }
-        JournalType::Nvme => (None, "local/journal"),
+        JournalType::Nvme => (None, "local/journal".to_string()),
     };
 
-    create_nss_config(volume_dev.as_deref(), shared_dir)?;
-    create_mirrord_config(volume_dev.as_deref(), shared_dir)?;
+    create_nss_config(volume_dev.as_deref(), &shared_dir, journal_uuid)?;
+    create_mirrord_config(volume_dev.as_deref(), &shared_dir)?;
 
-    // EBS-specific: mount unit
-    if let (JournalType::Ebs, Some(vdev)) = (journal_type, &volume_dev) {
-        create_mount_unit(vdev, "/data/ebs", "ext4")?;
+    // EBS-specific: mount at /data/ebs (simple unit name: data-ebs.mount)
+    if journal_type == JournalType::Ebs {
+        if let Some(vid) = volume_id {
+            let mount_dev = ebs_journal::get_volume_dev(vid);
+            create_mount_unit(&mount_dev, "/data/ebs", "ext4")?;
+        }
     }
 
     // Common configs
@@ -148,9 +166,14 @@ fn setup_configs(
     create_nss_role_agent_config(config)?;
     create_systemd_unit_file("nss_role_agent", false)?;
 
-    // Systemd units - NVMe needs journal_type for local mount dependency
-    create_systemd_unit_file_with_journal_type("mirrord", false, Some(journal_type))?;
-    create_systemd_unit_file_with_journal_type(service_name, false, Some(journal_type))?;
+    // Systemd units - NVMe needs journal_type for local mount dependency, EBS needs journal_uuid
+    create_systemd_unit_file_with_journal_type("mirrord", false, Some(journal_type), journal_uuid)?;
+    create_systemd_unit_file_with_journal_type(
+        service_name,
+        false,
+        Some(journal_type),
+        journal_uuid,
+    )?;
 
     create_logrotate_for_stats()?;
     if config.global.deploy_target == DeployTarget::Aws {
@@ -160,7 +183,11 @@ fn setup_configs(
     Ok(())
 }
 
-fn create_nss_config(volume_dev: Option<&str>, shared_dir: &str) -> CmdResult {
+fn create_nss_config(
+    volume_dev: Option<&str>,
+    shared_dir: &str,
+    journal_uuid: Option<&str>,
+) -> CmdResult {
     // Get total memory in kilobytes from /proc/meminfo
     let total_mem_kb_str = run_fun!(cat /proc/meminfo | grep MemTotal | awk r"{print $2}")?;
     let total_mem_kb = total_mem_kb_str
@@ -182,6 +209,12 @@ fn create_nss_config(volume_dev: Option<&str>, shared_dir: &str) -> CmdResult {
     let fa_thread_dataop_count = num_cores / 2;
     let fa_thread_count = fa_thread_dataop_count + 4;
 
+    // Include journal_uuid in config if provided
+    let journal_uuid_line = match journal_uuid {
+        Some(uuid) => format!("journal_uuid = \"{uuid}\"\n"),
+        None => String::new(),
+    };
+
     let config_content = format!(
         r##"working_dir = "/data"
 shared_dir = "{shared_dir}"
@@ -195,7 +228,7 @@ fa_journal_segment_size = {fa_journal_segment_size}
 log_level = "info"
 mirrord_port = 9999
 meta_cache_shards = {NSS_META_CACHE_SHARDS}
-"##
+{journal_uuid_line}"##
     );
     run_cmd! {
         mkdir -p $ETC_PATH;

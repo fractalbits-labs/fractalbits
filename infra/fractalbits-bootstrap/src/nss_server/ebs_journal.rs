@@ -3,25 +3,32 @@ use super::*;
 // Fixed journal segment size for AWS EBS: 4GB
 pub const FA_JOURNAL_SEGMENT_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Format EBS journal with a specific volume ID
-pub fn format_with_volume_id(volume_id: &str) -> CmdResult {
+/// Format EBS journal with a specific volume ID and journal UUID
+pub fn format_with_volume_id(volume_id: &str, journal_uuid: &str) -> CmdResult {
     let ebs_dev = get_volume_dev(volume_id);
-    info!("Formatting EBS device: {ebs_dev} for volume {volume_id}");
-    format_internal(&ebs_dev)?;
+    info!("Formatting EBS device: {ebs_dev} for volume {volume_id} with UUID {journal_uuid}");
+    format_internal(&ebs_dev, journal_uuid)?;
     Ok(())
 }
 
-pub(crate) fn format_internal(ebs_dev: &str) -> CmdResult {
+pub(crate) fn format_internal(ebs_dev: &str, journal_uuid: &str) -> CmdResult {
+    // Mount EBS at /data/ebs, create journal directory at /data/ebs/{uuid}/
+    let mount_point = "/data/ebs";
+    let journal_dir = format!("/data/ebs/{journal_uuid}");
+
     run_cmd! {
         info "Disabling udev rules for EBS";
         ln -sf /dev/null /etc/udev/rules.d/99-ebs.rules;
 
-        info "Formatting $ebs_dev to ext4 file system";
-        mkfs.ext4 -O bigalloc -C 16384 $ebs_dev &>/dev/null;
+        info "Formatting $ebs_dev to ext4 file system with UUID $journal_uuid";
+        mkfs.ext4 -U $journal_uuid -O bigalloc -C 16384 $ebs_dev &>/dev/null;
 
-        info "Mounting $ebs_dev to /data/ebs";
-        mkdir -p /data/ebs;
-        mount $ebs_dev /data/ebs;
+        info "Mounting $ebs_dev to $mount_point";
+        mkdir -p $mount_point;
+        mount $ebs_dev $mount_point;
+
+        info "Creating journal directory at $journal_dir";
+        mkdir -p $journal_dir;
     }?;
 
     format_nss(false)?;
@@ -32,7 +39,7 @@ pub(crate) fn format_internal(ebs_dev: &str) -> CmdResult {
         udevadm control --reload-rules;
         udevadm trigger;
 
-        info "${ebs_dev} is formatted successfully.";
+        info "${ebs_dev} is formatted successfully with UUID ${journal_uuid}.";
     }?;
 
     Ok(())

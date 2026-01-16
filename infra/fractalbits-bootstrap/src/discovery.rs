@@ -8,12 +8,19 @@ pub const SERVICE_TYPE_TAG: &str = "fractalbits:ServiceType";
 
 #[derive(Debug, Clone)]
 pub enum ServiceType {
-    RootServer { is_leader: bool },
-    NssServer { volume_id: Option<String> },
+    RootServer {
+        is_leader: bool,
+    },
+    NssServer {
+        volume_id: Option<String>,
+        journal_uuid: Option<String>,
+    },
     ApiServer,
     BssServer,
     GuiServer,
-    BenchServer { bench_client_num: usize },
+    BenchServer {
+        bench_client_num: usize,
+    },
     BenchClient,
 }
 
@@ -64,13 +71,24 @@ fn parse_instance_config(
         }
         "nss_server" => {
             let volume_id = instance_config.volume_id.clone();
-            // volume_id is required for ebs journal type
-            if config.global.journal_type == JournalType::Ebs && volume_id.is_none() {
-                return Err(Error::other(
-                    "NSS server config missing volume_id for ebs journal type",
-                ));
+            let journal_uuid = instance_config.journal_uuid.clone();
+            // volume_id and journal_uuid are required for ebs journal type
+            if config.global.journal_type == JournalType::Ebs {
+                if volume_id.is_none() {
+                    return Err(Error::other(
+                        "NSS server config missing volume_id for ebs journal type",
+                    ));
+                }
+                if journal_uuid.is_none() {
+                    return Err(Error::other(
+                        "NSS server config missing journal_uuid for ebs journal type",
+                    ));
+                }
             }
-            Ok(ServiceType::NssServer { volume_id })
+            Ok(ServiceType::NssServer {
+                volume_id,
+                journal_uuid,
+            })
         }
         "api_server" => Ok(ServiceType::ApiServer),
         "bss_server" => Ok(ServiceType::BssServer),

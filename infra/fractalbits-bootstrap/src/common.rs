@@ -87,16 +87,17 @@ pub fn backup_config_to_workflow(config: &BootstrapConfig, cluster_id: &str) -> 
 }
 
 pub fn create_systemd_unit_file(service_name: &str, enable_now: bool) -> CmdResult {
-    create_systemd_unit_file_with_journal_type(service_name, enable_now, None)
+    create_systemd_unit_file_with_journal_type(service_name, enable_now, None, None)
 }
 
 pub fn create_systemd_unit_file_with_journal_type(
     service_name: &str,
     enable_now: bool,
     journal_type: Option<JournalType>,
+    journal_uuid: Option<&str>,
 ) -> CmdResult {
     let working_dir = "/data";
-    let mut requires = "";
+    let mut requires = String::new();
     let mut env_settings = String::new();
     let mut managed_service = false;
     let mut scheduling = "";
@@ -126,19 +127,25 @@ Environment="HOST_ID={instance_id}"
         }
         "nss" => {
             managed_service = true;
-            requires = match journal_type {
-                Some(JournalType::Nvme) => "data-local.mount",
-                Some(JournalType::Ebs) => "data-ebs.mount data-local.mount",
-                None => unreachable!(),
+            requires = match (journal_type, journal_uuid) {
+                (Some(JournalType::Nvme), _) => "data-local.mount".to_string(),
+                (Some(JournalType::Ebs), Some(_)) => {
+                    "data-ebs.mount data-local.mount".to_string()
+                }
+                (Some(JournalType::Ebs), None) => "data-local.mount".to_string(),
+                (None, _) => unreachable!(),
             };
             format!("{BIN_PATH}nss_server serve -c {ETC_PATH}{NSS_SERVER_CONFIG}")
         }
         "mirrord" => {
             managed_service = true;
-            requires = match journal_type {
-                Some(JournalType::Nvme) => "data-local.mount",
-                Some(JournalType::Ebs) => "data-ebs.mount data-local.mount",
-                None => unreachable!(),
+            requires = match (journal_type, journal_uuid) {
+                (Some(JournalType::Nvme), _) => "data-local.mount".to_string(),
+                (Some(JournalType::Ebs), Some(_)) => {
+                    "data-ebs.mount data-local.mount".to_string()
+                }
+                (Some(JournalType::Ebs), None) => "data-local.mount".to_string(),
+                (None, _) => unreachable!(),
             };
             format!("{BIN_PATH}{service_name} -c {ETC_PATH}{MIRRORD_CONFIG}")
         }
@@ -155,7 +162,7 @@ IOSchedulingPriority=0";
             format!("{BIN_PATH}root_server -c {ETC_PATH}{ROOT_SERVER_CONFIG}")
         }
         "bss" => {
-            requires = "data-local.mount";
+            requires = "data-local.mount".to_string();
             format!("{BIN_PATH}bss_server -c {ETC_PATH}{BSS_SERVER_CONFIG}")
         }
         "bench_client" => {
@@ -524,7 +531,7 @@ Options={mount_options}
 WantedBy=multi-user.target
 "##
     );
-    let mount_unit_name = mount_point.trim_start_matches("/").replace("/", "-");
+    let mount_unit_name = mount_point.trim_start_matches('/').replace('/', "-");
     run_cmd! {
         info "Creating systemd unit ${mount_unit_name}.mount";
         mkdir -p $ETC_PATH;

@@ -72,6 +72,8 @@ pub struct NodeEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bench_client_num: Option<usize>,
 }
 
@@ -83,6 +85,7 @@ pub struct ClusterNodeConfig {
     pub private_ip: Option<String>,
     pub role: Option<String>,
     pub volume_id: Option<String>,
+    pub journal_uuid: Option<String>,
     pub bench_client_num: Option<usize>,
 }
 
@@ -94,6 +97,7 @@ impl ClusterNodeConfig {
             private_ip: entry.private_ip.clone(),
             role: entry.role.clone(),
             volume_id: entry.volume_id.clone(),
+            journal_uuid: entry.journal_uuid.clone(),
             bench_client_num: entry.bench_client_num,
         }
     }
@@ -396,11 +400,37 @@ pub fn create_bss_dirs(data_dir: &Path, bss_id: u32, bss_count: u32) -> CmdResul
 }
 
 /// Create directories for NSS server
-pub fn create_nss_dirs(data_dir: &Path, dir_name: &str) -> CmdResult {
+/// - is_ebs_journal: true for EBS journal, false for NVMe journal
+/// - For EBS: journal at data/ebs/<journal_uuid>/
+/// - For NVMe: journal at data/<dir_name>/local/journal/<journal_uuid>/
+pub fn create_nss_dirs(
+    data_dir: &Path,
+    dir_name: &str,
+    is_ebs_journal: bool,
+    journal_uuid: Option<&str>,
+) -> CmdResult {
     info!("Creating directories for {} server", dir_name);
 
     let nss_dir = data_dir.join(dir_name);
-    fs::create_dir_all(nss_dir.join("local/journal"))?;
+
+    // Create journal directory based on journal type
+    if is_ebs_journal {
+        if let Some(uuid) = journal_uuid {
+            let ebs_journal_dir = data_dir.join("ebs").join(uuid);
+            fs::create_dir_all(&ebs_journal_dir)?;
+            info!("Created EBS journal directory: {:?}", ebs_journal_dir);
+        }
+    } else {
+        // NVMe journal
+        if let Some(uuid) = journal_uuid {
+            let local_journal_dir = nss_dir.join("local/journal").join(uuid);
+            fs::create_dir_all(&local_journal_dir)?;
+            info!("Created NVMe journal directory: {:?}", local_journal_dir);
+        } else {
+            fs::create_dir_all(nss_dir.join("local/journal"))?;
+        }
+    }
+
     fs::create_dir_all(nss_dir.join("local/stats"))?;
     fs::create_dir_all(nss_dir.join("local/meta_cache/blobs"))?;
 

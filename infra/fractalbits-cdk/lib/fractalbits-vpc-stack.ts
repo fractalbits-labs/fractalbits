@@ -5,6 +5,7 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as autoscaling from "aws-cdk-lib/aws-autoscaling";
 import * as cr from "aws-cdk-lib/custom-resources";
+import * as crypto from "crypto";
 
 import {
   createInstance,
@@ -528,6 +529,14 @@ export class FractalbitsVpcStack extends cdk.Stack {
     // Each deployment gets fresh workflow state to avoid stale barrier objects
     const workflowClusterId = `fractalbits-${Date.now()}`;
 
+    // Generate journal UUIDs for EBS volumes (used for filesystem UUID and mount point)
+    const journalUuidA =
+      props.journalType === "ebs" ? crypto.randomUUID() : undefined;
+    const journalUuidB =
+      props.journalType === "ebs" && instances["nss-B"]
+        ? crypto.randomUUID()
+        : undefined;
+
     const bootstrapConfigContent = createConfigWithCfnTokens({
       deployTarget: "aws",
       region: cdk.Stack.of(this).region,
@@ -550,6 +559,8 @@ export class FractalbitsVpcStack extends cdk.Stack {
         : undefined,
       volumeAId: ebsVolumeAId,
       volumeBId: ebsVolumeBId || undefined,
+      journalUuidA: journalUuidA,
+      journalUuidB: journalUuidB,
       rssA: { id: instances["rss-A"].instanceId },
       rssB:
         props.rootServerHa && instances["rss-B"]
