@@ -413,6 +413,9 @@ pub fn create_nss_dirs(
 
     let nss_dir = data_dir.join(dir_name);
 
+    // Always create local/journal directory (needed for fbs.state and unit tests)
+    fs::create_dir_all(nss_dir.join("local/journal"))?;
+
     // Create journal directory based on journal type
     if is_ebs_journal {
         if let Some(uuid) = journal_uuid {
@@ -426,8 +429,6 @@ pub fn create_nss_dirs(
             let local_journal_dir = nss_dir.join("local/journal").join(uuid);
             fs::create_dir_all(&local_journal_dir)?;
             info!("Created NVMe journal directory: {:?}", local_journal_dir);
-        } else {
-            fs::create_dir_all(nss_dir.join("local/journal"))?;
         }
     }
 

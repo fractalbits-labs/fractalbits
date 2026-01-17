@@ -187,9 +187,16 @@ pub fn run_zig_unit_tests(init_config: InitConfig) -> CmdResult {
     }
 
     let working_dir = run_fun!(pwd)?;
+    let journal_uuid = std::fs::read_to_string("data/etc/journal_uuid.txt")?
+        .trim()
+        .to_string();
+    let shared_dir = match init_config.journal_type {
+        JournalType::Ebs => format!("../ebs/{}", journal_uuid),
+        JournalType::Nvme => format!("local/journal/{}", journal_uuid),
+    };
     run_cmd! {
         info "Formatting nss_server";
-        $working_dir/$ZIG_DEBUG_OUT/bin/nss_server format;
+        SHARED_DIR=$shared_dir JOURNAL_UUID=$journal_uuid $working_dir/$ZIG_DEBUG_OUT/bin/nss_server format;
     }?;
 
     run_cmd! {
