@@ -13,7 +13,7 @@ pub fn run_cmd_docker(cmd: DockerCommand) -> CmdResult {
             all_from_source,
             image_name,
             tag,
-        } => build_docker_image(release, all_from_source, &image_name, &tag),
+        } => build_docker_image(release, all_from_source, &image_name, &tag, true),
         DockerCommand::Run {
             image_name,
             tag,
@@ -31,6 +31,7 @@ fn build_docker_image(
     all_from_source: bool,
     image_name: &str,
     tag: &str,
+    include_volume: bool,
 ) -> CmdResult {
     info!("Building Docker image: {}:{}", image_name, tag);
 
@@ -109,7 +110,7 @@ fn build_docker_image(
         run_cmd!(cp $bin_path $bin_staging/)?;
     }
 
-    write_dockerfile(staging_dir)?;
+    write_dockerfile(staging_dir, include_volume)?;
 
     let dockerfile_path = format!("{}/Dockerfile", staging_dir);
     let image_id = run_fun! {
@@ -124,6 +125,10 @@ fn build_docker_image(
 
     info!("Docker image built: {}:{} ({})", image_name, tag, short_id);
     Ok(())
+}
+
+pub fn build_docker_image_for_prepopulation(image_name: &str) -> CmdResult {
+    build_docker_image(true, true, image_name, "latest", false)
 }
 
 fn run_docker_container(
@@ -201,8 +206,15 @@ fn show_docker_logs(name: Option<&str>, follow: bool) -> CmdResult {
     Ok(())
 }
 
-fn write_dockerfile(staging_dir: &str) -> CmdResult {
-    let dockerfile_content = r#"FROM ubuntu:24.04
+fn write_dockerfile(staging_dir: &str, include_volume: bool) -> CmdResult {
+    let volume_directive = if include_volume {
+        "VOLUME /data\n\n"
+    } else {
+        ""
+    };
+
+    let dockerfile_content = format!(
+        r#"FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -223,11 +235,10 @@ EXPOSE 8080 18080 2379
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD curl -sf http://localhost:18080/mgmt/health || exit 1
 
-VOLUME /data
-
-ENTRYPOINT ["container-all-in-one"]
+{volume_directive}ENTRYPOINT ["container-all-in-one"]
 CMD ["--bin-dir=/opt/fractalbits/bin", "--data-dir=/data"]
-"#;
+"#
+    );
 
     let dockerfile_path = format!("{}/Dockerfile", staging_dir);
     std::fs::write(&dockerfile_path, dockerfile_content)?;

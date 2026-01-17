@@ -51,7 +51,7 @@ fn publish(skip_build: bool, dry_run: bool, allow_dirty: bool) -> CmdResult {
 
         // Build binaries for all CPU targets (deployment)
         info!("Building binaries for all CPU targets...");
-        crate::cmd_deploy::build(DeployTarget::All, true, &[], &[])?;
+        crate::cmd_deploy::build(DeployTarget::All, true, &[], &[], false)?;
     } else {
         info!("Skipping build step (--skip-build)");
     }

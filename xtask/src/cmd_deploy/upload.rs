@@ -6,6 +6,24 @@ pub fn upload(deploy_target: DeployTarget) -> CmdResult {
     upload_with_endpoint(deploy_target, None)
 }
 
+/// Upload only Docker image to AWS S3 (for simulate-on-prem mode)
+pub fn upload_docker_image_only() -> CmdResult {
+    let bucket_name = get_bootstrap_bucket_name(DeployTarget::Aws)?;
+
+    if std::path::Path::new("prebuilt/deploy/docker/fractalbits-image.tar.gz").exists() {
+        run_cmd! {
+            info "Uploading Docker image to S3 bucket $bucket_name";
+            aws s3 cp prebuilt/deploy/docker/fractalbits-image.tar.gz "s3://$bucket_name/docker/fractalbits-image.tar.gz";
+        }?;
+    } else {
+        return Err(std::io::Error::other(
+            "Docker image not found. Run 'cargo xtask deploy build' first.",
+        ));
+    }
+
+    Ok(())
+}
+
 pub fn upload_with_endpoint(deploy_target: DeployTarget, s3_endpoint: Option<&str>) -> CmdResult {
     let bucket_name = get_bootstrap_bucket_name(deploy_target)?;
 
@@ -35,9 +53,13 @@ pub fn upload_with_endpoint(deploy_target: DeployTarget, s3_endpoint: Option<&st
     let boostrap_script_content = format!(
         r#"#!/bin/bash
 set -ex
+exec > >(tee -a /var/log/fractalbits-bootstrap.log) 2>&1
+echo "=== Bootstrap started at $(date) ==="
 aws s3 cp --no-progress s3://{bucket_name}/$(arch)/fractalbits-bootstrap /opt/fractalbits/bin/fractalbits-bootstrap
 chmod +x /opt/fractalbits/bin/fractalbits-bootstrap
-/opt/fractalbits/bin/fractalbits-bootstrap {bucket_name}"#
+/opt/fractalbits/bin/fractalbits-bootstrap {bucket_name}
+echo "=== Bootstrap completed at $(date) ==="
+"#
     );
 
     // Determine target-specific directory based on deploy target
@@ -68,6 +90,16 @@ chmod +x /opt/fractalbits/bin/fractalbits-bootstrap
         run_cmd! {
             info "Syncing UI to S3 bucket $bucket_name";
             $[env_vars] aws s3 sync prebuilt/deploy/ui "s3://$bucket_name/ui";
+        }?;
+    }
+
+    // Upload Docker image tgz if it exists (skip for on-prem since Docker is already loaded on RSS)
+    if deploy_target == DeployTarget::Aws
+        && std::path::Path::new("prebuilt/deploy/docker/fractalbits-image.tar.gz").exists()
+    {
+        run_cmd! {
+            info "Uploading Docker image to S3 bucket $bucket_name";
+            $[env_vars] aws s3 cp prebuilt/deploy/docker/fractalbits-image.tar.gz "s3://$bucket_name/docker/fractalbits-image.tar.gz";
         }?;
     }
 

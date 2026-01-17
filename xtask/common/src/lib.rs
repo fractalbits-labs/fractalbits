@@ -226,21 +226,28 @@ impl BootstrapClusterConfig {
         self.nodes.get(service_type)
     }
 
-    /// Get instance config by ID (searches all service types)
+    /// Get instance config by ID or private IP (searches all service types)
     pub fn get_instance(&self, id: &str) -> Option<ClusterNodeConfig> {
         for (service_type, entries) in &self.nodes {
+            // First try exact ID match
             if let Some(entry) = entries.iter().find(|e| e.id == id) {
+                return Some(ClusterNodeConfig::from_entry(service_type, entry));
+            }
+            // Then try matching by private_ip
+            if let Some(entry) = entries.iter().find(|e| e.private_ip.as_deref() == Some(id)) {
                 return Some(ClusterNodeConfig::from_entry(service_type, entry));
             }
         }
         None
     }
 
-    /// Check if instance exists in any service type
+    /// Check if instance exists in any service type (by ID or private_ip)
     pub fn contains_instance(&self, id: &str) -> bool {
-        self.nodes
-            .values()
-            .any(|entries| entries.iter().any(|e| e.id == id))
+        self.nodes.values().any(|entries| {
+            entries
+                .iter()
+                .any(|e| e.id == id || e.private_ip.as_deref() == Some(id))
+        })
     }
 
     pub fn get_resources(&self) -> ClusterResourcesConfig {

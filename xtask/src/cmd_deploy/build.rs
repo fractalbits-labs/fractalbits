@@ -1,15 +1,20 @@
+use crate::cmd_docker::build_docker_image_for_prepopulation;
 use crate::etcd_utils::download_etcd_for_deploy;
 use crate::*;
+use std::io::Error;
 use std::path::Path;
+use std::time::Duration;
 use xtask_common::DeployTarget as UploadTarget;
 
 use super::common::{ARCH_TARGETS, ArchTarget, RUST_BINS, ZIG_BINS};
+use super::upload::upload_with_endpoint;
 
 pub fn build(
     deploy_target: DeployTarget,
     release_mode: bool,
     zig_extra_build: &[String],
     api_server_build_env: &[String],
+    for_on_prem: bool,
 ) -> CmdResult {
     let (zig_build_opt, rust_build_opt, build_dir) = if release_mode {
         ("--release=safe", "--release", "release")
@@ -57,6 +62,11 @@ pub fn build(
         && Path::new(UI_REPO_PATH).exists()
     {
         build_ui()?;
+    }
+
+    // Build and export Docker image (only for on-prem deployment)
+    if for_on_prem && deploy_target == DeployTarget::All {
+        build_docker_with_prepopulated_binaries()?;
     }
 
     // Download (extract) warp binary for each architecture
@@ -270,5 +280,92 @@ fn download_warp_binaries() -> CmdResult {
         }?;
     }
 
+    Ok(())
+}
+
+fn build_docker_with_prepopulated_binaries() -> CmdResult {
+    const CONTAINER_NAME: &str = "fractalbits-prepopulate";
+    const IMAGE_NAME: &str = "fractalbits-prepopulate-base";
+
+    info!("Building Docker image with pre-populated binaries for on-prem...");
+
+    // Build a Docker image WITHOUT VOLUME directive so data is captured by commit
+    info!("Building base Docker image (without VOLUME) for pre-population...");
+    build_docker_image_for_prepopulation(IMAGE_NAME)?;
+
+    // Clean up any existing container
+    let _ = run_cmd!(ignore docker stop $CONTAINER_NAME 2>/dev/null);
+    let _ = run_cmd!(ignore docker rm -f $CONTAINER_NAME 2>/dev/null);
+
+    // Start the Docker container (no -v, data goes to container filesystem)
+    info!("Starting Docker container to populate with binaries...");
+    run_cmd!(
+        docker run -d --privileged --name $CONTAINER_NAME
+            -p 8080:8080 -p 18080:18080
+            $IMAGE_NAME
+    )?;
+
+    // Wait for the container to be healthy
+    info!("Waiting for container to be ready...");
+    let max_attempts = 60;
+    let mut ready = false;
+    for i in 1..=max_attempts {
+        std::thread::sleep(Duration::from_secs(5));
+        let health_check = std::process::Command::new("curl")
+            .args([
+                "-sf",
+                "--max-time",
+                "5",
+                "http://localhost:18080/mgmt/health",
+            ])
+            .output();
+        if health_check.is_ok_and(|o| o.status.success()) {
+            info!("Container is ready after {} attempts", i);
+            ready = true;
+            break;
+        }
+        if i % 6 == 0 {
+            info!(
+                "Still waiting for container... (attempt {}/{})",
+                i, max_attempts
+            );
+        }
+    }
+
+    if !ready {
+        run_cmd!(docker logs $CONTAINER_NAME 2>&1 | tail -50)?;
+        let _ = run_cmd!(docker stop $CONTAINER_NAME);
+        let _ = run_cmd!(docker rm -f $CONTAINER_NAME);
+        return Err(Error::other(
+            "Timed out waiting for Docker container to be ready",
+        ));
+    }
+
+    // Upload binaries to local fractalbits S3 service using common upload function
+    info!("Uploading binaries to local fractalbits container...");
+    upload_with_endpoint(UploadTarget::OnPrem, Some("localhost:8080"))?;
+
+    // Stop the container (preserves data)
+    info!("Stopping container...");
+    run_cmd!(docker stop $CONTAINER_NAME)?;
+
+    // Commit the container to capture data
+    info!("Committing container with pre-populated data...");
+    run_cmd!(docker commit $CONTAINER_NAME fractalbits:latest)?;
+
+    // Remove the temp container and base image
+    run_cmd!(docker rm -f $CONTAINER_NAME)?;
+    let _ = run_cmd!(docker rmi $IMAGE_NAME 2>/dev/null);
+
+    // Export the image
+    info!("Exporting Docker image with pre-populated binaries...");
+    run_cmd! {
+        mkdir -p prebuilt/deploy/docker;
+        docker save fractalbits:latest | gzip > prebuilt/deploy/docker/fractalbits-image.tar.gz;
+    }?;
+
+    info!(
+        "Docker image with pre-populated binaries exported to prebuilt/deploy/docker/fractalbits-image.tar.gz"
+    );
     Ok(())
 }

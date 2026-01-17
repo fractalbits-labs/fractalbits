@@ -25,3 +25,4 @@ dialoguer.workspace = true
 indicatif.workspace = true
 zip.workspace = true
 toml.workspace = true
+regex.workspace = true

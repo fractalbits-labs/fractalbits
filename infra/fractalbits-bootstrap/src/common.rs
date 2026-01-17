@@ -403,7 +403,7 @@ pub fn format_local_nvme_disks(support_storage_twp: bool) -> CmdResult {
             "ext4" => {
                 run_cmd! {
                     info "Creating ext4 on local nvme disks: ${nvme_disks:?}";
-                    mkfs.ext4 -I 128 -m 0 -i 8192 -J size=4096
+                    mkfs.ext4 -F -I 128 -m 0 -i 8192 -J size=4096
                         -E lazy_itable_init=0,lazy_journal_init=0
                         -O dir_index,extent,flex_bg,fast_commit $[nvme_disks] &>/dev/null;
                 }?;
@@ -460,7 +460,7 @@ pub fn format_local_nvme_disks(support_storage_twp: bool) -> CmdResult {
             let stripe_width = num_nvme_disks * 128;
             run_cmd! {
                 info "Creating ext4 on /dev/md0";
-                mkfs.ext4 -I 128 -m 0 -i 8192 -J size=4096
+                mkfs.ext4 -F -I 128 -m 0 -i 8192 -J size=4096
                     -E lazy_itable_init=0,lazy_journal_init=0,stride=128,stripe_width=${stripe_width}
                     -O dir_index,extent,flex_bg,fast_commit /dev/md0 &>/dev/null;
             }?;
@@ -984,7 +984,7 @@ pub fn get_service_ips_etcd(
     let etcd_prefix = format!("/fractalbits-service-discovery/{service_id}/");
     loop {
         if start_time.elapsed() > timeout {
-            cmd_die!("Timeout waiting for {service_id} service(s) via etcd");
+            cmd_die!("Timeout waiting for ${service_id} service(s) via etcd");
         }
 
         let res: Result<String, _> = run_fun! {

@@ -5,6 +5,7 @@ use std::path::Path;
 
 use super::bootstrap;
 use super::common::{DeployTarget, VpcConfig};
+use super::simulate_on_prem;
 use super::ssm_bootstrap;
 use super::upload::{get_bootstrap_bucket_name, upload};
 
@@ -25,11 +26,24 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         journal_type,
         watch_bootstrap,
         skip_upload,
+        simulate_on_prem,
     } = config;
 
+    // Override settings for simulate-on-prem mode
+    let (rss_backend, journal_type) = if simulate_on_prem {
+        (crate::RssBackend::Etcd, crate::JournalType::Nvme)
+    } else {
+        (rss_backend, journal_type)
+    };
+
     if !skip_upload {
-        info!("Uploading binaries to S3 bootstrap bucket...");
-        upload(DeployTarget::Aws)?;
+        if simulate_on_prem {
+            info!("Uploading Docker image to S3 bootstrap bucket (simulate-on-prem mode)...");
+            super::upload::upload_docker_image_only()?;
+        } else {
+            info!("Uploading binaries to S3 bootstrap bucket...");
+            upload(DeployTarget::Aws)?;
+        }
     }
 
     // Note: Template-based configuration is handled in CDK (vpc/fractalbits-cdk/bin/fractalbits-vpc.ts)
@@ -98,8 +112,28 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         add_context("skipUserData", "true".to_string());
     }
 
+    // Add simulate-on-prem context parameters
+    if simulate_on_prem {
+        add_context("simulateOnPrem", "true".to_string());
+        add_context("skipUserData", "true".to_string()); // Skip normal bootstrap
+    }
+
     // Deploy the VPC stack
-    if ssm_bootstrap {
+    if simulate_on_prem {
+        run_cmd! {
+            info "Deploying FractalbitsVpcStack (simulate-on-prem mode)...";
+            cd $cdk_dir;
+            npx cdk deploy FractalbitsVpcStack
+                $[context_params]
+                --outputs-file /tmp/cdk-outputs.json
+                --require-approval never 2>&1;
+            info "VPC deployment completed successfully";
+        }?;
+
+        // Set up on-prem simulation
+        simulate_on_prem::setup_on_prem_simulation()?;
+        return Ok(());
+    } else if ssm_bootstrap {
         run_cmd! {
             info "Deploying FractalbitsVpcStack (SSM bootstrap mode)...";
             cd $cdk_dir;

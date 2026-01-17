@@ -173,6 +173,37 @@ export class FractalbitsVpcStack extends cdk.Stack {
       );
     }
 
+    // Add ports for simulate-on-prem mode
+    const simulateOnPrem = this.node.tryGetContext("simulateOnPrem") === "true";
+    if (simulateOnPrem) {
+      privateSg.addIngressRule(
+        ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+        ec2.Port.tcp(22),
+        "Allow SSH access from within VPC (simulate-on-prem)",
+      );
+      privateSg.addIngressRule(
+        ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+        ec2.Port.tcp(8080),
+        "Allow Docker S3 API access from within VPC (simulate-on-prem)",
+      );
+      privateSg.addIngressRule(
+        ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+        ec2.Port.tcp(18080),
+        "Allow Docker mgmt API access from within VPC (simulate-on-prem)",
+      );
+      // simulate-on-prem always uses etcd
+      privateSg.addIngressRule(
+        ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+        ec2.Port.tcp(2379),
+        "Allow etcd client access from within VPC (simulate-on-prem)",
+      );
+      privateSg.addIngressRule(
+        ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+        ec2.Port.tcp(2380),
+        "Allow etcd peer-to-peer communication within VPC (simulate-on-prem)",
+      );
+    }
+
     // Create data blob bucket only for s3_hybrid_single_az mode
     let dataBlobBucket: s3.Bucket | undefined;
     if (dataBlobStorage === "s3_hybrid_single_az") {
@@ -204,7 +235,9 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     // Define instance metadata, and create instances
     const nssInstanceType = new ec2.InstanceType(props.nssInstanceType);
-    const rssInstanceType = new ec2.InstanceType("c7g.medium");
+    const rssInstanceType = new ec2.InstanceType(
+      simulateOnPrem ? "c7i.4xlarge" : "c7g.medium",
+    );
     const benchInstanceType = new ec2.InstanceType("c7g.large");
 
     // Get specific subnets for instances to ensure correct AZ placement

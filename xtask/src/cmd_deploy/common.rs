@@ -16,6 +16,7 @@ pub struct VpcConfig {
     pub journal_type: crate::JournalType,
     pub watch_bootstrap: bool,
     pub skip_upload: bool,
+    pub simulate_on_prem: bool,
 }
 
 #[derive(Clone)]

@@ -74,10 +74,12 @@ pub fn bootstrap(
 
     // For NVMe journal type, coordinate active/standby startup
     // Standby (nss_b) must start mirrord first, then active (nss_a) can start nss_server
+    // In solo mode (no nss_b), just start nss_server directly without mirrord coordination
     if journal_type == JournalType::Nvme {
         let resources = config.get_resources();
         let instance_id = get_instance_id_from_config(config)?;
         let is_standby = resources.nss_b_id.as_ref() == Some(&instance_id);
+        let is_solo_mode = resources.nss_b_id.is_none();
 
         if is_standby {
             // Standby: start mirrord first
@@ -93,8 +95,21 @@ pub fn bootstrap(
 
             // Complete services-ready stage
             barrier.complete_stage(stages::SERVICES_READY, None)?;
+        } else if is_solo_mode {
+            // Solo mode: no mirrord coordination needed, just start nss_server directly
+            info!("Starting as solo NSS (no mirrord coordination)");
+            run_cmd!(systemctl start nss_role_agent.service)?;
+
+            // Wait for nss_server to be ready before signaling
+            wait_for_service_ready("nss_server", 8088, 360)?;
+
+            // Signal that journal is ready and nss_server is accepting connections
+            barrier.complete_stage(stages::NSS_JOURNAL_READY, None)?;
+
+            // Complete services-ready stage
+            barrier.complete_stage(stages::SERVICES_READY, None)?;
         } else {
-            // Active: wait for mirrord to be ready first
+            // Active (HA mode): wait for mirrord to be ready first
             info!("Starting as active NSS, waiting for mirrord to be ready...");
             barrier.wait_for_nodes(stages::MIRRORD_READY, 1, timeouts::MIRRORD_READY)?;
             info!("Mirrord is ready, starting nss_role_agent");

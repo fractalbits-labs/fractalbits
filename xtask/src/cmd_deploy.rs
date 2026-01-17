@@ -2,6 +2,7 @@ pub mod bootstrap;
 mod build;
 mod common;
 mod create_cluster;
+mod simulate_on_prem;
 mod ssm_bootstrap;
 mod upload;
 mod vpc;
