@@ -110,7 +110,7 @@ fn bootstrap_leader(
 
     // Initialize NSS role states in service discovery BEFORE starting RSS
     // This ensures the observer state exists when RSS starts
-    initialize_nss_roles(config, nss_a_id, nss_b_id)?;
+    initialize_observer_state(config, nss_a_id, nss_b_id)?;
 
     create_rss_config(config, nss_endpoint, ha_enabled)?;
     create_rss_bootstrap_env()?;
@@ -175,7 +175,7 @@ fn bootstrap_leader(
     Ok(())
 }
 
-fn initialize_nss_roles(
+fn initialize_observer_state(
     config: &BootstrapConfig,
     nss_a_id: &str,
     nss_b_id: Option<&str>,
