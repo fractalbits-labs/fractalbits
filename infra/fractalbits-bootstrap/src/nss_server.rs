@@ -154,11 +154,11 @@ fn setup_configs(
     create_mirrord_config(volume_dev.as_deref(), &shared_dir)?;
 
     // EBS-specific: mount at /data/ebs (simple unit name: data-ebs.mount)
-    if journal_type == JournalType::Ebs {
-        if let Some(vid) = volume_id {
-            let mount_dev = ebs_journal::get_volume_dev(vid);
-            create_mount_unit(&mount_dev, "/data/ebs", "ext4")?;
-        }
+    if journal_type == JournalType::Ebs
+        && let Some(vid) = volume_id
+    {
+        let mount_dev = ebs_journal::get_volume_dev(vid);
+        create_mount_unit(&mount_dev, "/data/ebs", "ext4")?;
     }
 
     // Common configs

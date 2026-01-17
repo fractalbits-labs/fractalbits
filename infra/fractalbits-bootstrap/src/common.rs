@@ -129,9 +129,7 @@ Environment="HOST_ID={instance_id}"
             managed_service = true;
             requires = match (journal_type, journal_uuid) {
                 (Some(JournalType::Nvme), _) => "data-local.mount".to_string(),
-                (Some(JournalType::Ebs), Some(_)) => {
-                    "data-ebs.mount data-local.mount".to_string()
-                }
+                (Some(JournalType::Ebs), Some(_)) => "data-ebs.mount data-local.mount".to_string(),
                 (Some(JournalType::Ebs), None) => "data-local.mount".to_string(),
                 (None, _) => unreachable!(),
             };
@@ -141,9 +139,7 @@ Environment="HOST_ID={instance_id}"
             managed_service = true;
             requires = match (journal_type, journal_uuid) {
                 (Some(JournalType::Nvme), _) => "data-local.mount".to_string(),
-                (Some(JournalType::Ebs), Some(_)) => {
-                    "data-ebs.mount data-local.mount".to_string()
-                }
+                (Some(JournalType::Ebs), Some(_)) => "data-ebs.mount data-local.mount".to_string(),
                 (Some(JournalType::Ebs), None) => "data-local.mount".to_string(),
                 (None, _) => unreachable!(),
             };
