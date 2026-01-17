@@ -529,13 +529,10 @@ export class FractalbitsVpcStack extends cdk.Stack {
     // Each deployment gets fresh workflow state to avoid stale barrier objects
     const workflowClusterId = `fractalbits-${Date.now()}`;
 
-    // Generate journal UUIDs for EBS volumes (used for filesystem UUID and mount point)
-    const journalUuidA =
+    // Generate shared journal UUID for EBS volumes (used for filesystem UUID and mount point)
+    // Both NSS and mirrord use the same journal UUID
+    const journalUuid =
       props.journalType === "ebs" ? crypto.randomUUID() : undefined;
-    const journalUuidB =
-      props.journalType === "ebs" && instances["nss-B"]
-        ? crypto.randomUUID()
-        : undefined;
 
     const bootstrapConfigContent = createConfigWithCfnTokens({
       deployTarget: "aws",
@@ -559,8 +556,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         : undefined,
       volumeAId: ebsVolumeAId,
       volumeBId: ebsVolumeBId || undefined,
-      journalUuidA: journalUuidA,
-      journalUuidB: journalUuidB,
+      journalUuid: journalUuid,
       rssA: { id: instances["rss-A"].instanceId },
       rssB:
         props.rootServerHa && instances["rss-B"]

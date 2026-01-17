@@ -43,8 +43,7 @@ export function createConfigWithCfnTokens(props: {
   nssB?: InstanceProps;
   volumeAId: string;
   volumeBId?: string;
-  journalUuidA?: string;
-  journalUuidB?: string;
+  journalUuid?: string;
   rssA: InstanceProps;
   rssB?: InstanceProps;
   guiServer?: InstanceProps;
@@ -183,31 +182,29 @@ export function createConfigWithCfnTokens(props: {
     addNode(props.rssB, "root_server", "follower");
   }
 
-  // Add NSS nodes
+  // Add NSS nodes - both use the same shared journal UUID
   const nssAVolumeId =
     props.journalType === "ebs" ? props.volumeAId : undefined;
-  const nssAJournalUuid =
-    props.journalType === "ebs" ? props.journalUuidA : undefined;
+  const sharedJournalUuid =
+    props.journalType === "ebs" ? props.journalUuid : undefined;
   addNode(
     props.nssA,
     "nss_server",
     undefined,
     nssAVolumeId,
     undefined,
-    nssAJournalUuid,
+    sharedJournalUuid,
   );
   if (props.nssB) {
     const nssBVolumeId =
       props.journalType === "ebs" ? props.volumeBId : undefined;
-    const nssBJournalUuid =
-      props.journalType === "ebs" ? props.journalUuidB : undefined;
     addNode(
       props.nssB,
       "nss_server",
       undefined,
       nssBVolumeId,
       undefined,
-      nssBJournalUuid,
+      sharedJournalUuid,
     );
   }
 
