@@ -25,7 +25,11 @@ pub fn upload_docker_image_only() -> CmdResult {
 }
 
 pub fn upload_with_endpoint(deploy_target: DeployTarget, s3_endpoint: Option<&str>) -> CmdResult {
-    let bucket_name = get_bootstrap_bucket_name(deploy_target)?;
+    let bucket_name = if s3_endpoint.is_some() {
+        get_bootstrap_bucket_name(deploy_target)?
+    } else {
+        get_bootstrap_bucket_name(DeployTarget::Aws)?
+    };
 
     // Build environment variables for S3 access as a vector
     let endpoint_env = s3_endpoint.map(|e| format!("AWS_ENDPOINT_URL_S3=http://{}", e));
@@ -42,7 +46,6 @@ pub fn upload_with_endpoint(deploy_target: DeployTarget, s3_endpoint: Option<&st
     // Check if the bucket exists; create if it doesn't
     let bucket_exists =
         run_cmd!($[env_vars] aws s3api head-bucket --bucket $bucket_name &>/dev/null).is_ok();
-
     if !bucket_exists {
         run_cmd! {
             info "Creating bucket $bucket_name";
@@ -93,7 +96,7 @@ echo "=== Bootstrap completed at $(date) ==="
         }?;
     }
 
-    // Upload Docker image tgz if it exists (skip for on-prem since Docker is already loaded on RSS)
+    // Upload Docker image tgz if it exists
     if deploy_target == DeployTarget::Aws
         && std::path::Path::new("prebuilt/deploy/docker/fractalbits-image.tar.gz").exists()
     {
