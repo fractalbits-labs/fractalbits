@@ -10,7 +10,7 @@ use super::common::{ARCH_TARGETS, ArchTarget, RUST_BINS, ZIG_BINS};
 use super::upload::upload_with_endpoint;
 
 pub fn build(
-    deploy_target: DeployTarget,
+    target: DeployBuildTarget,
     release_mode: bool,
     zig_extra_build: &[String],
     api_server_build_env: &[String],
@@ -39,40 +39,40 @@ pub fn build(
 
     // Build fractalbits-bootstrap separately for each architecture without CPU flags
     if matches!(
-        deploy_target,
-        DeployTarget::Bootstrap | DeployTarget::Rust | DeployTarget::All
+        target,
+        DeployBuildTarget::Bootstrap | DeployBuildTarget::Rust | DeployBuildTarget::All
     ) {
         build_bootstrap(rust_build_opt, build_dir)?;
     }
 
     // Build other Rust projects with CPU-specific optimizations
-    if matches!(deploy_target, DeployTarget::Rust | DeployTarget::All) {
+    if matches!(target, DeployBuildTarget::Rust | DeployBuildTarget::All) {
         build_rust(rust_build_opt, build_dir, api_server_build_env)?;
     }
 
     // Build Zig projects for all CPU targets (for both aws and on_prem)
-    if matches!(deploy_target, DeployTarget::Zig | DeployTarget::All)
+    if matches!(target, DeployBuildTarget::Zig | DeployBuildTarget::All)
         && Path::new(ZIG_REPO_PATH).exists()
     {
         build_zig(zig_build_opt, build_dir, zig_extra_build)?;
     }
 
     // Build and copy UI
-    if matches!(deploy_target, DeployTarget::Ui | DeployTarget::All)
+    if matches!(target, DeployBuildTarget::Ui | DeployBuildTarget::All)
         && Path::new(UI_REPO_PATH).exists()
     {
         build_ui()?;
     }
 
-    // Build and export Docker image (only for on-prem deployment)
-    if for_on_prem && deploy_target == DeployTarget::All {
-        build_docker_with_prepopulated_binaries()?;
-    }
-
     // Download (extract) warp binary for each architecture
-    if deploy_target == DeployTarget::All {
+    if target == DeployBuildTarget::All {
         download_warp_binaries()?;
         download_etcd_for_deploy()?;
+    }
+
+    // Build and export Docker image (only for on-prem deployment)
+    if for_on_prem && target == DeployBuildTarget::All {
+        build_docker_with_prepopulated_binaries()?;
     }
 
     info!("Deploy build is done");

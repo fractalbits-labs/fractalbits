@@ -223,7 +223,7 @@ pub enum DeployCommand {
     #[clap(about = "Build binaries for deployment")]
     Build {
         #[clap(long, default_value = "all", value_enum)]
-        target: DeployTarget,
+        target: DeployBuildTarget,
 
         #[clap(long, action=ArgAction::Set, default_value = "true", num_args = 0..=1)]
         release: bool,
@@ -447,7 +447,7 @@ pub enum RssBackend {
 }
 
 #[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
-pub enum DeployTarget {
+pub enum DeployBuildTarget {
     Zig,
     Rust,
     Bootstrap,

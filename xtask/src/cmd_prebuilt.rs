@@ -1,5 +1,5 @@
 use crate::cmd_repo::{PREBUILT_REPO, all_repos, format_manifest, repo_has_changes};
-use crate::{DeployTarget, PrebuiltCommand};
+use crate::{DeployBuildTarget, PrebuiltCommand};
 use cmd_lib::*;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -51,7 +51,7 @@ fn publish(skip_build: bool, dry_run: bool, allow_dirty: bool) -> CmdResult {
 
         // Build binaries for all CPU targets (deployment)
         info!("Building binaries for all CPU targets...");
-        crate::cmd_deploy::build(DeployTarget::All, true, &[], &[], false)?;
+        crate::cmd_deploy::build(DeployBuildTarget::All, true, &[], &[], false)?;
     } else {
         info!("Skipping build step (--skip-build)");
     }
