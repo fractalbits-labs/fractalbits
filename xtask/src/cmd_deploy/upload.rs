@@ -1,6 +1,6 @@
 use crate::*;
 
-use super::common::DeployTarget;
+use super::common::{DeployTarget, get_bootstrap_bucket_name};
 
 pub fn upload(deploy_target: DeployTarget) -> CmdResult {
     upload_with_endpoint(deploy_target, None)
@@ -105,15 +105,4 @@ echo "=== Bootstrap completed at $(date) ==="
 
     info!("Syncing all binaries is done");
     Ok(())
-}
-
-pub fn get_bootstrap_bucket_name(deploy_target: DeployTarget) -> FunResult {
-    match deploy_target {
-        DeployTarget::OnPrem => Ok("fractalbits-bootstrap".to_string()),
-        DeployTarget::Aws => {
-            let region = run_fun!(aws configure get region)?;
-            let account_id = run_fun!(aws sts get-caller-identity --query Account --output text)?;
-            Ok(format!("fractalbits-bootstrap-{region}-{account_id}"))
-        }
-    }
 }

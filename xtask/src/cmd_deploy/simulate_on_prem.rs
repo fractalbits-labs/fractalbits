@@ -5,8 +5,7 @@ use std::collections::HashMap;
 use std::io::Error;
 use std::time::{Duration, Instant};
 
-use super::upload::get_bootstrap_bucket_name;
-use xtask_common::DeployTarget;
+use super::common::{DeployTarget, get_bootstrap_bucket_name};
 
 const CDK_OUTPUTS_PATH: &str = "/tmp/cdk-outputs.json";
 const SSM_POLL_INTERVAL_SECS: u64 = 5;

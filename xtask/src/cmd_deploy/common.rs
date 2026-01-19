@@ -1,3 +1,5 @@
+use cmd_lib::*;
+
 pub use xtask_common::DeployTarget;
 
 pub struct VpcConfig {
@@ -58,3 +60,14 @@ pub(super) const RUST_BINS: &[&str] = &[
 ];
 
 pub(super) const ZIG_BINS: &[&str] = &["nss_server", "bss_server", "mirrord"];
+
+pub fn get_bootstrap_bucket_name(deploy_target: DeployTarget) -> FunResult {
+    match deploy_target {
+        DeployTarget::OnPrem => Ok("fractalbits-bootstrap".to_string()),
+        DeployTarget::Aws => {
+            let region = run_fun!(aws configure get region)?;
+            let account_id = run_fun!(aws sts get-caller-identity --query Account --output text)?;
+            Ok(format!("fractalbits-bootstrap-{region}-{account_id}"))
+        }
+    }
+}

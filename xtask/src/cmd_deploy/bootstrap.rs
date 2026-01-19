@@ -1,5 +1,4 @@
-use super::common::DeployTarget;
-use super::upload::get_bootstrap_bucket_name;
+use super::common::{DeployTarget, get_bootstrap_bucket_name};
 use crate::CmdResult;
 use cmd_lib::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};

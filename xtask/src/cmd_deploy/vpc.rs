@@ -4,10 +4,10 @@ use dialoguer::Input;
 use std::path::Path;
 
 use super::bootstrap;
-use super::common::{DeployTarget, VpcConfig};
+use super::common::{DeployTarget, VpcConfig, get_bootstrap_bucket_name};
 use super::simulate_on_prem;
 use super::ssm_bootstrap;
-use super::upload::{get_bootstrap_bucket_name, upload};
+use super::upload::upload;
 
 pub fn create_vpc(config: VpcConfig) -> CmdResult {
     let VpcConfig {
