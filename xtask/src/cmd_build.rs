@@ -194,52 +194,85 @@ pub fn build_for_docker(release: bool) -> CmdResult {
 }
 
 pub fn build_prebuilt(_release: bool) -> CmdResult {
-    let build_target = "x86_64-unknown-linux-gnu";
-    let build_dir = format!("target/{build_target}/release");
-    let build_envs = get_build_envs();
-
     if !Path::new(&format!("{ZIG_REPO_PATH}/.git/")).exists() {
         warn!("No core repo found, skip building prebuilt");
         return Ok(());
     }
 
+    // Ensure cross-compilation targets are installed
     run_cmd! {
-        info "Building Zig binaries for x86_64_v3 (release mode)...";
-        cd $ZIG_REPO_PATH;
-        $[build_envs] zig build -p ../$build_dir/zig-out
-            -Doptimize=ReleaseSafe
-            -Dtarget=x86_64-linux-gnu
-            -Dcpu=x86_64_v3
-            -Dfor_prebuilt=true 2>&1;
-        info "Zig build complete";
+        rustup target add x86_64-unknown-linux-gnu;
+        rustup target add aarch64-unknown-linux-gnu;
     }?;
 
-    run_cmd! {
-        info "Building Rust binaries for x86_64_v3 (size-optimized release mode with zigbuild)...";
-        RUSTFLAGS="-C target-cpu=x86-64-v3 -C opt-level=z -C codegen-units=1 -C strip=symbols"
-        $[build_envs] cargo zigbuild --release --target $build_target
-            --workspace --exclude fractalbits-bootstrap --exclude rewrk*;
-    }?;
+    let build_envs = get_build_envs();
 
-    info!("Copying binaries to prebuilt directory...");
-    run_cmd!(mkdir -p prebuilt)?;
-    for bin in [
-        "nss_role_agent",
-        "root_server",
-        "rss_admin",
-        "zig-out/bin/bss_server",
-        "zig-out/bin/mirrord",
-        "zig-out/bin/nss_server",
-    ] {
-        run_cmd!(cp -f $build_dir/$bin prebuilt/)?;
+    struct ArchTarget {
+        arch: &'static str,
+        rust_target: &'static str,
+        rust_cpu: &'static str,
+        zig_target: &'static str,
+        zig_cpu: &'static str,
     }
 
-    run_cmd! {
-        info "Stripping debug symbols...";
-        find prebuilt -maxdepth 1 -type f -executable ! -name "*.d"
-            -exec strip --strip-all "{}" +;
-    }?;
+    let targets = [
+        ArchTarget {
+            arch: "x86_64",
+            rust_target: "x86_64-unknown-linux-gnu",
+            rust_cpu: "x86-64-v3",
+            zig_target: "x86_64-linux-gnu",
+            zig_cpu: "x86_64_v3",
+        },
+        ArchTarget {
+            arch: "aarch64",
+            rust_target: "aarch64-unknown-linux-gnu",
+            rust_cpu: "neoverse-n1",
+            zig_target: "aarch64-linux-gnu",
+            zig_cpu: "neoverse_n1",
+        },
+    ];
 
-    info!("Prebuilt binaries are ready");
+    for target in &targets {
+        let arch = target.arch;
+        let rust_target = target.rust_target;
+        let rust_cpu = target.rust_cpu;
+        let zig_target = target.zig_target;
+        let zig_cpu = target.zig_cpu;
+        let build_dir = format!("target/{rust_target}/release");
+
+        run_cmd! {
+            info "Building Zig binaries for $arch (release mode)...";
+            cd $ZIG_REPO_PATH;
+            $[build_envs] zig build -p ../$build_dir/zig-out
+                -Doptimize=ReleaseSafe
+                -Dtarget=$zig_target
+                -Dcpu=$zig_cpu
+                -Dfor_prebuilt=true 2>&1;
+            info "Zig build complete for $arch";
+        }?;
+
+        run_cmd! {
+            info "Building Rust binaries for $arch (size-optimized release mode with zigbuild)...";
+            RUSTFLAGS="-C target-cpu=$rust_cpu -C opt-level=z -C codegen-units=1 -C strip=symbols"
+            $[build_envs] cargo zigbuild --release --target $rust_target
+                --workspace --exclude fractalbits-bootstrap --exclude rewrk*;
+        }?;
+
+        info!("Copying binaries to prebuilt/{arch} directory...");
+        let prebuilt_dir = format!("prebuilt/{arch}");
+        run_cmd!(mkdir -p $prebuilt_dir)?;
+        for bin in [
+            "nss_role_agent",
+            "root_server",
+            "rss_admin",
+            "zig-out/bin/bss_server",
+            "zig-out/bin/mirrord",
+            "zig-out/bin/nss_server",
+        ] {
+            run_cmd!(cp -f $build_dir/$bin $prebuilt_dir/)?;
+        }
+    }
+
+    info!("Prebuilt binaries are ready for all architectures");
     Ok(())
 }

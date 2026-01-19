@@ -43,6 +43,8 @@ fn build_docker_image(
     };
     let staging_dir = "target/docker-staging";
     let bin_staging = format!("{staging_dir}/bin");
+    let arch = run_fun!(arch).unwrap_or_else(|_| "x86_64".to_string());
+    let prebuilt_dir = format!("prebuilt/{arch}");
 
     if all_from_source {
         info!("Building binaries for Docker...");
@@ -76,7 +78,7 @@ fn build_docker_image(
                 run_cmd!(cp $bin_path $bin_staging/)?;
             } else {
                 info!("{} not found, using prebuilt", bin);
-                run_cmd!(cp prebuilt/$bin $bin_staging/)?;
+                run_cmd!(cp $prebuilt_dir/$bin $bin_staging/)?;
             }
         }
 
@@ -88,7 +90,7 @@ fn build_docker_image(
                 run_cmd!(cp $bin_path $bin_staging/)?;
             } else {
                 info!("{} not found, using prebuilt", zig_bin);
-                run_cmd!(cp prebuilt/$zig_bin $bin_staging/)?;
+                run_cmd!(cp $prebuilt_dir/$zig_bin $bin_staging/)?;
             }
         }
     } else {
@@ -101,7 +103,7 @@ fn build_docker_image(
             "nss_role_agent",
         ];
         for bin in &prebuilt_binaries {
-            run_cmd!(cp prebuilt/$bin $bin_staging/)?;
+            run_cmd!(cp $prebuilt_dir/$bin $bin_staging/)?;
         }
     }
 

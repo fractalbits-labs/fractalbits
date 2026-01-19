@@ -1402,6 +1402,7 @@ fn register_local_api_server() -> CmdResult {
 fn resolve_binary_path(binary_name: &str, build_mode: BuildMode) -> String {
     let pwd = run_fun!(pwd).unwrap_or_else(|_| ".".to_string());
     let build = build_mode.as_ref();
+    let arch = run_fun!(arch).unwrap_or_else(|_| "x86_64".to_string());
 
     // Check different locations based on binary type
     let candidates = match binary_name {
@@ -1409,13 +1410,13 @@ fn resolve_binary_path(binary_name: &str, build_mode: BuildMode) -> String {
             vec![
                 format!("{pwd}/target/{build}/zig-out/bin/{binary_name}"),
                 format!("{pwd}/{ZIG_DEBUG_OUT}/bin/{binary_name}"),
-                format!("{pwd}/prebuilt/{binary_name}"),
+                format!("{pwd}/prebuilt/{arch}/{binary_name}"),
             ]
         }
         _ => {
             vec![
                 format!("{pwd}/target/{build}/{binary_name}"),
-                format!("{pwd}/prebuilt/{binary_name}"),
+                format!("{pwd}/prebuilt/{arch}/{binary_name}"),
             ]
         }
     };

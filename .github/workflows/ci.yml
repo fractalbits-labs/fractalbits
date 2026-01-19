@@ -16,7 +16,16 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    name: build (${{ matrix.arch }})
 
     steps:
     - name: Checkout code
@@ -51,7 +60,16 @@ jobs:
       run: cargo xtask precheckin --docker=excluded
 
   docker:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    name: docker (${{ matrix.arch }})
     needs: build
     permissions:
       contents: read
@@ -90,7 +108,7 @@ jobs:
       run: cargo xtask precheckin --docker=only
 
     - name: Log in to Container Registry
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.arch == 'x86_64'
       uses: docker/login-action@v3
       with:
         registry: ${{ env.REGISTRY }}
@@ -98,7 +116,7 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Tag and push Docker image
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.arch == 'x86_64'
       run: |
         docker tag fractalbits:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
         docker tag fractalbits:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
