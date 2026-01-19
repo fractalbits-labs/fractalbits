@@ -19,12 +19,6 @@ pub fn init_service(
 ) -> CmdResult {
     stop_service(service)?;
 
-    // Clean up previous service files to prevent stale configuration detection
-    // (e.g., nss_role_agent_b.service from previous NVMe runs affecting EBS mode)
-    if matches!(service, ServiceName::All) {
-        run_cmd!(rm -rf data/etc)?;
-    }
-
     // We are using minio to test large blob IO
     ensure_minio()?;
 
