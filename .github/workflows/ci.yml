@@ -85,6 +85,9 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
     - name: Free disk space
       uses: jlumbroso/free-disk-space@main
       with:

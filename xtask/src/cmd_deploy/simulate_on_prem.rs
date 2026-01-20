@@ -188,10 +188,24 @@ sudo yum install -y docker
 sudo systemctl start docker
 sudo systemctl enable docker
 
-# Download and load pre-built Docker image from S3
-aws s3 cp --no-progress s3://{aws_bucket}/docker/fractalbits-image.tar.gz /tmp/
-sudo docker load < <(gunzip -c /tmp/fractalbits-image.tar.gz)
-rm /tmp/fractalbits-image.tar.gz
+# Detect architecture and download correct image
+ARCH=$(arch)
+if [ "$ARCH" = "aarch64" ]; then
+    IMAGE_FILE="fractalbits-aarch64.tar.gz"
+elif [ "$ARCH" = "x86_64" ]; then
+    IMAGE_FILE="fractalbits-x86_64.tar.gz"
+else
+    echo "Unsupported architecture: $ARCH"
+    exit 1
+fi
+
+echo "Detected architecture: $ARCH, downloading $IMAGE_FILE"
+aws s3 cp --no-progress s3://{aws_bucket}/docker/$IMAGE_FILE /tmp/
+sudo docker load < <(gunzip -c /tmp/$IMAGE_FILE)
+rm /tmp/$IMAGE_FILE
+
+# Tag the image as 'latest' for easy reference
+sudo docker tag fractalbits:$ARCH fractalbits:latest
 
 # Run the fractalbits bootstrap container
 sudo docker run -d --privileged --name fractalbits-bootstrap \

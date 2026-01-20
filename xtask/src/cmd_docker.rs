@@ -1,5 +1,8 @@
 use crate::cmd_build::get_build_envs;
-use crate::etcd_utils::{ensure_etcd_local, resolve_etcd_bin};
+use crate::cmd_deploy::{
+    BinarySources, DockerBuildConfig, build_docker_image, get_host_arch, stage_binaries_for_docker,
+};
+use crate::etcd_utils::{ensure_etcd_local, resolve_etcd_dir};
 use crate::*;
 use cmd_lib::*;
 use std::io::Error;
@@ -13,7 +16,7 @@ pub fn run_cmd_docker(cmd: DockerCommand) -> CmdResult {
             all_from_source,
             image_name,
             tag,
-        } => build_docker_image(release, all_from_source, &image_name, &tag, true),
+        } => build_local_docker_image(release, all_from_source, &image_name, &tag, true),
         DockerCommand::Run {
             image_name,
             tag,
@@ -26,7 +29,7 @@ pub fn run_cmd_docker(cmd: DockerCommand) -> CmdResult {
     }
 }
 
-fn build_docker_image(
+fn build_local_docker_image(
     release: bool,
     all_from_source: bool,
     image_name: &str,
@@ -42,10 +45,10 @@ fn build_docker_image(
         ("", "target/debug")
     };
     let staging_dir = "target/docker-staging";
-    let bin_staging = format!("{staging_dir}/bin");
-    let arch = run_fun!(arch).unwrap_or_else(|_| "x86_64".to_string());
-    let prebuilt_dir = format!("prebuilt/{arch}");
+    let arch = get_host_arch();
+    let prebuilt_dir = format!("prebuilt/{}", arch);
 
+    // Build binaries
     if all_from_source {
         info!("Building binaries for Docker...");
         cmd_build::build_for_docker(release)?;
@@ -54,83 +57,41 @@ fn build_docker_image(
         run_cmd!($[build_envs] cargo build $build_flag -p api_server -p container-all-in-one)?;
     }
 
+    // Ensure etcd is available
     info!("Ensuring etcd binary...");
     ensure_etcd_local()?;
 
+    // Prepare staging directory
     info!("Preparing staging directory...");
-    run_cmd! {
-        rm -rf $staging_dir;
-        mkdir -p $bin_staging;
-    }?;
+    run_cmd!(rm -rf $staging_dir)?;
 
-    // Copy binaries built in this repo
-    let local_rust_binaries = ["api_server", "container-all-in-one"];
-    for rust_bin in &local_rust_binaries {
-        run_cmd!(cp $target_dir/$rust_bin $bin_staging/)?;
-    }
+    // Stage binaries
+    let zig_bin_dir = format!("{}/zig-out/bin", target_dir);
+    let sources = BinarySources {
+        rust_bin_dir: target_dir,
+        zig_bin_dir: if all_from_source {
+            Some(zig_bin_dir.as_str())
+        } else {
+            None
+        },
+        prebuilt_dir: &prebuilt_dir,
+        etcd_dir: &resolve_etcd_dir(),
+        prefer_built: all_from_source,
+    };
+    stage_binaries_for_docker(&sources, staging_dir, "bin")?;
 
-    if all_from_source {
-        // Use freshly built binaries, fall back to prebuilt if not found
-        let rust_binaries = ["root_server", "rss_admin", "nss_role_agent"];
-        for bin in &rust_binaries {
-            let bin_path = format!("{target_dir}/{bin}");
-            if std::path::Path::new(&bin_path).exists() {
-                run_cmd!(cp $bin_path $bin_staging/)?;
-            } else {
-                info!("{} not found, using prebuilt", bin);
-                run_cmd!(cp $prebuilt_dir/$bin $bin_staging/)?;
-            }
-        }
-
-        let zig_bin_dir = format!("{target_dir}/zig-out/bin");
-        let zig_binaries = ["bss_server", "nss_server"];
-        for zig_bin in &zig_binaries {
-            let bin_path = format!("{zig_bin_dir}/{zig_bin}");
-            if std::path::Path::new(&bin_path).exists() {
-                run_cmd!(cp $bin_path $bin_staging/)?;
-            } else {
-                info!("{} not found, using prebuilt", zig_bin);
-                run_cmd!(cp $prebuilt_dir/$zig_bin $bin_staging/)?;
-            }
-        }
-    } else {
-        // Use prebuilt binaries for external repos
-        let prebuilt_binaries = [
-            "root_server",
-            "rss_admin",
-            "bss_server",
-            "nss_server",
-            "nss_role_agent",
-        ];
-        for bin in &prebuilt_binaries {
-            run_cmd!(cp $prebuilt_dir/$bin $bin_staging/)?;
-        }
-    }
-
-    for bin in ["etcd", "etcdctl"] {
-        let bin_path = resolve_etcd_bin(bin);
-        run_cmd!(cp $bin_path $bin_staging/)?;
-    }
-
-    write_dockerfile(staging_dir, include_volume)?;
-
-    let dockerfile_path = format!("{}/Dockerfile", staging_dir);
-    let image_id = run_fun! {
-        docker build --no-cache -q -t "${image_name}:${tag}" -f $dockerfile_path $staging_dir
-    }?;
-    let short_id = image_id
-        .trim()
-        .trim_start_matches("sha256:")
-        .chars()
-        .take(12)
-        .collect::<String>();
-
-    info!("Docker image built: {}:{} ({})", image_name, tag, short_id);
-    Ok(())
-}
-
-pub fn build_docker_image_for_prepopulation(image_name: &str) -> CmdResult {
-    build_docker_image(true, true, image_name, "latest", false)
+    // Build Docker image
+    let config = DockerBuildConfig {
+        image_name,
+        tag,
+        arch: Some(&arch),
+        platform: None,
+        staging_dir,
+        bin_subdir: "bin",
+        include_volume,
+        data_source: None,
+    };
+    build_docker_image(&config)
 }
 
 fn run_docker_container(
@@ -204,47 +165,6 @@ fn show_docker_logs(name: Option<&str>, follow: bool) -> CmdResult {
     } else {
         run_cmd!(docker logs $container_name)?;
     }
-
-    Ok(())
-}
-
-fn write_dockerfile(staging_dir: &str, include_volume: bool) -> CmdResult {
-    let volume_directive = if include_volume {
-        "VOLUME /data\n\n"
-    } else {
-        ""
-    };
-
-    let dockerfile_content = format!(
-        r#"FROM ubuntu:24.04
-
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN mkdir -p /opt/fractalbits/bin /opt/fractalbits/etc /data
-
-COPY bin/ /opt/fractalbits/bin/
-
-RUN chmod +x /opt/fractalbits/bin/*
-
-ENV PATH="/opt/fractalbits/bin:$PATH"
-ENV RUST_LOG=info
-
-EXPOSE 8080 18080 2379
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-    CMD curl -sf http://localhost:18080/mgmt/health || exit 1
-
-{volume_directive}ENTRYPOINT ["container-all-in-one"]
-CMD ["--bin-dir=/opt/fractalbits/bin", "--data-dir=/data"]
-"#
-    );
-
-    let dockerfile_path = format!("{}/Dockerfile", staging_dir);
-    std::fs::write(&dockerfile_path, dockerfile_content)?;
-    info!("Wrote Dockerfile to {}", dockerfile_path);
 
     Ok(())
 }

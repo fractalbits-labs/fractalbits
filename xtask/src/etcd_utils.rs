@@ -79,3 +79,15 @@ pub fn resolve_etcd_bin(binary_name: &str) -> String {
     let pwd = run_fun!(pwd).unwrap_or_else(|_| ".".to_string());
     format!("{pwd}/third_party/etcd-{ETCD_VERSION}-linux-{etcd_arch}/{binary_name}")
 }
+
+/// Get the etcd directory for the host architecture
+pub fn resolve_etcd_dir() -> String {
+    let arch = std::env::consts::ARCH;
+    resolve_etcd_dir_for_arch(arch)
+}
+
+/// Get the etcd directory for a specific architecture
+pub fn resolve_etcd_dir_for_arch(arch: &str) -> String {
+    let etcd_arch = get_etcd_arch(arch);
+    format!("third_party/etcd-{ETCD_VERSION}-linux-{etcd_arch}")
+}

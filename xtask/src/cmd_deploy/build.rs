@@ -1,4 +1,3 @@
-use crate::cmd_docker::build_docker_image_for_prepopulation;
 use crate::etcd_utils::download_etcd_for_deploy;
 use crate::*;
 use std::io::Error;
@@ -6,8 +5,12 @@ use std::path::Path;
 use std::time::Duration;
 use xtask_common::DeployTarget as UploadTarget;
 
-use super::common::{ARCH_TARGETS, ArchTarget, RUST_BINS, ZIG_BINS};
+use super::common::{
+    ARCH_TARGETS, ArchTarget, BinarySources, DockerBuildConfig, RUST_BINS, ZIG_BINS,
+    build_docker_image, get_host_arch, stage_binaries_for_docker,
+};
 use super::upload::upload_with_endpoint;
+use crate::etcd_utils::resolve_etcd_dir_for_arch;
 
 pub fn build(
     target: DeployBuildTarget,
@@ -283,26 +286,134 @@ fn download_warp_binaries() -> CmdResult {
     Ok(())
 }
 
+/// Build all binaries from source for both architectures (aarch64 and x86_64)
+fn build_all_binaries_for_docker() -> CmdResult {
+    let build_envs = cmd_build::get_build_envs();
+
+    run_cmd! {
+        info "Ensuring required Rust targets are installed";
+        rustup target add x86_64-unknown-linux-gnu;
+        rustup target add aarch64-unknown-linux-gnu;
+    }?;
+
+    for target in ARCH_TARGETS {
+        let arch = target.arch;
+        let rust_target = target.rust_target;
+        let rust_cpu = target.rust_cpu;
+        let zig_target = target.zig_target;
+        let zig_cpu = target.zig_cpu;
+        let build_dir = format!("target/{}/release", rust_target);
+
+        // Build main repo Rust binaries (api_server, container-all-in-one)
+        run_cmd! {
+            info "Building api_server and container-all-in-one for $arch";
+            RUSTFLAGS="-C target-cpu=$rust_cpu"
+            $[build_envs] cargo zigbuild --release --target $rust_target
+                -p api_server
+                -p container-all-in-one;
+        }?;
+
+        // Build ha packages if they exist
+        if Path::new("crates/ha").exists() {
+            run_cmd! {
+                info "Building nss_role_agent for $arch";
+                RUSTFLAGS="-C target-cpu=$rust_cpu"
+                $[build_envs] cargo zigbuild --release --target $rust_target
+                    -p nss_role_agent;
+            }?;
+        }
+
+        // Build root_server packages if they exist
+        if Path::new("crates/root_server").exists() {
+            run_cmd! {
+                info "Building root_server and rss_admin for $arch";
+                RUSTFLAGS="-C target-cpu=$rust_cpu"
+                $[build_envs] cargo zigbuild --release --target $rust_target
+                    -p root_server
+                    -p rss_admin;
+            }?;
+        }
+
+        // Build zig servers if core repo exists
+        if Path::new(ZIG_REPO_PATH).exists() {
+            let zig_out = format!("{}/zig-out-docker", build_dir);
+            run_cmd! {
+                info "Building Zig binaries for Docker ($arch)";
+                cd $ZIG_REPO_PATH;
+                $[build_envs] zig build -p ../$zig_out
+                    --release=safe
+                    -Dtarget=$zig_target -Dcpu=$zig_cpu
+                    -Djournal_atomic_write_size=4096
+                    -Djournal_sampling_ratio=4 2>&1;
+            }?;
+        }
+    }
+    Ok(())
+}
+
 fn build_docker_with_prepopulated_binaries() -> CmdResult {
     const CONTAINER_NAME: &str = "fractalbits-prepopulate";
     const IMAGE_NAME: &str = "fractalbits-prepopulate-base";
 
-    info!("Building Docker image with pre-populated binaries for on-prem...");
+    info!("Building Docker images for both architectures with pre-populated binaries...");
 
-    // Build a Docker image WITHOUT VOLUME directive so data is captured by commit
-    info!("Building base Docker image (without VOLUME) for pre-population...");
-    build_docker_image_for_prepopulation(IMAGE_NAME)?;
+    // Build all binaries from source for both architectures
+    build_all_binaries_for_docker()?;
+
+    // Ensure etcd is downloaded for both architectures
+    download_etcd_for_deploy()?;
+
+    // Prepare staging directory
+    let staging_dir = "target/docker-staging";
+    run_cmd!(rm -rf $staging_dir)?;
+
+    // Stage binaries and build base images for each architecture
+    for target in ARCH_TARGETS {
+        let arch = target.arch;
+        let rust_target = target.rust_target;
+        let build_dir = format!("target/{}/release", rust_target);
+        let zig_out_dir = format!("{}/zig-out-docker/bin", build_dir);
+        let prebuilt_dir = format!("prebuilt/{}", arch);
+        let bin_subdir = format!("bin-{}", arch);
+
+        // Stage binaries using unified function
+        let sources = BinarySources {
+            rust_bin_dir: &build_dir,
+            zig_bin_dir: Some(&zig_out_dir),
+            prebuilt_dir: &prebuilt_dir,
+            etcd_dir: &resolve_etcd_dir_for_arch(arch),
+            prefer_built: true,
+        };
+        stage_binaries_for_docker(&sources, staging_dir, &bin_subdir)?;
+
+        // Build base image using unified function
+        let config = DockerBuildConfig {
+            image_name: IMAGE_NAME,
+            tag: arch,
+            arch: Some(arch),
+            platform: Some(target.docker_platform),
+            staging_dir,
+            bin_subdir: &bin_subdir,
+            include_volume: false,
+            data_source: None,
+        };
+        build_docker_image(&config)?;
+    }
+
+    // Use the host architecture image for pre-population
+    let host_arch = get_host_arch();
+    let host_image = format!("{}:{}", IMAGE_NAME, host_arch);
 
     // Clean up any existing container
     let _ = run_cmd!(ignore docker stop $CONTAINER_NAME 2>/dev/null);
     let _ = run_cmd!(ignore docker rm -f $CONTAINER_NAME 2>/dev/null);
 
-    // Start the Docker container (no -v, data goes to container filesystem)
+    // Start the Docker container for pre-population
     info!("Starting Docker container to populate with binaries...");
     run_cmd!(
         docker run -d --privileged --name $CONTAINER_NAME
             -p 8080:8080 -p 18080:18080
-            $IMAGE_NAME
+            $host_image
     )?;
 
     // Wait for the container to be healthy
@@ -341,7 +452,7 @@ fn build_docker_with_prepopulated_binaries() -> CmdResult {
         ));
     }
 
-    // Upload binaries to local fractalbits S3 service using common upload function
+    // Upload binaries to local fractalbits S3 service
     info!("Uploading binaries to local fractalbits container...");
     upload_with_endpoint(UploadTarget::OnPrem, Some("localhost:8080"))?;
 
@@ -349,23 +460,50 @@ fn build_docker_with_prepopulated_binaries() -> CmdResult {
     info!("Stopping container...");
     run_cmd!(docker stop $CONTAINER_NAME)?;
 
-    // Commit the container to capture data
-    info!("Committing container with pre-populated data...");
-    run_cmd!(docker commit $CONTAINER_NAME fractalbits:latest)?;
-
-    // Remove the temp container and base image
-    run_cmd!(docker rm -f $CONTAINER_NAME)?;
-    let _ = run_cmd!(docker rmi $IMAGE_NAME 2>/dev/null);
-
-    // Export the image
-    info!("Exporting Docker image with pre-populated binaries...");
+    // Export the pre-populated data from the running container
+    info!("Extracting pre-populated data...");
+    let data_extract_dir = format!("{}/data-extract", staging_dir);
     run_cmd! {
-        mkdir -p prebuilt/deploy/docker;
-        docker save fractalbits:latest | gzip > prebuilt/deploy/docker/fractalbits-image.tar.gz;
+        rm -rf $data_extract_dir;
+        mkdir -p $data_extract_dir;
+        docker cp $CONTAINER_NAME:/data $data_extract_dir/;
     }?;
 
-    info!(
-        "Docker image with pre-populated binaries exported to prebuilt/deploy/docker/fractalbits-image.tar.gz"
-    );
+    // Remove the container
+    run_cmd!(docker rm -f $CONTAINER_NAME)?;
+
+    // Build final images for each architecture with pre-populated data
+    info!("Building final images with pre-populated data...");
+    run_cmd!(mkdir -p target/on-prem)?;
+
+    for target in ARCH_TARGETS {
+        let arch = target.arch;
+        let bin_subdir = format!("bin-{}", arch);
+        let final_image = format!("fractalbits:{}", arch);
+
+        // Build final image with pre-populated data using unified function
+        let config = DockerBuildConfig {
+            image_name: "fractalbits",
+            tag: arch,
+            arch: Some(arch),
+            platform: Some(target.docker_platform),
+            staging_dir,
+            bin_subdir: &bin_subdir,
+            include_volume: false,
+            data_source: Some("data-extract/data"),
+        };
+        build_docker_image(&config)?;
+
+        // Export the image
+        let output_file = format!("target/on-prem/fractalbits-{}.tar.gz", arch);
+        info!("Exporting {} image to {}...", arch, output_file);
+        run_cmd!(docker save $final_image | gzip > $output_file)?;
+
+        // Clean up
+        let base_image = format!("{}:{}", IMAGE_NAME, arch);
+        let _ = run_cmd!(docker rmi $base_image $final_image 2>/dev/null);
+    }
+
+    info!("Multi-arch Docker images exported to target/on-prem/");
     Ok(())
 }

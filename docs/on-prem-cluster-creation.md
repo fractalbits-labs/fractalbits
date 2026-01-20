@@ -14,37 +14,48 @@ On-prem deployment uses:
 ### On Each Node
 
 1. Linux OS (Ubuntu 22.04+ or RHEL 8+)
-2. SSH server running with key-based authentication
-3. Passwordless sudo access for bootstrap user
-4. Network connectivity between all nodes
-5. AWS CLI v2 installed (used for S3-compatible API calls)
-6. NVMe storage device for NSS and BSS nodes (for journal/data persistence)
+2. **Supported architectures**: x86_64 (Intel/AMD) or aarch64 (ARM64)
+3. SSH server running with key-based authentication
+4. Passwordless sudo access for bootstrap user
+5. Network connectivity between all nodes
+6. AWS CLI v2 installed (used for S3-compatible API calls)
+7. NVMe storage device for NSS and BSS nodes (for journal/data persistence)
 
 ### On Deployment Machine
 
 1. SSH access to all cluster nodes
 2. Rust toolchain (1.88+) with `cargo` installed
+3. Docker with buildx plugin (for building multi-architecture images)
 
 ## Step 1: Build Bootstrap Artifacts
 
-Build the fractalbits binaries and Docker image (x86_64):
+Build the fractalbits binaries and Docker images for both architectures:
 
 ```bash
-# Build for on-prem deployment
+# Build for on-prem deployment (builds both x86_64 and aarch64 images)
 cargo xtask deploy build --for-on-prem
 ```
 
 This creates:
-- `prebuilt/deploy/docker/fractalbits-image.tar.gz` - Docker image for bootstrap container
+- `target/on-prem/fractalbits-x86_64.tar.gz` - Docker image for x86_64 nodes
+- `target/on-prem/fractalbits-aarch64.tar.gz` - Docker image for ARM64 nodes (e.g., AWS Graviton)
 
-Copy the Docker image to the root_server node and load it:
+Copy the appropriate Docker image to the root_server node based on its architecture and load it:
 
 ```bash
-# On deployment machine
-scp prebuilt/deploy/docker/fractalbits-image.tar.gz <rss-ip>:/var/
+# Determine target architecture
+ssh <rss-ip> "arch"  # Returns x86_64 or aarch64
+
+# On deployment machine - copy the correct image
+# For x86_64:
+scp target/on-prem/fractalbits-x86_64.tar.gz <rss-ip>:/var/fractalbits-image.tar.gz
+# For aarch64 (ARM64/Graviton):
+scp target/on-prem/fractalbits-aarch64.tar.gz <rss-ip>:/var/fractalbits-image.tar.gz
 
 # On root_server node
+ARCH=$(arch)
 gunzip -c /var/fractalbits-image.tar.gz | docker load
+docker tag fractalbits:$ARCH fractalbits:latest
 docker run -d --privileged --name fractalbits-bootstrap \
     -p 8080:8080 -p 18080:18080 \
     -v fractalbits-data:/data \
@@ -273,7 +284,7 @@ ssh 10.0.1.41 'WORKLOAD=get_4k /opt/fractalbits/bin/bench_start.sh'
 
 ```bash
 # On any node
-ssh <node-ip> "journalctl -u fractalbits-bootstrap"
+ssh <node-ip> "tail /var/log/fractalbits-bootstrap.log"
 ```
 
 ### Check Service Logs
