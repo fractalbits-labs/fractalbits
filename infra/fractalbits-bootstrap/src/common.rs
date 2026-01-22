@@ -127,23 +127,35 @@ Environment="HOST_ID={instance_id}"
         }
         "nss" => {
             managed_service = true;
+            env_settings = format!(
+                r##"
+EnvironmentFile=-{ETC_PATH}nss.env"##
+            );
             requires = match (journal_type, journal_uuid) {
                 (Some(JournalType::Nvme), _) => "data-local.mount".to_string(),
                 (Some(JournalType::Ebs), Some(_)) => "data-ebs.mount data-local.mount".to_string(),
                 (Some(JournalType::Ebs), None) => "data-local.mount".to_string(),
                 (None, _) => unreachable!(),
             };
-            format!("{BIN_PATH}nss_server serve -c {ETC_PATH}{NSS_SERVER_CONFIG}")
+            format!(
+                r#"/bin/bash -c 'if [ -n "$LOGS" ]; then {BIN_PATH}nss_server serve -c {ETC_PATH}{NSS_SERVER_CONFIG} 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/nss.log"; else exec {BIN_PATH}nss_server serve -c {ETC_PATH}{NSS_SERVER_CONFIG}; fi'"#
+            )
         }
         "mirrord" => {
             managed_service = true;
+            env_settings = format!(
+                r##"
+EnvironmentFile=-{ETC_PATH}mirrord.env"##
+            );
             requires = match (journal_type, journal_uuid) {
                 (Some(JournalType::Nvme), _) => "data-local.mount".to_string(),
                 (Some(JournalType::Ebs), Some(_)) => "data-ebs.mount data-local.mount".to_string(),
                 (Some(JournalType::Ebs), None) => "data-local.mount".to_string(),
                 (None, _) => unreachable!(),
             };
-            format!("{BIN_PATH}{service_name} -c {ETC_PATH}{MIRRORD_CONFIG}")
+            format!(
+                r#"/bin/bash -c 'if [ -n "$LOGS" ]; then {BIN_PATH}{service_name} -c {ETC_PATH}{MIRRORD_CONFIG} 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/mirrord.log"; else exec {BIN_PATH}{service_name} -c {ETC_PATH}{MIRRORD_CONFIG}; fi'"#
+            )
         }
         "rss" => {
             env_settings = format!(

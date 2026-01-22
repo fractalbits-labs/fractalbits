@@ -559,15 +559,6 @@ pub fn stop_service(service: ServiceName) -> CmdResult {
         single_service => vec![single_service],
     };
 
-    info!(
-        "Killing previous {} {} (if any) ...",
-        if services.len() > 1 {
-            "services"
-        } else {
-            "service"
-        },
-        service.as_ref()
-    );
     for service in services {
         if service == ServiceName::Nss || service == ServiceName::Mirrord {
             let service_name = service.as_ref();
@@ -1042,6 +1033,7 @@ Environment="BSS_WORKING_DIR=./data/bss%i""##;
             // Use template-based service with instance suffix (A or B)
             // WORKING_DIR, SHARED_DIR, JOURNAL_UUID, and HEALTH_PORT are set based on instance
             env_settings += "\nEnvironment=\"WORKING_DIR=./data/nss-%i\"";
+            env_settings += &format!("\nEnvironmentFile=-{pwd}/data/etc/nss.env");
             let nss_binary = resolve_binary_path("nss_server", build_mode);
             // Read journal_uuid from shared file and compute SHARED_DIR based on journal type
             // For EBS: "../ebs/<uuid>" (relative to ./data/nss-%i to reach ./data/ebs/<uuid>)
@@ -1052,7 +1044,7 @@ Environment="BSS_WORKING_DIR=./data/bss%i""##;
                 JournalType::Nvme => "local/journal",
             };
             format!(
-                "/bin/bash -c 'JOURNAL_UUID=$(cat ./data/etc/journal_uuid.txt); export JOURNAL_UUID; export SHARED_DIR=\"{shared_dir_prefix}/$JOURNAL_UUID\"; if [ \"%i\" = \"A\" ]; then HEALTH_PORT=29999; else HEALTH_PORT=29998; fi; export HEALTH_PORT; {nss_binary} serve'"
+                r#"/bin/bash -c 'JOURNAL_UUID=$(cat ./data/etc/journal_uuid.txt); export JOURNAL_UUID; export SHARED_DIR="{shared_dir_prefix}/$JOURNAL_UUID"; if [ "%i" = "A" ]; then HEALTH_PORT=29999; else HEALTH_PORT=29998; fi; export HEALTH_PORT; if [ -n "$LOGS" ]; then {nss_binary} serve 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/nss-%i.log"; else exec {nss_binary} serve; fi'"#
             )
         }
         ServiceName::Mirrord => {
@@ -1060,6 +1052,7 @@ Environment="BSS_WORKING_DIR=./data/bss%i""##;
             // Use template-based service with instance suffix (A or B)
             // WORKING_DIR, SHARED_DIR, JOURNAL_UUID, and HEALTH_PORT are set based on instance
             env_settings += "\nEnvironment=\"WORKING_DIR=./data/nss-%i\"";
+            env_settings += &format!("\nEnvironmentFile=-{pwd}/data/etc/mirrord.env");
             let mirrord_binary = resolve_binary_path("mirrord", build_mode);
             // Read journal_uuid from shared file and compute SHARED_DIR based on journal type
             // For EBS: "../ebs/<uuid>" (relative to ./data/nss-%i to reach ./data/ebs/<uuid>)
@@ -1070,7 +1063,7 @@ Environment="BSS_WORKING_DIR=./data/bss%i""##;
                 JournalType::Nvme => "local/journal",
             };
             format!(
-                "/bin/bash -c 'JOURNAL_UUID=$(cat ./data/etc/journal_uuid.txt); export JOURNAL_UUID; export SHARED_DIR=\"{shared_dir_prefix}/$JOURNAL_UUID\"; if [ \"%i\" = \"A\" ]; then HEALTH_PORT=19999; else HEALTH_PORT=19998; fi; export HEALTH_PORT; {mirrord_binary}'"
+                r#"/bin/bash -c 'JOURNAL_UUID=$(cat ./data/etc/journal_uuid.txt); export JOURNAL_UUID; export SHARED_DIR="{shared_dir_prefix}/$JOURNAL_UUID"; if [ "%i" = "A" ]; then HEALTH_PORT=19999; else HEALTH_PORT=19998; fi; export HEALTH_PORT; if [ -n "$LOGS" ]; then {mirrord_binary} 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/mirrord-%i.log"; else exec {mirrord_binary}; fi'"#
             )
         }
         ServiceName::NssRoleAgentA => {
