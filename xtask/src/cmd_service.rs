@@ -979,14 +979,26 @@ fn create_systemd_unit_files_for_init(
             create_systemd_unit_file(service, build_mode, init_config)?;
         }
         ServiceName::All => {
-            for service in all_services(
+            let services = all_services(
                 init_config.data_blob_storage,
                 init_config.rss_backend,
                 init_config.journal_type,
                 true,
                 false,
-            ) {
-                create_systemd_unit_file(service, build_mode, init_config)?;
+            );
+            for service in &services {
+                create_systemd_unit_file(*service, build_mode, init_config)?;
+            }
+
+            // Clean up service files that don't belong to the current configuration
+            // This prevents stale service files from previous runs affecting startup
+            let with_mirrord = init_config.journal_type == JournalType::Nvme
+                || init_config.data_blob_storage == DataBlobStorage::S3ExpressMultiAz;
+            if !with_mirrord {
+                run_cmd! {
+                    rm -f "data/etc/nss_role_agent_b.service";
+                    rm -f "data/etc/mirrord@.service";
+                }?;
             }
         }
     }
