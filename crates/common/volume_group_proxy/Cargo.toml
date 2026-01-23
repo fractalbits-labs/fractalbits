@@ -12,10 +12,8 @@ futures.workspace = true
 metrics_wrapper.workspace = true
 metrics = { workspace = true, optional = true }
 rand.workspace = true
-rkyv.workspace = true
 rpc_client_bss.workspace = true
 rpc_client_common.workspace = true
-rss_codec.workspace = true
 data_types.workspace = true
 tokio.workspace = true
 tracing.workspace = true

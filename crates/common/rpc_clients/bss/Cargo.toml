@@ -6,21 +6,13 @@ edition = "2024"
 [dependencies]
 tokio.workspace = true
 bytes.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
-tokio-stream.workspace = true
 uuid.workspace = true
 fake.workspace = true
-metrics-exporter-statsd.workspace = true
-tokio-retry.workspace = true
-parking_lot.workspace = true
-strum.workspace = true
 rpc_client_common.workspace = true
-socket2.workspace = true
 bss_codec.workspace = true
 rpc_codec_common.workspace = true
 data_types.workspace = true
-rand.workspace = true
 
 [dev-dependencies]
 tracing-test.workspace = true

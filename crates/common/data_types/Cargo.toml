@@ -4,14 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio.workspace = true
-bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 rand.workspace = true
-moka.workspace = true
-tracing.workspace = true
 sha2.workspace = true
 blake2.workspace = true
 xxhash-rust.workspace = true

@@ -12,7 +12,6 @@ anyhow.workspace = true
 bytes.workspace = true
 colored.workspace = true
 futures-util.workspace = true
-futures.workspace = true
 pin-project-lite.workspace = true
 regex.workspace = true
 rlimit.workspace = true

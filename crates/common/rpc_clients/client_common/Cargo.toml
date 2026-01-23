@@ -13,14 +13,9 @@ prost.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
 metrics_wrapper.workspace = true
 metrics = { workspace = true, optional = true }
-tokio-retry.workspace = true
 parking_lot.workspace = true
 strum.workspace = true
-rand.workspace = true
 socket2.workspace = true
 rpc_codec_common.workspace = true
-futures.workspace = true
-async-trait.workspace = true

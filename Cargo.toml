@@ -150,7 +150,6 @@ comfy-table = "7.1"
 glob = "0.3"
 dialoguer = "0.12"
 indicatif = "0.17"
-zip = "2.2"
 
 # Build dependencies
 prost-build = "0.13"
