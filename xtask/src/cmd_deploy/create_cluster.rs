@@ -118,8 +118,6 @@ pub struct InputClusterGlobal {
     pub num_api_servers: Option<usize>,
     #[serde(default)]
     pub num_bench_clients: Option<usize>,
-    #[serde(default)]
-    pub cpu_target: Option<String>,
 }
 
 fn default_region() -> String {
@@ -199,9 +197,9 @@ impl InputClusterConfig {
             num_bss_nodes: Some(self.global.num_bss_nodes),
             num_api_servers: self.global.num_api_servers,
             num_bench_clients: self.global.num_bench_clients,
-            cpu_target: self.global.cpu_target.clone(),
             workflow_cluster_id: Some(cluster_id),
             meta_stack_testing: false,
+            use_generic_binaries: true,
         };
 
         let nss_endpoint = self

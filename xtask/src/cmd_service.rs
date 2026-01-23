@@ -1403,13 +1403,13 @@ fn resolve_binary_path(binary_name: &str, build_mode: BuildMode) -> String {
             vec![
                 format!("{pwd}/target/{build}/zig-out/bin/{binary_name}"),
                 format!("{pwd}/{ZIG_DEBUG_OUT}/bin/{binary_name}"),
-                format!("{pwd}/prebuilt/{arch}/{binary_name}"),
+                format!("{pwd}/prebuilt/dev/{arch}/{binary_name}"),
             ]
         }
         _ => {
             vec![
                 format!("{pwd}/target/{build}/{binary_name}"),
-                format!("{pwd}/prebuilt/{arch}/{binary_name}"),
+                format!("{pwd}/prebuilt/dev/{arch}/{binary_name}"),
             ]
         }
     };

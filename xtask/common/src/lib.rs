@@ -121,11 +121,11 @@ pub struct ClusterGlobalConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_bench_clients: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_target: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_cluster_id: Option<String>,
     #[serde(default)]
     pub meta_stack_testing: bool,
+    #[serde(default)]
+    pub use_generic_binaries: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -208,8 +208,8 @@ pub enum BuildCommand {
     },
     #[clap(about = "Build only rust components")]
     Rust,
-    #[clap(about = "Build prebuilt binaries")]
-    Prebuilt,
+    #[clap(name = "prebuilt-dev", about = "Build dev prebuilt binaries")]
+    PrebuiltDev,
 }
 
 #[derive(Parser, Clone)]
@@ -332,6 +332,12 @@ pub enum DeployCommand {
             long_help = "Simulate on-prem deployment: open SSH internally, deploy Docker bootstrap container on RSS"
         )]
         simulate_on_prem: bool,
+
+        #[clap(
+            long,
+            long_help = "Use generic binaries (no CPU-specific optimizations) - use with --skip-upload when binaries were uploaded with --deploy-target on-prem"
+        )]
+        use_generic_binaries: bool,
     },
 
     #[clap(about = "Destroy VPC infrastructure (including s3 builds bucket cleanup)")]
@@ -653,7 +659,7 @@ async fn main() -> CmdResult {
                     let build_mode = cmd_build::build_mode(release);
                     cmd_build::build_rust_servers(build_mode)?;
                 }
-                BuildCommand::Prebuilt => cmd_build::build_prebuilt(release)?,
+                BuildCommand::PrebuiltDev => cmd_build::build_prebuilt_dev()?,
             },
             None => {
                 // Default to building all components
@@ -777,6 +783,7 @@ async fn main() -> CmdResult {
                 watch_bootstrap,
                 skip_upload,
                 simulate_on_prem,
+                use_generic_binaries,
             } => cmd_deploy::create_vpc(cmd_deploy::VpcConfig {
                 template,
                 num_api_servers,
@@ -794,6 +801,7 @@ async fn main() -> CmdResult {
                 watch_bootstrap,
                 skip_upload,
                 simulate_on_prem,
+                use_generic_binaries,
             })?,
             DeployCommand::DestroyVpc => cmd_deploy::destroy_vpc()?,
             DeployCommand::BootstrapProgress { deploy_target } => {

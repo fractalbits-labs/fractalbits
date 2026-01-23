@@ -46,7 +46,7 @@ fn build_local_docker_image(
     };
     let staging_dir = "target/docker-staging";
     let arch = get_host_arch();
-    let prebuilt_dir = format!("prebuilt/{}", arch);
+    let prebuilt_dir = format!("prebuilt/dev/{}", arch);
 
     // Build binaries
     if all_from_source {

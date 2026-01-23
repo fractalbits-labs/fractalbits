@@ -310,6 +310,9 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     // Read skipUserData context for ASGs (SSM-based bootstrap)
     const skipUserDataCtx = this.node.tryGetContext("skipUserData") === "true";
+    // Read useGenericBinaries context (for using on-prem style generic binaries)
+    const useGenericBinaries =
+      this.node.tryGetContext("useGenericBinaries") === "true";
 
     let benchClientAsg: autoscaling.AutoScalingGroup | undefined;
     if (props.benchType === "external") {
@@ -607,6 +610,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         props.benchType === "external" ? props.numBenchClients : undefined,
       workflowClusterId: workflowClusterId,
       bootstrapBucket: bootstrapBucket,
+      useGenericBinaries: useGenericBinaries,
     });
 
     new cr.AwsCustomResource(this, "UploadBootstrapConfig", {

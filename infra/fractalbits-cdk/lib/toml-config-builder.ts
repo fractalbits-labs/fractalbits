@@ -34,6 +34,7 @@ export function createConfigWithCfnTokens(props: {
   numApiServers?: number;
   numBenchClients?: number;
   cpuTarget?: string; // e.g., "i3", "graviton3"
+  useGenericBinaries?: boolean;
   dataBlobBucket?: string;
   localAz: string;
   remoteAz?: string;
@@ -79,6 +80,10 @@ export function createConfigWithCfnTokens(props: {
   }
   if (props.cpuTarget) {
     (staticConfig.global as TOML.JsonMap).cpu_target = props.cpuTarget;
+  }
+  if (props.useGenericBinaries) {
+    (staticConfig.global as TOML.JsonMap).use_generic_binaries =
+      props.useGenericBinaries;
   }
 
   // Add workflow_cluster_id for S3-based workflow barriers

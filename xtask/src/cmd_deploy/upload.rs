@@ -70,27 +70,54 @@ echo "=== Bootstrap completed at $(date) ==="
 "#
     );
 
-    // Determine target-specific directory based on deploy target
-    let target_dir = match deploy_target {
-        DeployTarget::Aws => "aws",
-        DeployTarget::OnPrem => "on_prem",
-    };
-
     // Upload bootstrap script and sync binaries
-    // First sync generic binaries, then overlay with target-specific Zig binaries
     run_cmd! {
         echo $boostrap_script_content | $[env_vars] aws s3 cp - "s3://$bucket_name/bootstrap.sh";
     }?;
 
-    for arch in ["x86_64", "aarch64"] {
-        run_cmd! {
-            info "Syncing generic binaries for $arch to S3 bucket $bucket_name";
-            $[env_vars] aws s3 sync prebuilt/deploy/generic/$arch "s3://$bucket_name/$arch";
-        }?;
-        run_cmd! {
-            info "Syncing $target_dir Zig binaries for $arch to S3 bucket $bucket_name";
-            $[env_vars] aws s3 sync prebuilt/deploy/$target_dir/$arch "s3://$bucket_name/$arch";
-        }?;
+    // Sync binaries based on deploy target
+    match deploy_target {
+        DeployTarget::OnPrem => {
+            // On-prem: sync only generic binaries (baseline CPU)
+            for arch in ["x86_64", "aarch64"] {
+                run_cmd! {
+                    info "Syncing generic binaries for $arch to S3 bucket $bucket_name";
+                    $[env_vars] aws s3 sync prebuilt/deploy/generic/$arch "s3://$bucket_name/$arch";
+                }?;
+            }
+        }
+        DeployTarget::Aws => {
+            // AWS: sync generic (for bootstrap/etcd/warp) to s3://{bucket}/{arch}/
+            // and CPU-specific binaries to s3://{bucket}/{arch}/{cpu}/
+            let cpu_targets = [
+                ("x86_64", vec!["broadwell", "skylake"]),
+                ("aarch64", vec!["neoverse-n1", "neoverse-n2"]),
+            ];
+
+            for (arch, cpus) in cpu_targets {
+                // Sync shared binaries (bootstrap, etcd, warp) from generic to s3://{bucket}/{arch}/
+                run_cmd! {
+                    info "Syncing shared binaries for $arch to S3 bucket $bucket_name";
+                    $[env_vars] aws s3 sync prebuilt/deploy/generic/$arch "s3://$bucket_name/$arch"
+                        --exclude "*"
+                        --include "fractalbits-bootstrap"
+                        --include "etcd"
+                        --include "etcdctl"
+                        --include "warp";
+                }?;
+
+                // Sync CPU-specific binaries to s3://{bucket}/{arch}/{cpu}/
+                for cpu in cpus {
+                    let aws_cpu_path = format!("prebuilt/deploy/aws/{}/{}", arch, cpu);
+                    if std::path::Path::new(&aws_cpu_path).exists() {
+                        run_cmd! {
+                            info "Syncing AWS $cpu binaries for $arch to S3 bucket $bucket_name/$arch/$cpu";
+                            $[env_vars] aws s3 sync $aws_cpu_path "s3://$bucket_name/$arch/$cpu";
+                        }?;
+                    }
+                }
+            }
+        }
     }
 
     // Sync UI if it exists

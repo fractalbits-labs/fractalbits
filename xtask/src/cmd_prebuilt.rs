@@ -47,7 +47,7 @@ fn publish(skip_build: bool, dry_run: bool, allow_dirty: bool) -> CmdResult {
     if !skip_build {
         // Build prebuilt binaries for x86_64 (Docker/local use)
         info!("Building prebuilt binaries for x86_64...");
-        crate::cmd_build::build_prebuilt(true)?;
+        crate::cmd_build::build_prebuilt_dev()?;
 
         // Build binaries for all CPU targets (deployment)
         info!("Building binaries for all CPU targets...");

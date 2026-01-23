@@ -30,6 +30,9 @@ pub const CLOUDWATCH_AGENT_CONFIG: &str = "cloudwatch_agent_config.json";
 pub const S3EXPRESS_LOCAL_BUCKET_CONFIG: &str = "s3express-local-bucket-config.json";
 pub const S3EXPRESS_REMOTE_BUCKET_CONFIG: &str = "s3express-remote-bucket-config.json";
 
+/// Shared binaries that are not CPU-specific (stored directly under {arch}/)
+const SHARED_BINARIES: &[&str] = &["fractalbits-bootstrap", "etcd", "etcdctl", "warp"];
+
 pub fn common_setup(target: DeployTarget) -> CmdResult {
     create_network_tuning_sysctl_file()?;
     create_storage_tuning_sysctl_file()?;
@@ -55,12 +58,52 @@ fn download_binary(config: &BootstrapConfig, file_name: &str) -> CmdResult {
     let bootstrap_bucket = config.get_bootstrap_bucket();
     let cpu_arch = run_fun!(arch)?;
 
-    // All binaries stored at: s3://bucket/{arch}/{binary}
-    let s3_path = format!("{bootstrap_bucket}/{cpu_arch}/{file_name}");
+    // Determine S3 path based on deploy target and binary type:
+    // - On-prem or use_generic_binaries: all binaries at s3://bucket/{arch}/{binary}
+    // - AWS shared binaries: s3://bucket/{arch}/{binary}
+    // - AWS CPU-specific binaries: s3://bucket/{arch}/{cpu}/{binary}
+    let s3_path = if config.global.deploy_target == DeployTarget::OnPrem
+        || config.global.use_generic_binaries
+        || SHARED_BINARIES.contains(&file_name)
+    {
+        format!("{bootstrap_bucket}/{cpu_arch}/{file_name}")
+    } else {
+        let cpu_target = get_cpu_target()?;
+        format!("{bootstrap_bucket}/{cpu_arch}/{cpu_target}/{file_name}")
+    };
 
     let local_path = format!("{BIN_PATH}{file_name}");
     download_from_s3(&s3_path, &local_path)?;
     run_cmd!(chmod +x $local_path)
+}
+
+pub fn get_ec2_instance_type() -> FunResult {
+    run_fun!(ec2-metadata --instance-type | awk r"{print $2}")
+}
+
+/// Get the CPU target based on EC2 instance type.
+/// Maps instance families to their optimal CPU targets for binary downloads.
+pub fn get_cpu_target_from_instance_type(instance_type: &str) -> &'static str {
+    let family = instance_type.split('.').next().unwrap_or("");
+
+    match family {
+        // x86_64 instance families
+        "i3" => "broadwell",
+        "i3en" => "skylake",
+        // aarch64 - Graviton3 (7th gen)
+        "c7g" | "m7g" | "r7g" | "c7gn" | "c7gd" | "m7gd" | "r7gd" => "neoverse-n1",
+        // aarch64 - Graviton4 (8th gen)
+        "c8g" | "m8g" | "r8g" | "x8g" | "i8g" | "im8g" => "neoverse-n2",
+        _ => {
+            cmd_die!("Unknown instance type: ${instance_type}, cannot determine CPU target")
+        }
+    }
+}
+
+/// Get the CPU target by detecting from EC2 instance type.
+fn get_cpu_target() -> FunResult {
+    let instance_type = get_ec2_instance_type()?;
+    Ok(get_cpu_target_from_instance_type(&instance_type).to_string())
 }
 
 pub fn download_from_s3(s3_path: &str, local_path: &str) -> CmdResult {

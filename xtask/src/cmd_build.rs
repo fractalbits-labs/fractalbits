@@ -193,7 +193,7 @@ pub fn build_for_docker(release: bool) -> CmdResult {
     Ok(())
 }
 
-pub fn build_prebuilt(_release: bool) -> CmdResult {
+pub fn build_prebuilt_dev() -> CmdResult {
     if !Path::new(&format!("{ZIG_REPO_PATH}/.git/")).exists() {
         warn!("No core repo found, skip building prebuilt");
         return Ok(());
@@ -258,8 +258,8 @@ pub fn build_prebuilt(_release: bool) -> CmdResult {
                 --workspace --exclude fractalbits-bootstrap --exclude rewrk*;
         }?;
 
-        info!("Copying binaries to prebuilt/{arch} directory...");
-        let prebuilt_dir = format!("prebuilt/{arch}");
+        info!("Copying binaries to prebuilt/dev/{arch} directory...");
+        let prebuilt_dir = format!("prebuilt/dev/{arch}");
         run_cmd!(mkdir -p $prebuilt_dir)?;
         for bin in [
             "nss_role_agent",

@@ -27,6 +27,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         watch_bootstrap,
         skip_upload,
         simulate_on_prem,
+        use_generic_binaries,
     } = config;
 
     // Override settings for simulate-on-prem mode
@@ -116,6 +117,11 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     if simulate_on_prem {
         add_context("simulateOnPrem", "true".to_string());
         add_context("skipUserData", "true".to_string()); // Skip normal bootstrap
+    }
+
+    // Use generic binaries (no CPU-specific paths)
+    if use_generic_binaries {
+        add_context("useGenericBinaries", "true".to_string());
     }
 
     // Deploy the VPC stack
