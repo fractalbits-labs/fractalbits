@@ -591,7 +591,10 @@ pub enum RepoCommand {
     List,
 
     #[clap(about = "Show git repo status")]
-    Status,
+    Status {
+        #[clap(short = 'm', long, long_help = "Show commit message in output")]
+        with_commit_message: bool,
+    },
 
     #[clap(about = "Initialize all git repos")]
     Init {

@@ -53,7 +53,7 @@ pub const PREBUILT_REPO: Repo = Repo {
 pub fn run_cmd_repo(repo_cmd: RepoCommand) -> CmdResult {
     match repo_cmd {
         RepoCommand::List => list_repos()?,
-        RepoCommand::Status => show_repos_status()?,
+        RepoCommand::Status { with_commit_message } => show_repos_status(with_commit_message)?,
         RepoCommand::Init { all } => init_repos(all)?,
         RepoCommand::Foreach { command } => run_foreach_repo(&command)?,
         RepoCommand::Manifest => show_manifest()?,
@@ -98,14 +98,26 @@ fn repo_has_unpushed_commits(path: &str) -> bool {
     count.trim() != "0"
 }
 
-fn show_repos_status() -> CmdResult {
+fn extract_origin_owner(url: &str) -> &str {
+    // Extract owner from URL like "https://github.com/fractalbits-labs/repo.git"
+    url.trim_end_matches(".git")
+        .rsplit('/')
+        .nth(1)
+        .unwrap_or("unknown")
+}
+
+fn show_repos_status(with_commit_message: bool) -> CmdResult {
     info!("Checking repo status...");
 
     let mut table = Table::new();
     table.load_preset(presets::ASCII_BORDERS_ONLY_CONDENSED);
-    table.set_header(vec![
-        "Path", "User", "Branch", "Status", "Commit", "Message",
-    ]);
+    if with_commit_message {
+        table.set_header(vec![
+            "Path", "Origin", "Branch", "Status", "Commit", "Message",
+        ]);
+    } else {
+        table.set_header(vec!["Path", "Origin", "Branch", "Status", "Commit"]);
+    }
 
     for repo in all_repos() {
         let path = repo.path;
@@ -155,10 +167,7 @@ fn show_repos_status() -> CmdResult {
             )
         };
 
-        let username = run_fun! {
-            cd $path;
-            git config user.name
-        }?;
+        let origin = extract_origin_owner(repo.url);
 
         // Create cells with appropriate colors
         let status_cell = match status {
@@ -174,14 +183,24 @@ fn show_repos_status() -> CmdResult {
             Cell::new(&branch)
         };
 
-        table.add_row(vec![
-            Cell::new(path),
-            Cell::new(&username),
-            branch_cell,
-            status_cell,
-            Cell::new(&commit),
-            Cell::new(&message),
-        ]);
+        if with_commit_message {
+            table.add_row(vec![
+                Cell::new(path),
+                Cell::new(origin),
+                branch_cell,
+                status_cell,
+                Cell::new(&commit),
+                Cell::new(&message),
+            ]);
+        } else {
+            table.add_row(vec![
+                Cell::new(path),
+                Cell::new(origin),
+                branch_cell,
+                status_cell,
+                Cell::new(&commit),
+            ]);
+        }
     }
 
     println!("{table}");
