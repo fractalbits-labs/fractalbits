@@ -5,6 +5,7 @@
 .vite/
 .DS_Store
 .idea/
+*.diff
 *.iml
 Cargo.lock
 
@@ -18,6 +19,8 @@ data/
 
 # Third party downloaded dependencies
 third_party/dynamodb_local/
+third_party/etcd-*/
+third_party/minio/
 third_party/*.tar.gz
 
 # Claude Code configuration
@@ -25,6 +28,7 @@ third_party/*.tar.gz
 
 # CDK generated JavaScript files (keep TypeScript sources and Lambda JS)
 vpc/fractalbits-cdk/bin/*.js
+infra/fractalbits-cdk/cdk.context.json
 vpc/fractalbits-cdk/lib/*.js
 !vpc/fractalbits-cdk/lib/lambda/**/*.js
 vpc/fractalbits-cdk/test/*.js
