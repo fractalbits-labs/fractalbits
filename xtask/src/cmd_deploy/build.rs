@@ -1,16 +1,16 @@
+use crate::docker_build::{
+    BinarySources, DockerBuildConfig, build_docker_image, get_host_arch, stage_binaries_for_docker,
+};
 use crate::etcd_utils::download_etcd_for_deploy;
+use crate::etcd_utils::resolve_etcd_dir_for_arch;
 use crate::*;
 use std::io::Error;
 use std::path::Path;
 use std::time::Duration;
 use xtask_common::DeployTarget as UploadTarget;
 
-use super::common::{
-    ARCH_TARGETS, AWS_CPU_TARGETS, ArchTarget, BinarySources, DockerBuildConfig, RUST_BINS,
-    ZIG_BINS, build_docker_image, get_host_arch, stage_binaries_for_docker,
-};
+use super::common::{ARCH_TARGETS, AWS_CPU_TARGETS, ArchTarget, RUST_BINS, ZIG_BINS};
 use super::upload::upload_with_endpoint;
-use crate::etcd_utils::resolve_etcd_dir_for_arch;
 
 pub fn build(
     target: DeployBuildTarget,

@@ -1,5 +1,5 @@
 use crate::cmd_build::get_build_envs;
-use crate::cmd_deploy::{
+use crate::docker_build::{
     BinarySources, DockerBuildConfig, build_docker_image, get_host_arch, stage_binaries_for_docker,
 };
 use crate::etcd_utils::{ensure_etcd_local, resolve_etcd_dir};

@@ -74,6 +74,28 @@ zig version
 npm --version
 ```
 
+#### Docker (Optional)
+
+Docker is required for building and testing container images (`just docker build`, `just precheckin --docker=only`).
+
+```bash
+# Debian/Ubuntu
+sudo apt install docker.io docker-buildx
+
+# Fedora
+sudo dnf install docker docker-buildx
+
+# Arch Linux
+sudo pacman -S docker docker-buildx
+
+# Add your user to the docker group (requires logout/login)
+sudo usermod -aG docker $USER
+
+# Verify installation
+docker --version
+docker buildx version
+```
+
 #### Optional Tools
 
 - [aws ssm (session manager) plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/install-plugin-linux-overview.html) for login from terminal to manage ec2 instances after deployment

@@ -9,6 +9,7 @@ mod cmd_repo;
 mod cmd_run_tests;
 mod cmd_service;
 mod cmd_tool;
+mod docker_build;
 mod etcd_utils;
 
 use clap::{ArgAction, Parser};
