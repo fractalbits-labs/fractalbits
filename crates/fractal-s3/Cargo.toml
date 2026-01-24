@@ -1,0 +1,22 @@
+[package]
+name = "fractal-s3"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "fractal-s3"
+path = "src/main.rs"
+
+[dependencies]
+aws_signature.workspace = true
+
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true
+chrono.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+urlencoding.workspace = true

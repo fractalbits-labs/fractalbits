@@ -27,6 +27,8 @@ exclude = [
     "crates/common/rpc_codecs/rss_codec/src",
     "crates/common/test_common/src",
     "crates/common/volume_group_proxy/src",
+    "crates/fractal-s3/demo",
+    "crates/fractal-s3/src",
     "crates/ha/multi_az",
     "crates/ha/nss_role_agent/src",
     "crates/ha/single_az",
@@ -134,6 +136,7 @@ futures-util = "0.3.31"
 anyhow = "1.0.89"
 regex = "1.10.6"
 core_affinity = "0.7"
+urlencoding = "2"
 
 # Dev dependencies
 aws-sdk-s3 = "1.65.0"
