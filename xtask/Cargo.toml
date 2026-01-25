@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono.workspace = true
 cmd_lib.workspace = true
 env_logger.workspace = true
 rlimit.workspace = true

@@ -1,7 +1,12 @@
 use crate::cmd_service::{start_service, stop_service};
 use crate::*;
+use chrono::Local;
 
 pub fn run_cmd_nightly() -> CmdResult {
+    // Clean environment: stop all processes before running
+    run_cmd!(info "Cleaning environment: stopping all services...")?;
+    let _ = stop_service(ServiceName::All);
+
     // Full build (release mode) - matches config.py BUILD_MODE = "release"
     cmd_build::build_all(true)?;
 
@@ -24,11 +29,14 @@ pub fn run_cmd_nightly() -> CmdResult {
     start_service(ServiceName::Rss)?;
     start_service(ServiceName::Bss)?;
 
-    // Run the nss_failover_test main.py script
-    let nightly_log = "test_nss_failover_nightly.log";
+    // Create timestamp-based log directory: data/logs/nightly/<YYYYMMDD_HHMMSS>/
+    let log_dir = format!("data/logs/nightly/{}", Local::now().format("%Y%m%d_%H%M%S"));
+    run_cmd!(mkdir -p $log_dir)?;
+
+    let nightly_log = format!("{}/nss_failover.log", log_dir);
     let result = run_cmd! {
-        info "Running nss_failover_test with log $nightly_log ...";
-        python3 ./core/nss_failover_test/main.py --duration 3600 |& ts -m $TS_FMT >$nightly_log;
+        info "Running nss_failover_test with log dir $log_dir ...";
+        python3 ./core/nss_failover_test/main.py --duration 7200 --log-dir $log_dir |& ts -m $TS_FMT >$nightly_log;
     }
     .map_err(|e| {
         let _ = run_cmd!(tail $nightly_log);
