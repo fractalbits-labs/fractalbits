@@ -287,9 +287,9 @@ where
             // Verify body checksum (works for empty bodies too - they have a known XXH3 hash)
             if !header.verify_body_checksum(&body) {
                 error!(%rpc_type, %socket_fd, request_id = %header.get_id(),
-                    "Response body checksum verification failed, dropping response");
+                    "Response body checksum verification failed, closing connection");
                 counter!("rpc_response_body_checksum_failed", "type" => rpc_type).increment(1);
-                continue;
+                return Err(RpcError::ChecksumMismatch);
             }
 
             let frame = MessageFrame::new(header, body);
@@ -478,5 +478,132 @@ where
         }
 
         Ok(client)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rpc_codec_common::ProtobufMessageHeader;
+    use std::mem::size_of;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use xxhash_rust::xxh3::xxh3_64;
+
+    #[derive(Default, Clone, Copy, Debug)]
+    #[repr(i32)]
+    enum TestCommand {
+        #[default]
+        Invalid = 0,
+        Echo = 1,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct TestHeader(ProtobufMessageHeader<TestCommand>);
+
+    // Manually implement Pod/Zeroable before using the macro (macro also implements them)
+    unsafe impl bytemuck::Pod for TestCommand {}
+    unsafe impl bytemuck::Zeroable for TestCommand {}
+
+    impl MessageHeaderTrait for TestHeader {
+        fn encode(&self) -> &[u8] {
+            self.0.encode()
+        }
+
+        fn decode(src: &[u8]) -> Self {
+            Self(ProtobufMessageHeader::decode(src))
+        }
+
+        fn get_size(&self) -> usize {
+            self.0.get_size()
+        }
+
+        fn get_id(&self) -> u32 {
+            self.0.get_id()
+        }
+
+        fn get_trace_id(&self) -> data_types::TraceId {
+            self.0.get_trace_id()
+        }
+
+        fn set_checksum(&mut self) {
+            self.0.set_checksum()
+        }
+
+        fn verify_body_checksum(&self, body: &[u8]) -> bool {
+            self.0.verify_body_checksum(body)
+        }
+    }
+
+    #[derive(Default, Clone)]
+    struct TestCodec;
+
+    impl RpcCodec<TestHeader> for TestCodec {
+        const RPC_TYPE: &'static str = "test";
+    }
+
+    #[tokio::test]
+    async fn test_body_checksum_mismatch_closes_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            // Read client request header
+            let mut header_buf = vec![0u8; size_of::<TestHeader>()];
+            tokio::io::AsyncReadExt::read_exact(&mut socket, &mut header_buf)
+                .await
+                .unwrap();
+            let request_header = TestHeader::decode(&header_buf);
+            let body_size = request_header.get_body_size();
+            if body_size > 0 {
+                let mut body_buf = vec![0u8; body_size];
+                tokio::io::AsyncReadExt::read_exact(&mut socket, &mut body_buf)
+                    .await
+                    .unwrap();
+            }
+
+            // Send response with valid header but corrupted body checksum
+            let body = b"response body";
+            let wrong_checksum = xxh3_64(b"different data");
+
+            let mut response_header = TestHeader::default();
+            response_header.0.id = request_header.get_id();
+            response_header.0.size = (size_of::<TestHeader>() + body.len()) as u32;
+            response_header.0.checksum_body = wrong_checksum;
+            response_header.0.command = TestCommand::Echo;
+            response_header.set_checksum();
+
+            socket.write_all(response_header.encode()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+            socket.flush().await.unwrap();
+
+            // Keep socket alive briefly to ensure client processes
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        // Connect client and send request
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client: RpcClient<TestCodec, TestHeader> =
+            RpcClient::new_internal_tokio(stream).await.unwrap();
+
+        let mut request_header = TestHeader::default();
+        request_header.0.id = 1;
+        request_header.0.size = size_of::<TestHeader>() as u32;
+        request_header.0.checksum_body = rpc_codec_common::EMPTY_BODY_CHECKSUM;
+        request_header.0.command = TestCommand::Echo;
+
+        let frame = MessageFrame::new(request_header, Bytes::new());
+        let result = client
+            .send_request(frame, Some(Duration::from_secs(5)))
+            .await;
+
+        // The request should fail because the connection closes on checksum mismatch
+        assert!(result.is_err());
+        // Client should report closed
+        assert!(client.is_closed());
+
+        server_task.await.unwrap();
     }
 }

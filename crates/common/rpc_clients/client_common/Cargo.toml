@@ -19,3 +19,7 @@ parking_lot.workspace = true
 strum.workspace = true
 socket2.workspace = true
 rpc_codec_common.workspace = true
+
+[dev-dependencies]
+bytemuck.workspace = true
+xxhash-rust.workspace = true
