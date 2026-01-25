@@ -227,24 +227,10 @@ fn run_docker_tests() -> CmdResult {
         port: 8080,
         name: None,
         detach: true,
+        wait_ready: true,
     })?;
 
     let result = (|| -> CmdResult {
-        info!("Waiting for container to be ready...");
-        let health_url = "http://localhost:18080/mgmt/health";
-        for i in 1..=120 {
-            let health_check = run_fun!(curl -sf $health_url);
-            if health_check.is_ok() {
-                info!("Container ready after {}s", i);
-                break;
-            }
-            if i == 120 {
-                run_cmd!(docker logs fractalbits-dev)?;
-                cmd_die!("Container failed to start within 120 seconds");
-            }
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-
         info!("Running api_server tests against Docker container...");
         let test_result = run_cmd!(cargo test --package api_server);
         if test_result.is_err() {

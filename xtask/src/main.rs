@@ -9,7 +9,7 @@ mod cmd_repo;
 mod cmd_run_tests;
 mod cmd_service;
 mod cmd_tool;
-mod docker_build;
+mod docker_utils;
 mod etcd_utils;
 
 use clap::{ArgAction, Parser};
@@ -159,6 +159,9 @@ pub enum DockerCommand {
 
         #[clap(long, long_help = "Run in detached mode")]
         detach: bool,
+
+        #[clap(long, long_help = "Wait for container to be ready (health check)")]
+        wait_ready: bool,
     },
 
     #[clap(about = "Stop Docker container")]

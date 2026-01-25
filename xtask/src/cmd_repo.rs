@@ -53,7 +53,9 @@ pub const PREBUILT_REPO: Repo = Repo {
 pub fn run_cmd_repo(repo_cmd: RepoCommand) -> CmdResult {
     match repo_cmd {
         RepoCommand::List => list_repos()?,
-        RepoCommand::Status { with_commit_message } => show_repos_status(with_commit_message)?,
+        RepoCommand::Status {
+            with_commit_message,
+        } => show_repos_status(with_commit_message)?,
         RepoCommand::Init { all } => init_repos(all)?,
         RepoCommand::Foreach { command } => run_foreach_repo(&command)?,
         RepoCommand::Manifest => show_manifest()?,

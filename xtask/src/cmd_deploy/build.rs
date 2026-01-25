@@ -1,12 +1,11 @@
-use crate::docker_build::{
+use crate::docker_utils::{
     BinarySources, DockerBuildConfig, build_docker_image, get_host_arch, stage_binaries_for_docker,
+    wait_for_container_ready,
 };
 use crate::etcd_utils::download_etcd_for_deploy;
 use crate::etcd_utils::resolve_etcd_dir_for_arch;
 use crate::*;
-use std::io::Error;
 use std::path::Path;
-use std::time::Duration;
 use xtask_common::DeployTarget as UploadTarget;
 
 use super::common::{ARCH_TARGETS, AWS_CPU_TARGETS, ArchTarget, RUST_BINS, ZIG_BINS};
@@ -514,41 +513,7 @@ fn build_docker_with_prepopulated_binaries() -> CmdResult {
             $host_image
     )?;
 
-    // Wait for the container to be healthy
-    info!("Waiting for container to be ready...");
-    let max_attempts = 60;
-    let mut ready = false;
-    for i in 1..=max_attempts {
-        std::thread::sleep(Duration::from_secs(5));
-        let health_check = std::process::Command::new("curl")
-            .args([
-                "-sf",
-                "--max-time",
-                "5",
-                "http://localhost:18080/mgmt/health",
-            ])
-            .output();
-        if health_check.is_ok_and(|o| o.status.success()) {
-            info!("Container is ready after {} attempts", i);
-            ready = true;
-            break;
-        }
-        if i % 6 == 0 {
-            info!(
-                "Still waiting for container... (attempt {}/{})",
-                i, max_attempts
-            );
-        }
-    }
-
-    if !ready {
-        run_cmd!(docker logs $CONTAINER_NAME 2>&1 | tail -50)?;
-        let _ = run_cmd!(docker stop $CONTAINER_NAME);
-        let _ = run_cmd!(docker rm -f $CONTAINER_NAME);
-        return Err(Error::other(
-            "Timed out waiting for Docker container to be ready",
-        ));
-    }
+    wait_for_container_ready(CONTAINER_NAME)?;
 
     // Upload binaries to local fractalbits S3 service
     info!("Uploading binaries to local fractalbits container...");

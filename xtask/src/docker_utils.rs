@@ -201,7 +201,9 @@ pub fn build_docker_image(config: &DockerBuildConfig) -> crate::CmdResult {
     );
 
     let image_id = run_fun! {
-        docker buildx build --platform $platform --no-cache -q -t "${image_name}:${tag}" -f $dockerfile_path --load $staging_dir
+        docker buildx build
+            --platform $platform --no-cache -q -t "${image_name}:${tag}"
+            -f $dockerfile_path --load $staging_dir
     }?;
 
     let short_id = image_id
@@ -221,4 +223,24 @@ pub fn get_host_arch() -> String {
         .unwrap_or_else(|_| "x86_64".to_string())
         .trim()
         .to_string()
+}
+
+/// Wait for a Docker container to be ready by polling the health endpoint
+pub fn wait_for_container_ready(container_name: &str) -> crate::CmdResult {
+    const TIMEOUT_SECS: u64 = 120;
+    info!("Waiting for container to be ready...");
+    let health_url = "http://localhost:18080/mgmt/health";
+    for i in 1..=TIMEOUT_SECS {
+        let health_check = run_fun!(curl -sf $health_url);
+        if health_check.is_ok() {
+            info!("Container ready after {}s", i);
+            return Ok(());
+        }
+        if i == TIMEOUT_SECS {
+            run_cmd!(docker logs $container_name)?;
+            cmd_die!("Container failed to start within {TIMEOUT_SECS} seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    Ok(())
 }

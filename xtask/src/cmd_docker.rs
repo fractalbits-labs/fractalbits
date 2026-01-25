@@ -1,6 +1,7 @@
 use crate::cmd_build::get_build_envs;
-use crate::docker_build::{
+use crate::docker_utils::{
     BinarySources, DockerBuildConfig, build_docker_image, get_host_arch, stage_binaries_for_docker,
+    wait_for_container_ready,
 };
 use crate::etcd_utils::{ensure_etcd_local, resolve_etcd_dir};
 use crate::*;
@@ -23,7 +24,8 @@ pub fn run_cmd_docker(cmd: DockerCommand) -> CmdResult {
             port,
             name,
             detach,
-        } => run_docker_container(&image_name, &tag, port, name.as_deref(), detach),
+            wait_ready,
+        } => run_docker_container(&image_name, &tag, port, name.as_deref(), detach, wait_ready),
         DockerCommand::Stop { name } => stop_docker_container(name.as_deref()),
         DockerCommand::Logs { name, follow } => show_docker_logs(name.as_deref(), follow),
     }
@@ -100,6 +102,7 @@ fn run_docker_container(
     port: u16,
     name: Option<&str>,
     detach: bool,
+    wait_ready: bool,
 ) -> CmdResult {
     let container_name = name.unwrap_or(DEFAULT_CONTAINER_NAME);
     let image = format!("{}:{}", image_name, tag);
@@ -117,6 +120,9 @@ fn run_docker_container(
     if detach {
         run_cmd!(docker run -d --privileged --name $container_name -p $port_mapping -p $mgmt_port_mapping -v "fractalbits-data:/data" $image)?;
         info!("Container started in detached mode: {}", container_name);
+        if wait_ready {
+            wait_for_container_ready(container_name)?;
+        }
     } else {
         // Use std::process::Command for interactive mode to pass through raw output
         let status = std::process::Command::new("docker")
