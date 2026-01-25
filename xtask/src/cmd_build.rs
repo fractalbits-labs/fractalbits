@@ -255,7 +255,8 @@ pub fn build_prebuilt_dev() -> CmdResult {
             info "Building Rust binaries for $arch (size-optimized release mode with zigbuild)...";
             RUSTFLAGS="-C target-cpu=$rust_cpu -C opt-level=z -C codegen-units=1 -C strip=symbols"
             $[build_envs] cargo zigbuild --release --target $rust_target
-                --workspace --exclude fractalbits-bootstrap --exclude rewrk* --exclude fractal-s3;
+                --workspace --exclude fractalbits-bootstrap --exclude rewrk* --exclude fractal-s3
+                --exclude xtask --exclude container-all-in-one;
         }?;
 
         info!("Copying binaries to prebuilt/dev/{arch} directory...");

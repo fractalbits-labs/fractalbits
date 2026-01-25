@@ -134,7 +134,8 @@ fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[Str
                     --target $rust_target $rust_build_opt --workspace
                     --exclude xtask
                     --exclude fractalbits-bootstrap
-                    --exclude fractal-s3;
+                    --exclude fractal-s3
+                    --exclude container-all-in-one;
             }?;
         } else {
             run_cmd! {
@@ -145,6 +146,7 @@ fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[Str
                     --exclude xtask
                     --exclude fractalbits-bootstrap
                     --exclude fractal-s3
+                    --exclude container-all-in-one
                     --exclude api_server;
 
                 info "Building api_server ...";
@@ -174,7 +176,8 @@ fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[Str
                     --target $rust_target $rust_build_opt --workspace
                     --exclude xtask
                     --exclude fractalbits-bootstrap
-                    --exclude fractal-s3;
+                    --exclude fractal-s3
+                    --exclude container-all-in-one;
             }?;
         } else {
             run_cmd! {
@@ -185,6 +188,7 @@ fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[Str
                     --exclude xtask
                     --exclude fractalbits-bootstrap
                     --exclude fractal-s3
+                    --exclude container-all-in-one
                     --exclude api_server;
 
                 info "Building api_server ...";
