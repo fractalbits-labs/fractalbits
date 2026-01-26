@@ -26,6 +26,9 @@ third_party/*.tar.gz
 # Claude Code configuration
 .claude/
 
+# Python virtual environments
+.venv/
+
 # CDK generated JavaScript files (keep TypeScript sources and Lambda JS)
 vpc/fractalbits-cdk/bin/*.js
 infra/fractalbits-cdk/cdk.context.json

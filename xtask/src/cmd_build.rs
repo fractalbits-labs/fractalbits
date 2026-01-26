@@ -157,6 +157,12 @@ pub fn build_all(release: bool) -> CmdResult {
     Ok(())
 }
 
+pub fn build_for_nightly() -> CmdResult {
+    build_rust_servers(BuildMode::Release)?;
+    build_zig_servers(BuildMode::Release)?;
+    Ok(())
+}
+
 /// Build only what's needed for Docker container (api_server, nss_role_agent, root_server, rss_admin, zig servers)
 pub fn build_for_docker(release: bool) -> CmdResult {
     let build_envs = get_build_envs();
