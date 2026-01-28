@@ -1236,6 +1236,7 @@ WantedBy=multi-user.target
 
     run_cmd! {
         mkdir -p $pwd/data/logs;
+        mkdir -p $pwd/data/coredumps;
         mkdir -p data/etc;
         echo $systemd_unit_content > data/etc/$service_file;
         info "Linking ./data/etc/$service_file into ~/.config/systemd/user";

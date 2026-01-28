@@ -53,7 +53,11 @@ pub fn run_cmd_nightly() -> CmdResult {
 
     // Create timestamp-based log directory: data/logs/nightly/<YYYYMMDD_HHMMSS>/
     let log_dir = format!("data/logs/nightly/{}", Local::now().format("%Y%m%d_%H%M%S"));
-    run_cmd!(mkdir -p $log_dir)?;
+    run_cmd! {
+        mkdir -p $log_dir;
+        rm -rf data/coredumps;
+        mkdir -p data/coredumps;
+    }?;
 
     let nightly_log = format!("{}/nss_failover.log", log_dir);
     let venv_python = "./core/nss_failover_test/.venv/bin/python3";

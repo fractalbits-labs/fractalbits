@@ -25,7 +25,10 @@ pub fn run_cmd_bench(
     let mut bench_opts = Vec::new();
     let keys_limit = keys_limit.to_string();
 
-    build_zig_servers(build_mode)?;
+    build_zig_servers(ZigBuildOpts {
+        mode: build_mode,
+        ..Default::default()
+    })?;
     match service {
         BenchService::NssRpc => {
             *service_name = ServiceName::Nss;

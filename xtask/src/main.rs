@@ -658,8 +658,11 @@ async fn main() -> CmdResult {
                         cmd_precheckin::run_zig_unit_tests(InitConfig::default())?
                     }
                     None => {
-                        let build_mode = cmd_build::build_mode(release);
-                        cmd_build::build_zig_servers(build_mode)?;
+                        let mode = cmd_build::build_mode(release);
+                        cmd_build::build_zig_servers(cmd_build::ZigBuildOpts {
+                            mode,
+                            ..Default::default()
+                        })?;
                     }
                 },
                 BuildCommand::Rust => {

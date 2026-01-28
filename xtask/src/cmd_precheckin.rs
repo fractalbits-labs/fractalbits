@@ -20,7 +20,10 @@ pub fn run_cmd_precheckin(
     } else {
         cmd_service::stop_service(ServiceName::All)?;
         cmd_build::build_rust_servers(BuildMode::Debug)?;
-        cmd_build::build_zig_servers(BuildMode::Debug)?;
+        cmd_build::build_zig_servers(cmd_build::ZigBuildOpts {
+            mode: BuildMode::Debug,
+            ..Default::default()
+        })?;
     }
 
     if s3_api_only {

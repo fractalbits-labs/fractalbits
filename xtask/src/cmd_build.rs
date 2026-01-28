@@ -11,9 +11,10 @@ pub fn get_build_envs() -> &'static Vec<String> {
     &BUILD_ENVS
 }
 
-#[derive(Copy, Clone, AsRefStr, EnumString)]
+#[derive(Copy, Clone, Default, AsRefStr, EnumString)]
 #[strum(serialize_all = "snake_case")]
 pub enum BuildMode {
+    #[default]
     Debug,
     Release,
 }
@@ -93,20 +94,29 @@ pub fn build_bench_rpc() -> CmdResult {
     }
 }
 
-pub fn build_zig_servers(mode: BuildMode) -> CmdResult {
+#[derive(Default)]
+pub struct ZigBuildOpts {
+    pub mode: BuildMode,
+    /// Strip debug symbols. Default is true for release builds.
+    /// Set to false to keep debug symbols for coredump analysis.
+    pub strip: bool,
+}
+
+pub fn build_zig_servers(opts: ZigBuildOpts) -> CmdResult {
     if !Path::new(ZIG_REPO_PATH).exists() {
         return Ok(());
     }
 
     let build_envs = get_build_envs();
-    let (opts, zig_out) = match mode {
+    let (release_opt, zig_out) = match opts.mode {
         BuildMode::Debug => ("", ZIG_DEBUG_OUT),
         BuildMode::Release => ("--release=safe", ZIG_RELEASE_OUT),
     };
+    let strip_opt = if opts.strip { "" } else { "-Dstrip=false" };
     run_cmd! {
         info "Building zig-based servers ...";
         cd $ZIG_REPO_PATH;
-        $[build_envs] zig build -p ../$zig_out $opts 2>&1;
+        $[build_envs] zig build -p ../$zig_out $release_opt $strip_opt 2>&1;
         info "Building bss and nss server done";
     }
 }
@@ -147,9 +157,12 @@ pub fn build_ui(region: &str) -> CmdResult {
 }
 
 pub fn build_all(release: bool) -> CmdResult {
-    let build_mode = build_mode(release);
-    build_rust_servers(build_mode)?;
-    build_zig_servers(build_mode)?;
+    let mode = build_mode(release);
+    build_rust_servers(mode)?;
+    build_zig_servers(ZigBuildOpts {
+        mode,
+        ..Default::default()
+    })?;
     if release {
         build_bench_rpc()?;
     }
@@ -159,7 +172,10 @@ pub fn build_all(release: bool) -> CmdResult {
 
 pub fn build_for_nightly() -> CmdResult {
     build_rust_servers(BuildMode::Release)?;
-    build_zig_servers(BuildMode::Release)?;
+    build_zig_servers(ZigBuildOpts {
+        mode: BuildMode::Release,
+        strip: false, // Keep debug symbols for coredump analysis
+    })?;
     Ok(())
 }
 
@@ -194,7 +210,10 @@ pub fn build_for_docker(release: bool) -> CmdResult {
     }
 
     // Build zig servers if core repo exists
-    build_zig_servers(build_mode(release))?;
+    build_zig_servers(ZigBuildOpts {
+        mode: build_mode(release),
+        ..Default::default()
+    })?;
 
     Ok(())
 }
