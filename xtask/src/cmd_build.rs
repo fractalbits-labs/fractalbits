@@ -100,6 +100,7 @@ pub struct ZigBuildOpts {
     /// Strip debug symbols. Default is true for release builds.
     /// Set to false to keep debug symbols for coredump analysis.
     pub strip: bool,
+    pub debug_checksum_mismatch: bool,
 }
 
 pub fn build_zig_servers(opts: ZigBuildOpts) -> CmdResult {
@@ -113,10 +114,15 @@ pub fn build_zig_servers(opts: ZigBuildOpts) -> CmdResult {
         BuildMode::Release => ("--release=safe", ZIG_RELEASE_OUT),
     };
     let strip_opt = if opts.strip { "" } else { "-Dstrip=false" };
+    let checksum_opt = if opts.debug_checksum_mismatch {
+        "-Ddebug_checksum_mismatch=true"
+    } else {
+        ""
+    };
     run_cmd! {
         info "Building zig-based servers ...";
         cd $ZIG_REPO_PATH;
-        $[build_envs] zig build -p ../$zig_out $release_opt $strip_opt 2>&1;
+        $[build_envs] zig build -p ../$zig_out $release_opt $strip_opt $checksum_opt 2>&1;
         info "Building bss and nss server done";
     }
 }
@@ -175,6 +181,7 @@ pub fn build_for_nightly() -> CmdResult {
     build_zig_servers(ZigBuildOpts {
         mode: BuildMode::Release,
         strip: false, // Keep debug symbols for coredump analysis
+        debug_checksum_mismatch: true,
     })?;
     Ok(())
 }
