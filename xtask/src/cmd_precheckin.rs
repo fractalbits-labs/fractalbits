@@ -47,9 +47,11 @@ pub fn run_cmd_precheckin(
         run_fractal_art_tests()?;
     }
 
-    if let Ok(core_file) = run_fun!(ls data | grep ^core) {
-        let core_files: Vec<&str> = core_file.split("\n").collect();
-        cmd_die!("Found core file(s) in directory ./data: ${core_files:?}");
+    if let Ok(core_file) = run_fun!(find data/ -type f -name "core.*") {
+        let core_files: Vec<&str> = core_file.split("\n").filter(|s| !s.is_empty()).collect();
+        if !core_files.is_empty() {
+            cmd_die!("Found core file(s) in directory ./data: ${core_files:?}");
+        }
     }
 
     if docker == DockerTestMode::Included {
