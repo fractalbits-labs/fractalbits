@@ -1036,7 +1036,7 @@ Environment="RUST_LOG=warn""##
             // Create template for BSS services using %i placeholder
             // Use bash arithmetic to calculate port dynamically: 8088 + instance_id
             env_settings += r##"
-Environment="BSS_WORKING_DIR=./data/bss%i""##;
+Environment="BSS_WORKING_DIR=./bss%i""##;
             let bss_binary = resolve_binary_path("bss_server", build_mode);
             format!("/bin/bash -c 'BSS_PORT=$((8088 + %i)) {bss_binary}'")
         }
@@ -1044,11 +1044,11 @@ Environment="BSS_WORKING_DIR=./data/bss%i""##;
             managed_service = true;
             // Use template-based service with instance suffix (A or B)
             // WORKING_DIR, SHARED_DIR, JOURNAL_UUID, and HEALTH_PORT are set based on instance
-            env_settings += "\nEnvironment=\"WORKING_DIR=./data/nss-%i\"";
+            env_settings += "\nEnvironment=\"WORKING_DIR=./nss-%i\"";
             env_settings += &format!("\nEnvironmentFile=-{pwd}/data/etc/nss.env");
             let nss_binary = resolve_binary_path("nss_server", build_mode);
             // Read journal_uuid from shared file and compute SHARED_DIR based on journal type
-            // For EBS: "../ebs/<uuid>" (relative to ./data/nss-%i to reach ./data/ebs/<uuid>)
+            // For EBS: "../ebs/<uuid>" (relative to ./nss-%i to reach ./ebs/<uuid>)
             // For NVMe: "local/journal/<uuid>"
             let journal_type = init_config.journal_type;
             let shared_dir_prefix = match journal_type {
@@ -1056,18 +1056,18 @@ Environment="BSS_WORKING_DIR=./data/bss%i""##;
                 JournalType::Nvme => "local/journal",
             };
             format!(
-                r#"/bin/bash -c 'JOURNAL_UUID=$(cat ./data/etc/journal_uuid.txt); export JOURNAL_UUID; export SHARED_DIR="{shared_dir_prefix}/$JOURNAL_UUID"; if [ "%i" = "A" ]; then HEALTH_PORT=29999; else HEALTH_PORT=29998; fi; export HEALTH_PORT; if [ -n "$LOGS" ]; then {nss_binary} serve 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/nss-%i.log"; else exec {nss_binary} serve; fi'"#
+                r#"/bin/bash -c 'JOURNAL_UUID=$(cat ./etc/journal_uuid.txt); export JOURNAL_UUID; export SHARED_DIR="{shared_dir_prefix}/$JOURNAL_UUID"; if [ "%i" = "A" ]; then HEALTH_PORT=29999; else HEALTH_PORT=29998; fi; export HEALTH_PORT; if [ -n "$LOGS" ]; then {nss_binary} serve 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/nss-%i.log"; else exec {nss_binary} serve; fi'"#
             )
         }
         ServiceName::Mirrord => {
             managed_service = true;
             // Use template-based service with instance suffix (A or B)
             // WORKING_DIR, SHARED_DIR, JOURNAL_UUID, and HEALTH_PORT are set based on instance
-            env_settings += "\nEnvironment=\"WORKING_DIR=./data/nss-%i\"";
+            env_settings += "\nEnvironment=\"WORKING_DIR=./nss-%i\"";
             env_settings += &format!("\nEnvironmentFile=-{pwd}/data/etc/mirrord.env");
             let mirrord_binary = resolve_binary_path("mirrord", build_mode);
             // Read journal_uuid from shared file and compute SHARED_DIR based on journal type
-            // For EBS: "../ebs/<uuid>" (relative to ./data/nss-%i to reach ./data/ebs/<uuid>)
+            // For EBS: "../ebs/<uuid>" (relative to ./nss-%i to reach ./ebs/<uuid>)
             // For NVMe: "local/journal/<uuid>"
             let journal_type = init_config.journal_type;
             let shared_dir_prefix = match journal_type {
@@ -1075,13 +1075,12 @@ Environment="BSS_WORKING_DIR=./data/bss%i""##;
                 JournalType::Nvme => "local/journal",
             };
             format!(
-                r#"/bin/bash -c 'JOURNAL_UUID=$(cat ./data/etc/journal_uuid.txt); export JOURNAL_UUID; export SHARED_DIR="{shared_dir_prefix}/$JOURNAL_UUID"; if [ "%i" = "A" ]; then HEALTH_PORT=19999; else HEALTH_PORT=19998; fi; export HEALTH_PORT; if [ -n "$LOGS" ]; then {mirrord_binary} 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/mirrord-%i.log"; else exec {mirrord_binary}; fi'"#
+                r#"/bin/bash -c 'JOURNAL_UUID=$(cat ./etc/journal_uuid.txt); export JOURNAL_UUID; export SHARED_DIR="{shared_dir_prefix}/$JOURNAL_UUID"; if [ "%i" = "A" ]; then HEALTH_PORT=19999; else HEALTH_PORT=19998; fi; export HEALTH_PORT; if [ -n "$LOGS" ]; then {mirrord_binary} 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/mirrord-%i.log"; else exec {mirrord_binary}; fi'"#
             )
         }
         ServiceName::NssRoleAgentA => {
             env_settings += env_rust_log(build_mode);
             env_settings += "\nEnvironment=\"INSTANCE_ID=nss-A\"";
-            env_settings += "\nEnvironment=\"RESTART_LOCKOUT_DIR=./data\"";
             if init_config.nss_disable_restart_limit {
                 env_settings += "\nEnvironment=\"NSS_DISABLE_RESTART_LIMIT=1\"";
             }
@@ -1090,7 +1089,6 @@ Environment="BSS_WORKING_DIR=./data/bss%i""##;
         ServiceName::NssRoleAgentB => {
             env_settings += env_rust_log(build_mode);
             env_settings += "\nEnvironment=\"INSTANCE_ID=nss-B\"";
-            env_settings += "\nEnvironment=\"RESTART_LOCKOUT_DIR=./data\"";
             if init_config.nss_disable_restart_limit {
                 env_settings += "\nEnvironment=\"NSS_DISABLE_RESTART_LIMIT=1\"";
             }
@@ -1132,7 +1130,7 @@ Environment="BSS_WORKING_DIR=./data/bss%i""##;
                 env_settings += "\nEnvironment=\"HTTPS_DISABLED=1\"";
             }
             env_settings += r##"
-Environment="GUI_WEB_ROOT=ui/dist""##;
+Environment="GUI_WEB_ROOT=../ui/dist""##;
             format!("{pwd}/target/{build}/api_server")
         }
         ServiceName::DdbLocal => {
@@ -1146,32 +1144,29 @@ Environment="GUI_WEB_ROOT=ui/dist""##;
             env_settings = r##"
 Environment="MINIO_REGION=localdev""##
                 .to_string();
-            format!("{minio_bin} server --address :9000 data/s3/")
+            format!("{minio_bin} server --address :9000 s3/")
         }
         ServiceName::MinioAz1 => {
             env_settings = r##"
 Environment="MINIO_REGION=localdev""##
                 .to_string();
-            format!("{minio_bin} server --address :9001 data/s3-localdev-az1/")
+            format!("{minio_bin} server --address :9001 s3-localdev-az1/")
         }
         ServiceName::MinioAz2 => {
             env_settings = r##"
 Environment="MINIO_REGION=localdev""##
                 .to_string();
-            format!("{minio_bin} server --address :9002 data/s3-localdev-az2/")
+            format!("{minio_bin} server --address :9002 s3-localdev-az2/")
         }
         ServiceName::Etcd => {
             let etcd_bin = resolve_etcd_bin("etcd");
             format!(
-                "{etcd_bin} --data-dir=./data/etcd --listen-client-urls=http://localhost:2379 --advertise-client-urls=http://localhost:2379"
+                "{etcd_bin} --data-dir=./etcd --listen-client-urls=http://localhost:2379 --advertise-client-urls=http://localhost:2379"
             )
         }
         _ => unreachable!(),
     };
-    let working_dir = match service {
-        ServiceName::DdbLocal => format!("{}/data", run_fun!(realpath $pwd)?),
-        _ => run_fun!(realpath $pwd)?,
-    };
+    let working_dir = format!("{}/data", run_fun!(realpath $pwd)?);
 
     // Add systemd dependencies based on service type
     let dependencies = match service {

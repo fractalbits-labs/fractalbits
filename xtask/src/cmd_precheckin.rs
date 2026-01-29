@@ -47,12 +47,7 @@ pub fn run_cmd_precheckin(
         run_fractal_art_tests()?;
     }
 
-    if let Ok(core_file) = run_fun!(find data/ -type f -name "core.*") {
-        let core_files: Vec<&str> = core_file.split("\n").filter(|s| !s.is_empty()).collect();
-        if !core_files.is_empty() {
-            cmd_die!("Found core file(s) in directory ./data: ${core_files:?}");
-        }
-    }
+    check_for_core_dumps()?;
 
     if docker == DockerTestMode::Included {
         run_docker_tests()?;
@@ -254,5 +249,15 @@ fn run_docker_tests() -> CmdResult {
     stop_result?;
 
     info!("Docker tests completed successfully");
+    Ok(())
+}
+
+pub fn check_for_core_dumps() -> CmdResult {
+    if let Ok(core_file) = run_fun!(find data/ -type f -name "core.*") {
+        let core_files: Vec<&str> = core_file.split("\n").filter(|s| !s.is_empty()).collect();
+        if !core_files.is_empty() {
+            cmd_die!("Found core file(s) in directory ./data: ${core_files:?}");
+        }
+    }
     Ok(())
 }

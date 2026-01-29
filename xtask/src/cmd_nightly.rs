@@ -25,6 +25,12 @@ pub fn run_cmd_nightly() -> CmdResult {
     // Clean environment: stop all processes before running
     run_cmd!(info "Cleaning environment: stopping all services...")?;
     stop_service(ServiceName::All)?;
+    // Kill leftover nightly test processes and transient units
+    run_cmd! {
+        ignore systemctl --user stop prefill-nss prefill-mirrord &>/dev/null;
+        ignore pkill -f test_async_fractal_art &>/dev/null;
+        ignore pkill -f mirrord &>/dev/null;
+    }?;
 
     // Full build (release mode)
     cmd_build::build_for_nightly()?;
@@ -51,6 +57,9 @@ pub fn run_cmd_nightly() -> CmdResult {
     // Set up Python virtual environment and install dependencies
     setup_python_venv()?;
 
+    // Check for leftover core dumps from a previous run
+    crate::cmd_precheckin::check_for_core_dumps()?;
+
     // Create timestamp-based log directory: data/logs/nightly/<YYYYMMDD_HHMMSS>/
     let log_dir = format!("data/logs/nightly/{}", Local::now().format("%Y%m%d_%H%M%S"));
     run_cmd! {
@@ -73,5 +82,10 @@ pub fn run_cmd_nightly() -> CmdResult {
     // Stop all services regardless of test result
     let _ = stop_service(ServiceName::All);
 
-    result
+    // Check for core dumps regardless of test result
+    let core_dump_result = crate::cmd_precheckin::check_for_core_dumps();
+
+    // Report test failure first, then core dump failure
+    result?;
+    core_dump_result
 }
