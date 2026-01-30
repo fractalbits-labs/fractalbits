@@ -21,7 +21,7 @@ fn setup_python_venv() -> CmdResult {
     }
 }
 
-pub fn run_cmd_nightly() -> CmdResult {
+pub fn run_cmd_nightly(multi_bss: bool) -> CmdResult {
     // Clean environment: stop all processes before running
     run_cmd!(info "Cleaning environment: stopping all services...")?;
     stop_service(ServiceName::All)?;
@@ -41,6 +41,7 @@ pub fn run_cmd_nightly() -> CmdResult {
         rss_backend: RssBackend::Etcd,
         journal_type: JournalType::Nvme,
         nss_disable_restart_limit: true,
+        bss_count: if multi_bss { 6 } else { 1 },
         ..Default::default()
     };
 
