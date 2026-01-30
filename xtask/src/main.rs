@@ -48,7 +48,10 @@ enum Cmd {
     },
 
     #[clap(about = "Run nightly tests")]
-    Nightly,
+    Nightly {
+        #[clap(long, help = "Initialize with 6 BSS nodes instead of 1")]
+        multi_bss: bool,
+    },
 
     #[clap(about = "Run precheckin tests")]
     Precheckin {
@@ -700,7 +703,7 @@ async fn main() -> CmdResult {
                 docker,
             )?;
         }
-        Cmd::Nightly => cmd_nightly::run_cmd_nightly()?,
+        Cmd::Nightly { multi_bss } => cmd_nightly::run_cmd_nightly(multi_bss)?,
         Cmd::Bench {
             service,
             workload,
