@@ -82,12 +82,17 @@ pub fn init_service(
         }?;
 
         // Initialize observer_state in service-discovery table
-        // Active/standby mode when JournalType::Nvme, solo mode otherwise
+        // Active/standby mode for both NVMe and EBS journal types
         // Fields match root_server's ObserverPersistentState and MachineState structs
-        let observer_state_json = if init_config.journal_type == JournalType::Nvme {
-            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0}"#
-        } else {
-            r#"{"observer_state":"solo","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"","network_address":null},"version":1,"last_updated":0}"#
+        let observer_state_json = match init_config.journal_type {
+            JournalType::Nvme => {
+                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0}"#
+            }
+            JournalType::Ebs => {
+                // EBS active/standby: standby is idle (no NSS running, no EBS mounted)
+                // On failover, standby mounts EBS volume and starts NSS
+                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"nss","expected_role":"standby","network_address":null},"version":1,"last_updated":0}"#
+            }
         };
         let observer_state_item = format!(
             r#"{{"service_id":{{"S":"observer_state"}},"state":{{"S":"{}"}}}}"#,
@@ -178,12 +183,17 @@ pub fn init_service(
         let etcdctl = resolve_etcd_bin("etcdctl");
 
         // Always use observer_state for role management
-        // Active/standby mode when JournalType::Nvme, solo mode otherwise
+        // Active/standby mode for both NVMe and EBS journal types
         // Fields match root_server's ObserverPersistentState and MachineState structs
-        let observer_state_json = if init_config.journal_type == JournalType::Nvme {
-            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0}"#
-        } else {
-            r#"{"observer_state":"solo","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"","network_address":null},"version":1,"last_updated":0}"#
+        let observer_state_json = match init_config.journal_type {
+            JournalType::Nvme => {
+                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0}"#
+            }
+            JournalType::Ebs => {
+                // EBS active/standby: standby is idle (no NSS running, no EBS mounted)
+                // On failover, standby mounts EBS volume and starts NSS
+                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"nss","expected_role":"standby","network_address":null},"version":1,"last_updated":0}"#
+            }
         };
 
         let az_status_json = r#"{"status":{"localdev-az1":"Normal","localdev-az2":"Normal"}}"#;
