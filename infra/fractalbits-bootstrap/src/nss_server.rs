@@ -150,7 +150,7 @@ fn setup_configs(
     service_name: &str,
 ) -> CmdResult {
     // Journal-type specific config paths
-    // For EBS: mount at /data/ebs, journal at /data/ebs/{uuid}/
+    // For EBS: journal at /data/ebs/{uuid}/ (mount handled by nss_role_agent)
     // For NVMe: journal at /data/local/journal/
     let (volume_dev, shared_dir) = match journal_type {
         JournalType::Ebs => {
@@ -167,14 +167,6 @@ fn setup_configs(
 
     create_nss_config(volume_dev.as_deref(), &shared_dir, journal_uuid)?;
     create_mirrord_config(volume_dev.as_deref(), &shared_dir)?;
-
-    // EBS-specific: mount at /data/ebs (simple unit name: data-ebs.mount)
-    if journal_type == JournalType::Ebs
-        && let Some(vid) = volume_id
-    {
-        let mount_dev = ebs_journal::get_volume_dev(vid);
-        create_mount_unit(&mount_dev, "/data/ebs", "ext4")?;
-    }
 
     // Common configs
     create_coredump_config()?;

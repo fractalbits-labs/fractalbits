@@ -12,9 +12,9 @@ pub fn format_with_volume_id(volume_id: &str, journal_uuid: &str) -> CmdResult {
 }
 
 pub(crate) fn format_internal(ebs_dev: &str, journal_uuid: &str) -> CmdResult {
-    // Mount EBS at /data/ebs, create journal directory at /data/ebs/{uuid}/
-    let mount_point = "/data/ebs";
-    let journal_dir = format!("/data/ebs/{journal_uuid}");
+    // Mount EBS at /data/ebs/{journal_uuid} (dynamic mount point per volume)
+    let mount_point = format!("/data/ebs/{journal_uuid}");
+    let journal_dir = mount_point.clone();
 
     run_cmd! {
         info "Disabling udev rules for EBS";

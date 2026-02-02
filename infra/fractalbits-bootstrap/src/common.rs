@@ -175,9 +175,7 @@ Environment="HOST_ID={instance_id}"
 EnvironmentFile=-{ETC_PATH}nss.env"##
             );
             requires = match (journal_type, journal_uuid) {
-                (Some(JournalType::Nvme), _) => "data-local.mount".to_string(),
-                (Some(JournalType::Ebs), Some(_)) => "data-ebs.mount data-local.mount".to_string(),
-                (Some(JournalType::Ebs), None) => "data-local.mount".to_string(),
+                (Some(_), _) => "data-local.mount".to_string(),
                 (None, _) => unreachable!(),
             };
             format!(
@@ -191,9 +189,7 @@ EnvironmentFile=-{ETC_PATH}nss.env"##
 EnvironmentFile=-{ETC_PATH}mirrord.env"##
             );
             requires = match (journal_type, journal_uuid) {
-                (Some(JournalType::Nvme), _) => "data-local.mount".to_string(),
-                (Some(JournalType::Ebs), Some(_)) => "data-ebs.mount data-local.mount".to_string(),
-                (Some(JournalType::Ebs), None) => "data-local.mount".to_string(),
+                (Some(_), _) => "data-local.mount".to_string(),
                 (None, _) => unreachable!(),
             };
             format!(
