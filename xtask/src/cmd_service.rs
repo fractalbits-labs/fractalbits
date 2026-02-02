@@ -82,15 +82,14 @@ pub fn init_service(
         }?;
 
         // Initialize observer_state in service-discovery table
-        // Active/standby mode for both NVMe and EBS journal types
+        // NVMe: active/standby with mirrord on standby machine
+        // EBS: active/standby with idle standby (no mirrord, role agent reports standby health)
         // Fields match root_server's ObserverPersistentState and MachineState structs
         let observer_state_json = match init_config.journal_type {
             JournalType::Nvme => {
                 r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0}"#
             }
             JournalType::Ebs => {
-                // EBS active/standby: standby is idle (no NSS running, no EBS mounted)
-                // On failover, standby mounts EBS volume and starts NSS
                 r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"nss","expected_role":"standby","network_address":null},"version":1,"last_updated":0}"#
             }
         };
@@ -183,15 +182,14 @@ pub fn init_service(
         let etcdctl = resolve_etcd_bin("etcdctl");
 
         // Always use observer_state for role management
-        // Active/standby mode for both NVMe and EBS journal types
+        // NVMe: active/standby with mirrord on standby machine
+        // EBS: active/standby with idle standby (no mirrord, role agent reports standby health)
         // Fields match root_server's ObserverPersistentState and MachineState structs
         let observer_state_json = match init_config.journal_type {
             JournalType::Nvme => {
                 r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0}"#
             }
             JournalType::Ebs => {
-                // EBS active/standby: standby is idle (no NSS running, no EBS mounted)
-                // On failover, standby mounts EBS volume and starts NSS
                 r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"mirrord_machine":{"machine_id":"nss-B","running_service":"nss","expected_role":"standby","network_address":null},"version":1,"last_updated":0}"#
             }
         };
@@ -626,7 +624,7 @@ fn all_services(
         RssBackend::Ddb => ServiceName::DdbLocal,
         RssBackend::Etcd => ServiceName::Etcd,
     };
-    // When journal_type is Nvme, we always need NssRoleAgentB and Mirrord
+    // Mirrord service is only needed for NVMe journal or S3ExpressMultiAz
     let with_mirrord =
         journal_type == JournalType::Nvme || data_blob_storage == DataBlobStorage::S3ExpressMultiAz;
 
@@ -635,14 +633,12 @@ fn all_services(
             let mut services = vec![
                 ServiceName::ApiServer,
                 ServiceName::NssRoleAgentA,
+                ServiceName::NssRoleAgentB,
                 ServiceName::Bss,
                 ServiceName::Rss,
                 rss_backend_service,
                 ServiceName::Minio,
             ];
-            if with_mirrord {
-                services.push(ServiceName::NssRoleAgentB);
-            }
             if with_managed_service {
                 services.push(ServiceName::Nss);
                 if with_mirrord {
@@ -672,13 +668,11 @@ fn all_services(
             let mut services = vec![
                 ServiceName::ApiServer,
                 ServiceName::NssRoleAgentA,
+                ServiceName::NssRoleAgentB,
                 ServiceName::Bss,
                 ServiceName::Rss,
                 rss_backend_service,
             ];
-            if with_mirrord {
-                services.push(ServiceName::NssRoleAgentB);
-            }
             if with_managed_service {
                 services.push(ServiceName::Nss);
                 if with_mirrord {
@@ -714,8 +708,8 @@ fn get_data_blob_storage_setting() -> DataBlobStorage {
 }
 
 fn get_journal_type_setting() -> JournalType {
-    // Check if nss_role_agent_b.service exists (indicates nvme/mirrord mode)
-    if Path::new("data/etc/nss_role_agent_b.service").exists() {
+    // Check if mirrord@.service exists (indicates NVMe journal with mirrord)
+    if Path::new("data/etc/mirrord@.service").exists() {
         JournalType::Nvme
     } else {
         JournalType::Ebs
@@ -899,11 +893,6 @@ fn start_all_services() -> CmdResult {
     // Start supporting services first based on backend configuration
     let rss_backend = get_rss_backend_setting();
     let data_blob_storage = get_data_blob_storage_setting();
-    let journal_type = get_journal_type_setting();
-
-    // When journal_type is Nvme, we need mirrord running before nss active
-    let with_mirrord =
-        journal_type == JournalType::Nvme || data_blob_storage == DataBlobStorage::S3ExpressMultiAz;
 
     match rss_backend {
         RssBackend::Ddb => {
@@ -941,10 +930,8 @@ fn start_all_services() -> CmdResult {
             for id in 0..bss_count {
                 start_bss_instance(id)?;
             }
-            // When using mirrord, start NssRoleAgentB first
-            if with_mirrord {
-                start_service(ServiceName::NssRoleAgentB)?;
-            }
+            // Start NssRoleAgentB first (mirrord for NVMe, idle standby for EBS)
+            start_service(ServiceName::NssRoleAgentB)?;
             start_service(ServiceName::NssRoleAgentA)?;
             start_service(ServiceName::ApiServer)?;
         }
@@ -1006,7 +993,6 @@ fn create_systemd_unit_files_for_init(
                 || init_config.data_blob_storage == DataBlobStorage::S3ExpressMultiAz;
             if !with_mirrord {
                 run_cmd! {
-                    rm -f "data/etc/nss_role_agent_b.service";
                     rm -f "data/etc/mirrord@.service";
                 }?;
             }
@@ -1094,6 +1080,9 @@ Environment="BSS_WORKING_DIR=./bss%i""##;
             if init_config.nss_disable_restart_limit {
                 env_settings += "\nEnvironment=\"NSS_DISABLE_RESTART_LIMIT=1\"";
             }
+            if init_config.journal_type == JournalType::Ebs {
+                env_settings += "\nEnvironment=\"APP_JOURNAL_TYPE=ebs\"";
+            }
             resolve_binary_path("nss_role_agent", build_mode)
         }
         ServiceName::NssRoleAgentB => {
@@ -1101,6 +1090,9 @@ Environment="BSS_WORKING_DIR=./bss%i""##;
             env_settings += "\nEnvironment=\"INSTANCE_ID=nss-B\"";
             if init_config.nss_disable_restart_limit {
                 env_settings += "\nEnvironment=\"NSS_DISABLE_RESTART_LIMIT=1\"";
+            }
+            if init_config.journal_type == JournalType::Ebs {
+                env_settings += "\nEnvironment=\"APP_JOURNAL_TYPE=ebs\"";
             }
             resolve_binary_path("nss_role_agent", build_mode)
         }
@@ -1318,7 +1310,14 @@ pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdRes
         ServiceName::Mirrord => ("port 9999", vec![9999]),
         ServiceName::ApiServer | ServiceName::GuiServer => ("port 8080", vec![8080]),
         ServiceName::NssRoleAgentA => ("managed nss port 8087", vec![8087]),
-        ServiceName::NssRoleAgentB => ("managed mirrord port 9999", vec![9999]),
+        ServiceName::NssRoleAgentB => {
+            if get_journal_type_setting() == JournalType::Ebs {
+                // EBS standby: no managed service port to check, just verify process is running
+                ("standby role agent", vec![])
+            } else {
+                ("managed mirrord port 9999", vec![9999])
+            }
+        }
         ServiceName::Etcd => ("port 2379", vec![2379]),
         ServiceName::All => unreachable!("Should not check readiness for All"),
     };
