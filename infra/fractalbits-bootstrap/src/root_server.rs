@@ -203,13 +203,13 @@ fn initialize_observer_state(
         // HA mode: active/standby - both machines share the same journal_uuid
         info!("HA mode: {nss_a_id} as active NSS, {nss_b_id} as standby mirrord");
         format!(
-            r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"active","network_address":null,"journal_uuid":{journal_uuid_json}}},"mirrord_machine":{{"machine_id":"{nss_b_id}","running_service":"mirrord","expected_role":"standby","network_address":null,"journal_uuid":{journal_uuid_json}}},"last_updated":{timestamp},"version":1}}"#
+            r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"active","network_address":null,"journal_uuid":{journal_uuid_json}}},"standby_machine":{{"machine_id":"{nss_b_id}","running_service":"mirrord","expected_role":"standby","network_address":null,"journal_uuid":{journal_uuid_json}}},"last_updated":{timestamp},"version":1}}"#
         )
     } else {
         // Solo mode: single NSS
         info!("Solo mode: {nss_a_id} as solo NSS");
         format!(
-            r#"{{"observer_state":"solo","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"solo","network_address":null,"journal_uuid":{journal_uuid_json}}},"mirrord_machine":{{"machine_id":"","running_service":"mirrord","expected_role":"","network_address":null,"journal_uuid":null}},"last_updated":{timestamp},"version":1}}"#
+            r#"{{"observer_state":"solo","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"solo","network_address":null,"journal_uuid":{journal_uuid_json}}},"standby_machine":{{"machine_id":"","running_service":"mirrord","expected_role":"","network_address":null,"journal_uuid":null}},"last_updated":{timestamp},"version":1}}"#
         )
     };
 

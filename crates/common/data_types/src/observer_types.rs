@@ -30,6 +30,7 @@ impl fmt::Display for ObserverState {
 pub enum ServiceType {
     Nss,
     Mirrord,
+    Noop,
 }
 
 impl fmt::Display for ServiceType {
@@ -37,6 +38,7 @@ impl fmt::Display for ServiceType {
         match self {
             ServiceType::Nss => write!(f, "nss"),
             ServiceType::Mirrord => write!(f, "mirrord"),
+            ServiceType::Noop => write!(f, "noop"),
         }
     }
 }
@@ -122,7 +124,7 @@ impl MachineState {
 pub struct ObserverPersistentState {
     pub observer_state: ObserverState,
     pub nss_machine: MachineState,
-    pub mirrord_machine: MachineState,
+    pub standby_machine: MachineState,
     #[serde(default = "default_timestamp")]
     pub last_updated: f64,
     /// Version counter, incremented on each persist.
@@ -139,12 +141,12 @@ impl ObserverPersistentState {
     pub fn new(
         observer_state: ObserverState,
         nss_machine: MachineState,
-        mirrord_machine: MachineState,
+        standby_machine: MachineState,
     ) -> Self {
         Self {
             observer_state,
             nss_machine,
-            mirrord_machine,
+            standby_machine,
             last_updated: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
@@ -206,6 +208,31 @@ mod tests {
         let parsed: ObserverPersistentState = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.observer_state, ObserverState::ActiveStandby);
         assert_eq!(parsed.nss_machine.machine_id, "nss-A");
-        assert_eq!(parsed.mirrord_machine.machine_id, "nss-B");
+        assert_eq!(parsed.standby_machine.machine_id, "nss-B");
+    }
+
+    #[test]
+    fn test_noop_service_type_serialization() {
+        let machine = MachineState::new(
+            "nss-B".to_string(),
+            ServiceType::Noop,
+            "standby".to_string(),
+        );
+        let json = serde_json::to_string(&machine).unwrap();
+        assert!(json.contains("\"noop\""));
+        let parsed: MachineState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.running_service, ServiceType::Noop);
+    }
+
+    #[test]
+    fn test_backward_compat_mirrord_machine_field() {
+        // Verify that JSON with old "mirrord_machine" field name can still be deserialized
+        // This is NOT supported - we use a clean rename. This test documents the break.
+        let json = r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby"},"last_updated":0.0,"version":0}"#;
+        let result = serde_json::from_str::<ObserverPersistentState>(json);
+        assert!(
+            result.is_err(),
+            "Old mirrord_machine field should not deserialize - clean rename"
+        );
     }
 }

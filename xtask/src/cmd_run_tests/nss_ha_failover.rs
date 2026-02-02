@@ -177,7 +177,7 @@ async fn test_full_stack_initialization(backend: RssBackend) -> CmdResult {
     let state = state.unwrap();
     info!(
         "Observer initialized: state={}, nss={}, mirrord={}",
-        state.observer_state, state.nss_machine.machine_id, state.mirrord_machine.machine_id
+        state.observer_state, state.nss_machine.machine_id, state.standby_machine.machine_id
     );
 
     // Verify nss-A is running NSS
@@ -189,10 +189,10 @@ async fn test_full_stack_initialization(backend: RssBackend) -> CmdResult {
     }
 
     // Verify nss-B is running mirrord
-    if state.mirrord_machine.machine_id != "nss-B" {
+    if state.standby_machine.machine_id != "nss-B" {
         return Err(Error::other(format!(
             "Expected nss-B to be mirrord machine, got {}",
-            state.mirrord_machine.machine_id
+            state.standby_machine.machine_id
         )));
     }
 
@@ -311,8 +311,8 @@ async fn test_mirrord_recovery(backend: RssBackend) -> CmdResult {
         state.observer_state,
         state.nss_machine.machine_id,
         state.nss_machine.expected_role,
-        state.mirrord_machine.machine_id,
-        state.mirrord_machine.expected_role
+        state.standby_machine.machine_id,
+        state.standby_machine.expected_role
     );
 
     println!(
