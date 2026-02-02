@@ -687,3 +687,366 @@ async fn test_api_server_during_nss_failover(backend: RssBackend) -> CmdResult {
     );
     Ok(())
 }
+
+pub async fn run_ebs_ha_failover_tests(backend: RssBackend) -> CmdResult {
+    info!(
+        "Running EBS HA failover tests with {} backend...",
+        backend.as_ref()
+    );
+
+    let _ = stop_service(ServiceName::All);
+
+    println!("{}", "=== EBS Test 1: Full Stack Initialization ===".bold());
+    if let Err(e) = test_ebs_full_stack_initialization(backend).await {
+        let _ = stop_service(ServiceName::All);
+        eprintln!("{}: {}", "EBS Test 1 FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!(
+        "{}",
+        "=== EBS Test 2: api_server During EBS Failover ===".bold()
+    );
+    if let Err(e) = test_ebs_api_server_during_failover(backend).await {
+        let _ = stop_service(ServiceName::All);
+        eprintln!("{}: {}", "EBS Test 2 FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!("{}", "=== EBS Test 3: EBS Standby Recovery ===".bold());
+    if let Err(e) = test_ebs_standby_recovery(backend).await {
+        let _ = stop_service(ServiceName::All);
+        eprintln!("{}: {}", "EBS Test 3 FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!("{}", "=== EBS Test 4: Observer Restart ===".bold());
+    if let Err(e) = test_observer_restart(backend).await {
+        let _ = stop_service(ServiceName::All);
+        eprintln!("{}: {}", "EBS Test 4 FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    let _ = stop_service(ServiceName::All);
+
+    println!(
+        "{}",
+        format!(
+            "=== All EBS HA Failover Tests ({}) PASSED ===",
+            backend.as_ref()
+        )
+        .green()
+        .bold()
+    );
+    Ok(())
+}
+
+async fn test_ebs_full_stack_initialization(backend: RssBackend) -> CmdResult {
+    info!("Initializing services with JournalType::Ebs...");
+
+    let init_config = InitConfig {
+        journal_type: JournalType::Ebs,
+        rss_backend: backend,
+        data_blob_storage: DataBlobStorage::AllInBssSingleAz,
+        bss_count: 1,
+        nss_disable_restart_limit: true,
+        ..Default::default()
+    };
+    init_service(ServiceName::All, BuildMode::Debug, init_config)?;
+    start_service(ServiceName::All)?;
+
+    let state = wait_for_observer_state(backend, ObserverState::ActiveStandby, 15);
+    if state.is_none() {
+        let current = get_observer_state(backend);
+        return Err(Error::other(format!(
+            "Observer did not create initial active_standby state. Current state: {:?}",
+            current.map(|s| s.observer_state)
+        )));
+    }
+
+    let state = state.unwrap();
+    info!(
+        "Observer initialized: state={}, nss={}, standby={}",
+        state.observer_state, state.nss_machine.machine_id, state.standby_machine.machine_id
+    );
+
+    if state.nss_machine.machine_id != "nss-A" {
+        return Err(Error::other(format!(
+            "Expected nss-A to be NSS machine, got {}",
+            state.nss_machine.machine_id
+        )));
+    }
+
+    if state.standby_machine.machine_id != "nss-B" {
+        return Err(Error::other(format!(
+            "Expected nss-B to be standby machine, got {}",
+            state.standby_machine.machine_id
+        )));
+    }
+
+    // Verify EBS mode: standby should have running_service = noop
+    if state.standby_machine.running_service != data_types::ServiceType::Noop {
+        return Err(Error::other(format!(
+            "Expected standby running_service=noop for EBS, got {}",
+            state.standby_machine.running_service
+        )));
+    }
+
+    println!(
+        "{}",
+        "SUCCESS: EBS full stack initialized with active_standby state!".green()
+    );
+    Ok(())
+}
+
+async fn test_ebs_api_server_during_failover(backend: RssBackend) -> CmdResult {
+    info!("Testing api_server during EBS failover...");
+
+    let state = get_observer_state(backend);
+    if state.is_none() || state.as_ref().unwrap().observer_state != ObserverState::ActiveStandby {
+        return Err(Error::other(
+            "Expected active_standby state before testing failover",
+        ));
+    }
+
+    if !verify_process_running("nss_server") {
+        return Err(Error::other(
+            "nss_server is not running before failover test",
+        ));
+    }
+
+    // Create bucket and upload test objects
+    let ctx = context();
+    let bucket_name = "test-ebs-failover";
+
+    match ctx.client.create_bucket().bucket(bucket_name).send().await {
+        Ok(_) => info!("Bucket created: {}", bucket_name),
+        Err(e) => {
+            let service_error = e.into_service_error();
+            if !service_error.is_bucket_already_owned_by_you() {
+                return Err(Error::other(format!(
+                    "Failed to create bucket: {:?}",
+                    service_error
+                )));
+            }
+            info!("Bucket already exists: {}", bucket_name);
+        }
+    }
+
+    for i in 0..3 {
+        let key = format!("ebs-obj-{}", i);
+        let data = format!("EBS test data for object {}", i);
+        ctx.client
+            .put_object()
+            .bucket(bucket_name)
+            .key(&key)
+            .body(ByteStream::from(data.into_bytes()))
+            .send()
+            .await
+            .map_err(|e| Error::other(format!("Failed to upload {}: {}", key, e)))?;
+    }
+    info!("Uploaded 3 test objects");
+
+    // Kill NSS to trigger failover
+    info!("Killing NSS process to trigger EBS failover...");
+    kill_nss_process()?;
+
+    std::thread::sleep(Duration::from_secs(1));
+    if verify_process_running("nss_server") {
+        kill_nss_process()?;
+    }
+
+    let state = wait_for_observer_state(backend, ObserverState::SoloDegraded, 30);
+    if state.is_none() {
+        let current = get_observer_state(backend);
+        return Err(Error::other(format!(
+            "Observer did not transition to solo_degraded. Current state: {:?}",
+            current.map(|s| format!("{} (version {})", s.observer_state, s.version))
+        )));
+    }
+
+    let state = state.unwrap();
+    info!(
+        "Failover detected: state={}, nss={} (role={})",
+        state.observer_state, state.nss_machine.machine_id, state.nss_machine.expected_role
+    );
+
+    if state.nss_machine.expected_role != "solo" {
+        return Err(Error::other(format!(
+            "Expected NSS machine to have solo role, got {}",
+            state.nss_machine.expected_role
+        )));
+    }
+
+    // Wait for new NSS to be ready
+    wait_for_port_ready(8087, 30)?;
+
+    // Verify reads still work after failover
+    for i in 0..3 {
+        let key = format!("ebs-obj-{}", i);
+        let expected_data = format!("EBS test data for object {}", i);
+
+        let mut read_ok = false;
+        for attempt in 0..5 {
+            match ctx
+                .client
+                .get_object()
+                .bucket(bucket_name)
+                .key(&key)
+                .send()
+                .await
+            {
+                Ok(result) => {
+                    let body = result
+                        .body
+                        .collect()
+                        .await
+                        .map_err(|e| Error::other(format!("Failed to read body: {e}")))?;
+                    if body.into_bytes().as_ref() == expected_data.as_bytes() {
+                        read_ok = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let is_503 = e
+                        .raw_response()
+                        .map(|r| r.status().as_u16() == 503)
+                        .unwrap_or(false);
+                    if is_503 && attempt < 4 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    return Err(Error::other(format!(
+                        "Failed to read {} after failover: {e}",
+                        key
+                    )));
+                }
+            }
+        }
+        if !read_ok {
+            return Err(Error::other(format!(
+                "Failed to verify read for {} after failover",
+                key
+            )));
+        }
+    }
+
+    // Verify new writes work
+    let post_key = "post-ebs-failover-obj";
+    let post_data = b"Data written after EBS failover";
+    let mut write_ok = false;
+    for attempt in 0..5 {
+        match ctx
+            .client
+            .put_object()
+            .bucket(bucket_name)
+            .key(post_key)
+            .body(ByteStream::from_static(post_data))
+            .send()
+            .await
+        {
+            Ok(_) => {
+                write_ok = true;
+                break;
+            }
+            Err(e) => {
+                let is_503 = e
+                    .raw_response()
+                    .map(|r| r.status().as_u16() == 503)
+                    .unwrap_or(false);
+                if is_503 && attempt < 4 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                return Err(Error::other(format!(
+                    "Failed to write post-failover object: {e}"
+                )));
+            }
+        }
+    }
+    if !write_ok {
+        return Err(Error::other(
+            "Post-failover write did not succeed after retries",
+        ));
+    }
+
+    println!(
+        "{}",
+        "SUCCESS: api_server handles EBS failover correctly!".green()
+    );
+    Ok(())
+}
+
+async fn test_ebs_standby_recovery(backend: RssBackend) -> CmdResult {
+    info!("Testing EBS standby recovery to active_standby...");
+
+    // EBS recovery should be fast: SoloDegraded -> ActiveStandby directly (no ActiveDegraded)
+    let mut stable_state: Option<ObserverPersistentState> = None;
+    for i in 0..30 {
+        let state = get_observer_state(backend);
+        if let Some(s) = state {
+            let state_name = s.observer_state;
+            info!("Attempt {}: observer state = {}", i + 1, state_name);
+
+            if state_name == ObserverState::ActiveStandby
+                || state_name == ObserverState::SoloDegraded
+            {
+                stable_state = Some(s);
+                break;
+            }
+            // For EBS, ActiveDegraded should NOT occur
+            if state_name == ObserverState::ActiveDegraded {
+                return Err(Error::other(
+                    "EBS failover should not enter ActiveDegraded state",
+                ));
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    let state = match stable_state {
+        Some(s) => s,
+        None => {
+            let current = get_observer_state(backend);
+            return Err(Error::other(format!(
+                "Observer state did not stabilize. Current: {:?}",
+                current.map(|s| s.observer_state)
+            )));
+        }
+    };
+
+    if state.observer_state == ObserverState::ActiveStandby {
+        info!("EBS: System already recovered to active_standby (fast path)!");
+        println!(
+            "{}",
+            "SUCCESS: EBS standby recovered directly to active_standby!".green()
+        );
+        return Ok(());
+    }
+
+    // Wait for recovery (SoloDegraded -> ActiveStandby, no intermediate state)
+    let state = wait_for_observer_state(backend, ObserverState::ActiveStandby, 30);
+    if state.is_none() {
+        let current = get_observer_state(backend);
+        return Err(Error::other(format!(
+            "EBS observer did not recover to active_standby. Current state: {:?}",
+            current.map(|s| format!("{} (version {})", s.observer_state, s.version))
+        )));
+    }
+
+    let state = state.unwrap();
+    info!(
+        "EBS recovery complete: state={}, nss={} (role={}), standby={} (role={})",
+        state.observer_state,
+        state.nss_machine.machine_id,
+        state.nss_machine.expected_role,
+        state.standby_machine.machine_id,
+        state.standby_machine.expected_role
+    );
+
+    println!(
+        "{}",
+        "SUCCESS: EBS standby recovered to active_standby!".green()
+    );
+    Ok(())
+}

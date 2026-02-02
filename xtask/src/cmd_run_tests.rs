@@ -66,6 +66,18 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         Ok(())
     };
 
+    let test_ebs_ha_failover = || async {
+        // Test with etcd backend
+        info!("Testing EBS HA failover with etcd backend...");
+        nss_ha_failover::run_ebs_ha_failover_tests(RssBackend::Etcd).await?;
+
+        // Test with DDB backend
+        info!("Testing EBS HA failover with DDB backend...");
+        nss_ha_failover::run_ebs_ha_failover_tests(RssBackend::Ddb).await?;
+
+        Ok(())
+    };
+
     // prepare
     cmd_service::stop_service(ServiceName::All)?;
     cmd_build::build_rust_servers(BuildMode::Debug)?;
@@ -74,6 +86,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         TestType::LeaderElection => test_leader_election(),
         TestType::BssNodeFailure => test_bss_node_failure().await,
         TestType::NssHaFailover => test_nss_ha_failover().await,
+        TestType::EbsHaFailover => test_ebs_ha_failover().await,
         TestType::All => {
             test_leader_election()?;
             multi_az::run_multi_az_tests(MultiAzTestType::All).await
