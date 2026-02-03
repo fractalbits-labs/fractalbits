@@ -54,25 +54,25 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         cmd_service::stop_service(ServiceName::All)
     };
 
-    let test_nss_ha_failover = || async {
+    let test_nss_ha_with_mirrord = || async {
         // Test with etcd backend
-        info!("Testing NSS HA failover with etcd backend...");
+        info!("Testing NSS HA (mirrord) failover with etcd backend...");
         nss_ha_failover::run_nss_ha_failover_tests(RssBackend::Etcd).await?;
 
         // Test with DDB backend
-        info!("Testing NSS HA failover with DDB backend...");
+        info!("Testing NSS HA (mirrord) failover with DDB backend...");
         nss_ha_failover::run_nss_ha_failover_tests(RssBackend::Ddb).await?;
 
         Ok(())
     };
 
-    let test_ebs_ha_failover = || async {
+    let test_nss_ha_with_ebs = || async {
         // Test with etcd backend
-        info!("Testing EBS HA failover with etcd backend...");
+        info!("Testing NSS HA (EBS) failover with etcd backend...");
         nss_ha_failover::run_ebs_ha_failover_tests(RssBackend::Etcd).await?;
 
         // Test with DDB backend
-        info!("Testing EBS HA failover with DDB backend...");
+        info!("Testing NSS HA (EBS) failover with DDB backend...");
         nss_ha_failover::run_ebs_ha_failover_tests(RssBackend::Ddb).await?;
 
         Ok(())
@@ -85,8 +85,8 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         TestType::MultiAz { subcommand } => multi_az::run_multi_az_tests(subcommand).await,
         TestType::LeaderElection => test_leader_election(),
         TestType::BssNodeFailure => test_bss_node_failure().await,
-        TestType::NssHaFailover => test_nss_ha_failover().await,
-        TestType::EbsHaFailover => test_ebs_ha_failover().await,
+        TestType::NssHaWithMirrord => test_nss_ha_with_mirrord().await,
+        TestType::NssHaWithEBS => test_nss_ha_with_ebs().await,
         TestType::All => {
             test_leader_election()?;
             multi_az::run_multi_az_tests(MultiAzTestType::All).await
