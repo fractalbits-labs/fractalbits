@@ -471,8 +471,8 @@ export class FractalbitsVpcStack extends cdk.Stack {
       );
       ebsVolumeAId = ebsVolumeA.volumeId;
 
-      // Only create volume B for multiAz mode
       if (multiAz) {
+        // Multi-AZ: separate volumes per AZ
         const ebsVolumeB = createEbsVolume(
           this,
           "MultiAttachVolumeB",
@@ -482,6 +482,13 @@ export class FractalbitsVpcStack extends cdk.Stack {
           props.ebsVolumeIops,
         );
         ebsVolumeBId = ebsVolumeB.volumeId;
+      } else {
+        // Single-AZ EBS HA: attach same volume to nss-B for NVMe reservation failover
+        new ec2.CfnVolumeAttachment(this, "MultiAttachVolumeAToNssB", {
+          instanceId: instances["nss-B"].instanceId,
+          device: "/dev/xvdf",
+          volumeId: ebsVolumeA.volumeId,
+        });
       }
     }
 
