@@ -32,6 +32,11 @@ const STAGES: &[StageInfo] = &[
         is_global: true,
     },
     StageInfo {
+        name: "25-metadata-vg-ready",
+        desc: "Metadata VG ready",
+        is_global: true,
+    },
+    StageInfo {
         name: "30-nss-formatted",
         desc: "NSS formatted",
         is_global: false,
@@ -244,8 +249,9 @@ pub fn show_progress(target: DeployTarget) -> CmdResult {
             // Only standby (nss-B) publishes mirrord-ready
             1
         } else if stage.name == "40-nss-journal-ready" {
-            // For NVMe, only active (nss-A) publishes journal-ready
-            if use_nvme_journal { 1 } else { num_nss }
+            // Only active (nss-A) publishes journal-ready in HA mode (both NVMe and EBS)
+            // Solo mode: the single node publishes
+            1
         } else if stage.name == "50-bss-configured" {
             num_bss
         } else {

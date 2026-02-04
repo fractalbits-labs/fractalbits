@@ -277,16 +277,16 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
-    // Create nss-B for multiAz mode OR when using nvme journal type (active/standby)
-    if (multiAz || props.journalType === "nvme") {
-      instanceConfigs.push({
-        id: "nss-B",
-        instanceType: nssInstanceType,
-        // For single-AZ nvme, place nss-B in same subnet as nss-A
-        specificSubnet: multiAz ? subnet2 : subnet1,
-        sg: privateSg,
-      });
-    }
+    // Always create nss-B for HA active/standby mode:
+    // - multiAz: nss-B in second AZ
+    // - single-AZ NVMe: nss-B runs mirrord for journal replication
+    // - single-AZ EBS: nss-B is idle standby, takes over EBS volume on failover
+    instanceConfigs.push({
+      id: "nss-B",
+      instanceType: nssInstanceType,
+      specificSubnet: multiAz ? subnet2 : subnet1,
+      sg: privateSg,
+    });
 
     if (props.browserIp) {
       const guiServerSg = new ec2.SecurityGroup(this, "GuiServerSG", {

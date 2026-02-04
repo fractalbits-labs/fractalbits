@@ -201,8 +201,12 @@ export function createConfigWithCfnTokens(props: {
     sharedJournalUuid,
   );
   if (props.nssB) {
+    // For single-AZ EBS: nss-B shares the same volume as nss-A (only one attaches at a time)
+    // For multi-AZ EBS: nss-B has its own volume in a different AZ
     const nssBVolumeId =
-      props.journalType === "ebs" ? props.volumeBId : undefined;
+      props.journalType === "ebs"
+        ? props.volumeBId || props.volumeAId
+        : undefined;
     addNode(
       props.nssB,
       "nss_server",

@@ -16,7 +16,7 @@ const META_DATA_VG_QUORUM_N: usize = 6;
 const META_DATA_VG_QUORUM_R: usize = 4;
 const META_DATA_VG_QUORUM_W: usize = 4;
 
-const BOOTSTRAP_GRACE_PERIOD_SECS: u64 = 120;
+const BOOTSTRAP_GRACE_PERIOD_SECS: u64 = 300;
 
 pub fn bootstrap(config: &BootstrapConfig, is_leader: bool, for_bench: bool) -> CmdResult {
     let nss_endpoint = &config.endpoints.nss_endpoint;
@@ -142,6 +142,10 @@ fn bootstrap_leader(
         initialize_bss_volume_groups(config, &barrier, total_bss_nodes)?;
     }
 
+    // Signal metadata VG ready - NSS active nodes wait for this before starting nss_role_agent
+    // This ensures metadata_vg_config is available when nss_role_agent calls wait_for_metadata_vg_ready()
+    barrier.complete_global_stage(stages::METADATA_VG_READY, None)?;
+
     // Wait for NSS formatting to complete via workflow barriers
     let expected_nss = if nss_b_id.is_some() { 2 } else { 1 };
     info!("Waiting for {expected_nss} NSS instance(s) to complete formatting...");
@@ -149,11 +153,13 @@ fn bootstrap_leader(
     info!("All NSS instances have completed formatting");
 
     // Wait for NSS journal to be ready via workflow barriers
-    // For NVMe journal, only active (nss-A) publishes journal-ready; standby runs mirrord
-    let expected_journal_ready = if config.global.journal_type == JournalType::Nvme {
-        1
+    // For NVMe HA: only active (nss-A) signals journal-ready; standby runs mirrord
+    // For EBS HA: only active (nss-A) signals journal-ready; standby is idle
+    // For solo (any journal type): the single node signals
+    let expected_journal_ready = if nss_b_id.is_some() {
+        1 // HA mode: only active node signals journal-ready
     } else {
-        expected_nss
+        expected_nss // Solo: the single node signals
     };
     info!("Waiting for {expected_journal_ready} NSS journal(s) to be ready...");
     barrier.wait_for_nodes(
@@ -201,9 +207,15 @@ fn initialize_observer_state(
     // Create ObserverPersistentState JSON
     let observer_state_json = if let Some(nss_b_id) = nss_b_id {
         // HA mode: active/standby - both machines share the same journal_uuid
-        info!("HA mode: {nss_a_id} as active NSS, {nss_b_id} as standby mirrord");
+        // For EBS journal: standby runs "noop" (idle), for NVMe: standby runs "mirrord"
+        let standby_service = if config.global.journal_type == JournalType::Ebs {
+            "noop"
+        } else {
+            "mirrord"
+        };
+        info!("HA mode: {nss_a_id} as active NSS, {nss_b_id} as standby {standby_service}");
         format!(
-            r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"active","network_address":null,"journal_uuid":{journal_uuid_json}}},"standby_machine":{{"machine_id":"{nss_b_id}","running_service":"mirrord","expected_role":"standby","network_address":null,"journal_uuid":{journal_uuid_json}}},"last_updated":{timestamp},"version":1}}"#
+            r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"active","network_address":null,"journal_uuid":{journal_uuid_json}}},"standby_machine":{{"machine_id":"{nss_b_id}","running_service":"{standby_service}","expected_role":"standby","network_address":null,"journal_uuid":{journal_uuid_json}}},"last_updated":{timestamp},"version":1}}"#
         )
     } else {
         // Solo mode: single NSS

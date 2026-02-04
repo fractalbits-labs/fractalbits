@@ -53,9 +53,36 @@ pub fn bootstrap(
     info!("Waiting for RSS to initialize...");
     barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
 
+    // Determine if this node is the EBS HA standby (nss-B with EBS journal)
+    // EBS standby skips format/mount since it doesn't have the volume attached
+    let resources = config.get_resources();
+    let instance_id = get_instance_id_from_config(config)?;
+    let is_standby = resources.nss_b_id.as_ref() == Some(&instance_id);
+    let is_ha_mode = resources.nss_b_id.is_some();
+    let is_ebs_standby = journal_type == JournalType::Ebs && is_standby;
+
     setup_configs(config, journal_type, volume_id, journal_uuid, "nss")?;
 
-    // Format journal based on type
+    if is_ebs_standby {
+        // EBS HA standby: skip format/mount entirely, start role_agent idle
+        info!("Starting as EBS HA standby NSS (idle)");
+
+        // Create local directories (stats, meta_cache) needed when standby becomes active
+        prepare_local_dirs()?;
+
+        // Signal formatting complete (standby has nothing to format)
+        barrier.complete_stage(stages::NSS_FORMATTED, None)?;
+
+        // Start role_agent in standby mode (it will be idle)
+        run_cmd!(systemctl start nss_role_agent.service)?;
+
+        // Complete services-ready stage
+        barrier.complete_stage(stages::SERVICES_READY, None)?;
+
+        return Ok(());
+    }
+
+    // Format journal based on type (active or solo nodes only)
     match journal_type {
         JournalType::Nvme => {
             nvme_journal::format()?;
@@ -76,11 +103,6 @@ pub fn bootstrap(
     // Standby (nss_b) must start mirrord first, then active (nss_a) can start nss_server
     // In solo mode (no nss_b), just start nss_server directly without mirrord coordination
     if journal_type == JournalType::Nvme {
-        let resources = config.get_resources();
-        let instance_id = get_instance_id_from_config(config)?;
-        let is_standby = resources.nss_b_id.as_ref() == Some(&instance_id);
-        let is_solo_mode = resources.nss_b_id.is_none();
-
         if is_standby {
             // Standby: start mirrord first
             info!("Starting as standby NSS (mirrord)");
@@ -95,9 +117,14 @@ pub fn bootstrap(
 
             // Complete services-ready stage
             barrier.complete_stage(stages::SERVICES_READY, None)?;
-        } else if is_solo_mode {
+        } else if !is_ha_mode {
             // Solo mode: no mirrord coordination needed, just start nss_server directly
             info!("Starting as solo NSS (no mirrord coordination)");
+
+            // Wait for metadata VG config to be ready before starting nss_role_agent
+            info!("Waiting for metadata VG configuration...");
+            barrier.wait_for_global(stages::METADATA_VG_READY, timeouts::METADATA_VG_READY)?;
+
             run_cmd!(systemctl start nss_role_agent.service)?;
 
             // Wait for nss_server to be ready before signaling
@@ -112,8 +139,13 @@ pub fn bootstrap(
             // Active (HA mode): wait for mirrord to be ready first
             info!("Starting as active NSS, waiting for mirrord to be ready...");
             barrier.wait_for_nodes(stages::MIRRORD_READY, 1, timeouts::MIRRORD_READY)?;
-            info!("Mirrord is ready, starting nss_role_agent");
+            info!("Mirrord is ready");
 
+            // Wait for metadata VG config to be ready before starting nss_role_agent
+            info!("Waiting for metadata VG configuration...");
+            barrier.wait_for_global(stages::METADATA_VG_READY, timeouts::METADATA_VG_READY)?;
+
+            info!("Starting nss_role_agent");
             run_cmd!(systemctl start nss_role_agent.service)?;
 
             // Wait for nss_server to be ready before signaling
@@ -126,7 +158,16 @@ pub fn bootstrap(
             barrier.complete_stage(stages::SERVICES_READY, None)?;
         }
     } else {
-        // EBS journal type: no active/standby coordination needed
+        // EBS journal type: active or solo (standby already handled above)
+        info!(
+            "Starting as EBS {} NSS",
+            if is_ha_mode { "HA active" } else { "solo" }
+        );
+
+        // Wait for metadata VG config to be ready before starting nss_role_agent
+        info!("Waiting for metadata VG configuration...");
+        barrier.wait_for_global(stages::METADATA_VG_READY, timeouts::METADATA_VG_READY)?;
+
         run_cmd!(systemctl start nss_role_agent.service)?;
 
         // Wait for nss_server to be ready before signaling
@@ -268,24 +309,15 @@ fa_journal_segment_size = {fa_journal_segment_size}
     Ok(())
 }
 
-/// Create common directories and run nss_server format.
-/// If `create_journal_dir` is true, also creates /data/local/journal (for nvme mode).
+/// Prepare local directories for nss_server (stats, meta_cache).
 /// Note: /data/local is already mounted by format_local_nvme_disks() earlier in bootstrap.
-pub(crate) fn format_nss(create_journal_dir: bool) -> CmdResult {
-    if create_journal_dir {
-        run_cmd! {
-            info "Creating directories for nss_server";
-            mkdir -p /data/local/journal;
-            mkdir -p /data/local/stats;
-            mkdir -p /data/local/meta_cache/blobs;
-        }?;
-    } else {
-        run_cmd! {
-            info "Creating directories for nss_server";
-            mkdir -p /data/local/stats;
-            mkdir -p /data/local/meta_cache/blobs;
-        }?;
-    }
+/// This is called for both active and standby nodes.
+fn prepare_local_dirs() -> CmdResult {
+    run_cmd! {
+        info "Creating local directories for nss_server";
+        mkdir -p /data/local/stats;
+        mkdir -p /data/local/meta_cache/blobs;
+    }?;
 
     info!(
         "Creating {} meta cache shard directories in parallel",
@@ -302,6 +334,21 @@ pub(crate) fn format_nss(create_journal_dir: bool) -> CmdResult {
         info "Syncing file system changes";
         sync;
     }?;
+
+    Ok(())
+}
+
+/// Prepare local directories and run nss_server format.
+/// If `create_journal_dir` is true, also creates /data/local/journal (for nvme mode).
+pub(crate) fn format_nss(create_journal_dir: bool) -> CmdResult {
+    if create_journal_dir {
+        run_cmd! {
+            info "Creating journal directory for nvme mode";
+            mkdir -p /data/local/journal;
+        }?;
+    }
+
+    prepare_local_dirs()?;
 
     run_cmd! {
         info "Running format for nss_server";
@@ -326,6 +373,52 @@ fn create_nss_role_agent_config(config: &BootstrapConfig) -> CmdResult {
         .collect::<Vec<_>>()
         .join(", ");
 
+    // Build EBS failover config section if applicable
+    let ebs_failover_section = if config.global.journal_type == JournalType::Ebs {
+        let resources = config.get_resources();
+        let nss_nodes = config.get_node_entries("nss_server");
+
+        // Get the shared EBS volume_id and journal_uuid from nss-A's node entry
+        let nss_a_entry =
+            nss_nodes.and_then(|nodes| nodes.iter().find(|n| n.id == resources.nss_a_id));
+        let ebs_volume_id = nss_a_entry
+            .and_then(|n| n.volume_id.as_deref())
+            .unwrap_or("");
+        let ebs_journal_uuid = nss_a_entry
+            .and_then(|n| n.journal_uuid.as_deref())
+            .unwrap_or("");
+
+        // Determine peer instance ID: A's peer is B, B's peer is A
+        let peer_instance_id = if let Some(ref nss_b_id) = resources.nss_b_id {
+            if instance_id == *nss_b_id {
+                resources.nss_a_id.clone()
+            } else {
+                nss_b_id.clone()
+            }
+        } else {
+            String::new()
+        };
+
+        let region = &config.global.region;
+
+        let mut section = format!(
+            r##"
+journal_type = "ebs"
+ebs_volume_id = "{ebs_volume_id}"
+ebs_journal_uuid = "{ebs_journal_uuid}"
+aws_region = "{region}"
+"##
+        );
+
+        if !peer_instance_id.is_empty() {
+            section.push_str(&format!("peer_instance_id = \"{peer_instance_id}\"\n"));
+        }
+
+        section
+    } else {
+        String::new()
+    };
+
     // mirrord_endpoint is fetched from RSS at runtime, not configured here
     let config_content = format!(
         r##"# NSS Role Agent Configuration
@@ -334,7 +427,7 @@ fn create_nss_role_agent_config(config: &BootstrapConfig) -> CmdResult {
 rss_addrs = [{rss_addrs_toml}]
 instance_id = "{instance_id}"
 network_address = "{private_ip}:{nss_port}"
-"##
+{ebs_failover_section}"##
     );
 
     run_cmd! {
