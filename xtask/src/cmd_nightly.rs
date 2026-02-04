@@ -21,7 +21,13 @@ fn setup_python_venv() -> CmdResult {
     }
 }
 
-pub fn run_cmd_nightly(multi_bss: bool) -> CmdResult {
+fn run_single_nightly_test(
+    multi_bss: bool,
+    journal_type: JournalType,
+    initial_run: bool,
+) -> CmdResult {
+    let journal_type_str = journal_type.as_ref();
+
     // Clean environment: stop all processes before running
     run_cmd!(info "Cleaning environment: stopping all services...")?;
     stop_service(ServiceName::All)?;
@@ -32,14 +38,16 @@ pub fn run_cmd_nightly(multi_bss: bool) -> CmdResult {
         ignore pkill -f mirrord &>/dev/null;
     }?;
 
-    // Full build (release mode)
-    cmd_build::build_for_nightly()?;
+    // Full build (release mode) - skip if already built
+    if initial_run {
+        cmd_build::build_for_nightly()?;
+    }
 
     // Initialize and start prerequisite services based on main.py comment:
     // Prerequisites: cargo xtask service start etcd rss bss
     let init_config = InitConfig {
         rss_backend: RssBackend::Etcd,
-        journal_type: JournalType::Nvme,
+        journal_type,
         nss_disable_restart_limit: true,
         bss_count: if multi_bss { 6 } else { 1 },
         ..Default::default()
@@ -55,14 +63,20 @@ pub fn run_cmd_nightly(multi_bss: bool) -> CmdResult {
     start_service(ServiceName::Rss)?;
     start_service(ServiceName::Bss)?;
 
-    // Set up Python virtual environment and install dependencies
-    setup_python_venv()?;
+    if initial_run {
+        // Set up Python virtual environment and install dependencies
+        setup_python_venv()?;
+    }
 
     // Check for leftover core dumps from a previous run
     crate::cmd_precheckin::check_for_core_dumps()?;
 
-    // Create timestamp-based log directory: data/logs/nightly/<YYYYMMDD_HHMMSS>/
-    let log_dir = format!("data/logs/nightly/{}", Local::now().format("%Y%m%d_%H%M%S"));
+    // Create timestamp-based log directory: data/logs/nightly/<YYYYMMDD_HHMMSS>_<journal_type>/
+    let log_dir = format!(
+        "data/logs/nightly/{}_{}",
+        Local::now().format("%Y%m%d_%H%M%S"),
+        journal_type_str
+    );
     run_cmd! {
         mkdir -p $log_dir;
         rm -rf data/coredumps;
@@ -71,13 +85,23 @@ pub fn run_cmd_nightly(multi_bss: bool) -> CmdResult {
 
     let nightly_log = format!("{}/nss_failover.log", log_dir);
     let venv_python = "./core/nss_failover_test/.venv/bin/python3";
-    let result = run_cmd! {
-        info "Running nss_failover_test with log $nightly_log ...";
-        $venv_python ./core/nss_failover_test/main.py --duration 7200 --log-dir $log_dir &>$nightly_log;
+
+    // Build the command based on journal type
+    let result = if journal_type == JournalType::Ebs {
+        // EBS mode: skip prefill since we're testing HA failover, not data operations
+        run_cmd! {
+            info "Running nss_failover_test ($journal_type_str) with log $nightly_log ...";
+            $venv_python ./core/nss_failover_test/main.py --duration 7200 --log-dir $log_dir --journal-type ebs --skip-prefill &>$nightly_log;
+        }
+    } else {
+        // NVMe mode: run with prefill
+        run_cmd! {
+            info "Running nss_failover_test ($journal_type_str) with log $nightly_log ...";
+            $venv_python ./core/nss_failover_test/main.py --duration 7200 --log-dir $log_dir --journal-type nvme &>$nightly_log;
+        }
     }
-    .map_err(|e| {
+    .inspect_err(|_| {
         let _ = run_cmd!(tail $nightly_log);
-        e
     });
 
     // Stop all services regardless of test result
@@ -89,4 +113,32 @@ pub fn run_cmd_nightly(multi_bss: bool) -> CmdResult {
     // Report test failure first, then core dump failure
     result?;
     core_dump_result
+}
+
+pub fn run_cmd_nightly(multi_bss: bool, nightly_journal_type: NightlyJournalType) -> CmdResult {
+    match nightly_journal_type {
+        NightlyJournalType::Ebs => {
+            info!("Running nightly test with EBS journal type");
+            run_single_nightly_test(multi_bss, JournalType::Ebs, true)
+        }
+        NightlyJournalType::Nvme => {
+            info!("Running nightly test with NVMe journal type");
+            run_single_nightly_test(multi_bss, JournalType::Nvme, true)
+        }
+        NightlyJournalType::Both => {
+            info!("Running nightly tests with both journal types (EBS first, then NVMe)");
+
+            // Build once upfront for both tests
+            info!("Building once for both journal types...");
+            cmd_build::build_for_nightly()?;
+
+            // Run EBS first (skip build since we already built)
+            info!("=== Phase 1/2: EBS journal type ===");
+            run_single_nightly_test(multi_bss, JournalType::Ebs, false)?;
+
+            // Run NVMe second (skip build)
+            info!("=== Phase 2/2: NVMe journal type ===");
+            run_single_nightly_test(multi_bss, JournalType::Nvme, false)
+        }
+    }
 }

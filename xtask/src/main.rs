@@ -51,6 +51,14 @@ enum Cmd {
     Nightly {
         #[clap(long, help = "Initialize with 6 BSS nodes instead of 1")]
         multi_bss: bool,
+
+        #[clap(
+            long,
+            value_enum,
+            default_value = "both",
+            help = "Journal type: ebs, nvme, or both"
+        )]
+        journal_type: NightlyJournalType,
     },
 
     #[clap(about = "Run precheckin tests")]
@@ -493,6 +501,16 @@ pub enum JournalType {
     Nvme,
 }
 
+#[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
+#[strum(serialize_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum NightlyJournalType {
+    Ebs,
+    Nvme,
+    #[default]
+    Both,
+}
+
 #[derive(Copy, Clone)]
 pub struct InitConfig {
     pub for_gui: bool,
@@ -704,7 +722,10 @@ async fn main() -> CmdResult {
                 docker,
             )?;
         }
-        Cmd::Nightly { multi_bss } => cmd_nightly::run_cmd_nightly(multi_bss)?,
+        Cmd::Nightly {
+            multi_bss,
+            journal_type,
+        } => cmd_nightly::run_cmd_nightly(multi_bss, journal_type)?,
         Cmd::Bench {
             service,
             workload,
