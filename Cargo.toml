@@ -31,7 +31,6 @@ exclude = [
     "crates/fractal-s3/src",
     "crates/ha/multi_az",
     "crates/ha/nss_role_agent/src",
-    "crates/ha/single_az",
     "crates/ha/src",
     "crates/ha/.git",
     "crates/root_server/admin/src",

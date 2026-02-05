@@ -221,12 +221,6 @@ Environment="RUST_LOG=info""##
                 .to_string();
             format!("{BIN_PATH}{service_name} -c {ETC_PATH}{NSS_ROLE_AGENT_CONFIG}")
         }
-        // "ebs-failover" => {
-        //     env_settings = r##"
-        // Environment="RUST_LOG=info""##
-        //         .to_string();
-        //     format!("{BIN_PATH}{service_name} -r {aws_region}")
-        // }
         _ => unreachable!(),
     };
     let (restart_settings, auto_restart) = if managed_service {
