@@ -90,12 +90,17 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     // This ensures etcd endpoints are available for registration
     register_service(config, "bss-server")?;
 
-    // Wait for RSS to initialize and publish volume configs
-    info!("Waiting for RSS to initialize...");
-    barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
+    if meta_stack_testing {
+        info!("Meta-stack testing mode: skipping RSS wait, creating default volume dirs");
+        create_default_volume_directories()?;
+    } else {
+        // Wait for RSS to initialize and publish volume configs
+        info!("Waiting for RSS to initialize...");
+        barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
 
-    // Now get volume configs and setup directories
-    setup_volume_directories(config, use_etcd)?;
+        // Now get volume configs and setup directories
+        setup_volume_directories(config, use_etcd)?;
+    }
     create_bss_config()?;
     create_systemd_unit_file("bss", true)?;
 
@@ -346,6 +351,14 @@ fn get_volume_assignments(
     assignments.metadata_volume = find_volume(&metadata_config)?;
 
     Ok(assignments)
+}
+
+fn create_default_volume_directories() -> CmdResult {
+    let assignments = VolumeAssignments {
+        data_volume: Some(1),
+        metadata_volume: Some(1),
+    };
+    create_volume_directories(&assignments)
 }
 
 fn create_volume_directories(assignments: &VolumeAssignments) -> CmdResult {

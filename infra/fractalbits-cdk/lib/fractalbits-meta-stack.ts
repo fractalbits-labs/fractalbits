@@ -27,6 +27,11 @@ export class FractalbitsMetaStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: FractalbitsMetaStackProps) {
     super(scope, id, props);
 
+    const region = cdk.Stack.of(this).region;
+    const account = cdk.Stack.of(this).account;
+    const bucketName = `fractalbits-bootstrap-${region}-${account}`;
+    const workflowClusterId = `meta-${Date.now()}`;
+
     const az =
       props.availabilityZone ??
       this.availabilityZones[this.availabilityZones.length - 1];
@@ -54,7 +59,6 @@ export class FractalbitsMetaStack extends cdk.Stack {
 
     const ec2Role = createEc2Role(this);
 
-    // Security Group
     const sg = new ec2.SecurityGroup(this, "InstanceSG", {
       vpc: this.vpc,
       securityGroupName: "FractalbitsInstanceSG",
@@ -64,45 +68,41 @@ export class FractalbitsMetaStack extends cdk.Stack {
 
     let targetIdOutput: cdk.CfnOutput;
 
-    // Build bootstrap config for meta stack testing
-    const buildMetaStackConfig = (instanceEntries: string[]): string => {
-      // Static config using TOML library
-      const staticConfig = {
+    const buildMetaStackConfig = (nodeEntries: string[]): string => {
+      const rootConfig: TOML.JsonMap = {
+        bootstrap_bucket: bucketName,
+      };
+
+      const staticConfig: TOML.JsonMap = {
         global: {
+          region: region,
           for_bench: false,
           data_blob_storage: "all_in_bss_single_az",
           rss_ha_enabled: false,
           meta_stack_testing: true,
+          workflow_cluster_id: workflowClusterId,
         },
         aws: {
-          bucket: "unused",
           local_az: az,
-          iam_role: ec2Role.roleName,
         },
         endpoints: {
           nss_endpoint: "unused",
-          api_server_endpoint: "unused",
-        },
-        resources: {
-          nss_a_id: "unused",
         },
       };
 
       const staticPart =
         "# Auto-generated bootstrap configuration for meta stack testing\n\n" +
-        TOML.stringify(staticConfig as TOML.JsonMap);
+        TOML.stringify(rootConfig) +
+        "\n" +
+        TOML.stringify(staticConfig);
 
-      // Combine static part with dynamic instance entries
-      return cdk.Fn.join("\n", [staticPart.trimEnd(), "", ...instanceEntries]);
+      return cdk.Fn.join("\n", [staticPart.trimEnd(), "", ...nodeEntries]);
     };
 
-    // Upload config to builds bucket
-    const region = cdk.Stack.of(this).region;
-    const account = cdk.Stack.of(this).account;
     const buildsBucket = s3.Bucket.fromBucketName(
       this,
       "BuildsBucket",
-      `fractalbits-bootstrap-${region}-${account}`,
+      bucketName,
     );
 
     if (props.serviceName == "nss") {
@@ -127,25 +127,27 @@ export class FractalbitsMetaStack extends cdk.Stack {
         10000,
       );
 
-      // Build instance config entries using CloudFormation tokens
-      const instanceEntries = [
-        cdk.Fn.join("", ['[instances."', instance.instanceId, '"]']),
-        'service_type = "nss_server"',
+      const nodeEntries = [
+        "[[nodes.nss_server]]",
+        cdk.Fn.join("", ['id = "', instance.instanceId, '"']),
         cdk.Fn.join("", ['volume_id = "', ebsVolume.volumeId, '"']),
         "",
       ];
 
-      const configContent = buildMetaStackConfig(instanceEntries);
+      const configContent = buildMetaStackConfig(nodeEntries);
       new s3deploy.BucketDeployment(this, "ConfigDeployment", {
-        sources: [s3deploy.Source.data("bootstrap_cluster.toml", configContent)],
+        sources: [
+          s3deploy.Source.data("bootstrap_cluster.toml", configContent),
+        ],
         destinationBucket: buildsBucket,
+        prune: false,
       });
 
       instance.addUserData(createUserData(this).render());
 
       targetIdOutput = new cdk.CfnOutput(this, "instanceId", {
         value: instance.instanceId,
-        description: `EC2 instance ID`,
+        description: "EC2 instance ID",
       });
     } else {
       if (!props.bssInstanceTypes) {
@@ -156,11 +158,13 @@ export class FractalbitsMetaStack extends cdk.Stack {
       }
       const bssInstanceTypes = props.bssInstanceTypes.split(",");
 
-      // For BSS ASG, instances discover their role from EC2 tags
       const configContent = buildMetaStackConfig([]);
       new s3deploy.BucketDeployment(this, "ConfigDeployment", {
-        sources: [s3deploy.Source.data("bootstrap_cluster.toml", configContent)],
+        sources: [
+          s3deploy.Source.data("bootstrap_cluster.toml", configContent),
+        ],
         destinationBucket: buildsBucket,
+        prune: false,
       });
 
       const bssAsg = createEc2Asg(
@@ -178,11 +182,10 @@ export class FractalbitsMetaStack extends cdk.Stack {
 
       targetIdOutput = new cdk.CfnOutput(this, "bssAsgName", {
         value: bssAsg.autoScalingGroupName,
-        description: `Bss Auto Scaling Group Name`,
+        description: "Bss Auto Scaling Group Name",
       });
     }
 
-    // Output the relevant ID (instance ID or ASG name)
     targetIdOutput;
   }
 }

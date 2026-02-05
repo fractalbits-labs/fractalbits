@@ -48,10 +48,14 @@ pub fn bootstrap(
         info!("etcd cluster is ready");
     }
 
-    // Wait for RSS to initialize - RSS will have registered with service discovery by then
-    // This must happen before setup_configs because create_nss_role_agent_config needs RSS IPs
-    info!("Waiting for RSS to initialize...");
-    barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
+    if !meta_stack_testing {
+        // Wait for RSS to initialize - RSS will have registered with service discovery by then
+        // This must happen before setup_configs because create_nss_role_agent_config needs RSS IPs
+        info!("Waiting for RSS to initialize...");
+        barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
+    } else {
+        info!("Meta-stack testing mode: skipping RSS wait");
+    }
 
     // Determine if this node is the EBS HA standby (nss-B with EBS journal)
     // EBS standby skips format/mount since it doesn't have the volume attached
@@ -121,9 +125,10 @@ pub fn bootstrap(
             // Solo mode: no mirrord coordination needed, just start nss_server directly
             info!("Starting as solo NSS (no mirrord coordination)");
 
-            // Wait for metadata VG config to be ready before starting nss_role_agent
-            info!("Waiting for metadata VG configuration...");
-            barrier.wait_for_global(stages::METADATA_VG_READY, timeouts::METADATA_VG_READY)?;
+            if !meta_stack_testing {
+                info!("Waiting for metadata VG configuration...");
+                barrier.wait_for_global(stages::METADATA_VG_READY, timeouts::METADATA_VG_READY)?;
+            }
 
             run_cmd!(systemctl start nss_role_agent.service)?;
 
@@ -141,9 +146,10 @@ pub fn bootstrap(
             barrier.wait_for_nodes(stages::MIRRORD_READY, 1, timeouts::MIRRORD_READY)?;
             info!("Mirrord is ready");
 
-            // Wait for metadata VG config to be ready before starting nss_role_agent
-            info!("Waiting for metadata VG configuration...");
-            barrier.wait_for_global(stages::METADATA_VG_READY, timeouts::METADATA_VG_READY)?;
+            if !meta_stack_testing {
+                info!("Waiting for metadata VG configuration...");
+                barrier.wait_for_global(stages::METADATA_VG_READY, timeouts::METADATA_VG_READY)?;
+            }
 
             info!("Starting nss_role_agent");
             run_cmd!(systemctl start nss_role_agent.service)?;
@@ -164,9 +170,10 @@ pub fn bootstrap(
             if is_ha_mode { "HA active" } else { "solo" }
         );
 
-        // Wait for metadata VG config to be ready before starting nss_role_agent
-        info!("Waiting for metadata VG configuration...");
-        barrier.wait_for_global(stages::METADATA_VG_READY, timeouts::METADATA_VG_READY)?;
+        if !meta_stack_testing {
+            info!("Waiting for metadata VG configuration...");
+            barrier.wait_for_global(stages::METADATA_VG_READY, timeouts::METADATA_VG_READY)?;
+        }
 
         run_cmd!(systemctl start nss_role_agent.service)?;
 
@@ -211,7 +218,9 @@ fn setup_configs(
 
     // Common configs
     create_coredump_config()?;
-    create_nss_role_agent_config(config)?;
+    if !config.global.meta_stack_testing {
+        create_nss_role_agent_config(config)?;
+    }
     create_systemd_unit_file("nss_role_agent", false)?;
 
     // Systemd units - NVMe needs journal_type for local mount dependency, EBS needs journal_uuid

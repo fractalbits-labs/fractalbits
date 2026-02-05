@@ -111,6 +111,7 @@ pub struct ClusterGlobalConfig {
     pub for_bench: bool,
     pub data_blob_storage: DataBlobStorage,
     pub rss_ha_enabled: bool,
+    #[serde(default)]
     pub rss_backend: RssBackend,
     #[serde(default)]
     pub journal_type: JournalType,
