@@ -87,10 +87,10 @@ pub fn init_service(
         // Fields match root_server's ObserverPersistentState and MachineState structs
         let observer_state_json = match init_config.journal_type {
             JournalType::Nvme => {
-                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0}"#
+                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0,"nss_node_map":{"nss-A":1,"nss-B":2},"next_nss_node_id":3}"#
             }
             JournalType::Ebs => {
-                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-B","running_service":"noop","expected_role":"standby","network_address":null},"version":1,"last_updated":0}"#
+                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-B","running_service":"noop","expected_role":"standby","network_address":null},"version":1,"last_updated":0,"nss_node_map":{"nss-A":1,"nss-B":2},"next_nss_node_id":3}"#
             }
         };
         let observer_state_item = format!(
@@ -187,10 +187,10 @@ pub fn init_service(
         // Fields match root_server's ObserverPersistentState and MachineState structs
         let observer_state_json = match init_config.journal_type {
             JournalType::Nvme => {
-                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0}"#
+                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0,"nss_node_map":{"nss-A":1,"nss-B":2},"next_nss_node_id":3}"#
             }
             JournalType::Ebs => {
-                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-B","running_service":"noop","expected_role":"standby","network_address":null},"version":1,"last_updated":0}"#
+                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-B","running_service":"noop","expected_role":"standby","network_address":null},"version":1,"last_updated":0,"nss_node_map":{"nss-A":1,"nss-B":2},"next_nss_node_id":3}"#
             }
         };
 

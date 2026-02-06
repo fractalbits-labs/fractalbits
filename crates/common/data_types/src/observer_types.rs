@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +132,13 @@ pub struct ObserverPersistentState {
     /// Used as fencing token for BSS metadata volume operations.
     #[serde(default)]
     pub version: u64,
+    /// Mapping from instance_id to NVMe reservation node sequence ID.
+    /// Monotonically increasing, never reused.
+    #[serde(default)]
+    pub nss_node_map: HashMap<String, u64>,
+    /// Next node sequence ID to assign.
+    #[serde(default)]
+    pub next_nss_node_id: u64,
 }
 
 fn default_timestamp() -> f64 {
@@ -143,6 +151,16 @@ impl ObserverPersistentState {
         nss_machine: MachineState,
         standby_machine: MachineState,
     ) -> Self {
+        let mut nss_node_map = HashMap::new();
+        let mut next_id = 1u64;
+        if !nss_machine.machine_id.is_empty() {
+            nss_node_map.insert(nss_machine.machine_id.clone(), next_id);
+            next_id += 1;
+        }
+        if !standby_machine.machine_id.is_empty() {
+            nss_node_map.insert(standby_machine.machine_id.clone(), next_id);
+            next_id += 1;
+        }
         Self {
             observer_state,
             nss_machine,
@@ -152,7 +170,21 @@ impl ObserverPersistentState {
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0),
             version: 0,
+            nss_node_map,
+            next_nss_node_id: next_id,
         }
+    }
+
+    /// Get or assign a node sequence ID for the given instance.
+    /// Assigns the next available ID if not present.
+    pub fn ensure_nss_node_id(&mut self, instance_id: &str) -> u64 {
+        if let Some(&id) = self.nss_node_map.get(instance_id) {
+            return id;
+        }
+        let id = self.next_nss_node_id;
+        self.nss_node_map.insert(instance_id.to_string(), id);
+        self.next_nss_node_id += 1;
+        id
     }
 }
 
@@ -209,6 +241,50 @@ mod tests {
         assert_eq!(parsed.observer_state, ObserverState::ActiveStandby);
         assert_eq!(parsed.nss_machine.machine_id, "nss-A");
         assert_eq!(parsed.standby_machine.machine_id, "nss-B");
+        assert_eq!(parsed.nss_node_map.get("nss-A"), Some(&1));
+        assert_eq!(parsed.nss_node_map.get("nss-B"), Some(&2));
+        assert_eq!(parsed.next_nss_node_id, 3);
+    }
+
+    #[test]
+    fn test_nss_node_map_solo_mode() {
+        let state = ObserverPersistentState::new(
+            ObserverState::Solo,
+            MachineState::new("nss-A".to_string(), ServiceType::Nss, "solo".to_string()),
+            MachineState::new(String::new(), ServiceType::Mirrord, String::new()),
+        );
+        assert_eq!(state.nss_node_map.len(), 1);
+        assert_eq!(state.nss_node_map.get("nss-A"), Some(&1));
+        assert_eq!(state.next_nss_node_id, 2);
+    }
+
+    #[test]
+    fn test_ensure_nss_node_id() {
+        let mut state = ObserverPersistentState::new(
+            ObserverState::ActiveStandby,
+            MachineState::new("nss-A".to_string(), ServiceType::Nss, "active".to_string()),
+            MachineState::new(
+                "nss-B".to_string(),
+                ServiceType::Mirrord,
+                "standby".to_string(),
+            ),
+        );
+        assert_eq!(state.ensure_nss_node_id("nss-A"), 1);
+        assert_eq!(state.ensure_nss_node_id("nss-B"), 2);
+        assert_eq!(state.ensure_nss_node_id("nss-C"), 3);
+        assert_eq!(state.next_nss_node_id, 4);
+        // Calling again returns same ID
+        assert_eq!(state.ensure_nss_node_id("nss-C"), 3);
+        assert_eq!(state.next_nss_node_id, 4);
+    }
+
+    #[test]
+    fn test_backward_compat_missing_nss_node_map() {
+        // Old JSON without nss_node_map should deserialize with defaults
+        let json = r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active"},"standby_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby"},"last_updated":0.0,"version":1}"#;
+        let parsed: ObserverPersistentState = serde_json::from_str(json).unwrap();
+        assert!(parsed.nss_node_map.is_empty());
+        assert_eq!(parsed.next_nss_node_id, 0);
     }
 
     #[test]

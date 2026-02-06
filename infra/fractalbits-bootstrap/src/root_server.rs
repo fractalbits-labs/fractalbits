@@ -215,13 +215,13 @@ fn initialize_observer_state(
         };
         info!("HA mode: {nss_a_id} as active NSS, {nss_b_id} as standby {standby_service}");
         format!(
-            r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"active","network_address":null,"journal_uuid":{journal_uuid_json}}},"standby_machine":{{"machine_id":"{nss_b_id}","running_service":"{standby_service}","expected_role":"standby","network_address":null,"journal_uuid":{journal_uuid_json}}},"last_updated":{timestamp},"version":1}}"#
+            r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"active","network_address":null,"journal_uuid":{journal_uuid_json}}},"standby_machine":{{"machine_id":"{nss_b_id}","running_service":"{standby_service}","expected_role":"standby","network_address":null,"journal_uuid":{journal_uuid_json}}},"last_updated":{timestamp},"version":1,"nss_node_map":{{"{nss_a_id}":1,"{nss_b_id}":2}},"next_nss_node_id":3}}"#
         )
     } else {
         // Solo mode: single NSS
         info!("Solo mode: {nss_a_id} as solo NSS");
         format!(
-            r#"{{"observer_state":"solo","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"solo","network_address":null,"journal_uuid":{journal_uuid_json}}},"standby_machine":{{"machine_id":"","running_service":"mirrord","expected_role":"","network_address":null,"journal_uuid":null}},"last_updated":{timestamp},"version":1}}"#
+            r#"{{"observer_state":"solo","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"solo","network_address":null,"journal_uuid":{journal_uuid_json}}},"standby_machine":{{"machine_id":"","running_service":"mirrord","expected_role":"","network_address":null,"journal_uuid":null}},"last_updated":{timestamp},"version":1,"nss_node_map":{{"{nss_a_id}":1}},"next_nss_node_id":2}}"#
         )
     };
 

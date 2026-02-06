@@ -118,8 +118,10 @@ message GetNssRoleResponse {
     string error = 2;
   }
   uint64 version = 3;
-  optional string mirrord_endpoint = 4;  // IP address of mirrord (for active NSS role)
-  optional string journal_uuid = 5;  // UUID of the journal device for validation
+  uint64 nss_node_id = 4;  // NVMe reservation node sequence ID for this instance
+  uint64 peer_nss_node_id = 5;  // NVMe reservation node sequence ID for peer instance
+  optional string mirrord_endpoint = 6;  // IP address of mirrord (for active NSS role)
+  optional string journal_uuid = 7;  // UUID of the journal device for validation
 }
 
 // GetAzStatus - Query AZ availability status from service-discovery table
