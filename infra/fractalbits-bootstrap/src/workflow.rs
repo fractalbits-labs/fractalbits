@@ -149,8 +149,9 @@ impl WorkflowBarrier {
 
     /// Wait for a global stage (single file, no node suffix)
     pub fn wait_for_global(&self, stage: &str, timeout_secs: u64) -> CmdResult {
-        let s3_path = format!("{}.json", self.stage_path(stage));
-        info!("Waiting for global stage '{stage}' at {s3_path}");
+        let bucket = &self.bucket;
+        let key = format!("workflow/{}/stages/{}.json", self.cluster_id, stage);
+        info!("Waiting for global stage '{stage}' (head-object {bucket}/{key})");
 
         let start = Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
@@ -163,8 +164,8 @@ impl WorkflowBarrier {
             }
 
             // Check if the file exists
-            let result = run_fun!(aws s3 ls $s3_path 2>/dev/null);
-            if result.is_ok() && !result.as_ref().unwrap().trim().is_empty() {
+            let result = run_fun!(aws s3api head-object --bucket $bucket --key $key 2>/dev/null);
+            if result.is_ok() {
                 info!("Global stage '{stage}' is complete");
                 return Ok(());
             }
