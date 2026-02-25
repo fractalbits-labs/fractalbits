@@ -29,6 +29,11 @@ impl AllInBssSingleAzStorage {
     pub fn create_data_blob_guid(&self) -> DataBlobGuid {
         self.data_vg_proxy.create_data_blob_guid()
     }
+
+    pub fn create_data_blob_guid_with_preference(&self, prefer_ec: bool) -> DataBlobGuid {
+        self.data_vg_proxy
+            .create_data_blob_guid_with_preference(prefer_ec)
+    }
 }
 
 impl AllInBssSingleAzStorage {

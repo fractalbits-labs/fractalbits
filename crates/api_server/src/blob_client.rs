@@ -4,6 +4,7 @@ use crate::{
         S3ExpressMultiAzStorage, S3HybridSingleAzStorage,
     },
     config::{BlobStorageBackend, BlobStorageConfig},
+    object_layout::ObjectLayout,
 };
 use bytes::Bytes;
 use data_blob_tracking::DataBlobTracker;
@@ -183,6 +184,20 @@ impl BlobClient {
             BlobStorageImpl::HybridSingleAz(storage) => storage.create_data_blob_guid(),
             BlobStorageImpl::S3ExpressMultiAz(storage) => storage.create_data_blob_guid(),
             BlobStorageImpl::AllInBssSingleAz(storage) => storage.create_data_blob_guid(),
+        }
+    }
+
+    pub fn create_data_blob_guid_with_size_hint(&self, content_len: Option<usize>) -> DataBlobGuid {
+        let prefer_ec =
+            content_len.is_none_or(|size| size >= ObjectLayout::DEFAULT_BLOCK_SIZE as usize);
+        match &*self.storage {
+            BlobStorageImpl::HybridSingleAz(storage) => {
+                storage.create_data_blob_guid_with_preference(prefer_ec)
+            }
+            BlobStorageImpl::S3ExpressMultiAz(storage) => storage.create_data_blob_guid(),
+            BlobStorageImpl::AllInBssSingleAz(storage) => {
+                storage.create_data_blob_guid_with_preference(prefer_ec)
+            }
         }
     }
 

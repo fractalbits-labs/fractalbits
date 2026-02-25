@@ -91,6 +91,7 @@ clap = { version = "4.5.27", features = ["derive"] }
 hmac = "0.12"
 itertools = "0.13"
 crc32fast = "1.4.2"
+reed-solomon-simd = "3.1.0"
 xxhash-rust = {version = "0.8.15", features = ["xxh3"] }
 blake2 = "0.10.6"
 nom = "7.1"

@@ -1,4 +1,4 @@
-use data_types::DataBlobGuid;
+use data_types::{DataBlobGuid, EcVolume};
 use metrics_wrapper::histogram;
 use rpc_client_common::nss_rpc_retry;
 use std::hash::Hasher;
@@ -87,7 +87,13 @@ pub async fn put_object_handler(ctx: ObjectRequestContext) -> Result<HttpRespons
         .get_blob_client()
         .await
         .map_err(|_| S3Error::InternalError)?;
-    let blob_guid = blob_client.create_data_blob_guid();
+    let content_len_hint = ctx
+        .request
+        .headers()
+        .get("content-length")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
+    let blob_guid = blob_client.create_data_blob_guid_with_size_hint(content_len_hint);
 
     // Decide whether to use streaming based on request characteristics
     if should_use_streaming(&ctx.request) {
@@ -395,7 +401,10 @@ async fn put_object_streaming_internal(
         ctx.app.config.blob_storage.backend,
         BlobStorageBackend::S3HybridSingleAz | BlobStorageBackend::S3ExpressMultiAz
     );
-    if uses_s3_for_large_blobs && total_size >= ObjectLayout::DEFAULT_BLOCK_SIZE as u64 {
+    if uses_s3_for_large_blobs
+        && total_size >= ObjectLayout::DEFAULT_BLOCK_SIZE as u64
+        && !EcVolume::is_ec_volume_id(blob_guid.volume_id)
+    {
         blob_guid.volume_id = DataBlobGuid::S3_VOLUME;
     }
 

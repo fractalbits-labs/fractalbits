@@ -20,3 +20,8 @@ tracing.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 xxhash-rust.workspace = true
+reed-solomon-simd.workspace = true
+crc32fast.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

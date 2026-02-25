@@ -382,15 +382,25 @@ pub fn create_bss_dirs(data_dir: &Path, bss_id: u32, bss_count: u32) -> CmdResul
     fs::create_dir_all(bss_dir.join("local/stats"))?;
     fs::create_dir_all(bss_dir.join("local/blobs"))?;
 
-    // Data volume
-    let data_volume_id = match bss_count {
-        1 => 1,
-        _ => (bss_id / 3) + 1, // DATA_VG_QUORUM_N = 3
-    };
-    let data_vol_dir = bss_dir.join(format!("local/blobs/data_volume{}", data_volume_id));
-    fs::create_dir_all(&data_vol_dir)?;
-    for i in 0..256 {
-        fs::create_dir_all(data_vol_dir.join(format!("{}", i)))?;
+    // Data volume: EC-only for 6-node, replicated otherwise
+    if bss_count == 6 {
+        // EC volume: all 6 nodes get data_volume32768 (0x8000)
+        let ec_volume_id: u16 = 0x8000;
+        let data_vol_dir = bss_dir.join(format!("local/blobs/data_volume{}", ec_volume_id));
+        fs::create_dir_all(&data_vol_dir)?;
+        for i in 0..256 {
+            fs::create_dir_all(data_vol_dir.join(format!("{}", i)))?;
+        }
+    } else {
+        let data_volume_id = match bss_count {
+            1 => 1,
+            _ => (bss_id / 3) + 1, // DATA_VG_QUORUM_N = 3
+        };
+        let data_vol_dir = bss_dir.join(format!("local/blobs/data_volume{}", data_volume_id));
+        fs::create_dir_all(&data_vol_dir)?;
+        for i in 0..256 {
+            fs::create_dir_all(data_vol_dir.join(format!("{}", i)))?;
+        }
     }
 
     // Metadata volume
@@ -481,15 +491,38 @@ pub fn generate_volume_group_config(bss_count: u32, n: u32, r: u32, w: u32) -> S
     )
 }
 
+/// Generate EC-only volume group config for 6-node cluster
+fn generate_ec_volume_group_config(bss_count: u32) -> String {
+    let ec_volume_id: u16 = 0x8000; // EcVolume::EC_VOLUME_ID_BASE
+    let data_shards: u32 = 4;
+    let parity_shards: u32 = 2;
+    let total_shards = data_shards + parity_shards;
+
+    let nodes: Vec<String> = (0..total_shards)
+        .map(|i| {
+            format!(
+                r#"{{"node_id":"bss{i}","ip":"127.0.0.1","port":{}}}"#,
+                8088 + i
+            )
+        })
+        .collect();
+
+    assert_eq!(bss_count, total_shards);
+
+    format!(
+        r#"{{"volumes":[],"ec_volumes":[{{"volume_id":{},"data_shards":{},"parity_shards":{},"bss_nodes":[{}]}}]}}"#,
+        ec_volume_id,
+        data_shards,
+        parity_shards,
+        nodes.join(","),
+    )
+}
+
 /// Generate BSS data volume group config for given bss_count
 pub fn generate_bss_data_vg_config(bss_count: u32) -> String {
-    const DATA_VG_QUORUM_N: u32 = 3;
-    const DATA_VG_QUORUM_R: u32 = 2;
-    const DATA_VG_QUORUM_W: u32 = 2;
-
     match bss_count {
         1 => generate_volume_group_config(1, 1, 1, 1),
-        6 => generate_volume_group_config(6, DATA_VG_QUORUM_N, DATA_VG_QUORUM_R, DATA_VG_QUORUM_W),
+        6 => generate_ec_volume_group_config(6),
         _ => generate_volume_group_config(1, 1, 1, 1),
     }
 }
@@ -509,5 +542,76 @@ pub fn generate_bss_metadata_vg_config(bss_count: u32) -> String {
             METADATA_VG_QUORUM_W,
         ),
         _ => generate_volume_group_config(1, 1, 1, 1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ec_config_for_6_nodes() {
+        let config = generate_bss_data_vg_config(6);
+        let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
+
+        let volumes = parsed["volumes"].as_array().unwrap();
+        assert!(volumes.is_empty());
+
+        let ec_volumes = parsed["ec_volumes"].as_array().unwrap();
+        assert_eq!(ec_volumes.len(), 1);
+
+        let ec = &ec_volumes[0];
+        assert_eq!(ec["volume_id"].as_u64().unwrap(), 0x8000);
+        assert_eq!(ec["data_shards"].as_u64().unwrap(), 4);
+        assert_eq!(ec["parity_shards"].as_u64().unwrap(), 2);
+        assert_eq!(ec["bss_nodes"].as_array().unwrap().len(), 6);
+
+        // No quorum field for EC-only config
+        assert!(parsed.get("quorum").is_none());
+    }
+
+    #[test]
+    fn replicated_config_for_1_node() {
+        let config = generate_bss_data_vg_config(1);
+        let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
+
+        let volumes = parsed["volumes"].as_array().unwrap();
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0]["volume_id"].as_u64().unwrap(), 1);
+
+        let quorum = &parsed["quorum"];
+        assert_eq!(quorum["n"].as_u64().unwrap(), 1);
+        assert_eq!(quorum["r"].as_u64().unwrap(), 1);
+        assert_eq!(quorum["w"].as_u64().unwrap(), 1);
+
+        assert!(parsed.get("ec_volumes").is_none());
+    }
+
+    #[test]
+    fn ec_config_nodes_have_correct_ports() {
+        let config = generate_bss_data_vg_config(6);
+        let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
+        let nodes = parsed["ec_volumes"][0]["bss_nodes"].as_array().unwrap();
+
+        for (i, node) in nodes.iter().enumerate() {
+            assert_eq!(node["node_id"].as_str().unwrap(), format!("bss{}", i));
+            assert_eq!(node["ip"].as_str().unwrap(), "127.0.0.1");
+            assert_eq!(node["port"].as_u64().unwrap(), 8088 + i as u64);
+        }
+    }
+
+    #[test]
+    fn metadata_config_unchanged_for_6_nodes() {
+        let config = generate_bss_metadata_vg_config(6);
+        let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
+
+        let volumes = parsed["volumes"].as_array().unwrap();
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0]["bss_nodes"].as_array().unwrap().len(), 6);
+
+        let quorum = &parsed["quorum"];
+        assert_eq!(quorum["n"].as_u64().unwrap(), 6);
+        assert_eq!(quorum["r"].as_u64().unwrap(), 4);
+        assert_eq!(quorum["w"].as_u64().unwrap(), 4);
     }
 }
