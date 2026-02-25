@@ -4,7 +4,7 @@ use super::{
 use crate::{config::S3HybridSingleAzConfig, object_layout::ObjectLayout};
 use aws_sdk_s3::Client as S3Client;
 use bytes::Bytes;
-use data_types::{DataBlobGuid, DataVgInfo, EcVolume, TraceId};
+use data_types::{DataBlobGuid, DataVgInfo, TraceId, Volume};
 use metrics_wrapper::histogram;
 use std::{
     sync::Arc,
@@ -74,7 +74,7 @@ impl S3HybridSingleAzStorage {
         // Determine location based on size (single block and small size)
         let is_small = block_number == 0 && body.len() < ObjectLayout::DEFAULT_BLOCK_SIZE as usize;
 
-        if is_small || EcVolume::is_ec_volume_id(volume_id) {
+        if is_small || Volume::is_ec_volume_id(volume_id) {
             // Small blob or EC-routed blob - store in DataVgProxy
             let blob_guid = DataBlobGuid { blob_id, volume_id };
             self.data_vg_proxy
@@ -113,7 +113,7 @@ impl S3HybridSingleAzStorage {
 
         let is_small = block_number == 0 && total_size < ObjectLayout::DEFAULT_BLOCK_SIZE as usize;
 
-        if is_small || EcVolume::is_ec_volume_id(volume_id) {
+        if is_small || Volume::is_ec_volume_id(volume_id) {
             let blob_guid = DataBlobGuid { blob_id, volume_id };
             self.data_vg_proxy
                 .put_blob_vectored(blob_guid, block_number, chunks, trace_id)

@@ -312,14 +312,14 @@ fn initialize_bss_volume_groups(
         ),
     };
 
-    let bss_data_vg_config_json = build_volume_group_config(
+    let bss_data_vg_config_json = build_data_volume_group_config(
         &bss_addresses,
         data_vg_quorum_n,
         data_vg_quorum_r,
         data_vg_quorum_w,
     );
 
-    let bss_metadata_vg_config_json = build_volume_group_config(
+    let bss_metadata_vg_config_json = build_metadata_volume_group_config(
         &bss_addresses,
         metadata_vg_quorum_n,
         metadata_vg_quorum_r,
@@ -372,7 +372,39 @@ fn initialize_bss_volume_groups(
     Ok(())
 }
 
-fn build_volume_group_config(
+fn build_data_volume_group_config(
+    bss_addresses: &[(String, String)],
+    quorum_n: usize,
+    quorum_r: usize,
+    quorum_w: usize,
+) -> String {
+    let num_volumes = bss_addresses.len() / quorum_n;
+
+    let mut volumes = Vec::new();
+    for vol_id_idx in 0..num_volumes {
+        let start_idx = vol_id_idx * quorum_n;
+        let end_idx = start_idx + quorum_n;
+
+        let nodes: Vec<String> = (start_idx..end_idx)
+            .map(|i| {
+                format!(
+                    r#"{{"node_id":"{}","ip":"{}","port":8088}}"#,
+                    bss_addresses[i].0, bss_addresses[i].1
+                )
+            })
+            .collect();
+
+        volumes.push(format!(
+            r#"{{"volume_id":{},"bss_nodes":[{}],"mode":{{"type":"replicated","n":{quorum_n},"r":{quorum_r},"w":{quorum_w}}}}}"#,
+            vol_id_idx + 1,
+            nodes.join(",")
+        ));
+    }
+
+    format!(r#"{{"volumes":[{}]}}"#, volumes.join(","))
+}
+
+fn build_metadata_volume_group_config(
     bss_addresses: &[(String, String)],
     quorum_n: usize,
     quorum_r: usize,

@@ -1,4 +1,4 @@
-use data_types::{DataBlobGuid, EcVolume};
+use data_types::{DataBlobGuid, Volume};
 use metrics_wrapper::histogram;
 use rpc_client_common::nss_rpc_retry;
 use std::hash::Hasher;
@@ -403,7 +403,7 @@ async fn put_object_streaming_internal(
     );
     if uses_s3_for_large_blobs
         && total_size >= ObjectLayout::DEFAULT_BLOCK_SIZE as u64
-        && !EcVolume::is_ec_volume_id(blob_guid.volume_id)
+        && !Volume::is_ec_volume_id(blob_guid.volume_id)
     {
         blob_guid.volume_id = DataBlobGuid::S3_VOLUME;
     }

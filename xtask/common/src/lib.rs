@@ -460,8 +460,73 @@ pub fn create_nss_dirs(
     Ok(())
 }
 
-/// Generate volume group configuration JSON
-pub fn generate_volume_group_config(bss_count: u32, n: u32, r: u32, w: u32) -> String {
+/// Generate data volume group configuration JSON (unified format with per-volume mode)
+fn generate_data_vg_replicated_config(bss_count: u32, n: u32, r: u32, w: u32) -> String {
+    let num_volumes = bss_count / n;
+    let mut volumes = Vec::new();
+
+    for vol_idx in 0..num_volumes {
+        let start_idx = vol_idx * n;
+        let end_idx = start_idx + n;
+
+        let nodes: Vec<String> = (start_idx..end_idx)
+            .map(|i| {
+                format!(
+                    r#"{{"node_id":"bss{i}","ip":"127.0.0.1","port":{}}}"#,
+                    8088 + i
+                )
+            })
+            .collect();
+
+        volumes.push(format!(
+            r#"{{"volume_id":{},"bss_nodes":[{}],"mode":{{"type":"replicated","n":{n},"r":{r},"w":{w}}}}}"#,
+            vol_idx + 1,
+            nodes.join(",")
+        ));
+    }
+
+    format!(r#"{{"volumes":[{}]}}"#, volumes.join(","))
+}
+
+/// Generate EC-only data volume group config for 6-node cluster
+fn generate_ec_volume_group_config(bss_count: u32) -> String {
+    let ec_volume_id: u16 = 0x8000; // Volume::EC_VOLUME_ID_BASE
+    let data_shards: u32 = 4;
+    let parity_shards: u32 = 2;
+    let total_shards = data_shards + parity_shards;
+
+    let nodes: Vec<String> = (0..total_shards)
+        .map(|i| {
+            format!(
+                r#"{{"node_id":"bss{i}","ip":"127.0.0.1","port":{}}}"#,
+                8088 + i
+            )
+        })
+        .collect();
+
+    assert_eq!(bss_count, total_shards);
+
+    format!(
+        r#"{{"volumes":[{{"volume_id":{},"bss_nodes":[{}],"mode":{{"type":"erasure_coded","data_shards":{},"parity_shards":{}}}}}]}}"#,
+        ec_volume_id,
+        nodes.join(","),
+        data_shards,
+        parity_shards,
+    )
+}
+
+/// Generate BSS data volume group config for given bss_count
+pub fn generate_bss_data_vg_config(bss_count: u32) -> String {
+    match bss_count {
+        1 => generate_data_vg_replicated_config(1, 1, 1, 1),
+        6 => generate_ec_volume_group_config(6),
+        _ => generate_data_vg_replicated_config(1, 1, 1, 1),
+    }
+}
+
+/// Generate metadata volume group configuration JSON (old format with top-level quorum,
+/// consumed by the Zig NSS server)
+pub fn generate_metadata_vg_config(bss_count: u32, n: u32, r: u32, w: u32) -> String {
     let num_volumes = bss_count / n;
     let mut volumes = Vec::new();
 
@@ -491,42 +556,6 @@ pub fn generate_volume_group_config(bss_count: u32, n: u32, r: u32, w: u32) -> S
     )
 }
 
-/// Generate EC-only volume group config for 6-node cluster
-fn generate_ec_volume_group_config(bss_count: u32) -> String {
-    let ec_volume_id: u16 = 0x8000; // EcVolume::EC_VOLUME_ID_BASE
-    let data_shards: u32 = 4;
-    let parity_shards: u32 = 2;
-    let total_shards = data_shards + parity_shards;
-
-    let nodes: Vec<String> = (0..total_shards)
-        .map(|i| {
-            format!(
-                r#"{{"node_id":"bss{i}","ip":"127.0.0.1","port":{}}}"#,
-                8088 + i
-            )
-        })
-        .collect();
-
-    assert_eq!(bss_count, total_shards);
-
-    format!(
-        r#"{{"volumes":[],"ec_volumes":[{{"volume_id":{},"data_shards":{},"parity_shards":{},"bss_nodes":[{}]}}]}}"#,
-        ec_volume_id,
-        data_shards,
-        parity_shards,
-        nodes.join(","),
-    )
-}
-
-/// Generate BSS data volume group config for given bss_count
-pub fn generate_bss_data_vg_config(bss_count: u32) -> String {
-    match bss_count {
-        1 => generate_volume_group_config(1, 1, 1, 1),
-        6 => generate_ec_volume_group_config(6),
-        _ => generate_volume_group_config(1, 1, 1, 1),
-    }
-}
-
 /// Generate BSS metadata volume group config for given bss_count
 pub fn generate_bss_metadata_vg_config(bss_count: u32) -> String {
     const METADATA_VG_QUORUM_N: u32 = 6;
@@ -534,14 +563,14 @@ pub fn generate_bss_metadata_vg_config(bss_count: u32) -> String {
     const METADATA_VG_QUORUM_W: u32 = 4;
 
     match bss_count {
-        1 => generate_volume_group_config(1, 1, 1, 1),
-        6 => generate_volume_group_config(
+        1 => generate_metadata_vg_config(1, 1, 1, 1),
+        6 => generate_metadata_vg_config(
             6,
             METADATA_VG_QUORUM_N,
             METADATA_VG_QUORUM_R,
             METADATA_VG_QUORUM_W,
         ),
-        _ => generate_volume_group_config(1, 1, 1, 1),
+        _ => generate_metadata_vg_config(1, 1, 1, 1),
     }
 }
 
@@ -555,19 +584,16 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
 
         let volumes = parsed["volumes"].as_array().unwrap();
-        assert!(volumes.is_empty());
+        assert_eq!(volumes.len(), 1);
 
-        let ec_volumes = parsed["ec_volumes"].as_array().unwrap();
-        assert_eq!(ec_volumes.len(), 1);
-
-        let ec = &ec_volumes[0];
+        let ec = &volumes[0];
         assert_eq!(ec["volume_id"].as_u64().unwrap(), 0x8000);
-        assert_eq!(ec["data_shards"].as_u64().unwrap(), 4);
-        assert_eq!(ec["parity_shards"].as_u64().unwrap(), 2);
         assert_eq!(ec["bss_nodes"].as_array().unwrap().len(), 6);
 
-        // No quorum field for EC-only config
-        assert!(parsed.get("quorum").is_none());
+        let mode = &ec["mode"];
+        assert_eq!(mode["type"].as_str().unwrap(), "erasure_coded");
+        assert_eq!(mode["data_shards"].as_u64().unwrap(), 4);
+        assert_eq!(mode["parity_shards"].as_u64().unwrap(), 2);
     }
 
     #[test]
@@ -579,19 +605,18 @@ mod tests {
         assert_eq!(volumes.len(), 1);
         assert_eq!(volumes[0]["volume_id"].as_u64().unwrap(), 1);
 
-        let quorum = &parsed["quorum"];
-        assert_eq!(quorum["n"].as_u64().unwrap(), 1);
-        assert_eq!(quorum["r"].as_u64().unwrap(), 1);
-        assert_eq!(quorum["w"].as_u64().unwrap(), 1);
-
-        assert!(parsed.get("ec_volumes").is_none());
+        let mode = &volumes[0]["mode"];
+        assert_eq!(mode["type"].as_str().unwrap(), "replicated");
+        assert_eq!(mode["n"].as_u64().unwrap(), 1);
+        assert_eq!(mode["r"].as_u64().unwrap(), 1);
+        assert_eq!(mode["w"].as_u64().unwrap(), 1);
     }
 
     #[test]
     fn ec_config_nodes_have_correct_ports() {
         let config = generate_bss_data_vg_config(6);
         let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
-        let nodes = parsed["ec_volumes"][0]["bss_nodes"].as_array().unwrap();
+        let nodes = parsed["volumes"][0]["bss_nodes"].as_array().unwrap();
 
         for (i, node) in nodes.iter().enumerate() {
             assert_eq!(node["node_id"].as_str().unwrap(), format!("bss{}", i));

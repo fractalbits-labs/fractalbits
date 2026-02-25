@@ -13,7 +13,7 @@ pub use blob_guid::{DataBlobGuid, MetaBlobGuid};
 pub use bucket::Bucket;
 pub use permission::BucketKeyPerm;
 pub use trace_id::TraceId;
-pub use volume::{BssNode, DataVgInfo, DataVolume, EcVolume, QuorumConfig};
+pub use volume::{BssNode, DataVgInfo, Volume, VolumeMode};
 
 pub use observer_types::{
     HealthCheckResponse, MachineState, ObserverPersistentState, ObserverState, ServiceStatus,

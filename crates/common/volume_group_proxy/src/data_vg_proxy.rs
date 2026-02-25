@@ -1,6 +1,6 @@
 use crate::DataVgError;
 use bytes::Bytes;
-use data_types::{DataBlobGuid, DataVgInfo, EcVolume, QuorumConfig, TraceId};
+use data_types::{DataBlobGuid, DataVgInfo, TraceId, Volume, VolumeMode};
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics_wrapper::{counter, histogram};
 use rand::seq::SliceRandom;
@@ -200,20 +200,12 @@ impl BssNode {
 struct VolumeWithNodes {
     volume_id: u16,
     bss_nodes: Vec<Arc<BssNode>>,
-}
-
-struct EcVolumeWithNodes {
-    volume_id: u16,
-    data_shards: u32,
-    parity_shards: u32,
-    bss_nodes: Vec<Arc<BssNode>>,
+    mode: VolumeMode,
 }
 
 pub struct DataVgProxy {
     volumes: Vec<VolumeWithNodes>,
-    ec_volumes: Vec<EcVolumeWithNodes>,
     round_robin_counter: AtomicU64,
-    quorum_config: Option<QuorumConfig>,
     rpc_timeout: Duration,
 }
 
@@ -238,24 +230,12 @@ impl DataVgProxy {
         cb_config: CircuitBreakerConfig,
     ) -> Result<Self, DataVgError> {
         info!(
-            "Initializing DataVgProxy with {} volumes, {} EC volumes, circuit breaker config: {:?}",
+            "Initializing DataVgProxy with {} volumes, circuit breaker config: {:?}",
             data_vg_info.volumes.len(),
-            data_vg_info.ec_volumes.len(),
             cb_config
         );
 
-        // Quorum config is required only when replicated volumes are present
-        let quorum_config = if !data_vg_info.volumes.is_empty() {
-            Some(data_vg_info.quorum.ok_or_else(|| {
-                DataVgError::InitializationError(
-                    "QuorumConfig is required when replicated volumes are present".to_string(),
-                )
-            })?)
-        } else {
-            data_vg_info.quorum
-        };
-
-        if data_vg_info.volumes.is_empty() && data_vg_info.ec_volumes.is_empty() {
+        if data_vg_info.volumes.is_empty() {
             return Err(DataVgError::InitializationError(
                 "No volumes (replicated or EC) configured".to_string(),
             ));
@@ -264,101 +244,110 @@ impl DataVgProxy {
         let mut volumes_with_nodes = Vec::new();
 
         for volume in data_vg_info.volumes {
-            let mut bss_nodes = Vec::new();
+            // Validate based on mode
+            match &volume.mode {
+                VolumeMode::Replicated { r, w, .. } => {
+                    if *r == 0 {
+                        return Err(DataVgError::InitializationError(format!(
+                            "Volume {} has invalid r=0",
+                            volume.volume_id
+                        )));
+                    }
+                    if *w == 0 {
+                        return Err(DataVgError::InitializationError(format!(
+                            "Volume {} has invalid w=0",
+                            volume.volume_id
+                        )));
+                    }
+                    if *w as usize > volume.bss_nodes.len() {
+                        return Err(DataVgError::InitializationError(format!(
+                            "Volume {} has w={} but only {} nodes",
+                            volume.volume_id,
+                            w,
+                            volume.bss_nodes.len()
+                        )));
+                    }
+                }
+                VolumeMode::ErasureCoded {
+                    data_shards,
+                    parity_shards,
+                } => {
+                    if !Volume::is_ec_volume_id(volume.volume_id) {
+                        return Err(DataVgError::InitializationError(format!(
+                            "EC volume {} must be in 0x8000..0xFFFE range",
+                            volume.volume_id
+                        )));
+                    }
+                    if *data_shards == 0 {
+                        return Err(DataVgError::InitializationError(format!(
+                            "EC volume {} has invalid data_shards=0",
+                            volume.volume_id
+                        )));
+                    }
+                    if *parity_shards == 0 {
+                        return Err(DataVgError::InitializationError(format!(
+                            "EC volume {} has invalid parity_shards=0",
+                            volume.volume_id
+                        )));
+                    }
+                    let total_shards = data_shards + parity_shards;
+                    if volume.bss_nodes.len() != total_shards as usize {
+                        return Err(DataVgError::InitializationError(format!(
+                            "EC volume {} has {} nodes but expected k+m={}",
+                            volume.volume_id,
+                            volume.bss_nodes.len(),
+                            total_shards
+                        )));
+                    }
+                }
+            }
 
+            let volume_id = volume.volume_id;
+            let mode = volume.mode;
+
+            let mut bss_nodes = Vec::new();
             for bss_node in volume.bss_nodes {
                 let address = format!("{}:{}", bss_node.ip, bss_node.port);
                 debug!(
-                    "Creating BSS node for node {}: {}",
-                    bss_node.node_id, address
+                    "Creating BSS node for volume {} node {}: {}",
+                    volume_id, bss_node.node_id, address
                 );
-
                 bss_nodes.push(Arc::new(BssNode::new(
                     address,
                     cb_config.clone(),
                     rpc_connection_timeout,
                 )));
+            }
+
+            if let VolumeMode::ErasureCoded {
+                data_shards,
+                parity_shards,
+            } = &mode
+            {
+                info!(
+                    "EC volume {} initialized: k={}, m={}, {} nodes",
+                    volume_id,
+                    data_shards,
+                    parity_shards,
+                    bss_nodes.len()
+                );
             }
 
             volumes_with_nodes.push(VolumeWithNodes {
-                volume_id: volume.volume_id,
+                volume_id,
                 bss_nodes,
-            });
-        }
-
-        let mut ec_volumes_with_nodes = Vec::new();
-
-        for ec_vol in data_vg_info.ec_volumes {
-            if !EcVolume::is_ec_volume_id(ec_vol.volume_id) {
-                return Err(DataVgError::InitializationError(format!(
-                    "EC volume {} must be in 0x8000..0xFFFE range",
-                    ec_vol.volume_id
-                )));
-            }
-            if ec_vol.data_shards == 0 {
-                return Err(DataVgError::InitializationError(format!(
-                    "EC volume {} has invalid data_shards=0",
-                    ec_vol.volume_id
-                )));
-            }
-            if ec_vol.parity_shards == 0 {
-                return Err(DataVgError::InitializationError(format!(
-                    "EC volume {} has invalid parity_shards=0",
-                    ec_vol.volume_id
-                )));
-            }
-
-            let total_shards = ec_vol.data_shards + ec_vol.parity_shards;
-            if ec_vol.bss_nodes.len() != total_shards as usize {
-                return Err(DataVgError::InitializationError(format!(
-                    "EC volume {} has {} nodes but expected k+m={}",
-                    ec_vol.volume_id,
-                    ec_vol.bss_nodes.len(),
-                    total_shards
-                )));
-            }
-
-            let mut bss_nodes = Vec::new();
-            for bss_node in ec_vol.bss_nodes {
-                let address = format!("{}:{}", bss_node.ip, bss_node.port);
-                debug!(
-                    "Creating EC BSS node for node {}: {}",
-                    bss_node.node_id, address
-                );
-                bss_nodes.push(Arc::new(BssNode::new(
-                    address,
-                    cb_config.clone(),
-                    rpc_connection_timeout,
-                )));
-            }
-
-            info!(
-                "EC volume {} initialized: k={}, m={}, {} nodes",
-                ec_vol.volume_id,
-                ec_vol.data_shards,
-                ec_vol.parity_shards,
-                bss_nodes.len()
-            );
-
-            ec_volumes_with_nodes.push(EcVolumeWithNodes {
-                volume_id: ec_vol.volume_id,
-                data_shards: ec_vol.data_shards,
-                parity_shards: ec_vol.parity_shards,
-                bss_nodes,
+                mode,
             });
         }
 
         debug!(
-            "DataVgProxy initialized successfully with {} volumes, {} EC volumes",
+            "DataVgProxy initialized successfully with {} volumes",
             volumes_with_nodes.len(),
-            ec_volumes_with_nodes.len()
         );
 
         Ok(Self {
             volumes: volumes_with_nodes,
-            ec_volumes: ec_volumes_with_nodes,
             round_robin_counter: AtomicU64::new(0),
-            quorum_config,
             rpc_timeout: rpc_request_timeout,
         })
     }
@@ -366,26 +355,36 @@ impl DataVgProxy {
     pub fn select_volume_for_blob_with_preference(&self, prefer_ec: bool) -> u16 {
         let counter = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) as usize;
 
-        if prefer_ec && !self.ec_volumes.is_empty() {
-            let volume_index = counter % self.ec_volumes.len();
-            return self.ec_volumes[volume_index].volume_id;
+        if prefer_ec {
+            let ec_volumes: Vec<_> = self
+                .volumes
+                .iter()
+                .filter(|v| matches!(v.mode, VolumeMode::ErasureCoded { .. }))
+                .collect();
+            if !ec_volumes.is_empty() {
+                return ec_volumes[counter % ec_volumes.len()].volume_id;
+            }
         }
 
-        if !self.volumes.is_empty() {
-            let volume_index = counter % self.volumes.len();
-            return self.volumes[volume_index].volume_id;
+        let replicated: Vec<_> = self
+            .volumes
+            .iter()
+            .filter(|v| matches!(v.mode, VolumeMode::Replicated { .. }))
+            .collect();
+        if !replicated.is_empty() {
+            return replicated[counter % replicated.len()].volume_id;
         }
 
-        let volume_index = counter % self.ec_volumes.len();
-        self.ec_volumes[volume_index].volume_id
+        // Fallback to whatever is available
+        self.volumes[counter % self.volumes.len()].volume_id
     }
 
     pub fn select_volume_for_blob(&self) -> u16 {
         self.select_volume_for_blob_with_preference(false)
     }
 
-    fn find_ec_volume(&self, volume_id: u16) -> Option<&EcVolumeWithNodes> {
-        self.ec_volumes.iter().find(|v| v.volume_id == volume_id)
+    fn find_volume(&self, volume_id: u16) -> Option<&VolumeWithNodes> {
+        self.volumes.iter().find(|v| v.volume_id == volume_id)
     }
 
     async fn get_blob_from_node_instance(
@@ -520,7 +519,14 @@ impl DataVgProxy {
         body: Bytes,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
-        if EcVolume::is_ec_volume_id(blob_guid.volume_id) {
+        let selected_volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
+            DataVgError::InitializationError(format!(
+                "Volume {} not found in DataVgProxy",
+                blob_guid.volume_id
+            ))
+        })?;
+
+        if let VolumeMode::ErasureCoded { .. } = &selected_volume.mode {
             return self
                 .put_blob_ec(blob_guid, block_number, body, trace_id)
                 .await;
@@ -530,21 +536,13 @@ impl DataVgProxy {
         let trace_id = *trace_id;
         histogram!("blob_size", "operation" => "put").record(body.len() as f64);
 
-        // Use the volume_id from blob_guid to find the volume
-        let selected_volume = self
-            .volumes
-            .iter()
-            .find(|v| v.volume_id == blob_guid.volume_id)
-            .ok_or_else(|| {
-                DataVgError::InitializationError(format!(
-                    "Volume {} not found in DataVgProxy",
-                    blob_guid.volume_id
-                ))
-            })?;
         debug!("Using volume {} for put_blob", selected_volume.volume_id);
 
         let rpc_timeout = self.rpc_timeout;
-        let write_quorum = self.quorum_config.as_ref().unwrap().w as usize;
+        let write_quorum = match &selected_volume.mode {
+            VolumeMode::Replicated { w, .. } => *w as usize,
+            VolumeMode::ErasureCoded { .. } => unreachable!(),
+        };
 
         // Compute checksum once for all replicas
         let body_checksum = xxhash_rust::xxh3::xxh3_64(&body);
@@ -647,14 +645,12 @@ impl DataVgProxy {
             .record(start.elapsed().as_nanos() as f64);
         error!(
             "Write quorum failed ({}/{}). Errors: {:?}",
-            successful_writes,
-            self.quorum_config.as_ref().unwrap().w,
-            errors
+            successful_writes, write_quorum, errors
         );
         Err(DataVgError::QuorumFailure(format!(
             "Write quorum failed ({}/{}): {}",
             successful_writes,
-            self.quorum_config.as_ref().unwrap().w,
+            write_quorum,
             errors.join("; ")
         )))
     }
@@ -666,8 +662,14 @@ impl DataVgProxy {
         chunks: Vec<Bytes>,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
-        if EcVolume::is_ec_volume_id(blob_guid.volume_id) {
-            // Concatenate chunks for EC encoding
+        let selected_volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
+            DataVgError::InitializationError(format!(
+                "Volume {} not found in DataVgProxy",
+                blob_guid.volume_id
+            ))
+        })?;
+
+        if let VolumeMode::ErasureCoded { .. } = &selected_volume.mode {
             let total_size: usize = chunks.iter().map(|c| c.len()).sum();
             let mut combined = Vec::with_capacity(total_size);
             for chunk in &chunks {
@@ -683,23 +685,16 @@ impl DataVgProxy {
         let total_size: usize = chunks.iter().map(|c| c.len()).sum();
         histogram!("blob_size", "operation" => "put").record(total_size as f64);
 
-        let selected_volume = self
-            .volumes
-            .iter()
-            .find(|v| v.volume_id == blob_guid.volume_id)
-            .ok_or_else(|| {
-                DataVgError::InitializationError(format!(
-                    "Volume {} not found in DataVgProxy",
-                    blob_guid.volume_id
-                ))
-            })?;
         debug!(
             "Using volume {} for put_blob_vectored",
             selected_volume.volume_id
         );
 
         let rpc_timeout = self.rpc_timeout;
-        let write_quorum = self.quorum_config.as_ref().unwrap().w as usize;
+        let write_quorum = match &selected_volume.mode {
+            VolumeMode::Replicated { w, .. } => *w as usize,
+            VolumeMode::ErasureCoded { .. } => unreachable!(),
+        };
 
         // Compute checksum once for all replicas
         let mut hasher = xxhash_rust::xxh3::Xxh3::new();
@@ -803,7 +798,7 @@ impl DataVgProxy {
         error!(
             "Failed to achieve write quorum ({}/{}) for blob {}:{}: {}",
             successful_writes,
-            self.quorum_config.as_ref().unwrap().w,
+            write_quorum,
             blob_guid.blob_id,
             block_number,
             errors.join("; ")
@@ -811,7 +806,7 @@ impl DataVgProxy {
         Err(DataVgError::QuorumFailure(format!(
             "Failed to achieve write quorum ({}/{}): {}",
             successful_writes,
-            self.quorum_config.as_ref().unwrap().w,
+            write_quorum,
             errors.join("; ")
         )))
     }
@@ -889,7 +884,13 @@ impl DataVgProxy {
         body: &mut Bytes,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
-        if EcVolume::is_ec_volume_id(blob_guid.volume_id) {
+        let volume_id = blob_guid.volume_id;
+        let volume = self.find_volume(volume_id).ok_or_else(|| {
+            tracing::error!(volume_id, available_volumes=?self.volumes.iter().map(|v| v.volume_id).collect::<Vec<_>>(), "Volume not found in DataVgProxy for get_blob");
+            DataVgError::InitializationError(format!("Volume {} not found", volume_id))
+        })?;
+
+        if let VolumeMode::ErasureCoded { .. } = &volume.mode {
             return self
                 .get_blob_ec(blob_guid, block_number, content_len, body, trace_id)
                 .await;
@@ -898,18 +899,8 @@ impl DataVgProxy {
         let start = Instant::now();
 
         let blob_id = blob_guid.blob_id;
-        let volume_id = blob_guid.volume_id;
 
         tracing::debug!(%blob_id, volume_id, available_volumes=?self.volumes.iter().map(|v| v.volume_id).collect::<Vec<_>>(), "get_blob looking for volume");
-
-        let volume = self
-            .volumes
-            .iter()
-            .find(|v| v.volume_id == volume_id)
-            .ok_or_else(|| {
-                tracing::error!(%blob_id, volume_id, available_volumes=?self.volumes.iter().map(|v| v.volume_id).collect::<Vec<_>>(), "Volume not found in DataVgProxy for get_blob");
-                DataVgError::InitializationError(format!("Volume {} not found", volume_id))
-            })?;
 
         // Filter available nodes for fast path (only try nodes with closed circuit)
         let available_nodes: Vec<_> = volume
@@ -988,7 +979,10 @@ impl DataVgProxy {
             fallback_nodes.len()
         );
 
-        let _read_quorum = self.quorum_config.as_ref().unwrap().r as usize;
+        let _read_quorum = match &volume.mode {
+            VolumeMode::Replicated { r, .. } => *r as usize,
+            VolumeMode::ErasureCoded { .. } => unreachable!(),
+        };
 
         // Create read futures for all available nodes
         let mut read_futures = FuturesUnordered::new();
@@ -1068,26 +1062,22 @@ impl DataVgProxy {
         block_number: u32,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
-        if EcVolume::is_ec_volume_id(blob_guid.volume_id) {
+        let volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
+            DataVgError::InitializationError(format!("Volume {} not found", blob_guid.volume_id))
+        })?;
+
+        if let VolumeMode::ErasureCoded { .. } = &volume.mode {
             return self.delete_blob_ec(blob_guid, block_number, trace_id).await;
         }
 
         let start = Instant::now();
         let trace_id = *trace_id;
 
-        let volume = self
-            .volumes
-            .iter()
-            .find(|v| v.volume_id == blob_guid.volume_id)
-            .ok_or_else(|| {
-                DataVgError::InitializationError(format!(
-                    "Volume {} not found",
-                    blob_guid.volume_id
-                ))
-            })?;
-
         let rpc_timeout = self.rpc_timeout;
-        let write_quorum = self.quorum_config.as_ref().unwrap().w as usize;
+        let write_quorum = match &volume.mode {
+            VolumeMode::Replicated { w, .. } => *w as usize,
+            VolumeMode::ErasureCoded { .. } => unreachable!(),
+        };
 
         // Filter available nodes based on circuit breaker state
         let available_nodes: Vec<_> = volume
@@ -1181,14 +1171,12 @@ impl DataVgProxy {
             .record(start.elapsed().as_nanos() as f64);
         error!(
             "Delete quorum failed ({}/{}). Errors: {:?}",
-            successful_deletes,
-            self.quorum_config.as_ref().unwrap().w,
-            errors
+            successful_deletes, write_quorum, errors
         );
         Err(DataVgError::QuorumFailure(format!(
             "Delete quorum failed ({}/{}): {}",
             successful_deletes,
-            self.quorum_config.as_ref().unwrap().w,
+            write_quorum,
             errors.join("; ")
         )))
     }
@@ -1230,12 +1218,17 @@ impl DataVgProxy {
             return Ok(());
         }
 
-        let ec_vol = self.find_ec_volume(blob_guid.volume_id).ok_or_else(|| {
+        let ec_vol = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
             DataVgError::InitializationError(format!("EC volume {} not found", blob_guid.volume_id))
         })?;
 
-        let k = ec_vol.data_shards as usize;
-        let m = ec_vol.parity_shards as usize;
+        let (k, m) = match &ec_vol.mode {
+            VolumeMode::ErasureCoded {
+                data_shards,
+                parity_shards,
+            } => (*data_shards as usize, *parity_shards as usize),
+            _ => unreachable!(),
+        };
         let total = k + m;
         let write_quorum = k + 1; // W = k + 1
 
@@ -1383,12 +1376,17 @@ impl DataVgProxy {
             return Ok(());
         }
 
-        let ec_vol = self.find_ec_volume(blob_guid.volume_id).ok_or_else(|| {
+        let ec_vol = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
             DataVgError::InitializationError(format!("EC volume {} not found", blob_guid.volume_id))
         })?;
 
-        let k = ec_vol.data_shards as usize;
-        let m = ec_vol.parity_shards as usize;
+        let (k, m) = match &ec_vol.mode {
+            VolumeMode::ErasureCoded {
+                data_shards,
+                parity_shards,
+            } => (*data_shards as usize, *parity_shards as usize),
+            _ => unreachable!(),
+        };
         let total = k + m;
 
         let rotation = Self::ec_rotation(&blob_guid.blob_id, total as u32);
@@ -1578,12 +1576,17 @@ impl DataVgProxy {
         let start = Instant::now();
         let trace_id = *trace_id;
 
-        let ec_vol = self.find_ec_volume(blob_guid.volume_id).ok_or_else(|| {
+        let ec_vol = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
             DataVgError::InitializationError(format!("EC volume {} not found", blob_guid.volume_id))
         })?;
 
-        let k = ec_vol.data_shards as usize;
-        let m = ec_vol.parity_shards as usize;
+        let (k, m) = match &ec_vol.mode {
+            VolumeMode::ErasureCoded {
+                data_shards,
+                parity_shards,
+            } => (*data_shards as usize, *parity_shards as usize),
+            _ => unreachable!(),
+        };
         let total = k + m;
         let write_quorum = k + 1;
 
@@ -1688,17 +1691,17 @@ impl DataVgProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use data_types::EcVolume;
+    use data_types::Volume;
 
     #[test]
     fn ec_volume_id_range() {
-        assert!(!EcVolume::is_ec_volume_id(0));
-        assert!(!EcVolume::is_ec_volume_id(1));
-        assert!(!EcVolume::is_ec_volume_id(0x7FFF));
-        assert!(EcVolume::is_ec_volume_id(0x8000));
-        assert!(EcVolume::is_ec_volume_id(0x8001));
-        assert!(EcVolume::is_ec_volume_id(0xFFFE));
-        assert!(!EcVolume::is_ec_volume_id(0xFFFF));
+        assert!(!Volume::is_ec_volume_id(0));
+        assert!(!Volume::is_ec_volume_id(1));
+        assert!(!Volume::is_ec_volume_id(0x7FFF));
+        assert!(Volume::is_ec_volume_id(0x8000));
+        assert!(Volume::is_ec_volume_id(0x8001));
+        assert!(Volume::is_ec_volume_id(0xFFFE));
+        assert!(!Volume::is_ec_volume_id(0xFFFF));
     }
 
     #[test]
@@ -1861,11 +1864,8 @@ mod tests {
     #[test]
     fn parse_ec_config_json() {
         let json = r#"{
-            "volumes": [],
-            "ec_volumes": [{
+            "volumes": [{
                 "volume_id": 32768,
-                "data_shards": 4,
-                "parity_shards": 2,
                 "bss_nodes": [
                     {"node_id":"bss0","ip":"127.0.0.1","port":8088},
                     {"node_id":"bss1","ip":"127.0.0.1","port":8089},
@@ -1873,43 +1873,44 @@ mod tests {
                     {"node_id":"bss3","ip":"127.0.0.1","port":8091},
                     {"node_id":"bss4","ip":"127.0.0.1","port":8092},
                     {"node_id":"bss5","ip":"127.0.0.1","port":8093}
-                ]
+                ],
+                "mode": {"type":"erasure_coded","data_shards":4,"parity_shards":2}
             }]
         }"#;
 
         let info: DataVgInfo = serde_json::from_str(json).unwrap();
-        assert!(info.volumes.is_empty());
-        assert!(info.quorum.is_none());
-        assert_eq!(info.ec_volumes.len(), 1);
+        assert_eq!(info.volumes.len(), 1);
 
-        let ec = &info.ec_volumes[0];
+        let ec = &info.volumes[0];
         assert_eq!(ec.volume_id, 0x8000);
-        assert_eq!(ec.data_shards, 4);
-        assert_eq!(ec.parity_shards, 2);
+        assert!(ec.is_ec());
+        if let VolumeMode::ErasureCoded {
+            data_shards,
+            parity_shards,
+        } = &ec.mode
+        {
+            assert_eq!(*data_shards, 4);
+            assert_eq!(*parity_shards, 2);
+        }
         assert_eq!(ec.bss_nodes.len(), 6);
     }
 
     #[test]
-    fn parse_backward_compatible_no_ec_volumes() {
+    fn parse_replicated_config_json() {
         let json = r#"{
-            "volumes": [{"volume_id":1,"bss_nodes":[{"node_id":"bss0","ip":"127.0.0.1","port":8088}]}],
-            "quorum": {"n":1,"r":1,"w":1}
+            "volumes": [{"volume_id":1,"bss_nodes":[{"node_id":"bss0","ip":"127.0.0.1","port":8088}],"mode":{"type":"replicated","n":1,"r":1,"w":1}}]
         }"#;
 
         let info: DataVgInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.volumes.len(), 1);
-        assert!(info.ec_volumes.is_empty());
-        assert!(info.quorum.is_some());
+        assert!(!info.volumes[0].is_ec());
     }
 
     #[test]
     fn datavgproxy_init_ec_only() {
         let json = r#"{
-            "volumes": [],
-            "ec_volumes": [{
+            "volumes": [{
                 "volume_id": 32768,
-                "data_shards": 4,
-                "parity_shards": 2,
                 "bss_nodes": [
                     {"node_id":"bss0","ip":"127.0.0.1","port":18088},
                     {"node_id":"bss1","ip":"127.0.0.1","port":18089},
@@ -1917,7 +1918,8 @@ mod tests {
                     {"node_id":"bss3","ip":"127.0.0.1","port":18091},
                     {"node_id":"bss4","ip":"127.0.0.1","port":18092},
                     {"node_id":"bss5","ip":"127.0.0.1","port":18093}
-                ]
+                ],
+                "mode": {"type":"erasure_coded","data_shards":4,"parity_shards":2}
             }]
         }"#;
 
@@ -1927,21 +1929,19 @@ mod tests {
         // Should select EC volume
         let guid = proxy.create_data_blob_guid();
         assert_eq!(guid.volume_id, 0x8000);
-        assert!(EcVolume::is_ec_volume_id(guid.volume_id));
+        assert!(Volume::is_ec_volume_id(guid.volume_id));
     }
 
     #[test]
     fn datavgproxy_init_ec_invalid_node_count() {
         let json = r#"{
-            "volumes": [],
-            "ec_volumes": [{
+            "volumes": [{
                 "volume_id": 32768,
-                "data_shards": 4,
-                "parity_shards": 2,
                 "bss_nodes": [
                     {"node_id":"bss0","ip":"127.0.0.1","port":18088},
                     {"node_id":"bss1","ip":"127.0.0.1","port":18089}
-                ]
+                ],
+                "mode": {"type":"erasure_coded","data_shards":4,"parity_shards":2}
             }]
         }"#;
 
@@ -1955,11 +1955,8 @@ mod tests {
     #[test]
     fn datavgproxy_init_ec_invalid_volume_id_range() {
         let json = r#"{
-            "volumes": [],
-            "ec_volumes": [{
+            "volumes": [{
                 "volume_id": 65535,
-                "data_shards": 4,
-                "parity_shards": 2,
                 "bss_nodes": [
                     {"node_id":"bss0","ip":"127.0.0.1","port":18088},
                     {"node_id":"bss1","ip":"127.0.0.1","port":18089},
@@ -1967,7 +1964,8 @@ mod tests {
                     {"node_id":"bss3","ip":"127.0.0.1","port":18091},
                     {"node_id":"bss4","ip":"127.0.0.1","port":18092},
                     {"node_id":"bss5","ip":"127.0.0.1","port":18093}
-                ]
+                ],
+                "mode": {"type":"erasure_coded","data_shards":4,"parity_shards":2}
             }]
         }"#;
 
@@ -1981,15 +1979,13 @@ mod tests {
     #[test]
     fn datavgproxy_init_ec_zero_data_shards_fails() {
         let json = r#"{
-            "volumes": [],
-            "ec_volumes": [{
+            "volumes": [{
                 "volume_id": 32768,
-                "data_shards": 0,
-                "parity_shards": 2,
                 "bss_nodes": [
                     {"node_id":"bss0","ip":"127.0.0.1","port":18088},
                     {"node_id":"bss1","ip":"127.0.0.1","port":18089}
-                ]
+                ],
+                "mode": {"type":"erasure_coded","data_shards":0,"parity_shards":2}
             }]
         }"#;
 
@@ -2003,17 +1999,15 @@ mod tests {
     #[test]
     fn datavgproxy_init_ec_zero_parity_shards_fails() {
         let json = r#"{
-            "volumes": [],
-            "ec_volumes": [{
+            "volumes": [{
                 "volume_id": 32768,
-                "data_shards": 4,
-                "parity_shards": 0,
                 "bss_nodes": [
                     {"node_id":"bss0","ip":"127.0.0.1","port":18088},
                     {"node_id":"bss1","ip":"127.0.0.1","port":18089},
                     {"node_id":"bss2","ip":"127.0.0.1","port":18090},
                     {"node_id":"bss3","ip":"127.0.0.1","port":18091}
-                ]
+                ],
+                "mode": {"type":"erasure_coded","data_shards":4,"parity_shards":0}
             }]
         }"#;
 
@@ -2026,7 +2020,7 @@ mod tests {
 
     #[test]
     fn datavgproxy_init_no_volumes_fails() {
-        let json = r#"{"volumes": [], "ec_volumes": []}"#;
+        let json = r#"{"volumes": []}"#;
 
         let info: DataVgInfo = serde_json::from_str(json).unwrap();
         let result = DataVgProxy::new(info, Duration::from_secs(5), Duration::from_secs(5));
@@ -2036,41 +2030,29 @@ mod tests {
     }
 
     #[test]
-    fn datavgproxy_init_replicated_requires_quorum() {
-        let json = r#"{
-            "volumes": [{"volume_id":1,"bss_nodes":[{"node_id":"bss0","ip":"127.0.0.1","port":18088}]}]
-        }"#;
-
-        let info: DataVgInfo = serde_json::from_str(json).unwrap();
-        let result = DataVgProxy::new(info, Duration::from_secs(5), Duration::from_secs(5));
-        assert!(result.is_err());
-        let err = result.err().unwrap().to_string();
-        assert!(err.contains("QuorumConfig is required"), "err: {}", err);
-    }
-
-    #[test]
     fn create_data_blob_guid_with_preference_uses_ec_when_available() {
         let json = r#"{
-            "volumes": [{
-                "volume_id": 1,
-                "bss_nodes": [
-                    {"node_id":"bss0","ip":"127.0.0.1","port":18088}
-                ]
-            }],
-            "quorum": {"n":1,"r":1,"w":1},
-            "ec_volumes": [{
-                "volume_id": 32768,
-                "data_shards": 4,
-                "parity_shards": 2,
-                "bss_nodes": [
-                    {"node_id":"bss0","ip":"127.0.0.1","port":18088},
-                    {"node_id":"bss1","ip":"127.0.0.1","port":18089},
-                    {"node_id":"bss2","ip":"127.0.0.1","port":18090},
-                    {"node_id":"bss3","ip":"127.0.0.1","port":18091},
-                    {"node_id":"bss4","ip":"127.0.0.1","port":18092},
-                    {"node_id":"bss5","ip":"127.0.0.1","port":18093}
-                ]
-            }]
+            "volumes": [
+                {
+                    "volume_id": 1,
+                    "bss_nodes": [
+                        {"node_id":"bss0","ip":"127.0.0.1","port":18088}
+                    ],
+                    "mode": {"type":"replicated","n":1,"r":1,"w":1}
+                },
+                {
+                    "volume_id": 32768,
+                    "bss_nodes": [
+                        {"node_id":"bss0","ip":"127.0.0.1","port":18088},
+                        {"node_id":"bss1","ip":"127.0.0.1","port":18089},
+                        {"node_id":"bss2","ip":"127.0.0.1","port":18090},
+                        {"node_id":"bss3","ip":"127.0.0.1","port":18091},
+                        {"node_id":"bss4","ip":"127.0.0.1","port":18092},
+                        {"node_id":"bss5","ip":"127.0.0.1","port":18093}
+                    ],
+                    "mode": {"type":"erasure_coded","data_shards":4,"parity_shards":2}
+                }
+            ]
         }"#;
 
         let info: DataVgInfo = serde_json::from_str(json).unwrap();
