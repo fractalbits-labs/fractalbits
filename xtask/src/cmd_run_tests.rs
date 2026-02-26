@@ -44,7 +44,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
             ServiceName::All,
             BuildMode::Debug,
             InitConfig {
-                data_blob_storage: DataBlobStorage::S3HybridSingleAz,
+                data_blob_storage: DataBlobStorage::AllInBssSingleAz,
                 bss_count: 6,
                 ..Default::default()
             },

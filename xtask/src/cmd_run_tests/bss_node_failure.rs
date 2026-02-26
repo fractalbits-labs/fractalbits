@@ -19,6 +19,12 @@ pub async fn run_bss_node_failure_tests() -> CmdResult {
         return Err(e);
     }
 
+    println!("\n{}", "=== Test: EC Degraded Read/Write ===".bold());
+    if let Err(e) = test_ec_degraded_read_write().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
     println!(
         "\n{}",
         "=== All BSS Node Failure Tests PASSED ===".green().bold()
@@ -360,5 +366,267 @@ async fn test_write_read_delete_with_node_down() -> CmdResult {
     }
 
     println!("{}", "SUCCESS: BSS node failure test completed".green());
+    Ok(())
+}
+
+/// Generate deterministic test data from a key name.
+/// Repeats a pattern derived from the key to fill the requested size.
+fn generate_test_data(key: &str, size: usize) -> Vec<u8> {
+    let pattern = format!("<<{key}>>");
+    let pattern_bytes = pattern.as_bytes();
+    let mut data = Vec::with_capacity(size);
+    while data.len() < size {
+        let remaining = size - data.len();
+        let chunk = &pattern_bytes[..remaining.min(pattern_bytes.len())];
+        data.extend_from_slice(chunk);
+    }
+    data
+}
+
+async fn put_object_with_retry(
+    ctx: &test_common::Context,
+    bucket: &str,
+    key: &str,
+    data: Vec<u8>,
+    max_attempts: u32,
+) -> CmdResult {
+    for attempt in 1..=max_attempts {
+        match ctx
+            .client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(data.clone()))
+            .send()
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                if attempt == max_attempts {
+                    return Err(std::io::Error::other(format!(
+                        "Put {key} failed after {max_attempts} attempts: {e}"
+                    )));
+                }
+                println!("    Put {key}: attempt {attempt}/{max_attempts} failed, retrying...");
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// Warm up circuit breakers for downed nodes by sending probe puts.
+///
+/// The api_server has multiple workers, each with its own DataVgProxy and
+/// independent circuit breakers. Each circuit breaker needs 3 consecutive
+/// failures to open. Probes are randomly distributed across workers, so we
+/// send enough to reliably cover all workers (2 workers × 3 failures = 6
+/// minimum, using 20 for safety margin).
+///
+/// Only uses put operations — gets on non-existent keys would record
+/// "not found" as failures against healthy nodes, accidentally tripping
+/// their circuit breakers.
+async fn warmup_circuit_breaker(ctx: &test_common::Context, bucket: &str) {
+    println!("    Warming up circuit breakers across workers...");
+    for i in 0..20 {
+        let key = format!("ec-probe-{i}");
+        let _ = ctx
+            .client
+            .put_object()
+            .bucket(bucket)
+            .key(&key)
+            .body(ByteStream::from(vec![0u8; 64]))
+            .send()
+            .await;
+    }
+    println!("    Circuit breakers warmed up");
+}
+
+async fn test_ec_degraded_read_write() -> CmdResult {
+    let ctx = context();
+    let bucket = ctx.create_bucket("test-ec-degraded").await;
+
+    // Object sizes: 4KB, 512KB, 2MB
+    let sizes: &[(&str, usize)] = &[
+        ("small", 4 * 1024),
+        ("medium", 512 * 1024),
+        ("large", 2 * 1024 * 1024),
+    ];
+
+    // Phase 1: Baseline - all 6 nodes up
+    println!("  Phase 1: Write and read objects with all 6 nodes up");
+    for (label, size) in sizes {
+        let key = format!("ec-baseline-{label}");
+        let data = generate_test_data(&key, *size);
+        ctx.client
+            .put_object()
+            .bucket(&bucket)
+            .key(&key)
+            .body(ByteStream::from(data.clone()))
+            .send()
+            .await
+            .expect("Failed to put baseline object with all nodes up");
+
+        let resp = ctx
+            .client
+            .get_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .expect("Failed to get baseline object with all nodes up");
+        let body = resp.body.collect().await.expect("Failed to read body");
+        assert_eq!(
+            body.into_bytes().as_ref(),
+            data.as_slice(),
+            "Data mismatch for baseline {key}"
+        );
+        println!("    {label} ({size} bytes): write + read OK");
+    }
+
+    // Phase 2: 1 node down (stop bss@2)
+    println!("  Phase 2: Stop BSS node 2 (1 of 6 down)");
+    run_cmd!(systemctl --user stop bss@2.service)?;
+    sleep(Duration::from_secs(2)).await;
+    if run_cmd!(systemctl --user is-active --quiet bss@2.service).is_ok() {
+        return Err(std::io::Error::other(
+            "BSS node 2 should be stopped but is still active",
+        ));
+    }
+    println!("    BSS node 2 confirmed down");
+
+    warmup_circuit_breaker(&ctx, &bucket).await;
+
+    // Write new objects with 1 node down (5 available >= quorum 5)
+    println!("  Phase 2a: Write new objects with 1 node down");
+    for (label, size) in sizes {
+        let key = format!("ec-degraded1-{label}");
+        let data = generate_test_data(&key, *size);
+        put_object_with_retry(&ctx, &bucket, &key, data, 5).await?;
+        println!("    {label} ({size} bytes): write OK");
+    }
+
+    // Read baseline objects (degraded path reconstruction)
+    println!("  Phase 2b: Read baseline objects with 1 node down");
+    for (label, size) in sizes {
+        let key = format!("ec-baseline-{label}");
+        let expected = generate_test_data(&key, *size);
+        let resp = ctx
+            .client
+            .get_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .expect("Read baseline should succeed with 1 node down");
+        let body = resp.body.collect().await.expect("Failed to read body");
+        assert_eq!(
+            body.into_bytes().as_ref(),
+            expected.as_slice(),
+            "Data integrity failed for {key} with 1 node down"
+        );
+        println!("    {label} ({size} bytes): read + verify OK");
+    }
+
+    // Read newly written objects
+    println!("  Phase 2c: Read degraded-1 objects");
+    for (label, size) in sizes {
+        let key = format!("ec-degraded1-{label}");
+        let expected = generate_test_data(&key, *size);
+        let resp = ctx
+            .client
+            .get_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .expect("Read degraded-1 should succeed with 1 node down");
+        let body = resp.body.collect().await.expect("Failed to read body");
+        assert_eq!(
+            body.into_bytes().as_ref(),
+            expected.as_slice(),
+            "Data integrity failed for {key} with 1 node down"
+        );
+        println!("    {label} ({size} bytes): read + verify OK");
+    }
+
+    // Phase 3: 2 nodes down (also stop bss@4)
+    println!("  Phase 3: Stop BSS node 4 (2 of 6 down)");
+    run_cmd!(systemctl --user stop bss@4.service)?;
+    sleep(Duration::from_secs(2)).await;
+    if run_cmd!(systemctl --user is-active --quiet bss@4.service).is_ok() {
+        return Err(std::io::Error::other(
+            "BSS node 4 should be stopped but is still active",
+        ));
+    }
+    println!("    BSS node 4 confirmed down");
+
+    warmup_circuit_breaker(&ctx, &bucket).await;
+
+    // Writes should fail with 2 nodes down (4 available < quorum 5)
+    println!("  Phase 3a: Write objects with 2 nodes down (expect failure)");
+    for (label, size) in sizes {
+        let key = format!("ec-degraded2-{label}");
+        let data = generate_test_data(&key, *size);
+        match ctx
+            .client
+            .put_object()
+            .bucket(&bucket)
+            .key(&key)
+            .body(ByteStream::from(data))
+            .send()
+            .await
+        {
+            Ok(_) => {
+                return Err(std::io::Error::other(format!(
+                    "Write for {key} should have failed with 2 nodes down (4 < quorum 5)"
+                )));
+            }
+            Err(_) => {
+                println!("    {label} ({size} bytes): write correctly failed");
+            }
+        }
+    }
+
+    // Note: Reads with 2 nodes down are NOT tested here because the EC write
+    // path only guarantees k+1=5 shard writes (the 6th is backgrounded via
+    // tokio::spawn after quorum). With 2 nodes down, only 3 shards may be
+    // available on surviving nodes, which is below the k=4 minimum for reads.
+
+    // Phase 4: Recovery - restart nodes for cleanup
+    println!("  Phase 4: Restart BSS nodes 2 and 4");
+    start_bss_instance(2)?;
+    start_bss_instance(4)?;
+    sleep(Duration::from_secs(2)).await;
+    println!("    Both nodes restarted");
+
+    // Cleanup
+    println!("  Cleanup: Deleting test objects and bucket");
+    for prefix in &["ec-baseline", "ec-degraded1", "ec-degraded2"] {
+        for (label, _) in sizes {
+            let _ = ctx
+                .client
+                .delete_object()
+                .bucket(&bucket)
+                .key(format!("{prefix}-{label}"))
+                .send()
+                .await;
+        }
+    }
+    for i in 0..20 {
+        let _ = ctx
+            .client
+            .delete_object()
+            .bucket(&bucket)
+            .key(format!("ec-probe-{i}"))
+            .send()
+            .await;
+    }
+    let _ = ctx.client.delete_bucket().bucket(&bucket).send().await;
+
+    println!(
+        "{}",
+        "SUCCESS: EC degraded read/write test completed".green()
+    );
     Ok(())
 }
