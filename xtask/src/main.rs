@@ -602,6 +602,7 @@ pub enum TestType {
     BssNodeFailure,
     NssHaWithMirrord,
     NssHaWithEBS,
+    FuseClient,
 }
 
 #[derive(Parser, Clone, EnumString)]

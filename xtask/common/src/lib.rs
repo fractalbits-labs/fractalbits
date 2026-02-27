@@ -72,12 +72,36 @@ pub fn generate_blueprint(config: &BootstrapClusterConfig) -> StageBlueprint {
     let stage_defs: &[(&str, &str, bool, usize, bool)] = &[
         (stages::INSTANCES_READY, "Instances ready", false, all, true),
         (stages::ETCD_READY, "etcd cluster formed", true, 1, use_etcd),
-        (stages::RSS_INITIALIZED, "RSS config published", true, 1, true),
-        (stages::METADATA_VG_READY, "Metadata VG ready", true, 1, true),
+        (
+            stages::RSS_INITIALIZED,
+            "RSS config published",
+            true,
+            1,
+            true,
+        ),
+        (
+            stages::METADATA_VG_READY,
+            "Metadata VG ready",
+            true,
+            1,
+            true,
+        ),
         (stages::NSS_FORMATTED, "NSS formatted", false, num_nss, true),
         (stages::MIRRORD_READY, "Mirrord ready", false, 1, use_nvme),
-        (stages::NSS_JOURNAL_READY, "NSS journal ready", false, 1, true),
-        (stages::BSS_CONFIGURED, "BSS configured", false, num_bss, true),
+        (
+            stages::NSS_JOURNAL_READY,
+            "NSS journal ready",
+            false,
+            1,
+            true,
+        ),
+        (
+            stages::BSS_CONFIGURED,
+            "BSS configured",
+            false,
+            num_bss,
+            true,
+        ),
         (stages::SERVICES_READY, "Services ready", false, all, true),
     ];
 

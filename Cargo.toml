@@ -27,6 +27,7 @@ exclude = [
     "crates/common/rpc_codecs/rss_codec/src",
     "crates/common/test_common/src",
     "crates/common/volume_group_proxy/src",
+    "crates/fuse_client/src",
     "crates/fractal-s3/demo",
     "crates/fractal-s3/src",
     "crates/ha/multi_az",
@@ -135,6 +136,7 @@ anyhow = "1.0.89"
 regex = "1.10.6"
 core_affinity = "0.7"
 urlencoding = "2"
+fuse3 = { version = "0.8", features = ["tokio-runtime", "unprivileged"] }
 
 # Dev dependencies
 aws-sdk-s3 = "1.65.0"
