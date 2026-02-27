@@ -1,4 +1,4 @@
-pub mod bootstrap;
+pub mod bootstrap_progress;
 mod build;
 mod common;
 mod create_cluster;

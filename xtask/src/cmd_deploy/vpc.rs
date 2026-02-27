@@ -3,7 +3,7 @@ use colored::*;
 use dialoguer::Input;
 use std::path::Path;
 
-use super::bootstrap;
+use super::bootstrap_progress;
 use super::common::{DeployTarget, VpcConfig, get_bootstrap_bucket_name};
 use super::simulate_on_prem;
 use super::ssm_bootstrap;
@@ -164,7 +164,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     }
 
     if watch_bootstrap {
-        bootstrap::show_progress(DeployTarget::Aws)?;
+        bootstrap_progress::show_progress(DeployTarget::Aws)?;
     } else {
         info!("To monitor bootstrap progress, run:");
         info!("  cargo xtask deploy bootstrap-progress");

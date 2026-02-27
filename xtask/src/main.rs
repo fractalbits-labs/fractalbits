@@ -840,7 +840,7 @@ async fn main() -> CmdResult {
             })?,
             DeployCommand::DestroyVpc => cmd_deploy::destroy_vpc()?,
             DeployCommand::BootstrapProgress { deploy_target } => {
-                cmd_deploy::bootstrap::show_progress(deploy_target)?
+                cmd_deploy::bootstrap_progress::show_progress(deploy_target)?
             }
             DeployCommand::CreateCluster {
                 config,

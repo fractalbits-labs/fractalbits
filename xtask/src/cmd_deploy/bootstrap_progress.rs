@@ -4,64 +4,13 @@ use cmd_lib::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::io::Error;
 use std::time::{Duration, Instant};
-use xtask_common::{BOOTSTRAP_CLUSTER_CONFIG, BootstrapClusterConfig, RssBackend};
+use xtask_common::workflow_stages::names as stage_names;
+use xtask_common::{
+    BOOTSTRAP_CLUSTER_CONFIG, BootstrapClusterConfig, RssBackend, STAGES, StageInfo,
+};
 
 const POLL_INTERVAL_SECS: u64 = 2;
 const TIMEOUT_SECS: u64 = 600; // 10 minutes
-
-struct StageInfo {
-    name: &'static str,
-    desc: &'static str,
-    is_global: bool,
-}
-
-const STAGES: &[StageInfo] = &[
-    StageInfo {
-        name: "00-instances-ready",
-        desc: "Instances ready",
-        is_global: false,
-    },
-    StageInfo {
-        name: "10-etcd-ready",
-        desc: "etcd cluster formed",
-        is_global: true,
-    },
-    StageInfo {
-        name: "20-rss-initialized",
-        desc: "RSS config published",
-        is_global: true,
-    },
-    StageInfo {
-        name: "25-metadata-vg-ready",
-        desc: "Metadata VG ready",
-        is_global: true,
-    },
-    StageInfo {
-        name: "30-nss-formatted",
-        desc: "NSS formatted",
-        is_global: false,
-    },
-    StageInfo {
-        name: "35-mirrord-ready",
-        desc: "Mirrord ready",
-        is_global: false,
-    },
-    StageInfo {
-        name: "40-nss-journal-ready",
-        desc: "NSS journal ready",
-        is_global: false,
-    },
-    StageInfo {
-        name: "50-bss-configured",
-        desc: "BSS configured",
-        is_global: false,
-    },
-    StageInfo {
-        name: "60-services-ready",
-        desc: "Services ready",
-        is_global: false,
-    },
-];
 
 struct WorkflowConfig {
     cluster_id: String,
@@ -120,18 +69,6 @@ fn parse_workflow_config(content: &str) -> Result<WorkflowConfig, Error> {
 
 fn get_workflow_config(bucket: &str) -> Result<WorkflowConfig, Error> {
     let s3_path = format!("s3://{bucket}/{BOOTSTRAP_CLUSTER_CONFIG}");
-    let content = run_fun!(aws s3 cp $s3_path - 2>/dev/null).map_err(|e| {
-        Error::other(format!(
-            "Failed to download {BOOTSTRAP_CLUSTER_CONFIG}: {e}"
-        ))
-    })?;
-
-    parse_workflow_config(&content)
-}
-
-#[allow(dead_code)]
-fn get_workflow_config_by_id(bucket: &str, cluster_id: &str) -> Result<WorkflowConfig, Error> {
-    let s3_path = format!("s3://{bucket}/workflow/{cluster_id}/{BOOTSTRAP_CLUSTER_CONFIG}");
     let content = run_fun!(aws s3 cp $s3_path - 2>/dev/null).map_err(|e| {
         Error::other(format!(
             "Failed to download {BOOTSTRAP_CLUSTER_CONFIG}: {e}"
@@ -233,26 +170,26 @@ pub fn show_progress(target: DeployTarget) -> CmdResult {
     let mut bars: Vec<(ProgressBar, &StageInfo, usize, bool)> = Vec::new();
 
     for stage in STAGES {
-        if stage.name == "10-etcd-ready" && !use_etcd {
+        if stage.name == stage_names::ETCD_READY && !use_etcd {
             continue;
         }
         // Skip mirrord stage when not using NVMe journal
-        if stage.name == "35-mirrord-ready" && !use_nvme_journal {
+        if stage.name == stage_names::MIRRORD_READY && !use_nvme_journal {
             continue;
         }
 
         let expected = if stage.is_global {
             1
-        } else if stage.name == "30-nss-formatted" {
+        } else if stage.name == stage_names::NSS_FORMATTED {
             num_nss
-        } else if stage.name == "35-mirrord-ready" {
+        } else if stage.name == stage_names::MIRRORD_READY {
             // Only standby (nss-B) publishes mirrord-ready
             1
-        } else if stage.name == "40-nss-journal-ready" {
+        } else if stage.name == stage_names::NSS_JOURNAL_READY {
             // Only active (nss-A) publishes journal-ready in HA mode (both NVMe and EBS)
             // Solo mode: the single node publishes
             1
-        } else if stage.name == "50-bss-configured" {
+        } else if stage.name == stage_names::BSS_CONFIGURED {
             num_bss
         } else {
             total_nodes

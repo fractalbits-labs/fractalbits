@@ -356,32 +356,8 @@ impl EtcdNodeInfo {
     }
 }
 
-/// Stage constants for type safety
-pub mod stages {
-    pub const INSTANCES_READY: &str = "00-instances-ready";
-    pub const ETCD_READY: &str = "10-etcd-ready";
-    pub const RSS_INITIALIZED: &str = "20-rss-initialized";
-    pub const METADATA_VG_READY: &str = "25-metadata-vg-ready";
-    pub const NSS_FORMATTED: &str = "30-nss-formatted";
-    pub const MIRRORD_READY: &str = "35-mirrord-ready";
-    pub const NSS_JOURNAL_READY: &str = "40-nss-journal-ready";
-    pub const BSS_CONFIGURED: &str = "50-bss-configured";
-    pub const SERVICES_READY: &str = "60-services-ready";
-}
-
-/// Timeout constants for each stage (in seconds)
-#[allow(dead_code)]
-pub mod timeouts {
-    pub const INSTANCES_READY: u64 = 120;
-    pub const ETCD_READY: u64 = 300;
-    pub const RSS_INITIALIZED: u64 = 300;
-    pub const METADATA_VG_READY: u64 = 300;
-    pub const NSS_FORMATTED: u64 = 300;
-    pub const MIRRORD_READY: u64 = 120;
-    pub const NSS_JOURNAL_READY: u64 = 120;
-    pub const BSS_CONFIGURED: u64 = 300;
-    pub const SERVICES_READY: u64 = 60;
-}
+pub use xtask_common::workflow_stages::names as stages;
+pub use xtask_common::workflow_stages::timeouts;
 
 #[cfg(test)]
 mod tests {

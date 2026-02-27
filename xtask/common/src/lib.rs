@@ -13,6 +13,9 @@ use uuid::Uuid;
 
 pub const BOOTSTRAP_CLUSTER_CONFIG: &str = "bootstrap_cluster.toml";
 
+pub mod workflow_stages;
+pub use workflow_stages::{STAGES, StageInfo};
+
 /// AWS credentials + endpoint for DynamoDB Local (used in tests and local development)
 pub const LOCAL_DDB_ENVS: &[&str] = &[
     "AWS_DEFAULT_REGION=fakeRegion",
