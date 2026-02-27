@@ -3,6 +3,7 @@ use crate::config::{BootstrapConfig, DeployTarget, JournalType};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use std::io::Error;
+use xtask_common::STAGE_BLUEPRINT_FILE;
 
 const POLL_INTERVAL_SECONDS: u64 = 1;
 const MAX_POLL_ATTEMPTS: u64 = 300;
@@ -88,6 +89,9 @@ fn bootstrap_leader(
 
     // Complete instances-ready stage
     barrier.complete_stage(stages::INSTANCES_READY, None)?;
+
+    // Generate and upload stage blueprint so progress display knows what to expect
+    upload_stage_blueprint(config)?;
 
     // Wait for etcd cluster if using etcd backend
     if config.is_etcd_backend() {
@@ -707,5 +711,18 @@ fn create_rss_bootstrap_env() -> CmdResult {
 fn clear_rss_bootstrap_env() -> CmdResult {
     run_cmd!(echo -n "" > ${ETC_PATH}rss.env)?;
     info!("Cleared RSS bootstrap env file");
+    Ok(())
+}
+
+fn upload_stage_blueprint(config: &BootstrapConfig) -> CmdResult {
+    let blueprint = xtask_common::generate_blueprint(config);
+    let blueprint_json = serde_json::to_string_pretty(&blueprint)
+        .map_err(|e| Error::other(format!("Failed to serialize stage blueprint: {e}")))?;
+
+    let bucket = config.get_bootstrap_bucket();
+    let s3_path = format!("{bucket}/{STAGE_BLUEPRINT_FILE}");
+    info!("Uploading {STAGE_BLUEPRINT_FILE} to {s3_path}");
+    run_cmd!(echo $blueprint_json | aws s3 cp - $s3_path --quiet)?;
+    info!("{STAGE_BLUEPRINT_FILE} uploaded successfully");
     Ok(())
 }

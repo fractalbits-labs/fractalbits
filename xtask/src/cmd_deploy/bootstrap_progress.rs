@@ -4,78 +4,18 @@ use cmd_lib::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::io::Error;
 use std::time::{Duration, Instant};
-use xtask_common::workflow_stages::names as stage_names;
-use xtask_common::{
-    BOOTSTRAP_CLUSTER_CONFIG, BootstrapClusterConfig, RssBackend, STAGES, StageInfo,
-};
+use xtask_common::{STAGE_BLUEPRINT_FILE, StageBlueprint, StageBlueprintEntry};
 
 const POLL_INTERVAL_SECS: u64 = 2;
 const TIMEOUT_SECS: u64 = 600; // 10 minutes
 
-struct WorkflowConfig {
-    cluster_id: String,
-    num_bss: usize,
-    num_nss: usize,
-    num_rss: usize,
-    num_api: usize,
-    num_bench: usize,
-    use_etcd: bool,
-    use_nvme_journal: bool,
-}
+fn get_blueprint(bucket: &str) -> Result<StageBlueprint, Error> {
+    let s3_path = format!("s3://{bucket}/{STAGE_BLUEPRINT_FILE}");
+    let content = run_fun!(aws s3 cp $s3_path - 2>/dev/null)
+        .map_err(|e| Error::other(format!("Failed to download {STAGE_BLUEPRINT_FILE}: {e}")))?;
 
-fn parse_workflow_config(content: &str) -> Result<WorkflowConfig, Error> {
-    let config: BootstrapClusterConfig = toml::from_str(content)
-        .map_err(|e| Error::other(format!("Failed to parse {BOOTSTRAP_CLUSTER_CONFIG}: {e}")))?;
-
-    let cluster_id = config
-        .global
-        .workflow_cluster_id
-        .clone()
-        .ok_or_else(|| Error::other("workflow_cluster_id not found in config"))?;
-
-    let num_bss = config.global.num_bss_nodes.unwrap_or(1);
-    let num_rss = if config.global.rss_ha_enabled { 2 } else { 1 };
-    let use_etcd = config.global.rss_backend == RssBackend::Etcd;
-    let use_nvme_journal = config.global.journal_type == xtask_common::JournalType::Nvme;
-
-    // Get num_api from config, fallback to counting nodes
-    let num_api = config
-        .global
-        .num_api_servers
-        .unwrap_or_else(|| config.nodes.get("api_server").map(|v| v.len()).unwrap_or(0));
-
-    // Get num_bench from config (bench clients + 1 bench server if present)
-    // Only count if for_bench is true
-    let num_bench = if config.global.for_bench {
-        config.global.num_bench_clients.map(|n| n + 1).unwrap_or(0)
-    } else {
-        0
-    };
-
-    // Count NSS from nodes
-    let num_nss = config.nodes.get("nss_server").map(|v| v.len()).unwrap_or(1);
-
-    Ok(WorkflowConfig {
-        cluster_id,
-        num_bss,
-        num_nss,
-        num_rss,
-        num_api,
-        num_bench,
-        use_etcd,
-        use_nvme_journal,
-    })
-}
-
-fn get_workflow_config(bucket: &str) -> Result<WorkflowConfig, Error> {
-    let s3_path = format!("s3://{bucket}/{BOOTSTRAP_CLUSTER_CONFIG}");
-    let content = run_fun!(aws s3 cp $s3_path - 2>/dev/null).map_err(|e| {
-        Error::other(format!(
-            "Failed to download {BOOTSTRAP_CLUSTER_CONFIG}: {e}"
-        ))
-    })?;
-
-    parse_workflow_config(&content)
+    serde_json::from_str(&content)
+        .map_err(|e| Error::other(format!("Failed to parse {STAGE_BLUEPRINT_FILE}: {e}")))
 }
 
 /// Cached S3 listing for all stages - avoids repeated S3 calls
@@ -115,12 +55,12 @@ pub fn show_progress(target: DeployTarget) -> CmdResult {
             .template("{spinner:.cyan} {msg}")
             .unwrap(),
     );
-    spinner.set_message("Waiting for bootstrap config...");
+    spinner.set_message("Waiting for stage blueprint...");
     spinner.enable_steady_tick(Duration::from_millis(100));
 
-    let config = loop {
-        match get_workflow_config(&bucket) {
-            Ok(config) => break config,
+    let blueprint = loop {
+        match get_blueprint(&bucket) {
+            Ok(bp) => break bp,
             Err(_) => {
                 std::thread::sleep(Duration::from_secs(POLL_INTERVAL_SECS));
             }
@@ -128,19 +68,12 @@ pub fn show_progress(target: DeployTarget) -> CmdResult {
     };
     spinner.finish_and_clear();
 
-    let WorkflowConfig {
-        cluster_id,
-        num_bss,
-        num_nss,
-        num_rss,
-        num_api,
-        num_bench,
-        use_etcd,
-        use_nvme_journal,
-    } = config;
-    let total_nodes = num_bss + num_nss + num_rss + num_api + num_bench;
+    let cluster_id = &blueprint.cluster_id;
 
-    info!("Monitoring bootstrap progress (cluster_id: {cluster_id}, {total_nodes} total nodes)");
+    info!(
+        "Monitoring bootstrap progress (cluster_id: {cluster_id}, {} stages)",
+        blueprint.stages.len()
+    );
 
     let mp = MultiProgress::new();
     let start_time = Instant::now();
@@ -167,62 +100,39 @@ pub fn show_progress(target: DeployTarget) -> CmdResult {
         .template("  {prefix:.green} {msg}")
         .unwrap();
 
-    let mut bars: Vec<(ProgressBar, &StageInfo, usize, bool)> = Vec::new();
+    let mut bars: Vec<(ProgressBar, &StageBlueprintEntry, bool)> = Vec::new();
 
-    for stage in STAGES {
-        if stage.name == stage_names::ETCD_READY && !use_etcd {
-            continue;
-        }
-        // Skip mirrord stage when not using NVMe journal
-        if stage.name == stage_names::MIRRORD_READY && !use_nvme_journal {
-            continue;
-        }
-
-        let expected = if stage.is_global {
-            1
-        } else if stage.name == stage_names::NSS_FORMATTED {
-            num_nss
-        } else if stage.name == stage_names::MIRRORD_READY {
-            // Only standby (nss-B) publishes mirrord-ready
-            1
-        } else if stage.name == stage_names::NSS_JOURNAL_READY {
-            // Only active (nss-A) publishes journal-ready in HA mode (both NVMe and EBS)
-            // Solo mode: the single node publishes
-            1
-        } else if stage.name == stage_names::BSS_CONFIGURED {
-            num_bss
-        } else {
-            total_nodes
-        };
-
-        let pb = mp.add(ProgressBar::new(expected as u64));
+    for stage in &blueprint.stages {
+        let pb = mp.add(ProgressBar::new(stage.expected as u64));
         if stage.is_global {
             pb.set_style(style_global_pending.clone());
         } else {
             pb.set_style(style_pending.clone());
         }
         pb.set_prefix("[  ]");
-        pb.set_message(stage.desc.to_string());
-        bars.push((pb, stage, expected, false)); // false = not finished
+        pb.set_message(stage.desc.clone());
+        bars.push((pb, stage, false));
     }
 
     loop {
         // Single S3 call per iteration - fetch all stage data at once
-        let cache = StageCache::fetch(&bucket, &cluster_id);
+        let cache = StageCache::fetch(&bucket, cluster_id);
         let mut all_complete = true;
 
-        for (pb, stage, expected, finished) in &mut bars {
+        for (pb, stage, finished) in &mut bars {
             if *finished {
                 continue;
             }
 
-            let desc = stage.desc;
+            let desc = &stage.desc;
+            let expected = stage.expected;
+
             if stage.is_global {
-                let complete = cache.check_global_stage(stage.name);
+                let complete = cache.check_global_stage(&stage.name);
                 if complete {
                     pb.set_style(style_global_done.clone());
                     pb.set_prefix("[OK]");
-                    pb.finish_with_message(desc.to_string());
+                    pb.finish_with_message(desc.clone());
                     *finished = true;
                 } else {
                     all_complete = false;
@@ -230,10 +140,10 @@ pub fn show_progress(target: DeployTarget) -> CmdResult {
                     pb.set_prefix("[..]");
                 }
             } else {
-                let count = cache.count_stage_completions(stage.name);
+                let count = cache.count_stage_completions(&stage.name);
                 pb.set_position(count as u64);
 
-                if count >= *expected {
+                if count >= expected {
                     pb.set_style(style_done.clone());
                     pb.set_prefix("[OK]");
                     pb.finish_with_message(format!("{desc}: {count}/{expected}"));
@@ -256,7 +166,7 @@ pub fn show_progress(target: DeployTarget) -> CmdResult {
         }
 
         if start_time.elapsed() > timeout {
-            for (pb, _, _, _) in &bars {
+            for (pb, _, _) in &bars {
                 pb.abandon();
             }
             return Err(Error::other(format!(

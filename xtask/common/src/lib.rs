@@ -12,9 +12,88 @@ use tracing::info;
 use uuid::Uuid;
 
 pub const BOOTSTRAP_CLUSTER_CONFIG: &str = "bootstrap_cluster.toml";
+pub const STAGE_BLUEPRINT_FILE: &str = "stage_blueprint.json";
 
-pub mod workflow_stages;
-pub use workflow_stages::{STAGES, StageInfo};
+/// Stage name constants (used as S3 key prefixes for workflow barriers)
+pub mod stages {
+    pub const INSTANCES_READY: &str = "00-instances-ready";
+    pub const ETCD_READY: &str = "10-etcd-ready";
+    pub const RSS_INITIALIZED: &str = "20-rss-initialized";
+    pub const METADATA_VG_READY: &str = "25-metadata-vg-ready";
+    pub const NSS_FORMATTED: &str = "30-nss-formatted";
+    pub const MIRRORD_READY: &str = "35-mirrord-ready";
+    pub const NSS_JOURNAL_READY: &str = "40-nss-journal-ready";
+    pub const BSS_CONFIGURED: &str = "50-bss-configured";
+    pub const SERVICES_READY: &str = "60-services-ready";
+}
+
+/// A resolved stage entry in the blueprint
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StageBlueprintEntry {
+    pub name: String,
+    pub desc: String,
+    pub is_global: bool,
+    pub expected: usize,
+}
+
+/// Self-contained blueprint for bootstrap progress display
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StageBlueprint {
+    pub cluster_id: String,
+    pub stages: Vec<StageBlueprintEntry>,
+}
+
+/// Generate a stage blueprint from a bootstrap cluster config
+pub fn generate_blueprint(config: &BootstrapClusterConfig) -> StageBlueprint {
+    let num_bss = config.global.num_bss_nodes.unwrap_or(1);
+    let num_nss = config.nodes.get("nss_server").map(|v| v.len()).unwrap_or(1);
+    let num_rss = if config.global.rss_ha_enabled { 2 } else { 1 };
+    let num_api = config
+        .global
+        .num_api_servers
+        .unwrap_or_else(|| config.nodes.get("api_server").map(|v| v.len()).unwrap_or(0));
+    let num_bench = if config.global.for_bench {
+        config.global.num_bench_clients.map(|n| n + 1).unwrap_or(0)
+    } else {
+        0
+    };
+    let all = num_bss + num_nss + num_rss + num_api + num_bench;
+
+    let use_etcd = config.global.rss_backend == RssBackend::Etcd;
+    let use_nvme = config.global.journal_type == JournalType::Nvme;
+
+    let cluster_id = config
+        .global
+        .workflow_cluster_id
+        .clone()
+        .unwrap_or_default();
+
+    // Stage definitions: (name, desc, is_global, expected, include)
+    let stage_defs: &[(&str, &str, bool, usize, bool)] = &[
+        (stages::INSTANCES_READY, "Instances ready", false, all, true),
+        (stages::ETCD_READY, "etcd cluster formed", true, 1, use_etcd),
+        (stages::RSS_INITIALIZED, "RSS config published", true, 1, true),
+        (stages::METADATA_VG_READY, "Metadata VG ready", true, 1, true),
+        (stages::NSS_FORMATTED, "NSS formatted", false, num_nss, true),
+        (stages::MIRRORD_READY, "Mirrord ready", false, 1, use_nvme),
+        (stages::NSS_JOURNAL_READY, "NSS journal ready", false, 1, true),
+        (stages::BSS_CONFIGURED, "BSS configured", false, num_bss, true),
+        (stages::SERVICES_READY, "Services ready", false, all, true),
+    ];
+
+    let stages = stage_defs
+        .iter()
+        .filter(|(_, _, _, _, include)| *include)
+        .map(|(name, desc, is_global, expected, _)| StageBlueprintEntry {
+            name: name.to_string(),
+            desc: desc.to_string(),
+            is_global: *is_global,
+            expected: *expected,
+        })
+        .collect();
+
+    StageBlueprint { cluster_id, stages }
+}
 
 /// AWS credentials + endpoint for DynamoDB Local (used in tests and local development)
 pub const LOCAL_DDB_ENVS: &[&str] = &[

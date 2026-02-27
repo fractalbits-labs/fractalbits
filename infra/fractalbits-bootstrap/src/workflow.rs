@@ -356,8 +356,21 @@ impl EtcdNodeInfo {
     }
 }
 
-pub use xtask_common::workflow_stages::names as stages;
-pub use xtask_common::workflow_stages::timeouts;
+pub use xtask_common::stages;
+
+/// Timeout constants for each stage (in seconds)
+#[allow(dead_code)]
+pub mod timeouts {
+    pub const INSTANCES_READY: u64 = 120;
+    pub const ETCD_READY: u64 = 300;
+    pub const RSS_INITIALIZED: u64 = 300;
+    pub const METADATA_VG_READY: u64 = 300;
+    pub const NSS_FORMATTED: u64 = 300;
+    pub const MIRRORD_READY: u64 = 120;
+    pub const NSS_JOURNAL_READY: u64 = 120;
+    pub const BSS_CONFIGURED: u64 = 300;
+    pub const SERVICES_READY: u64 = 60;
+}
 
 #[cfg(test)]
 mod tests {
