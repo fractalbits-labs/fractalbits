@@ -4,9 +4,9 @@ use crate::{
         ObjectRequestContext,
         common::{list_raw_objects, mpu_get_part_prefix, s3_error::S3Error},
     },
-    object_layout::{MpuState, ObjectLayout, ObjectState},
 };
 use actix_web::HttpResponse;
+use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
 use metrics_wrapper::histogram;
 use nss_codec::delete_inode_response;
 use rkyv::{self, rancor::Error};

@@ -31,8 +31,8 @@ use crate::{
             signature::ChunkSignatureContext,
         },
     },
-    object_layout::*,
 };
+use data_types::object_layout::*;
 
 fn split_chunks_into_blocks(
     chunks: Vec<actix_web::web::Bytes>,
@@ -433,7 +433,7 @@ async fn put_object_streaming_internal(
         .unwrap()
         .as_millis() as u64;
     let etag = blob_guid.blob_id.simple().to_string();
-    let version_id = gen_version_id();
+    let version_id = ObjectLayout::gen_version_id();
 
     // Create object layout
     let object_layout = ObjectLayout {
@@ -653,7 +653,7 @@ async fn put_object_with_no_trailer(
         .unwrap()
         .as_millis() as u64;
     let etag = blob_guid.blob_id.simple().to_string();
-    let version_id = gen_version_id();
+    let version_id = ObjectLayout::gen_version_id();
 
     // Create object layout with calculated checksum
     let object_layout = ObjectLayout {

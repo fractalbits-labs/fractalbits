@@ -13,3 +13,5 @@ blake2.workspace = true
 xxhash-rust.workspace = true
 uuid.workspace = true
 rkyv.workspace = true
+thiserror.workspace = true
+serde_bytes.workspace = true

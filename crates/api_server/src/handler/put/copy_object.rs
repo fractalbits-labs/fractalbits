@@ -15,11 +15,11 @@ use crate::{
         get::get_object_content_as_bytes,
         put::put_object_handler,
     },
-    object_layout::*,
 };
 use actix_web::http::header::{self, HeaderMap, HeaderValue};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use bytes::Bytes;
+use data_types::object_layout::*;
 use data_types::{ApiKey, TraceId, Versioned};
 use serde::Serialize;
 

@@ -6,7 +6,6 @@ mod cache_registry;
 mod config;
 pub mod handler;
 pub mod http_stats;
-mod object_layout;
 pub mod unified_stats;
 
 pub use blob_client::BlobClient;

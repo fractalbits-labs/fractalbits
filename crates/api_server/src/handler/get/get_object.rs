@@ -3,9 +3,6 @@ use std::sync::Arc;
 use crate::{AppState, blob_storage::BlobLocation};
 use crate::{
     BlobClient,
-    object_layout::{MpuState, ObjectState},
-};
-use crate::{
     handler::{
         ObjectRequestContext,
         common::{
@@ -13,7 +10,6 @@ use crate::{
             s3_error::S3Error, xheader,
         },
     },
-    object_layout::ObjectLayout,
 };
 use actix_web::{
     HttpResponse,
@@ -22,6 +18,7 @@ use actix_web::{
 };
 use bytes::Bytes;
 use data_types::DataBlobGuid;
+use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
 use data_types::{Bucket, TraceId};
 use futures::{StreamExt, TryStreamExt, stream};
 use metrics_wrapper::histogram;

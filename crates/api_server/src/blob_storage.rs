@@ -31,14 +31,7 @@ use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
-/// Specifies where a blob should be stored/retrieved from
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BlobLocation {
-    /// Small blobs stored in DataVgProxy
-    DataVgProxy,
-    /// Large blobs stored in S3
-    S3,
-}
+pub use data_types::object_layout::BlobLocation;
 
 #[allow(clippy::enum_variant_names)]
 pub enum BlobStorageImpl {

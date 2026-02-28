@@ -9,7 +9,7 @@ use crate::handler::{
         s3_error::S3Error,
     },
 };
-use crate::object_layout::{MpuState, ObjectLayout, ObjectState, gen_version_id};
+use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
 use rkyv::{self, api::high::to_bytes_in, rancor::Error};
 use serde::Serialize;
 
@@ -48,7 +48,7 @@ pub async fn create_multipart_upload_handler(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    let version_id = gen_version_id();
+    let version_id = ObjectLayout::gen_version_id();
     let object_layout = ObjectLayout {
         version_id,
         block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,

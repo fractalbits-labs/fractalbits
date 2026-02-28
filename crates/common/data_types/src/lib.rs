@@ -2,6 +2,7 @@ mod api_key;
 mod blob_guid;
 mod bucket;
 pub mod hash;
+pub mod object_layout;
 pub mod observer_types;
 mod permission;
 mod trace_id;

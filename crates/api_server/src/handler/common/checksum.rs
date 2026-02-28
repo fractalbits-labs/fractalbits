@@ -6,62 +6,10 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use crc32c::Crc32cHasher as Crc32c;
 use crc32fast::Hasher as Crc32;
 use crc64fast_nvme::Digest as Crc64Nvme;
-use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Serialize, Deserialize)]
-pub enum ChecksumAlgorithm {
-    Crc32,
-    Crc32c,
-    Crc64Nvme,
-    Sha1,
-    Sha256,
-}
-
-#[derive(
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Clone,
-    Copy,
-    Debug,
-    Serialize,
-    Deserialize,
-)]
-pub enum ChecksumValue {
-    Crc32(#[serde(with = "serde_bytes")] [u8; 4]),
-    Crc32c(#[serde(with = "serde_bytes")] [u8; 4]),
-    Crc64Nvme(#[serde(with = "serde_bytes")] [u8; 8]),
-    Sha1(#[serde(with = "serde_bytes")] [u8; 20]),
-    Sha256(#[serde(with = "serde_bytes")] [u8; 32]),
-}
-
-impl ChecksumValue {
-    pub fn algorithm(&self) -> ChecksumAlgorithm {
-        match self {
-            ChecksumValue::Crc32(_) => ChecksumAlgorithm::Crc32,
-            ChecksumValue::Crc32c(_) => ChecksumAlgorithm::Crc32c,
-            ChecksumValue::Crc64Nvme(_) => ChecksumAlgorithm::Crc64Nvme,
-            ChecksumValue::Sha1(_) => ChecksumAlgorithm::Sha1,
-            ChecksumValue::Sha256(_) => ChecksumAlgorithm::Sha256,
-        }
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        match self {
-            ChecksumValue::Crc32(bytes) => bytes,
-            ChecksumValue::Crc32c(bytes) => bytes,
-            ChecksumValue::Crc64Nvme(bytes) => bytes,
-            ChecksumValue::Sha1(bytes) => bytes,
-            ChecksumValue::Sha256(bytes) => bytes,
-        }
-    }
-}
+pub use data_types::object_layout::{ChecksumAlgorithm, ChecksumValue};
 
 pub enum Checksummer {
     Crc32(Crc32),

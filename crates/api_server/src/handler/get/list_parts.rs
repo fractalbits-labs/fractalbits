@@ -10,9 +10,9 @@ use crate::handler::common::{
     s3_error::S3Error,
     time,
 };
-use crate::object_layout::{MpuState, ObjectState};
 use actix_web::web::Query;
 use base64::prelude::*;
+use data_types::object_layout::{MpuState, ObjectState};
 use data_types::{Bucket, TraceId};
 use serde::{Deserialize, Serialize};
 

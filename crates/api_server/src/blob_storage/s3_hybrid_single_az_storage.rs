@@ -1,9 +1,10 @@
 use super::{
     BlobLocation, BlobStorageError, DataVgProxy, blob_key, chunks_to_bytestream, create_s3_client,
 };
-use crate::{config::S3HybridSingleAzConfig, object_layout::ObjectLayout};
+use crate::config::S3HybridSingleAzConfig;
 use aws_sdk_s3::Client as S3Client;
 use bytes::Bytes;
+use data_types::object_layout::ObjectLayout;
 use data_types::{DataBlobGuid, DataVgInfo, TraceId, Volume};
 use metrics_wrapper::histogram;
 use std::{

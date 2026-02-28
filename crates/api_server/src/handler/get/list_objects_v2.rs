@@ -3,7 +3,6 @@ use nss_codec::list_inodes_response;
 use rpc_client_common::nss_rpc_retry;
 use std::sync::Arc;
 
-use crate::object_layout::ObjectLayout;
 use crate::{
     AppState,
     handler::{
@@ -15,6 +14,7 @@ use crate::{
         },
     },
 };
+use data_types::object_layout::ObjectLayout;
 use data_types::{Bucket, TraceId};
 use rkyv::{self, rancor::Error};
 use serde::{Deserialize, Serialize};

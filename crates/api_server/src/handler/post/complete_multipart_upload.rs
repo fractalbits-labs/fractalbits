@@ -1,22 +1,20 @@
-use crate::{
-    handler::{
-        ObjectRequestContext,
-        common::{
-            buffer_payload,
-            checksum::{ChecksumAlgorithm, ChecksumValue, Checksummer},
-            extract_metadata_headers, gen_etag, get_raw_object, list_raw_objects,
-            mpu_get_part_prefix, mpu_parse_part_number,
-            response::xml::{Xml, XmlnsS3},
-            s3_error::S3Error,
-        },
-        delete::delete_object_handler,
+use crate::handler::{
+    ObjectRequestContext,
+    common::{
+        buffer_payload,
+        checksum::{ChecksumAlgorithm, ChecksumValue, Checksummer},
+        extract_metadata_headers, gen_etag, get_raw_object, list_raw_objects, mpu_get_part_prefix,
+        mpu_parse_part_number,
+        response::xml::{Xml, XmlnsS3},
+        s3_error::S3Error,
     },
-    object_layout::{MpuState, ObjectCoreMetaData, ObjectState},
+    delete::delete_object_handler,
 };
 use actix_web::http::header::HeaderValue;
 use actix_web::web::Bytes;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use bytes::Buf;
+use data_types::object_layout::{MpuState, ObjectCoreMetaData, ObjectState};
 use nss_codec::put_inode_response;
 use rkyv::{self, api::high::to_bytes_in, rancor::Error};
 use rpc_client_common::nss_rpc_retry;

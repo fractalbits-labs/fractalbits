@@ -919,6 +919,13 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for S3Error {
     }
 }
 
+impl From<data_types::object_layout::ObjectLayoutError> for S3Error {
+    fn from(value: data_types::object_layout::ObjectLayoutError) -> Self {
+        tracing::error!("ObjectLayoutError: {value}");
+        Self::InvalidObjectState
+    }
+}
+
 impl From<BlobStorageError> for S3Error {
     fn from(err: BlobStorageError) -> Self {
         tracing::error!("blob storage error: {}", err);

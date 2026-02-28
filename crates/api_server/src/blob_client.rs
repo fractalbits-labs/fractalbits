@@ -4,10 +4,10 @@ use crate::{
         S3ExpressMultiAzStorage, S3HybridSingleAzStorage,
     },
     config::{BlobStorageBackend, BlobStorageConfig},
-    object_layout::ObjectLayout,
 };
 use bytes::Bytes;
 use data_blob_tracking::DataBlobTracker;
+use data_types::object_layout::ObjectLayout;
 use data_types::{DataBlobGuid, TraceId};
 use moka::future::Cache;
 use std::{sync::Arc, time::Duration};

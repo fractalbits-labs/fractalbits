@@ -49,12 +49,14 @@ pub async fn abort_multipart_upload_handler(
     };
 
     // Verify upload_id matches and mark as aborted
-    let mut object = rkyv::from_bytes::<crate::object_layout::ObjectLayout, Error>(&object_bytes)?;
+    let mut object =
+        rkyv::from_bytes::<data_types::object_layout::ObjectLayout, Error>(&object_bytes)?;
     if object.version_id.simple().to_string() != upload_id {
         return Err(S3Error::NoSuchUpload);
     }
 
-    object.state = crate::object_layout::ObjectState::Mpu(crate::object_layout::MpuState::Aborted);
+    object.state =
+        data_types::object_layout::ObjectState::Mpu(data_types::object_layout::MpuState::Aborted);
     let new_object_bytes: Bytes = to_bytes_in::<_, Error>(&object, Vec::new())?.into();
 
     let resp = nss_rpc_retry!(

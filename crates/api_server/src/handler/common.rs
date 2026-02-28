@@ -7,12 +7,10 @@ pub mod signature;
 pub mod time;
 pub mod xheader;
 
-use crate::{
-    AppState,
-    object_layout::{HeaderList, ObjectLayout},
-};
+use crate::AppState;
 use actix_web::http::header::{self, HeaderMap};
 use data_types::TraceId;
+use data_types::object_layout::{HeaderList, ObjectLayout};
 use futures::StreamExt;
 use rand::Rng;
 use rkyv::{self, rancor::Error};
