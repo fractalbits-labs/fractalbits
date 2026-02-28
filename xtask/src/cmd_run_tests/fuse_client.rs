@@ -39,6 +39,79 @@ pub async fn run_fuse_client_tests() -> CmdResult {
         return Err(e);
     }
 
+    // Phase 2: Write tests
+    println!("\n{}", "=== Test: Create, Write, Read via FUSE ===".bold());
+    if let Err(e) = test_create_write_read().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!("\n{}", "=== Test: Mkdir and Rmdir via FUSE ===".bold());
+    if let Err(e) = test_mkdir_rmdir().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!("\n{}", "=== Test: Unlink via FUSE ===".bold());
+    if let Err(e) = test_unlink().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!("\n{}", "=== Test: Rename via FUSE ===".bold());
+    if let Err(e) = test_rename().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!(
+        "\n{}",
+        "=== Test: Unlink with Open Handle via FUSE ===".bold()
+    );
+    if let Err(e) = test_unlink_open_handle().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!(
+        "\n{}",
+        "=== Test: Overwrite Existing File via FUSE ===".bold()
+    );
+    if let Err(e) = test_overwrite_existing().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!(
+        "\n{}",
+        "=== Test: Rename No-Replace (EEXIST) via FUSE ===".bold()
+    );
+    if let Err(e) = test_rename_noreplace().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!("\n{}", "=== Test: Truncate Write via FUSE ===".bold());
+    if let Err(e) = test_truncate_write().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!(
+        "\n{}",
+        "=== Test: Write in Subdirectory via FUSE ===".bold()
+    );
+    if let Err(e) = test_write_in_subdirectory().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!("\n{}", "=== Test: Rename Directory via FUSE ===".bold());
+    if let Err(e) = test_rename_directory().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
     println!(
         "\n{}",
         "=== All FUSE Client Tests PASSED ===".green().bold()
@@ -54,6 +127,14 @@ fn fuse_binary_path() -> String {
 }
 
 fn mount_fuse(bucket: &str) -> CmdResult {
+    mount_fuse_with_opts(bucket, false)
+}
+
+fn mount_fuse_rw(bucket: &str) -> CmdResult {
+    mount_fuse_with_opts(bucket, true)
+}
+
+fn mount_fuse_with_opts(bucket: &str, read_write: bool) -> CmdResult {
     let binary = fuse_binary_path();
     let mount_point = MOUNT_POINT;
 
@@ -61,8 +142,12 @@ fn mount_fuse(bucket: &str) -> CmdResult {
     run_cmd!(mkdir -p $mount_point)?;
 
     // Start fuse_client as a background process
+    let mut args = vec!["-b", bucket, "-m", mount_point];
+    if read_write {
+        args.push("-r");
+    }
     std::process::Command::new(&binary)
-        .args(["-b", bucket, "-m", mount_point])
+        .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -487,5 +572,547 @@ async fn test_nested_directories() -> CmdResult {
         "{}",
         "SUCCESS: Nested directory structure test passed".green()
     );
+    Ok(())
+}
+
+// Phase 2: Write tests
+
+async fn test_create_write_read() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    // Step 2: Create and write files via FUSE
+    println!("  Step 2: Create and write files via FUSE");
+    let test_data = b"Hello from FUSE write!";
+    let fuse_path = format!("{}/write-test.txt", MOUNT_POINT);
+    std::fs::write(&fuse_path, test_data)
+        .map_err(|e| std::io::Error::other(format!("Failed to write file: {e}")))?;
+    println!("    Written: write-test.txt ({} bytes)", test_data.len());
+
+    // Step 3: Read back via FUSE and verify
+    println!("  Step 3: Read back and verify");
+    let read_back = std::fs::read(&fuse_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read back: {e}")))?;
+    if read_back != test_data {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "Data mismatch: expected {} bytes, got {}",
+            test_data.len(),
+            read_back.len()
+        )));
+    }
+    println!("    write-test.txt content: OK");
+
+    // Step 4: Write a larger file
+    println!("  Step 4: Write a larger file (64KB)");
+    let large_data = generate_test_data("large-write", 64 * 1024);
+    let large_path = format!("{}/large-write.bin", MOUNT_POINT);
+    std::fs::write(&large_path, &large_data)
+        .map_err(|e| std::io::Error::other(format!("Failed to write large file: {e}")))?;
+
+    let large_read = std::fs::read(&large_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read back large file: {e}")))?;
+    if large_read != large_data {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "Large file data mismatch: expected {} bytes, got {}",
+            large_data.len(),
+            large_read.len()
+        )));
+    }
+    println!("    large-write.bin (64KB): OK");
+
+    // Step 5: Verify file appears in directory listing
+    println!("  Step 5: Verify files appear in listing");
+    let entries: Vec<String> = std::fs::read_dir(MOUNT_POINT)
+        .map_err(|e| std::io::Error::other(format!("Failed to list root: {e}")))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    if !entries.contains(&"write-test.txt".to_string()) {
+        unmount_fuse()?;
+        return Err(std::io::Error::other("write-test.txt not found in listing"));
+    }
+    println!("    write-test.txt in listing: OK");
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: Create/write/read test passed".green());
+    Ok(())
+}
+
+async fn test_mkdir_rmdir() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    // Create directory
+    println!("  Step 2: Create directory via FUSE");
+    let dir_path = format!("{}/testdir", MOUNT_POINT);
+    std::fs::create_dir(&dir_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to mkdir: {e}")))?;
+    println!("    Created: testdir/");
+
+    // Verify it appears
+    if !Path::new(&dir_path).is_dir() {
+        unmount_fuse()?;
+        return Err(std::io::Error::other("testdir/ is not a directory"));
+    }
+    println!("    testdir/ is a directory: OK");
+
+    // Rmdir
+    println!("  Step 3: Remove empty directory");
+    std::fs::remove_dir(&dir_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to rmdir: {e}")))?;
+    println!("    Removed: testdir/");
+
+    // Verify it's gone
+    if Path::new(&dir_path).exists() {
+        unmount_fuse()?;
+        return Err(std::io::Error::other("testdir/ still exists after rmdir"));
+    }
+    println!("    testdir/ gone: OK");
+
+    // Test non-empty rmdir should fail
+    println!("  Step 4: Verify non-empty rmdir fails");
+    let dir2_path = format!("{}/testdir2", MOUNT_POINT);
+    std::fs::create_dir(&dir2_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to mkdir testdir2: {e}")))?;
+    let file_in_dir = format!("{}/testdir2/file.txt", MOUNT_POINT);
+    std::fs::write(&file_in_dir, b"content")
+        .map_err(|e| std::io::Error::other(format!("Failed to write file in dir: {e}")))?;
+
+    match std::fs::remove_dir(&dir2_path) {
+        Err(e) if e.raw_os_error() == Some(39) => {
+            // ENOTEMPTY = 39 on Linux
+            println!("    Non-empty rmdir correctly returned ENOTEMPTY");
+        }
+        Err(e) => {
+            println!(
+                "    Non-empty rmdir returned error: {} (expected ENOTEMPTY)",
+                e
+            );
+        }
+        Ok(()) => {
+            unmount_fuse()?;
+            return Err(std::io::Error::other(
+                "Non-empty rmdir should have failed but succeeded",
+            ));
+        }
+    }
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: Mkdir/rmdir test passed".green());
+    Ok(())
+}
+
+async fn test_unlink() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    // Create file
+    println!("  Step 2: Create file then unlink");
+    let file_path = format!("{}/to-delete.txt", MOUNT_POINT);
+    std::fs::write(&file_path, b"delete me")
+        .map_err(|e| std::io::Error::other(format!("Failed to write: {e}")))?;
+    println!("    Created: to-delete.txt");
+
+    // Verify exists
+    if !Path::new(&file_path).exists() {
+        unmount_fuse()?;
+        return Err(std::io::Error::other("to-delete.txt should exist"));
+    }
+
+    // Unlink
+    std::fs::remove_file(&file_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to unlink: {e}")))?;
+    println!("    Unlinked: to-delete.txt");
+
+    // Verify gone
+    if Path::new(&file_path).exists() {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(
+            "to-delete.txt still exists after unlink",
+        ));
+    }
+    println!("    to-delete.txt gone: OK");
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: Unlink test passed".green());
+    Ok(())
+}
+
+async fn test_rename() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    // Create file
+    println!("  Step 2: Create file and rename");
+    let src_path = format!("{}/original.txt", MOUNT_POINT);
+    let dst_path = format!("{}/renamed.txt", MOUNT_POINT);
+    let content = b"rename me";
+    std::fs::write(&src_path, content)
+        .map_err(|e| std::io::Error::other(format!("Failed to write: {e}")))?;
+    println!("    Created: original.txt");
+
+    // Rename
+    std::fs::rename(&src_path, &dst_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to rename: {e}")))?;
+    println!("    Renamed: original.txt -> renamed.txt");
+
+    // Verify old path gone
+    if Path::new(&src_path).exists() {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(
+            "original.txt still exists after rename",
+        ));
+    }
+    println!("    original.txt gone: OK");
+
+    // Verify new path has correct content
+    let read_back = std::fs::read(&dst_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read renamed file: {e}")))?;
+    if read_back != content {
+        unmount_fuse()?;
+        return Err(std::io::Error::other("renamed.txt content mismatch"));
+    }
+    println!("    renamed.txt content: OK");
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: Rename test passed".green());
+    Ok(())
+}
+
+async fn test_unlink_open_handle() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    // Create file
+    println!("  Step 2: Create file and open a read handle");
+    let file_path = format!("{}/open-del.txt", MOUNT_POINT);
+    let content = b"still readable after unlink";
+    std::fs::write(&file_path, content)
+        .map_err(|e| std::io::Error::other(format!("Failed to write: {e}")))?;
+    println!("    Created: open-del.txt");
+
+    // Open the file and keep the handle
+    let mut file = std::fs::File::open(&file_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to open: {e}")))?;
+    println!("    Opened read handle");
+
+    // Unlink while fd is open
+    println!("  Step 3: Unlink while handle is open");
+    std::fs::remove_file(&file_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to unlink: {e}")))?;
+    println!("    Unlinked: open-del.txt");
+
+    // Verify path is gone
+    if Path::new(&file_path).exists() {
+        drop(file);
+        unmount_fuse()?;
+        return Err(std::io::Error::other(
+            "open-del.txt still exists after unlink",
+        ));
+    }
+    println!("    Path is gone (ENOENT): OK");
+
+    // Read from still-open handle - blob data should still be accessible
+    println!("  Step 4: Read from open handle after unlink");
+    use std::io::Read;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|e| std::io::Error::other(format!("Failed to read from open handle: {e}")))?;
+    if buf != content {
+        drop(file);
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "Content mismatch from open handle: expected {} bytes, got {}",
+            content.len(),
+            buf.len()
+        )));
+    }
+    println!("    Read from open handle: OK ({} bytes)", buf.len());
+
+    // Close handle (triggers deferred blob cleanup)
+    drop(file);
+    println!("    Closed handle (deferred cleanup triggered)");
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: Unlink with open handle test passed".green());
+    Ok(())
+}
+
+async fn test_overwrite_existing() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    // Create original file
+    println!("  Step 2: Create original file");
+    let file_path = format!("{}/overwrite.txt", MOUNT_POINT);
+    let original = b"0123456789";
+    std::fs::write(&file_path, original)
+        .map_err(|e| std::io::Error::other(format!("Failed to write original: {e}")))?;
+    println!("    Created: overwrite.txt (10 bytes)");
+
+    // Open for write without truncate, write at offset 3
+    println!("  Step 3: Partial overwrite at offset 3");
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .map_err(|e| std::io::Error::other(format!("Failed to open for write: {e}")))?;
+        file.seek(SeekFrom::Start(3))
+            .map_err(|e| std::io::Error::other(format!("Failed to seek: {e}")))?;
+        file.write_all(b"XYZ")
+            .map_err(|e| std::io::Error::other(format!("Failed to write: {e}")))?;
+        file.flush()
+            .map_err(|e| std::io::Error::other(format!("Failed to flush: {e}")))?;
+    }
+    println!("    Wrote 'XYZ' at offset 3");
+
+    // Read back and verify
+    println!("  Step 4: Verify merged content");
+    let result = std::fs::read(&file_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read back: {e}")))?;
+    let expected = b"012XYZ6789";
+    if result != expected {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "Content mismatch: expected {:?}, got {:?}",
+            String::from_utf8_lossy(expected),
+            String::from_utf8_lossy(&result)
+        )));
+    }
+    println!(
+        "    Content after overwrite: OK ({:?})",
+        String::from_utf8_lossy(&result)
+    );
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: Overwrite existing file test passed".green());
+    Ok(())
+}
+
+/// Design doc test 7: rename when destination exists should return EEXIST.
+async fn test_rename_noreplace() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    // Create source and destination files
+    println!("  Step 2: Create source and destination files");
+    let src_path = format!("{}/rename-src.txt", MOUNT_POINT);
+    let dst_path = format!("{}/rename-dst.txt", MOUNT_POINT);
+    std::fs::write(&src_path, b"source content")
+        .map_err(|e| std::io::Error::other(format!("Failed to write src: {e}")))?;
+    std::fs::write(&dst_path, b"destination content")
+        .map_err(|e| std::io::Error::other(format!("Failed to write dst: {e}")))?;
+    println!("    Created: rename-src.txt and rename-dst.txt");
+
+    // Rename should fail with EEXIST since destination exists
+    println!("  Step 3: Rename with existing destination should return EEXIST");
+    match std::fs::rename(&src_path, &dst_path) {
+        Err(e) if e.raw_os_error() == Some(17) => {
+            // EEXIST = 17 on Linux
+            println!("    Rename correctly returned EEXIST");
+        }
+        Err(e) => {
+            unmount_fuse()?;
+            return Err(std::io::Error::other(format!(
+                "Expected EEXIST, got error: {} (raw_os_error={:?})",
+                e,
+                e.raw_os_error()
+            )));
+        }
+        Ok(()) => {
+            unmount_fuse()?;
+            return Err(std::io::Error::other(
+                "Rename should have failed with EEXIST but succeeded",
+            ));
+        }
+    }
+
+    // Verify both files are unchanged
+    println!("  Step 4: Verify both files are unchanged");
+    let src_data = std::fs::read(&src_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read src: {e}")))?;
+    let dst_data = std::fs::read(&dst_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read dst: {e}")))?;
+    if src_data != b"source content" {
+        unmount_fuse()?;
+        return Err(std::io::Error::other("Source file content changed"));
+    }
+    if dst_data != b"destination content" {
+        unmount_fuse()?;
+        return Err(std::io::Error::other("Destination file content changed"));
+    }
+    println!("    Both files unchanged: OK");
+
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: Rename no-replace (EEXIST) test passed".green()
+    );
+    Ok(())
+}
+
+/// Test O_TRUNC: writing to existing file with truncation replaces content.
+async fn test_truncate_write() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    // Create original file with some content
+    println!("  Step 2: Create original file");
+    let file_path = format!("{}/trunc.txt", MOUNT_POINT);
+    std::fs::write(&file_path, b"original long content here")
+        .map_err(|e| std::io::Error::other(format!("Failed to write original: {e}")))?;
+    println!("    Created: trunc.txt (26 bytes)");
+
+    // Overwrite with shorter content using std::fs::write (which uses O_TRUNC)
+    println!("  Step 3: Overwrite with O_TRUNC (shorter content)");
+    std::fs::write(&file_path, b"short")
+        .map_err(|e| std::io::Error::other(format!("Failed to truncate-write: {e}")))?;
+    println!("    Wrote 'short' with O_TRUNC");
+
+    // Read back and verify only new content is present
+    println!("  Step 4: Verify truncated content");
+    let result = std::fs::read(&file_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read back: {e}")))?;
+    if result != b"short" {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "Content mismatch: expected 'short', got {:?} ({} bytes)",
+            String::from_utf8_lossy(&result),
+            result.len()
+        )));
+    }
+    println!(
+        "    Content after truncate: OK ({:?})",
+        String::from_utf8_lossy(&result)
+    );
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: Truncate write test passed".green());
+    Ok(())
+}
+
+/// Test creating files inside a mkdir'd subdirectory.
+async fn test_write_in_subdirectory() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    // Create a subdirectory
+    println!("  Step 2: Create subdirectory");
+    let dir_path = format!("{}/subdir", MOUNT_POINT);
+    std::fs::create_dir(&dir_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to mkdir: {e}")))?;
+    println!("    Created: subdir/");
+
+    // Write files into subdirectory
+    println!("  Step 3: Write files into subdirectory");
+    let file1 = format!("{}/subdir/file1.txt", MOUNT_POINT);
+    let file2 = format!("{}/subdir/file2.txt", MOUNT_POINT);
+    std::fs::write(&file1, b"content one")
+        .map_err(|e| std::io::Error::other(format!("Failed to write file1: {e}")))?;
+    std::fs::write(&file2, b"content two")
+        .map_err(|e| std::io::Error::other(format!("Failed to write file2: {e}")))?;
+    println!("    Written: subdir/file1.txt and subdir/file2.txt");
+
+    // Read back and verify
+    println!("  Step 4: Read back and verify");
+    let data1 = std::fs::read(&file1)
+        .map_err(|e| std::io::Error::other(format!("Failed to read file1: {e}")))?;
+    let data2 = std::fs::read(&file2)
+        .map_err(|e| std::io::Error::other(format!("Failed to read file2: {e}")))?;
+    if data1 != b"content one" || data2 != b"content two" {
+        unmount_fuse()?;
+        return Err(std::io::Error::other("Subdirectory file content mismatch"));
+    }
+    println!("    Content verified: OK");
+
+    // Remount to clear all kernel and FUSE-side caches, then verify listing
+    println!("  Step 5: Remount and verify subdirectory listing");
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket)?;
+    let entries: Vec<String> = std::fs::read_dir(&dir_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to list subdir: {e}")))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    println!("    Listing: {:?}", entries);
+    for expected in &["file1.txt", "file2.txt"] {
+        if !entries.contains(&expected.to_string()) {
+            unmount_fuse()?;
+            return Err(std::io::Error::other(format!(
+                "Missing entry in subdir listing: {expected}"
+            )));
+        }
+    }
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: Write in subdirectory test passed".green());
+    Ok(())
+}
+
+/// Test renaming a directory (rename_folder path).
+async fn test_rename_directory() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    // Create directory with files
+    println!("  Step 2: Create directory with files");
+    let src_dir = format!("{}/srcdir", MOUNT_POINT);
+    std::fs::create_dir(&src_dir)
+        .map_err(|e| std::io::Error::other(format!("Failed to mkdir srcdir: {e}")))?;
+    let child_file = format!("{}/srcdir/child.txt", MOUNT_POINT);
+    std::fs::write(&child_file, b"child content")
+        .map_err(|e| std::io::Error::other(format!("Failed to write child: {e}")))?;
+    println!("    Created: srcdir/child.txt");
+
+    // Rename directory
+    println!("  Step 3: Rename directory");
+    let dst_dir = format!("{}/dstdir", MOUNT_POINT);
+    std::fs::rename(&src_dir, &dst_dir)
+        .map_err(|e| std::io::Error::other(format!("Failed to rename dir: {e}")))?;
+    println!("    Renamed: srcdir/ -> dstdir/");
+
+    // Verify old path gone
+    if Path::new(&src_dir).exists() {
+        unmount_fuse()?;
+        return Err(std::io::Error::other("srcdir still exists after rename"));
+    }
+    println!("    srcdir/ gone: OK");
+
+    // Verify child accessible at new path
+    println!("  Step 4: Verify child at new path");
+    let new_child = format!("{}/dstdir/child.txt", MOUNT_POINT);
+    let data = std::fs::read(&new_child)
+        .map_err(|e| std::io::Error::other(format!("Failed to read dstdir/child.txt: {e}")))?;
+    if data != b"child content" {
+        unmount_fuse()?;
+        return Err(std::io::Error::other("dstdir/child.txt content mismatch"));
+    }
+    println!("    dstdir/child.txt content: OK");
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: Rename directory test passed".green());
     Ok(())
 }
