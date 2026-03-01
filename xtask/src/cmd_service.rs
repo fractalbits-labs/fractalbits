@@ -344,6 +344,7 @@ pub fn init_service(
         ServiceName::NssRoleAgentA | ServiceName::NssRoleAgentB => {}
         ServiceName::Mirrord => init_mirrord()?,
         ServiceName::Etcd => init_etcd()?,
+        ServiceName::FsServer => {}
         ServiceName::All => {
             if init_config.with_https {
                 generate_https_certificates()?;
@@ -972,7 +973,8 @@ fn create_systemd_unit_files_for_init(
         | ServiceName::Minio
         | ServiceName::MinioAz1
         | ServiceName::MinioAz2
-        | ServiceName::Etcd => {
+        | ServiceName::Etcd
+        | ServiceName::FsServer => {
             create_systemd_unit_file(service, build_mode, init_config)?;
         }
         ServiceName::All => {
@@ -1166,6 +1168,10 @@ Environment="MINIO_REGION=localdev""##
                 "{etcd_bin} --data-dir=./etcd --listen-client-urls=http://localhost:2379 --advertise-client-urls=http://localhost:2379"
             )
         }
+        ServiceName::FsServer => {
+            env_settings += &format!("\nEnvironmentFile=-{pwd}/data/etc/fs_server.env");
+            resolve_binary_path("fs_server", build_mode)
+        }
         _ => unreachable!(),
     };
     let working_dir = format!("{}/data", run_fun!(realpath $pwd)?);
@@ -1188,6 +1194,9 @@ Environment="MINIO_REGION=localdev""##
                     "After=rss.service nss_role_agent_a.service minio.service\nWants=rss.service nss_role_agent_a.service minio.service\n".to_string()
                 }
             }
+        }
+        ServiceName::FsServer => {
+            "After=rss.service nss_role_agent_a.service\nWants=rss.service nss_role_agent_a.service\n".to_string()
         }
         _ => String::new(),
     };
@@ -1319,6 +1328,7 @@ pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdRes
             }
         }
         ServiceName::Etcd => ("port 2379", vec![2379]),
+        ServiceName::FsServer => ("mountpoint check", vec![]),
         ServiceName::All => unreachable!("Should not check readiness for All"),
     };
 

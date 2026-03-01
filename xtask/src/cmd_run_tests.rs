@@ -1,5 +1,5 @@
 pub mod bss_node_failure;
-pub mod fuse_client;
+pub mod fs_server;
 pub mod leader_election;
 pub mod multi_az;
 pub mod nss_ha_failover;
@@ -79,7 +79,9 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         Ok(())
     };
 
-    let test_fuse_client = || async {
+    let test_fs_server = || async {
+        fs_server::build_fs_server()?;
+        fs_server::ensure_fuse_uring()?;
         cmd_service::init_service(
             ServiceName::All,
             BuildMode::Debug,
@@ -90,7 +92,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
             },
         )?;
         cmd_service::start_service(ServiceName::All)?;
-        fuse_client::run_fuse_client_tests().await?;
+        fs_server::run_fs_server_tests().await?;
         cmd_service::stop_service(ServiceName::All)
     };
 
@@ -103,7 +105,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         TestType::BssNodeFailure => test_bss_node_failure().await,
         TestType::NssHaWithMirrord => test_nss_ha_with_mirrord().await,
         TestType::NssHaWithEBS => test_nss_ha_with_ebs().await,
-        TestType::FuseClient => test_fuse_client().await,
+        TestType::FsServer => test_fs_server().await,
         TestType::All => {
             test_leader_election()?;
             multi_az::run_multi_az_tests(MultiAzTestType::All).await

@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+default = ["tokio-runtime"]
+tokio-runtime = []
 metrics = ["metrics_wrapper/metrics", "dep:metrics"]
 
 [dependencies]

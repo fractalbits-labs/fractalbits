@@ -438,6 +438,7 @@ pub enum ServiceName {
     MinioAz2,
     DdbLocal,
     Etcd,
+    FsServer,
 }
 
 impl ServiceName {
@@ -619,7 +620,7 @@ pub enum TestType {
     BssNodeFailure,
     NssHaWithMirrord,
     NssHaWithEBS,
-    FuseClient,
+    FsServer,
 }
 
 #[derive(Parser, Clone, EnumString)]

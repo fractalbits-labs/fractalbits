@@ -1,4 +1,5 @@
-use crate::CmdResult;
+use crate::cmd_service;
+use crate::{CmdResult, ServiceName};
 use aws_sdk_s3::primitives::ByteStream;
 use cmd_lib::*;
 use colored::*;
@@ -6,25 +7,25 @@ use std::path::Path;
 use std::time::Duration;
 use test_common::*;
 
-const MOUNT_POINT: &str = "/tmp/fuse_client_test";
-const BUCKET_NAME: &str = "test-fuse";
+const MOUNT_POINT: &str = "/tmp/fs_server_test";
+const BUCKET_NAME: &str = "test-file-server";
 
-pub async fn run_fuse_client_tests() -> CmdResult {
-    info!("Running FUSE client integration tests...");
+pub async fn run_fs_server_tests() -> CmdResult {
+    info!("Running fs_server integration tests...");
 
-    println!("\n{}", "=== Test: Basic File Read via FUSE ===".bold());
+    println!("\n{}", "=== Test: Basic File Read ===".bold());
     if let Err(e) = test_basic_file_read().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
     }
 
-    println!("\n{}", "=== Test: Directory Listing via FUSE ===".bold());
+    println!("\n{}", "=== Test: Directory Listing ===".bold());
     if let Err(e) = test_directory_listing().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
     }
 
-    println!("\n{}", "=== Test: Large File Read via FUSE ===".bold());
+    println!("\n{}", "=== Test: Large File Read ===".bold());
     if let Err(e) = test_large_file_read().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
@@ -32,7 +33,7 @@ pub async fn run_fuse_client_tests() -> CmdResult {
 
     println!(
         "\n{}",
-        "=== Test: Nested Directory Structure via FUSE ===".bold()
+        "=== Test: Nested Directory Structure ===".bold()
     );
     if let Err(e) = test_nested_directories().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
@@ -40,25 +41,25 @@ pub async fn run_fuse_client_tests() -> CmdResult {
     }
 
     // Phase 2: Write tests
-    println!("\n{}", "=== Test: Create, Write, Read via FUSE ===".bold());
+    println!("\n{}", "=== Test: Create, Write, Read ===".bold());
     if let Err(e) = test_create_write_read().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
     }
 
-    println!("\n{}", "=== Test: Mkdir and Rmdir via FUSE ===".bold());
+    println!("\n{}", "=== Test: Mkdir and Rmdir ===".bold());
     if let Err(e) = test_mkdir_rmdir().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
     }
 
-    println!("\n{}", "=== Test: Unlink via FUSE ===".bold());
+    println!("\n{}", "=== Test: Unlink ===".bold());
     if let Err(e) = test_unlink().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
     }
 
-    println!("\n{}", "=== Test: Rename via FUSE ===".bold());
+    println!("\n{}", "=== Test: Rename ===".bold());
     if let Err(e) = test_rename().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
@@ -66,7 +67,7 @@ pub async fn run_fuse_client_tests() -> CmdResult {
 
     println!(
         "\n{}",
-        "=== Test: Unlink with Open Handle via FUSE ===".bold()
+        "=== Test: Unlink with Open Handle ===".bold()
     );
     if let Err(e) = test_unlink_open_handle().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
@@ -75,7 +76,7 @@ pub async fn run_fuse_client_tests() -> CmdResult {
 
     println!(
         "\n{}",
-        "=== Test: Overwrite Existing File via FUSE ===".bold()
+        "=== Test: Overwrite Existing File ===".bold()
     );
     if let Err(e) = test_overwrite_existing().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
@@ -84,14 +85,14 @@ pub async fn run_fuse_client_tests() -> CmdResult {
 
     println!(
         "\n{}",
-        "=== Test: Rename No-Replace (EEXIST) via FUSE ===".bold()
+        "=== Test: Rename No-Replace (EEXIST) ===".bold()
     );
     if let Err(e) = test_rename_noreplace().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
     }
 
-    println!("\n{}", "=== Test: Truncate Write via FUSE ===".bold());
+    println!("\n{}", "=== Test: Truncate Write ===".bold());
     if let Err(e) = test_truncate_write().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
@@ -99,31 +100,63 @@ pub async fn run_fuse_client_tests() -> CmdResult {
 
     println!(
         "\n{}",
-        "=== Test: Write in Subdirectory via FUSE ===".bold()
+        "=== Test: Write in Subdirectory ===".bold()
     );
     if let Err(e) = test_write_in_subdirectory().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
     }
 
-    println!("\n{}", "=== Test: Rename Directory via FUSE ===".bold());
+    println!("\n{}", "=== Test: Rename Directory ===".bold());
     if let Err(e) = test_rename_directory().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
     }
 
-    println!(
-        "\n{}",
-        "=== All FUSE Client Tests PASSED ===".green().bold()
-    );
+    println!("\n{}", "=== All FS Server Tests PASSED ===".green().bold());
     Ok(())
 }
 
-fn fuse_binary_path() -> String {
-    format!(
-        "{}/target/debug/fuse_client",
-        env!("CARGO_MANIFEST_DIR").trim_end_matches("/xtask")
-    )
+/// Build the fs_server binary.
+pub fn build_fs_server() -> CmdResult {
+    run_cmd! {
+        info "Building fs_server ...";
+        cargo build -p fs_server;
+    }
+}
+
+/// Enable FUSE io_uring support (requires kernel >= 6.14).
+pub fn ensure_fuse_uring() -> CmdResult {
+    #[rustfmt::skip]
+    let kernel_version = run_fun!(uname -r)?;
+    let parts: Vec<&str> = kernel_version.split('.').collect();
+    let major: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    if major < 6 || (major == 6 && minor < 14) {
+        info!("Kernel {kernel_version} < 6.14, skipping FUSE io_uring enablement");
+        return Ok(());
+    }
+
+    let current =
+        std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring").unwrap_or_default();
+    if current.trim() != "N" {
+        info!("FUSE io_uring already enabled (kernel {kernel_version})");
+        return Ok(());
+    }
+
+    info!("Enabling FUSE io_uring support (kernel {kernel_version})");
+    run_cmd!(sudo sh -c "echo Y > /sys/module/fuse/parameters/enable_uring")?;
+    Ok(())
+}
+
+fn write_fs_server_env(bucket: &str, mount_point: &str, read_write: bool) -> CmdResult {
+    let env_content = format!(
+        "FUSE_BUCKET_NAME={bucket}\nFUSE_MOUNT_POINT={mount_point}\nFUSE_READ_WRITE={read_write}\n"
+    );
+    run_cmd!(mkdir -p data/etc)?;
+    std::fs::write("data/etc/fs_server.env", env_content)?;
+    Ok(())
 }
 
 fn mount_fuse(bucket: &str) -> CmdResult {
@@ -135,23 +168,19 @@ fn mount_fuse_rw(bucket: &str) -> CmdResult {
 }
 
 fn mount_fuse_with_opts(bucket: &str, read_write: bool) -> CmdResult {
-    let binary = fuse_binary_path();
     let mount_point = MOUNT_POINT;
 
     // Create mount point directory
     run_cmd!(mkdir -p $mount_point)?;
 
-    // Start fuse_client as a background process
-    let mut args = vec!["-b", bucket, "-m", mount_point];
-    if read_write {
-        args.push("-r");
-    }
-    std::process::Command::new(&binary)
-        .args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| std::io::Error::other(format!("Failed to spawn fuse_client: {e}")))?;
+    // Write env file and start fs_server via systemd
+    write_fs_server_env(bucket, mount_point, read_write)?;
+    cmd_service::init_service(
+        ServiceName::FsServer,
+        crate::cmd_build::BuildMode::Debug,
+        crate::InitConfig::default(),
+    )?;
+    cmd_service::start_service(ServiceName::FsServer)?;
 
     // Wait for mount to appear (poll up to 10 seconds)
     for i in 0..20 {
@@ -184,8 +213,10 @@ fn unmount_fuse() -> CmdResult {
     if run_cmd!(fusermount3 -u $mount_point 2>/dev/null).is_err() {
         let _ = run_cmd!(fusermount -u $mount_point 2>/dev/null);
     }
-    // Kill any remaining fuse_client processes
-    let _ = run_cmd!(pkill -f "fuse_client.*test-fuse" 2>/dev/null);
+    // Stop fs_server systemd service
+    let _ = cmd_service::stop_service(ServiceName::FsServer);
+    // Kill any remaining fs_server processes
+    let _ = run_cmd!(pkill -f "fs_server" 2>/dev/null);
     std::thread::sleep(Duration::from_millis(500));
     Ok(())
 }
@@ -248,8 +279,8 @@ async fn test_basic_file_read() -> CmdResult {
     println!("  Step 2: Mount FUSE filesystem");
     mount_fuse(&bucket)?;
 
-    // Step 3: Read and verify files via FUSE mount
-    println!("  Step 3: Read and verify files via FUSE mount");
+    // Step 3: Read and verify files mount
+    println!("  Step 3: Read and verify files mount");
     let mut passed = 0;
     let mut failed = 0;
 
@@ -583,15 +614,15 @@ async fn test_create_write_read() -> CmdResult {
     println!("  Step 1: Mount FUSE in read-write mode");
     mount_fuse_rw(&bucket)?;
 
-    // Step 2: Create and write files via FUSE
-    println!("  Step 2: Create and write files via FUSE");
+    // Step 2: Create and write files
+    println!("  Step 2: Create and write files");
     let test_data = b"Hello from FUSE write!";
     let fuse_path = format!("{}/write-test.txt", MOUNT_POINT);
     std::fs::write(&fuse_path, test_data)
         .map_err(|e| std::io::Error::other(format!("Failed to write file: {e}")))?;
     println!("    Written: write-test.txt ({} bytes)", test_data.len());
 
-    // Step 3: Read back via FUSE and verify
+    // Step 3: Read back and verify
     println!("  Step 3: Read back and verify");
     let read_back = std::fs::read(&fuse_path)
         .map_err(|e| std::io::Error::other(format!("Failed to read back: {e}")))?;
@@ -649,7 +680,7 @@ async fn test_mkdir_rmdir() -> CmdResult {
     mount_fuse_rw(&bucket)?;
 
     // Create directory
-    println!("  Step 2: Create directory via FUSE");
+    println!("  Step 2: Create directory");
     let dir_path = format!("{}/testdir", MOUNT_POINT);
     std::fs::create_dir(&dir_path)
         .map_err(|e| std::io::Error::other(format!("Failed to mkdir: {e}")))?;
