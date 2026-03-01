@@ -3,8 +3,12 @@ name = "rpc_client_bss"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["tokio-runtime"]
+tokio-runtime = ["rpc_client_common/tokio-runtime"]
+compio-runtime = ["rpc_client_common/compio-runtime"]
+
 [dependencies]
-tokio.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 uuid.workspace = true
@@ -17,3 +21,4 @@ data_types.workspace = true
 [dev-dependencies]
 tracing-test.workspace = true
 xxhash-rust.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }

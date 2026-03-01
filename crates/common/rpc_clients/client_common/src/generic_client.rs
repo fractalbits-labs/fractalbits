@@ -6,7 +6,6 @@ use rpc_codec_common::{MessageFrame, MessageHeaderTrait};
 use socket2::{Socket, TcpKeepalive};
 use std::collections::HashMap;
 use std::io;
-use std::io::IoSlice;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
@@ -15,13 +14,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use strum::AsRefStr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot,
 };
-use tokio::task::AbortHandle;
 use tracing::{debug, error, warn};
+
+#[cfg(feature = "tokio-runtime")]
+use std::io::IoSlice;
+#[cfg(feature = "tokio-runtime")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "tokio-runtime")]
+use tokio::task::AbortHandle;
 
 type ZcMessageFrame<Header> = MessageFrame<Header, Vec<Bytes>>;
 type RequestMap<Header> = Arc<Mutex<HashMap<u32, oneshot::Sender<MessageFrame<Header>>>>>;
@@ -30,6 +34,16 @@ pub trait RpcCodec<Header: MessageHeaderTrait>: Default + Clone + Send + Sync + 
     const RPC_TYPE: &'static str;
 }
 
+#[cfg(all(feature = "compio-runtime", not(feature = "tokio-runtime")))]
+pub struct RpcClient<Codec: RpcCodec<Header>, Header: MessageHeaderTrait> {
+    requests: RequestMap<Header>,
+    sender: Sender<ZcMessageFrame<Header>>,
+    socket_fd: RawFd,
+    is_closed: Arc<AtomicBool>,
+    _phantom: PhantomData<Codec>,
+}
+
+#[cfg(feature = "tokio-runtime")]
 pub struct RpcClient<Codec: RpcCodec<Header>, Header: MessageHeaderTrait> {
     requests: RequestMap<Header>,
     sender: Sender<ZcMessageFrame<Header>>,
@@ -48,6 +62,18 @@ enum DrainFrom {
     RpcClient,
 }
 
+#[cfg(all(feature = "compio-runtime", not(feature = "tokio-runtime")))]
+impl<Codec: RpcCodec<Header>, Header: MessageHeaderTrait> Drop for RpcClient<Codec, Header> {
+    fn drop(&mut self) {
+        debug!(rpc_type = Codec::RPC_TYPE, socket_fd = %self.socket_fd, "RpcClient dropped, shutting down socket");
+        unsafe {
+            libc::shutdown(self.socket_fd, libc::SHUT_RDWR);
+        }
+        Self::drain_pending_requests(self.socket_fd, &self.requests, DrainFrom::RpcClient);
+    }
+}
+
+#[cfg(feature = "tokio-runtime")]
 impl<Codec: RpcCodec<Header>, Header: MessageHeaderTrait> Drop for RpcClient<Codec, Header> {
     fn drop(&mut self) {
         debug!(rpc_type = Codec::RPC_TYPE, socket_fd = %self.socket_fd, "RpcClient dropped, aborting tasks");
@@ -57,6 +83,154 @@ impl<Codec: RpcCodec<Header>, Header: MessageHeaderTrait> Drop for RpcClient<Cod
     }
 }
 
+// Common methods
+impl<Codec, Header> RpcClient<Codec, Header>
+where
+    Codec: RpcCodec<Header>,
+    Header: MessageHeaderTrait + Clone + Send + Sync + 'static,
+{
+    fn handle_incoming_frame(
+        frame: MessageFrame<Header>,
+        requests: &RequestMap<Header>,
+        socket_fd: RawFd,
+        rpc_type: &'static str,
+    ) {
+        let request_id = frame.header.get_id();
+        let trace_id = frame.header.get_trace_id();
+        debug!(%rpc_type, %socket_fd, %request_id, %trace_id, "receiving response:");
+        counter!("rpc_response_received", "type" => rpc_type, "name" => "all").increment(1);
+        let tx: oneshot::Sender<MessageFrame<Header>> = match requests.lock().remove(&request_id) {
+            Some(tx) => tx,
+            None => {
+                warn!(%rpc_type, %socket_fd, %request_id,
+                    "received rpc message with id not in the resp_map");
+                return;
+            }
+        };
+        gauge!("rpc_request_pending_in_resp_map", "type" => rpc_type).decrement(1.0);
+        if tx.send(frame).is_err() {
+            warn!(%rpc_type, %socket_fd, %request_id, "oneshot response send failed");
+        }
+    }
+
+    fn drain_pending_requests(
+        socket_fd: RawFd,
+        requests: &RequestMap<Header>,
+        drain_from: DrainFrom,
+    ) {
+        let mut requests = requests.lock();
+        let pending_count = requests.len();
+        if pending_count > 0 {
+            warn!(
+                rpc_type = %Codec::RPC_TYPE,
+                %socket_fd,
+                "draining {pending_count} pending requests from {} on connection close",
+                drain_from.as_ref()
+            );
+            gauge!("rpc_request_pending_in_resp_map", "type" => Codec::RPC_TYPE)
+                .decrement(pending_count as f64);
+            requests.clear(); // This drops the senders, notifying receivers of an error.
+        }
+    }
+
+    pub async fn send_request(
+        &self,
+        frame: MessageFrame<Header, Bytes>,
+        timeout: Option<Duration>,
+    ) -> Result<MessageFrame<Header>, RpcError> {
+        let vectored_frame = MessageFrame::new(frame.header, vec![frame.body]);
+        self.send_request_vectored_internal(vectored_frame, timeout)
+            .await
+    }
+
+    pub async fn send_request_vectored(
+        &self,
+        frame: MessageFrame<Header, Vec<Bytes>>,
+        timeout: Option<Duration>,
+    ) -> Result<MessageFrame<Header>, RpcError> {
+        self.send_request_vectored_internal(frame, timeout).await
+    }
+
+    async fn send_request_vectored_internal(
+        &self,
+        frame: ZcMessageFrame<Header>,
+        timeout: Option<Duration>,
+    ) -> Result<MessageFrame<Header>, RpcError> {
+        if self.is_closed.load(Ordering::SeqCst) {
+            return Err(RpcError::InternalRequestError(
+                "Connection is closed".into(),
+            ));
+        }
+
+        let rpc_type = Codec::RPC_TYPE;
+        let (tx, rx) = oneshot::channel();
+        self.requests.lock().insert(frame.header.get_id(), tx);
+        gauge!("rpc_request_pending_in_resp_map", "type" => rpc_type).increment(1.0);
+
+        let request_id = frame.header.get_id();
+        self.sender
+            .send(frame)
+            .await
+            .map_err(|e| RpcError::InternalRequestError(e.to_string()))?;
+        gauge!("rpc_request_pending_in_send_queue", "type" => rpc_type).increment(1.0);
+
+        let result = match timeout {
+            None => rx.await,
+            Some(rpc_timeout) => match crate::rpc_timeout(rpc_timeout, rx).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(%rpc_type, socket_fd=%self.socket_fd, %request_id, "rpc request timeout");
+                    return Err(RpcError::InternalResponseError("timeout".into()));
+                }
+            },
+        };
+        result.map_err(|e| RpcError::InternalResponseError(e.to_string()))
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.is_closed.load(Ordering::SeqCst)
+    }
+
+    fn configure_tcp_socket(socket: &Socket) -> Result<(), io::Error> {
+        socket.set_recv_buffer_size(16 * 1024 * 1024)?;
+        socket.set_send_buffer_size(16 * 1024 * 1024)?;
+
+        let keepalive = TcpKeepalive::new()
+            .with_time(Duration::from_secs(5))
+            .with_interval(Duration::from_secs(2))
+            .with_retries(2);
+        socket.set_tcp_keepalive(&keepalive)?;
+        socket.set_nodelay(true)?;
+        socket.set_nonblocking(true)?;
+
+        Ok(())
+    }
+
+    fn log_connection_duration(addr: &str, start: std::time::Instant) {
+        let duration = start.elapsed();
+        if duration > Duration::from_secs(1) {
+            warn!(
+                rpc_type = %Codec::RPC_TYPE,
+                addr = %addr,
+                duration_ms = %duration.as_millis(),
+                "Slow connection establishment to RPC server"
+            );
+        } else if duration > Duration::from_millis(100) {
+            debug!(
+                rpc_type = %Codec::RPC_TYPE,
+                addr = %addr,
+                duration_ms = %duration.as_millis(),
+                "Connection established to RPC server"
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Compio runtime implementation (takes priority when feature is enabled)
+// ============================================================================
+
+#[cfg(all(feature = "compio-runtime", not(feature = "tokio-runtime")))]
 impl<Codec, Header> RpcClient<Codec, Header>
 where
     Codec: RpcCodec<Header>,
@@ -67,7 +241,254 @@ where
         if let Ok(socket_addr) = addr_str.parse::<SocketAddr>() {
             return Ok(socket_addr);
         }
+        // Use blocking DNS resolution since compio doesn't have async DNS
+        let addr_str = addr_str.to_owned();
+        let addrs: Vec<SocketAddr> =
+            compio_runtime::spawn_blocking(move || -> Result<Vec<SocketAddr>, io::Error> {
+                use std::net::ToSocketAddrs;
+                Ok(addr_str.to_socket_addrs()?.collect())
+            })
+            .await
+            .map_err(|_| io::Error::other("DNS resolution task failed"))??;
+        addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No addresses found"))
+    }
 
+    async fn new_internal(stream: compio_net::TcpStream) -> Result<Self, RpcError> {
+        let rpc_type = Codec::RPC_TYPE;
+        let socket_fd = stream.as_raw_fd();
+        let (reader, writer) = stream.into_split();
+        let requests: RequestMap<Header> = Arc::new(Mutex::new(HashMap::with_capacity(1024 * 32)));
+        let (sender, receiver) = mpsc::channel::<ZcMessageFrame<Header>>(1024 * 32);
+        let is_closed = Arc::new(AtomicBool::new(false));
+
+        // Spawn send task - detach (task cleaned up via socket shutdown in Drop)
+        {
+            let sender_requests = requests.clone();
+            let is_closed = is_closed.clone();
+            compio_runtime::spawn(async move {
+                if let Err(e) = Self::send_task(writer, receiver, socket_fd, rpc_type).await {
+                    warn!(%rpc_type, %socket_fd, %e, "send task failed");
+                }
+                is_closed.store(true, Ordering::SeqCst);
+                Self::drain_pending_requests(socket_fd, &sender_requests, DrainFrom::SendTask);
+            })
+            .detach();
+        }
+
+        // Spawn receive task - detach
+        {
+            let receiver_requests = requests.clone();
+            let is_closed = is_closed.clone();
+            compio_runtime::spawn(async move {
+                if let Err(e) =
+                    Self::receive_task(reader, &receiver_requests, socket_fd, rpc_type).await
+                {
+                    warn!(%rpc_type, %socket_fd, %e, "receive task failed");
+                }
+                is_closed.store(true, Ordering::SeqCst);
+                Self::drain_pending_requests(socket_fd, &receiver_requests, DrainFrom::ReceiveTask);
+            })
+            .detach();
+        }
+
+        debug!(%rpc_type, %socket_fd, "Creating RPC client");
+
+        Ok(RpcClient {
+            requests,
+            sender,
+            socket_fd,
+            is_closed,
+            _phantom: PhantomData,
+        })
+    }
+
+    async fn send_task(
+        mut writer: compio_net::OwnedWriteHalf<compio_net::TcpStream>,
+        mut receiver: Receiver<ZcMessageFrame<Header>>,
+        socket_fd: RawFd,
+        rpc_type: &'static str,
+    ) -> Result<(), RpcError> {
+        use compio_io::AsyncWriteExt;
+
+        const MAX_BATCH_SIZE: usize = 32;
+        let mut batch = Vec::with_capacity(MAX_BATCH_SIZE);
+        let mut batch_headers: Vec<Header> = Vec::with_capacity(MAX_BATCH_SIZE);
+        let mut body_chunks: Vec<Vec<Bytes>> = Vec::with_capacity(MAX_BATCH_SIZE);
+
+        loop {
+            batch.clear();
+            batch_headers.clear();
+            body_chunks.clear();
+            let count = receiver.recv_many(&mut batch, MAX_BATCH_SIZE).await;
+            if count == 0 {
+                break;
+            }
+
+            gauge!("rpc_request_pending_in_send_queue", "type" => rpc_type).decrement(count as f64);
+            counter!("rpc_send_batch_size", "type" => rpc_type).increment(count as u64);
+
+            for mut frame in batch.drain(..) {
+                let request_id = frame.header.get_id();
+                let trace_id = frame.header.get_trace_id();
+                debug!(%rpc_type, %socket_fd, %request_id, %trace_id, "sending request");
+
+                frame.header.set_checksum();
+                batch_headers.push(frame.header);
+                body_chunks.push(frame.body);
+            }
+
+            // Gather into a single buffer for write_all.
+            // RPC payloads are typically small (headers + protobuf), so the copy
+            // overhead is negligible compared to network I/O.
+            let total_size: usize = batch_headers
+                .iter()
+                .map(|h| h.encode().len())
+                .sum::<usize>()
+                + body_chunks
+                    .iter()
+                    .map(|chunks| chunks.iter().map(|c| c.len()).sum::<usize>())
+                    .sum::<usize>();
+
+            let mut combined = Vec::with_capacity(total_size);
+            for (header, chunks) in batch_headers.iter().zip(body_chunks.iter()) {
+                combined.extend_from_slice(header.encode());
+                for chunk in chunks {
+                    combined.extend_from_slice(chunk);
+                }
+            }
+
+            writer
+                .write_all(combined)
+                .await
+                .0
+                .map_err(RpcError::IoError)?;
+
+            counter!("rpc_request_sent", "type" => rpc_type, "name" => "all")
+                .increment(batch_headers.len() as u64);
+        }
+
+        warn!(%rpc_type, %socket_fd, "sender closed, send message task quit");
+        Ok(())
+    }
+
+    async fn receive_task(
+        mut reader: compio_net::OwnedReadHalf<compio_net::TcpStream>,
+        requests: &RequestMap<Header>,
+        socket_fd: RawFd,
+        rpc_type: &'static str,
+    ) -> Result<(), RpcError> {
+        use compio_io::AsyncReadExt;
+
+        let header_size = size_of::<Header>();
+        let mut header_buf = vec![0u8; header_size];
+
+        loop {
+            // Compio ownership model: BufResult(io::Result, buf)
+            let buf_result = reader.read_exact(header_buf).await;
+            header_buf = buf_result.1;
+
+            match buf_result.0 {
+                Ok(()) => {
+                    if !Header::verify_header_checksum_raw(&header_buf[..header_size]) {
+                        warn!(%rpc_type, %socket_fd, "header checksum verification failed");
+                        return Err(RpcError::ChecksumMismatch);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    warn!(%rpc_type, %socket_fd, "connection closed, receive message task quit");
+                    return Ok(());
+                }
+                Err(e) => return Err(RpcError::IoError(e)),
+            }
+
+            let header = Header::decode(&header_buf[..header_size]);
+
+            let body_size = header.get_body_size();
+            let body = if body_size > 0 {
+                let body_buf = vec![0u8; body_size];
+                let buf_result = reader.read_exact(body_buf).await;
+                buf_result.0.map_err(RpcError::IoError)?;
+                Bytes::from(buf_result.1)
+            } else {
+                Bytes::new()
+            };
+
+            if !header.verify_body_checksum(&body) {
+                error!(%rpc_type, %socket_fd, request_id = %header.get_id(),
+                    "Response body checksum verification failed, closing connection");
+                counter!("rpc_response_body_checksum_failed", "type" => rpc_type).increment(1);
+                return Err(RpcError::ChecksumMismatch);
+            }
+
+            let frame = MessageFrame::new(header, body);
+            Self::handle_incoming_frame(frame, requests, socket_fd, rpc_type);
+        }
+    }
+
+    pub async fn establish_connection(
+        addr: String,
+        connect_timeout: Duration,
+    ) -> Result<Self, RpcError>
+    where
+        Header: Default,
+    {
+        let start = std::time::Instant::now();
+
+        debug!(rpc_type=%Codec::RPC_TYPE, %addr, ?connect_timeout, "Trying to connect to rpc server");
+
+        let client = match compio_runtime::time::timeout(connect_timeout, async {
+            let socket_addr = Self::resolve_address(&addr).await?;
+
+            // Connect using std TCP, configure socket, then wrap with compio
+            let std_stream =
+                std::net::TcpStream::connect(socket_addr).map_err(RpcError::IoError)?;
+            let socket = Socket::from(std_stream);
+            Self::configure_tcp_socket(&socket).map_err(RpcError::IoError)?;
+            let std_stream: std::net::TcpStream = socket.into();
+            let compio_stream =
+                compio_net::TcpStream::from_std(std_stream).map_err(RpcError::IoError)?;
+
+            Self::new_internal(compio_stream).await
+        })
+        .await
+        {
+            Ok(Ok(client)) => client,
+            Ok(Err(e)) => {
+                warn!(rpc_type = %Codec::RPC_TYPE, %addr, error = %e, "failed to connect RPC server");
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                warn!(rpc_type = %Codec::RPC_TYPE, %addr, ?connect_timeout, "connection timeout to RPC server");
+                return Err(RpcError::IoError(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connection timeout after {:?}", connect_timeout),
+                )));
+            }
+        };
+
+        Self::log_connection_duration(&addr, start);
+        Ok(client)
+    }
+}
+
+// ============================================================================
+// Tokio runtime implementation (used when compio-runtime is NOT enabled)
+// ============================================================================
+
+#[cfg(feature = "tokio-runtime")]
+impl<Codec, Header> RpcClient<Codec, Header>
+where
+    Codec: RpcCodec<Header>,
+    Header: MessageHeaderTrait + Clone + Send + Sync + 'static,
+{
+    async fn resolve_address(addr_str: &str) -> Result<SocketAddr, io::Error> {
+        // Try to parse as SocketAddr first (for backward compatibility with IP addresses)
+        if let Ok(socket_addr) = addr_str.parse::<SocketAddr>() {
+            return Ok(socket_addr);
+        }
         // Use tokio's native async DNS resolution
         let mut addrs = tokio::net::lookup_host(addr_str).await?;
         addrs.next().ok_or_else(|| {
@@ -78,12 +499,18 @@ where
         })
     }
 
-    async fn new_internal_tokio(stream: tokio::net::TcpStream) -> Result<Self, RpcError> {
+    #[cfg(test)]
+    pub(crate) async fn new_internal_tokio(
+        stream: tokio::net::TcpStream,
+    ) -> Result<Self, RpcError> {
+        Self::new_internal(stream).await
+    }
+
+    async fn new_internal(stream: tokio::net::TcpStream) -> Result<Self, RpcError> {
         let rpc_type = Codec::RPC_TYPE;
         let socket_fd = stream.as_raw_fd();
         let (reader, writer) = stream.into_split();
-        let requests: Arc<Mutex<HashMap<u32, oneshot::Sender<MessageFrame<Header>>>>> =
-            Arc::new(Mutex::new(HashMap::with_capacity(1024 * 32)));
+        let requests: RequestMap<Header> = Arc::new(Mutex::new(HashMap::with_capacity(1024 * 32)));
         let (sender, receiver) = mpsc::channel::<ZcMessageFrame<Header>>(1024 * 32);
         let is_closed = Arc::new(AtomicBool::new(false));
 
@@ -92,7 +519,7 @@ where
             let sender_requests = requests.clone();
             let is_closed = is_closed.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::send_task_tokio(writer, receiver, socket_fd, rpc_type).await {
+                if let Err(e) = Self::send_task(writer, receiver, socket_fd, rpc_type).await {
                     warn!(%rpc_type, %socket_fd, %e, "send task failed");
                 }
                 is_closed.store(true, Ordering::SeqCst);
@@ -107,7 +534,7 @@ where
             let is_closed = is_closed.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    Self::receive_task_tokio(reader, &receiver_requests, socket_fd, rpc_type).await
+                    Self::receive_task(reader, &receiver_requests, socket_fd, rpc_type).await
                 {
                     warn!(%rpc_type, %socket_fd, %e, "receive task failed");
                 }
@@ -130,7 +557,7 @@ where
         })
     }
 
-    async fn send_task_tokio(
+    async fn send_task(
         mut writer: tokio::net::tcp::OwnedWriteHalf,
         mut receiver: Receiver<ZcMessageFrame<Header>>,
         socket_fd: RawFd,
@@ -235,7 +662,7 @@ where
         Ok(())
     }
 
-    async fn receive_task_tokio(
+    async fn receive_task(
         mut receiver: tokio::net::tcp::OwnedReadHalf,
         requests: &RequestMap<Header>,
         socket_fd: RawFd,
@@ -297,129 +724,6 @@ where
         }
     }
 
-    fn handle_incoming_frame(
-        frame: MessageFrame<Header>,
-        requests: &RequestMap<Header>,
-        socket_fd: RawFd,
-        rpc_type: &'static str,
-    ) {
-        let request_id = frame.header.get_id();
-        let trace_id = frame.header.get_trace_id();
-        debug!(%rpc_type, %socket_fd, %request_id, %trace_id, "receiving response:");
-        counter!("rpc_response_received", "type" => rpc_type, "name" => "all").increment(1);
-        let tx: oneshot::Sender<MessageFrame<Header>> = match requests.lock().remove(&request_id) {
-            Some(tx) => tx,
-            None => {
-                warn!(%rpc_type, %socket_fd, %request_id,
-                    "received rpc message with id not in the resp_map");
-                return;
-            }
-        };
-        gauge!("rpc_request_pending_in_resp_map", "type" => rpc_type).decrement(1.0);
-        if tx.send(frame).is_err() {
-            warn!(%rpc_type, %socket_fd, %request_id, "oneshot response send failed");
-        }
-    }
-
-    fn drain_pending_requests(
-        socket_fd: RawFd,
-        requests: &RequestMap<Header>,
-        drain_from: DrainFrom,
-    ) {
-        let mut requests = requests.lock();
-        let pending_count = requests.len();
-        if pending_count > 0 {
-            warn!(
-                rpc_type = %Codec::RPC_TYPE,
-                %socket_fd,
-                "draining {pending_count} pending requests from {} on connection close",
-                drain_from.as_ref()
-            );
-            gauge!("rpc_request_pending_in_resp_map", "type" => Codec::RPC_TYPE)
-                .decrement(pending_count as f64);
-            requests.clear(); // This drops the senders, notifying receivers of an error.
-        }
-    }
-
-    pub async fn send_request(
-        &self,
-        frame: MessageFrame<Header, Bytes>,
-        timeout: Option<std::time::Duration>,
-    ) -> Result<MessageFrame<Header>, RpcError> {
-        let vectored_frame = MessageFrame::new(frame.header, vec![frame.body]);
-        self.send_request_vectored_internal(vectored_frame, timeout)
-            .await
-    }
-
-    pub async fn send_request_vectored(
-        &self,
-        frame: MessageFrame<Header, Vec<Bytes>>,
-        timeout: Option<std::time::Duration>,
-    ) -> Result<MessageFrame<Header>, RpcError> {
-        self.send_request_vectored_internal(frame, timeout).await
-    }
-
-    async fn send_request_vectored_internal(
-        &self,
-        frame: ZcMessageFrame<Header>,
-        timeout: Option<Duration>,
-    ) -> Result<MessageFrame<Header>, RpcError> {
-        if self.is_closed.load(Ordering::SeqCst) {
-            return Err(RpcError::InternalRequestError(
-                "Connection is closed".into(),
-            ));
-        }
-
-        let rpc_type = Codec::RPC_TYPE;
-        let (tx, rx) = oneshot::channel();
-        self.requests.lock().insert(frame.header.get_id(), tx);
-        gauge!("rpc_request_pending_in_resp_map", "type" => rpc_type).increment(1.0);
-
-        let request_id = frame.header.get_id();
-        self.sender
-            .send(frame)
-            .await
-            .map_err(|e| RpcError::InternalRequestError(e.to_string()))?;
-        gauge!("rpc_request_pending_in_send_queue", "type" => rpc_type).increment(1.0);
-
-        let result = match timeout {
-            None => rx.await,
-            Some(rpc_timeout) => match tokio::time::timeout(rpc_timeout, rx).await {
-                Ok(result) => result,
-                Err(_) => {
-                    warn!(%rpc_type, socket_fd=%self.socket_fd, %request_id, "rpc request timeout");
-                    return Err(RpcError::InternalResponseError("timeout".into()));
-                }
-            },
-        };
-        result.map_err(|e| RpcError::InternalResponseError(e.to_string()))
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.is_closed.load(Ordering::SeqCst)
-    }
-}
-
-impl<Codec, Header> RpcClient<Codec, Header>
-where
-    Codec: RpcCodec<Header>,
-    Header: MessageHeaderTrait + Clone + Send + Sync + 'static,
-{
-    fn configure_tcp_socket(socket: &Socket) -> Result<(), io::Error> {
-        socket.set_recv_buffer_size(16 * 1024 * 1024)?;
-        socket.set_send_buffer_size(16 * 1024 * 1024)?;
-
-        let keepalive = TcpKeepalive::new()
-            .with_time(Duration::from_secs(5))
-            .with_interval(Duration::from_secs(2))
-            .with_retries(2);
-        socket.set_tcp_keepalive(&keepalive)?;
-        socket.set_nodelay(true)?;
-        socket.set_nonblocking(true)?;
-
-        Ok(())
-    }
-
     pub async fn establish_connection(
         addr: String,
         connect_timeout: Duration,
@@ -442,7 +746,7 @@ where
             let configured_stream =
                 tokio::net::TcpStream::from_std(std_stream).map_err(RpcError::IoError)?;
 
-            Self::new_internal_tokio(configured_stream).await
+            Self::new_internal(configured_stream).await
         })
         .await
         {
@@ -460,28 +764,12 @@ where
             }
         };
 
-        let duration = start.elapsed();
-        if duration > Duration::from_secs(1) {
-            warn!(
-                rpc_type = %Codec::RPC_TYPE,
-                addr = %addr,
-                duration_ms = %duration.as_millis(),
-                "Slow connection establishment to RPC server"
-            );
-        } else if duration > Duration::from_millis(100) {
-            debug!(
-                rpc_type = %Codec::RPC_TYPE,
-                addr = %addr,
-                duration_ms = %duration.as_millis(),
-                "Connection established to RPC server"
-            );
-        }
-
+        Self::log_connection_duration(&addr, start);
         Ok(client)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "compio-runtime")))]
 mod tests {
     use super::*;
     use rpc_codec_common::ProtobufMessageHeader;

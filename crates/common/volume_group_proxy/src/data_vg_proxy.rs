@@ -17,6 +17,16 @@ use std::{
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+#[cfg(feature = "tokio-runtime")]
+fn spawn_background<F: std::future::Future<Output = ()> + Send + 'static>(fut: F) {
+    tokio::spawn(fut);
+}
+
+#[cfg(all(feature = "compio-runtime", not(feature = "tokio-runtime")))]
+fn spawn_background<F: std::future::Future<Output = ()> + 'static>(fut: F) {
+    compio_runtime::spawn(fut).detach();
+}
+
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
 fn current_timestamp_nanos() -> u64 {
@@ -438,7 +448,7 @@ impl DataVgProxy {
                     Err(e) if e.retryable() && retries > 0 => {
                         retries -= 1;
                         retry_count += 1;
-                        tokio::time::sleep(backoff).await;
+                        rpc_client_common::rpc_sleep(backoff).await;
                         backoff = backoff.saturating_mul(2);
                     }
                     Err(e) => return Err(e),
@@ -483,7 +493,7 @@ impl DataVgProxy {
                     Err(e) if e.retryable() && retries > 0 => {
                         retries -= 1;
                         retry_count += 1;
-                        tokio::time::sleep(backoff).await;
+                        rpc_client_common::rpc_sleep(backoff).await;
                         backoff = backoff.saturating_mul(2);
                     }
                     Err(e) => return Err(e),
@@ -612,7 +622,7 @@ impl DataVgProxy {
             // Check if we've achieved write quorum
             if successful_writes >= write_quorum {
                 // Spawn remaining writes as background task for eventual consistency
-                tokio::spawn(async move {
+                spawn_background(async move {
                     while let Some((bg_node, addr, res)) = write_futures.next().await {
                         match res {
                             Ok(()) => {
@@ -765,7 +775,7 @@ impl DataVgProxy {
             }
 
             if successful_writes >= write_quorum {
-                tokio::spawn(async move {
+                spawn_background(async move {
                     while let Some((bg_node, addr, res)) = write_futures.next().await {
                         match res {
                             Ok(()) => {
@@ -1139,7 +1149,7 @@ impl DataVgProxy {
 
             if successful_deletes >= write_quorum {
                 // Spawn remaining deletes as background task for eventual consistency
-                tokio::spawn(async move {
+                spawn_background(async move {
                     while let Some((bg_node, addr, res)) = delete_futures.next().await {
                         match res {
                             Ok(()) => {
@@ -1318,7 +1328,7 @@ impl DataVgProxy {
 
             if successful_writes >= write_quorum {
                 // Background remaining writes
-                tokio::spawn(async move {
+                spawn_background(async move {
                     while let Some((bg_node, addr, res)) = write_futures.next().await {
                         match res {
                             Ok(()) => {
@@ -1648,7 +1658,7 @@ impl DataVgProxy {
             }
 
             if successful_deletes >= write_quorum {
-                tokio::spawn(async move {
+                spawn_background(async move {
                     while let Some((bg_node, addr, res)) = delete_futures.next().await {
                         match res {
                             Ok(()) => {

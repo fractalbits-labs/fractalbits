@@ -46,12 +46,12 @@ resolver = "2"
 aws_signature = { path = "crates/common/aws_signature" }
 data_types = { path = "crates/common/data_types" }
 data_blob_tracking = { path = "crates/common/data_blob_tracking" }
-volume_group_proxy = { path = "crates/common/volume_group_proxy" }
+volume_group_proxy = { path = "crates/common/volume_group_proxy", default-features = false }
 metrics_wrapper = { path = "crates/common/metrics_wrapper" }
-rpc_client_common = { path = "crates/common/rpc_clients/client_common" }
-rpc_client_bss = { path = "crates/common/rpc_clients/bss" }
-rpc_client_nss = { path = "crates/common/rpc_clients/nss" }
-rpc_client_rss = { path = "crates/common/rpc_clients/rss" }
+rpc_client_common = { path = "crates/common/rpc_clients/client_common", default-features = false }
+rpc_client_bss = { path = "crates/common/rpc_clients/bss", default-features = false }
+rpc_client_nss = { path = "crates/common/rpc_clients/nss", default-features = false }
+rpc_client_rss = { path = "crates/common/rpc_clients/rss", default-features = false }
 rpc_codec_common = { path = "crates/common/rpc_codecs/codec_common" }
 bss_codec = { path = "crates/common/rpc_codecs/bss_codec" }
 nss_codec = { path = "crates/common/rpc_codecs/nss_codec" }
@@ -139,6 +139,9 @@ regex = "1.10.6"
 core_affinity = "0.7"
 urlencoding = "2"
 fuse3 = { version = "0.8", features = ["tokio-runtime", "unprivileged"] }
+compio-runtime = { git = "https://github.com/compio-rs/compio", branch = "master", features = ["time"] }
+compio-net = { git = "https://github.com/compio-rs/compio", branch = "master" }
+compio-io = { git = "https://github.com/compio-rs/compio", branch = "master" }
 
 # Dev dependencies
 aws-sdk-s3 = "1.65.0"

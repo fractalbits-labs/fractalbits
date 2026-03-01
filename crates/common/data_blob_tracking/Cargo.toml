@@ -12,9 +12,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 # RPC clients
-rpc_client_nss = { workspace = true }
-rpc_client_rss = { workspace = true }
-rpc_client_common = { workspace = true }
+rpc_client_nss = { workspace = true, features = ["tokio-runtime"] }
+rpc_client_rss = { workspace = true, features = ["tokio-runtime"] }
+rpc_client_common = { workspace = true, features = ["tokio-runtime"] }
 
 # Codecs (needed for response types)
 rss_codec = { workspace = true }

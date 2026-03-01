@@ -3,6 +3,11 @@ name = "rpc_client_nss"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["tokio-runtime"]
+tokio-runtime = ["rpc_client_common/tokio-runtime"]
+compio-runtime = ["rpc_client_common/compio-runtime"]
+
 [dependencies]
 prost.workspace = true
 bytes.workspace = true

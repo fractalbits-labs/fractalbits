@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rpc_client_nss.workspace = true
-rpc_client_bss.workspace = true
+rpc_client_nss = { workspace = true, features = ["tokio-runtime"] }
+rpc_client_bss = { workspace = true, features = ["tokio-runtime"] }
 data_types.workspace = true
 
 anyhow.workspace = true

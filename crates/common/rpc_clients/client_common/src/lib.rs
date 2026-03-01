@@ -8,6 +8,36 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error};
 
+#[cfg(all(feature = "compio-runtime", not(feature = "tokio-runtime")))]
+pub async fn rpc_timeout<F: std::future::Future>(
+    duration: Duration,
+    future: F,
+) -> Result<F::Output, std::io::Error> {
+    compio_runtime::time::timeout(duration, future)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "rpc timeout"))
+}
+
+#[cfg(feature = "tokio-runtime")]
+pub async fn rpc_timeout<F: std::future::Future>(
+    duration: Duration,
+    future: F,
+) -> Result<F::Output, std::io::Error> {
+    tokio::time::timeout(duration, future)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "rpc timeout"))
+}
+
+#[cfg(all(feature = "compio-runtime", not(feature = "tokio-runtime")))]
+pub async fn rpc_sleep(duration: Duration) {
+    compio_runtime::time::sleep(duration).await;
+}
+
+#[cfg(feature = "tokio-runtime")]
+pub async fn rpc_sleep(duration: Duration) {
+    tokio::time::sleep(duration).await;
+}
+
 #[cfg(feature = "metrics")]
 use metrics_wrapper::{Gauge, counter, gauge, histogram};
 
@@ -233,7 +263,7 @@ macro_rules! rpc_retry {
                         if e.retryable() && retries > 0 {
                             retries -= 1;
                             retry_count += 1;
-                            tokio::time::sleep(backoff).await;
+                            $crate::rpc_sleep(backoff).await;
                             backoff = backoff.saturating_mul(2);
                         } else {
                             if e.retryable() {
@@ -321,7 +351,7 @@ macro_rules! nss_rpc_retry {
                     refresh_attempt + 1,
                     failover_start.elapsed().as_millis()
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                $crate::rpc_sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 refresh_attempt = refresh_attempt.saturating_add(1);
             }
         }

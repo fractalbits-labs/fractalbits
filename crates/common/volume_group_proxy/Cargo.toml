@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+default = ["tokio-runtime"]
+tokio-runtime = ["rpc_client_bss/tokio-runtime", "rpc_client_common/tokio-runtime", "dep:tokio"]
+compio-runtime = ["rpc_client_bss/compio-runtime", "rpc_client_common/compio-runtime", "dep:compio-runtime"]
 metrics = ["metrics_wrapper/metrics", "dep:metrics"]
 
 [dependencies]
@@ -15,7 +18,8 @@ rand.workspace = true
 rpc_client_bss.workspace = true
 rpc_client_common.workspace = true
 data_types.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, optional = true }
+compio-runtime = { workspace = true, optional = true }
 tracing.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
