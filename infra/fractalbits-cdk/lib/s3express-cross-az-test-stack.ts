@@ -42,7 +42,7 @@ export class S3ExpressCrossAzTestStack extends cdk.Stack {
       enableDnsSupport: true,
     });
 
-    createVpcEndpoints(this.vpc);
+    createVpcEndpoints(this.vpc, ec2.SubnetType.PRIVATE_ISOLATED);
 
     const ec2Role = createEc2Role(this);
 

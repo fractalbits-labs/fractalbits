@@ -58,6 +58,8 @@ fn generic_bootstrap() -> CmdResult {
 
     info!("Starting config-based bootstrap mode (bucket: {bucket_name})");
 
+    ensure_ec2_metadata()?;
+
     let config = config::download_and_parse(bucket_name)?;
 
     // Backup config to workflow directory for progress tracking

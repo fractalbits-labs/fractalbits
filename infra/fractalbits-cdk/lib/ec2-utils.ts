@@ -12,6 +12,8 @@ import * as elbv2_targets from "aws-cdk-lib/aws-elasticloadbalancingv2-targets";
 import * as path from "path";
 import { execSync } from "child_process";
 
+export type DeployOS = "al2023" | "ubuntu";
+
 export const getAzNameFromIdAtBuildTime = (
   azId: string,
   region?: string,
@@ -36,7 +38,10 @@ export const getAzNameFromIdAtBuildTime = (
   }
 };
 
-export const createVpcEndpoints = (vpc: ec2.Vpc) => {
+export const createVpcEndpoints = (
+  vpc: ec2.Vpc,
+  subnetType: ec2.SubnetType = ec2.SubnetType.PRIVATE_ISOLATED,
+) => {
   // Add Gateway Endpoint for S3
   vpc.addGatewayEndpoint("S3Endpoint", {
     service: ec2.GatewayVpcEndpointAwsService.S3,
@@ -64,7 +69,7 @@ export const createVpcEndpoints = (vpc: ec2.Vpc) => {
   ].forEach((service) => {
     vpc.addInterfaceEndpoint(`${service}Endpoint`, {
       service: (ec2.InterfaceVpcEndpointAwsService as any)[service],
-      subnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      subnets: { subnetType },
       privateDnsEnabled: true,
     });
   });
@@ -121,6 +126,22 @@ export const createDynamoDbTable = (
   });
 };
 
+const getMachineImage = (
+  arch: string,
+  deployOS: DeployOS,
+): ec2.IMachineImage => {
+  if (deployOS === "al2023") {
+    const al2023Arch = arch === "arm64" ? "arm64" : "x86_64";
+    return ec2.MachineImage.fromSsmParameter(
+      `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.12-${al2023Arch}`,
+    );
+  }
+  const ubuntuArch = arch === "arm64" ? "arm64" : "amd64";
+  return ec2.MachineImage.fromSsmParameter(
+    `/aws/service/canonical/ubuntu/server/25.04/stable/current/${ubuntuArch}/hvm/ebs-gp3/ami-id`,
+  );
+};
+
 export const createInstance = (
   scope: Construct,
   vpc: ec2.Vpc,
@@ -129,14 +150,13 @@ export const createInstance = (
   instanceType: ec2.InstanceType,
   sg: ec2.SecurityGroup,
   role: iam.Role,
+  deployOS: DeployOS = "al2023",
 ): ec2.Instance => {
   const arch =
     instanceType.architecture === ec2.InstanceArchitecture.ARM_64
       ? "arm64"
-      : "x86_64";
-  const machineImage = ec2.MachineImage.fromSsmParameter(
-    `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.12-${arch}`,
-  );
+      : "amd64";
+  const machineImage = getMachineImage(arch, deployOS);
 
   return new ec2.Instance(scope, id, {
     vpc: vpc,
@@ -148,13 +168,21 @@ export const createInstance = (
   });
 };
 
-export const createUserData = (scope: Construct): ec2.UserData => {
+export const createUserData = (
+  scope: Construct,
+  deployOS: DeployOS = "al2023",
+): ec2.UserData => {
   const region = cdk.Stack.of(scope).region;
   const account = cdk.Stack.of(scope).account;
   const bucketName = `fractalbits-bootstrap-${region}-${account}`;
   const userData = ec2.UserData.forLinux();
+  const installAwsCli =
+    deployOS === "ubuntu"
+      ? `command -v aws >/dev/null 2>&1 || snap install aws-cli --classic`
+      : ``;
   userData.addCommands(
-    `aws s3 cp --no-progress s3://${bucketName}/bootstrap.sh - | sh`,
+    ...(installAwsCli ? [installAwsCli] : []),
+    `aws s3 cp --no-progress s3://${bucketName}/bootstrap.sh - | bash`,
   );
   return userData;
 };
@@ -184,6 +212,7 @@ export const createEc2Asg = (
   maxCapacity: number,
   serviceType?: string,
   skipUserData?: boolean,
+  deployOS: DeployOS = "al2023",
 ): autoscaling.AutoScalingGroup => {
   if (instanceTypeNames.length === 0) {
     throw new Error("instanceTypeNames must not be empty.");
@@ -206,17 +235,15 @@ export const createEc2Asg = (
     process.exit(1);
   }
 
-  const arch = isArm ? "arm64" : "x86_64";
-  const machineImage = ec2.MachineImage.fromSsmParameter(
-    `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.12-${arch}`,
-  );
+  const arch = isArm ? "arm64" : "amd64";
+  const machineImage = getMachineImage(arch, deployOS);
 
   const launchTemplate = new ec2.LaunchTemplate(scope, `${id}Template`, {
     instanceType: new ec2.InstanceType(instanceTypeNames[0]),
     machineImage: machineImage,
     securityGroup: sg,
     role: role,
-    userData: skipUserData ? undefined : createUserData(scope),
+    userData: skipUserData ? undefined : createUserData(scope, deployOS),
   });
 
   if (serviceType) {
@@ -378,14 +405,17 @@ export function createPrivateLinkNlb(
   vpc: ec2.Vpc,
   targetInstances: ec2.Instance[],
   servicePort: number,
+  subnets?: ec2.ISubnet[],
 ): PrivateLinkSetup {
+  const selectedSubnets = subnets ?? vpc.privateSubnets;
+
   // Create Network Load Balancer
   const nlb = new elbv2.NetworkLoadBalancer(scope, `${id}Nlb`, {
     vpc,
     internetFacing: false,
     crossZoneEnabled: true,
     vpcSubnets: {
-      subnets: vpc.isolatedSubnets,
+      subnets: selectedSubnets,
     },
   });
 
@@ -418,7 +448,7 @@ export function createPrivateLinkNlb(
     },
     privateDnsEnabled: false,
     subnets: {
-      subnets: vpc.isolatedSubnets,
+      subnets: selectedSubnets,
     },
   });
 

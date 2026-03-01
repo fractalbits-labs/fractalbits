@@ -20,6 +20,7 @@ pub struct VpcConfig {
     pub skip_upload: bool,
     pub simulate_on_prem: bool,
     pub use_generic_binaries: bool,
+    pub deploy_os: crate::DeployOS,
 }
 
 #[derive(Clone)]

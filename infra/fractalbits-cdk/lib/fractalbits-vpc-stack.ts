@@ -18,6 +18,7 @@ import {
   createPrivateLinkNlb,
   addAsgDynamoDbDeregistrationLifecycleHook,
   getAzNameFromIdAtBuildTime,
+  DeployOS,
 } from "./ec2-utils";
 import {
   createConfigWithCfnTokens,
@@ -41,6 +42,7 @@ export interface FractalbitsVpcStackProps extends cdk.StackProps {
   ebsVolumeIops: number;
   rssBackend: "etcd" | "ddb";
   journalType: "ebs" | "nvme";
+  deployOS?: DeployOS;
 }
 
 function isSingleAzMode(mode: DataBlobStorage): boolean {
@@ -85,30 +87,42 @@ export class FractalbitsVpcStack extends cdk.Stack {
       ? [az1] // Single AZ for single-AZ mode
       : [az1, az2]; // Multi-AZ for multi-AZ mode
 
+    // AL2023 (default): no NAT needed, repos are S3-hosted, AWS CLI pre-installed.
+    // Ubuntu: needs NAT gateway for apt-get access to public repos.
+    const deployOS = props.deployOS ?? "al2023";
+    const useNatGateway = deployOS === "ubuntu";
+    const privateSubnetType = useNatGateway
+      ? ec2.SubnetType.PRIVATE_WITH_EGRESS
+      : ec2.SubnetType.PRIVATE_ISOLATED;
+
     // Create VPC with specific availability zones using resolved zone names
     this.vpc = new ec2.Vpc(this, "FractalbitsVpc", {
       vpcName: "fractalbits-vpc",
       ipAddresses: ec2.IpAddresses.cidr("10.0.0.0/16"),
       availabilityZones,
-      natGateways: 0,
+      natGateways: useNatGateway ? 1 : 0,
       enableDnsHostnames: true,
       enableDnsSupport: true,
       subnetConfiguration: [
         {
           name: "PrivateSubnet",
-          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+          subnetType: privateSubnetType,
           cidrMask: 24,
         },
-        {
-          name: "PublicSubnet",
-          subnetType: ec2.SubnetType.PUBLIC,
-          cidrMask: 24,
-        },
+        ...(useNatGateway
+          ? [
+              {
+                name: "PublicSubnet",
+                subnetType: ec2.SubnetType.PUBLIC,
+                cidrMask: 24,
+              },
+            ]
+          : []),
       ],
     });
 
     const ec2Role = createEc2Role(this);
-    createVpcEndpoints(this.vpc);
+    createVpcEndpoints(this.vpc, privateSubnetType);
 
     const publicSg = new ec2.SecurityGroup(this, "PublicInstanceSG", {
       vpc: this.vpc,
@@ -241,7 +255,9 @@ export class FractalbitsVpcStack extends cdk.Stack {
     const benchInstanceType = new ec2.InstanceType("c7g.large");
 
     // Get specific subnets for instances to ensure correct AZ placement
-    const privateSubnets = this.vpc.isolatedSubnets;
+    const privateSubnets = useNatGateway
+      ? this.vpc.privateSubnets
+      : this.vpc.isolatedSubnets;
     const publicSubnets = this.vpc.publicSubnets;
     const subnet1 = privateSubnets[0]; // First AZ (private)
     // Only get second subnet for multi-AZ mode
@@ -336,6 +352,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         props.numBenchClients,
         "bench_client",
         skipUserDataCtx,
+        deployOS,
       );
       // Add lifecycle hook for bench_client ASG
       addAsgDynamoDbDeregistrationLifecycleHook(
@@ -356,6 +373,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         instanceType,
         sg,
         ec2Role,
+        deployOS,
       );
     });
 
@@ -374,6 +392,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         props.numBssNodes,
         "bss_server",
         skipUserDataCtx,
+        deployOS,
       );
     }
 
@@ -392,6 +411,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         this.vpc,
         nssTargets,
         servicePort,
+        privateSubnets,
       );
     }
 
@@ -405,6 +425,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         this.vpc,
         [instances["nss-A"], instances["nss-B"]],
         mirrordPort,
+        privateSubnets,
       );
     }
 
@@ -426,6 +447,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       props.numApiServers,
       "api_server",
       skipUserDataCtx,
+      deployOS,
     );
 
     // Add lifecycle hook for api_server ASG
@@ -441,7 +463,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
     const nlb = new elbv2.NetworkLoadBalancer(this, "ApiNLB", {
       vpc: this.vpc,
       internetFacing: false,
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      vpcSubnets: { subnetType: privateSubnetType },
       crossZoneEnabled: multiAz, // Only enable cross-zone for multi-AZ
     });
     const listener = nlb.addListener("ApiListener", { port: 80 });
@@ -497,7 +519,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
     const skipUserData = this.node.tryGetContext("skipUserData") === "true";
     if (!skipUserData) {
       for (const instance of Object.values(instances)) {
-        instance.addUserData(createUserData(this).render());
+        instance.addUserData(createUserData(this, deployOS).render());
       }
     }
 

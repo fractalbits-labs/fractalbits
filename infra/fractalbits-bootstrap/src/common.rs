@@ -33,15 +33,47 @@ pub const S3EXPRESS_REMOTE_BUCKET_CONFIG: &str = "s3express-remote-bucket-config
 /// Shared binaries that are not CPU-specific (stored directly under {arch}/)
 const SHARED_BINARIES: &[&str] = &["fractalbits-bootstrap", "etcd", "etcdctl", "warp"];
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OsType {
+    AmazonLinux,
+    Ubuntu,
+}
+
+impl OsType {
+    pub fn detect() -> Self {
+        if let Ok(content) = std::fs::read_to_string("/etc/os-release")
+            && (content.contains("Ubuntu") || content.contains("Debian"))
+        {
+            return OsType::Ubuntu;
+        }
+        OsType::AmazonLinux
+    }
+}
+
+/// Install amazon-ec2-utils on Ubuntu so that ec2-metadata is available early,
+/// before common_setup() runs. On AL2023 it's pre-installed.
+pub fn ensure_ec2_metadata() -> CmdResult {
+    if OsType::detect() == OsType::Ubuntu {
+        install_packages(&["amazon-ec2-utils"])?;
+    }
+    Ok(())
+}
+
 pub fn common_setup(target: DeployTarget) -> CmdResult {
     create_network_tuning_sysctl_file()?;
     create_storage_tuning_sysctl_file()?;
+    let os = OsType::detect();
+    let perf_pkg = match os {
+        OsType::Ubuntu => "linux-tools-generic",
+        OsType::AmazonLinux => "perf",
+    };
     match target {
         DeployTarget::Aws => {
-            install_rpms(&["amazon-cloudwatch-agent", "perf", "lldb"])?;
+            install_cloudwatch_agent(os)?;
+            install_packages(&[perf_pkg, "lldb"])?;
         }
         DeployTarget::OnPrem => {
-            install_rpms(&["perf", "lldb"])?;
+            install_packages(&[perf_pkg, "lldb"])?;
         }
     }
     Ok(())
@@ -292,8 +324,17 @@ pub fn create_logrotate_for_stats() -> CmdResult {
     Ok(())
 }
 
+// It could be replaced with `ec2-metadata --region`,
+// however, which seemed not working on ubuntu (version 0.1.2)
 pub fn get_current_aws_region() -> FunResult {
-    run_fun!(ec2-metadata --region | awk r"{print $2}")
+    let token = run_fun! {
+        curl -X PUT "http://169.254.169.254/latest/api/token"
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -s
+    }?;
+    run_fun! {
+        curl -H "X-aws-ec2-metadata-token: $token"
+            "http://169.254.169.254/latest/meta-data/placement/region" -s
+    }
 }
 
 pub fn get_ec2_tag(instance_id: &str, region: &str, tag_name: &str) -> FunResult {
@@ -597,12 +638,45 @@ pub fn create_coredump_config() -> CmdResult {
     }
 }
 
-pub fn install_rpms(rpms: &[&str]) -> CmdResult {
-    run_cmd! {
-        info "Installing ${rpms:?}";
-        yum install -y -q $[rpms] >/dev/null;
-    }?;
+pub fn install_packages(packages: &[&str]) -> CmdResult {
+    let os = OsType::detect();
+    run_cmd!(info "Installing ${packages:?}")?;
+    match os {
+        OsType::Ubuntu => {
+            run_cmd! {
+                apt-get update -qq 2>&1 >/dev/null;
+                apt-get install -y -qq $[packages] >/dev/null;
+            }?;
+        }
+        OsType::AmazonLinux => {
+            run_cmd!(yum install -y -q $[packages] >/dev/null)?;
+        }
+    }
+    Ok(())
+}
 
+fn install_cloudwatch_agent(os: OsType) -> CmdResult {
+    match os {
+        OsType::AmazonLinux => {
+            run_cmd!(yum install -y -q amazon-cloudwatch-agent >/dev/null)?;
+        }
+        OsType::Ubuntu => {
+            let cpu_arch = run_fun!(arch)?;
+            let deb_arch = match cpu_arch.as_str() {
+                "aarch64" => "arm64",
+                _ => "amd64",
+            };
+            let url = format!(
+                "https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/{deb_arch}/latest/amazon-cloudwatch-agent.deb"
+            );
+            run_cmd! {
+                info "Downloading CloudWatch agent for Ubuntu";
+                curl -sL -o /tmp/amazon-cloudwatch-agent.deb $url;
+                dpkg -i /tmp/amazon-cloudwatch-agent.deb >/dev/null;
+                rm -f /tmp/amazon-cloudwatch-agent.deb;
+            }?;
+        }
+    }
     Ok(())
 }
 
@@ -1344,9 +1418,14 @@ echo "XPS configured for TX steering" >&2
 }
 
 pub fn setup_serial_console_password() -> CmdResult {
+    let os = OsType::detect();
+    let username = match os {
+        OsType::Ubuntu => "ubuntu",
+        OsType::AmazonLinux => "ec2-user",
+    };
     run_cmd! {
-        info "Setting password for ec2-user to enable serial console access";
-        echo "ec2-user:fractalbits!" | chpasswd;
+        info "Setting password for $username to enable serial console access";
+        echo "$username:fractalbits!" | chpasswd;
     }?;
     Ok(())
 }

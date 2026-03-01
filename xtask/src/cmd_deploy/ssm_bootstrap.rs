@@ -113,7 +113,7 @@ fn ssm_send_command(
 
     let instance_ids_str = instance_ids.join(",");
     let bootstrap_command = format!(
-        "aws s3 cp --no-progress s3://{bucket_name}/bootstrap.sh - | sh 2>&1 | tee -a /var/log/cloud-init-output.log"
+        "command -v aws >/dev/null 2>&1 || snap install aws-cli --classic; aws s3 cp --no-progress s3://{bucket_name}/bootstrap.sh - | bash 2>&1 | tee -a /var/log/cloud-init-output.log"
     );
 
     let command_id = run_fun!(

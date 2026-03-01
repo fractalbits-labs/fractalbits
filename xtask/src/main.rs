@@ -353,6 +353,14 @@ pub enum DeployCommand {
             long_help = "Use generic binaries (no CPU-specific optimizations) - use with --skip-upload when binaries were uploaded with --deploy-target on-prem"
         )]
         use_generic_binaries: bool,
+
+        #[clap(
+            long,
+            value_enum,
+            long_help = "Deployment OS: al2023 (default, no NAT) or ubuntu (with NAT gateway)",
+            default_value = "al2023"
+        )]
+        deploy_os: DeployOS,
     },
 
     #[clap(about = "Destroy VPC infrastructure (including s3 builds bucket cleanup)")]
@@ -499,6 +507,15 @@ pub enum JournalType {
     #[default]
     Ebs,
     Nvme,
+}
+
+#[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
+#[strum(serialize_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum DeployOS {
+    #[default]
+    Al2023,
+    Ubuntu,
 }
 
 #[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
@@ -820,6 +837,7 @@ async fn main() -> CmdResult {
                 skip_upload,
                 simulate_on_prem,
                 use_generic_binaries,
+                deploy_os,
             } => cmd_deploy::create_vpc(cmd_deploy::VpcConfig {
                 template,
                 num_api_servers,
@@ -838,6 +856,7 @@ async fn main() -> CmdResult {
                 skip_upload,
                 simulate_on_prem,
                 use_generic_binaries,
+                deploy_os,
             })?,
             DeployCommand::DestroyVpc => cmd_deploy::destroy_vpc()?,
             DeployCommand::BootstrapProgress { deploy_target } => {

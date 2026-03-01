@@ -53,7 +53,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     // Complete instances-ready stage
     barrier.complete_stage(stages::INSTANCES_READY, None)?;
 
-    install_rpms(&["nvme-cli", "mdadm"])?;
+    install_packages(&["nvme-cli", "mdadm"])?;
     format_local_nvme_disks(false)?; // no twp support since experiment is done
 
     let mut binaries = vec!["bss_server"];

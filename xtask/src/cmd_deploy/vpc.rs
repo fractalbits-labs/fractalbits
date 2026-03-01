@@ -28,6 +28,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         skip_upload,
         simulate_on_prem,
         use_generic_binaries,
+        deploy_os,
     } = config;
 
     // Override settings for simulate-on-prem mode
@@ -123,6 +124,8 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     if use_generic_binaries {
         add_context("useGenericBinaries", "true".to_string());
     }
+
+    add_context("deployOS", deploy_os.as_ref().to_string());
 
     // Deploy the VPC stack
     if simulate_on_prem {

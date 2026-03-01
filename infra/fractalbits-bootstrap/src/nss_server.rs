@@ -25,7 +25,7 @@ pub fn bootstrap(
     // Complete instances-ready stage
     barrier.complete_stage(stages::INSTANCES_READY, None)?;
 
-    install_rpms(&["nvme-cli", "mdadm"])?;
+    install_packages(&["nvme-cli", "mdadm"])?;
     if meta_stack_testing || for_bench {
         let _ = download_binaries(config, &["rewrk_rpc"]);
     }

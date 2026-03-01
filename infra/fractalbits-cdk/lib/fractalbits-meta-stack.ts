@@ -48,7 +48,7 @@ export class FractalbitsMetaStack extends cdk.Stack {
       ],
     });
 
-    createVpcEndpoints(this.vpc);
+    createVpcEndpoints(this.vpc, ec2.SubnetType.PRIVATE_ISOLATED);
 
     createDynamoDbTable(
       this,

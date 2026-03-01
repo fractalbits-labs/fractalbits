@@ -4,7 +4,7 @@ import { FractalbitsVpcStack } from "../lib/fractalbits-vpc-stack";
 import { FractalbitsBenchVpcStack } from "../lib/fractalbits-bench-vpc-stack";
 import { PeeringStack } from "../lib/fractalbits-peering-stack";
 import { FractalbitsMetaStack } from "../lib/fractalbits-meta-stack";
-import { getAzNameFromIdAtBuildTime } from "../lib/ec2-utils";
+import { getAzNameFromIdAtBuildTime, DeployOS } from "../lib/ec2-utils";
 
 const app = new cdk.App();
 
@@ -59,6 +59,7 @@ let numBssNodes = Number(app.node.tryGetContext("numBssNodes")) || 1;
 let ebsVolumeIops = Number(app.node.tryGetContext("ebsVolumeIops")) || 10000;
 let ebsVolumeSize = Number(app.node.tryGetContext("ebsVolumeSize")) || 20;
 let rootServerHa = app.node.tryGetContext("rootServerHa") || false;
+const deployOS = (app.node.tryGetContext("deployOS") ?? "al2023") as DeployOS;
 
 // Configure based on template type
 let nssInstanceType = "m7gd.4xlarge";
@@ -113,6 +114,7 @@ const vpcStack = new FractalbitsVpcStack(app, "FractalbitsVpcStack", {
   rootServerHa: rootServerHa,
   ebsVolumeSize: ebsVolumeSize,
   ebsVolumeIops: ebsVolumeIops,
+  deployOS: deployOS,
 });
 
 if (benchType === "service_endpoint") {
