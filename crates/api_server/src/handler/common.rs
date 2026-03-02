@@ -14,7 +14,6 @@ use data_types::object_layout::{HeaderList, ObjectLayout};
 pub use file_ops::mpu_get_part_prefix;
 use file_ops::{parse_get_inode, parse_list_inodes};
 use futures::StreamExt;
-use rand::Rng;
 use rpc_client_common::nss_rpc_retry;
 use s3_error::S3Error;
 use std::collections::BTreeMap;
@@ -211,7 +210,6 @@ pub fn object_headers(
 
 // Not using md5 as etag for speed reason
 pub fn gen_etag() -> String {
-    let mut rng = rand::thread_rng();
-    let random: [u8; 16] = rng.r#gen();
+    let random: [u8; 16] = rand::random();
     hex::encode(random)
 }

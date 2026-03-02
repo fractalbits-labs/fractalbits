@@ -200,7 +200,7 @@ where
             .with_interval(Duration::from_secs(2))
             .with_retries(2);
         socket.set_tcp_keepalive(&keepalive)?;
-        socket.set_nodelay(true)?;
+        socket.set_tcp_nodelay(true)?;
         socket.set_nonblocking(true)?;
 
         Ok(())
