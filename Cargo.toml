@@ -30,6 +30,7 @@ exclude = [
     "crates/common/volume_group_proxy/src",
     "crates/fs_server/src",
     "crates/fs_server/fractal-fuse/src",
+    "crates/fs_server/fractal-fuse/examples",
     "crates/fractal-s3/demo",
     "crates/fractal-s3/src",
     "crates/ha/multi_az",
