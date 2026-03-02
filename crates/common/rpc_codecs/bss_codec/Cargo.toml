@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 rpc_codec_common.workspace = true
-rpc_client_common.workspace = true
+rpc_client_common = { workspace = true, default-features = false }
 bytes.workspace = true
 bytemuck.workspace = true
 data_types.workspace = true

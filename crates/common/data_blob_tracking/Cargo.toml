@@ -3,8 +3,12 @@ name = "data_blob_tracking"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["tokio-runtime"]
+tokio-runtime = ["rpc_client_nss/tokio-runtime", "rpc_client_rss/tokio-runtime", "rpc_client_common/tokio-runtime"]
+compio-runtime = ["rpc_client_nss/compio-runtime", "rpc_client_rss/compio-runtime", "rpc_client_common/compio-runtime"]
+
 [dependencies]
-tokio = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -12,9 +16,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 # RPC clients
-rpc_client_nss = { workspace = true, features = ["tokio-runtime"] }
-rpc_client_rss = { workspace = true, features = ["tokio-runtime"] }
-rpc_client_common = { workspace = true, features = ["tokio-runtime"] }
+rpc_client_nss = { workspace = true, default-features = false }
+rpc_client_rss = { workspace = true, default-features = false }
+rpc_client_common = { workspace = true, default-features = false }
 
 # Codecs (needed for response types)
 rss_codec = { workspace = true }

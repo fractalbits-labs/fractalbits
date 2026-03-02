@@ -102,11 +102,14 @@ pub async fn run_fs_server_tests() -> CmdResult {
     Ok(())
 }
 
-/// Build the fs_server binary.
+/// Build the fs_server binary using isolated COMPIO_TARGET_DIR
+/// to prevent workspace feature unification from enabling tokio-runtime.
 pub fn build_fs_server() -> CmdResult {
+    let compio_target_dir = crate::cmd_build::COMPIO_TARGET_DIR;
     run_cmd! {
-        info "Building fs_server ...";
-        cargo build -p fs_server;
+        info "Building fs_server (isolated compio build) ...";
+        CARGO_TARGET_DIR=$compio_target_dir cargo build -p fs_server;
+        cp $compio_target_dir/debug/fs_server target/debug/fs_server;
     }
 }
 

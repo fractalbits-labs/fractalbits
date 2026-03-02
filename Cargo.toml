@@ -46,7 +46,7 @@ resolver = "2"
 [workspace.dependencies]
 aws_signature = { path = "crates/common/aws_signature" }
 data_types = { path = "crates/common/data_types" }
-data_blob_tracking = { path = "crates/common/data_blob_tracking" }
+data_blob_tracking = { path = "crates/common/data_blob_tracking", default-features = false }
 volume_group_proxy = { path = "crates/common/volume_group_proxy", default-features = false }
 metrics_wrapper = { path = "crates/common/metrics_wrapper" }
 rpc_client_common = { path = "crates/common/rpc_clients/client_common", default-features = false }
