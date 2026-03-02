@@ -1,0 +1,11 @@
+[package]
+name = "file_ops"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nss_codec.workspace = true
+data_types.workspace = true
+rkyv.workspace = true
+bytes.workspace = true
+tracing.workspace = true

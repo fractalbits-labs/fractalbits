@@ -12,8 +12,9 @@ use actix_web::http::header::{self, HeaderMap};
 use data_types::TraceId;
 use data_types::object_layout::{HeaderList, ObjectLayout};
 use futures::StreamExt;
+pub use file_ops::mpu_get_part_prefix;
+use file_ops::{parse_get_inode, parse_list_inodes};
 use rand::Rng;
-use rkyv::{self, rancor::Error};
 use rpc_client_common::nss_rpc_retry;
 use s3_error::S3Error;
 use std::collections::BTreeMap;
@@ -79,19 +80,7 @@ pub async fn get_raw_object(
     )
     .await?;
 
-    let object_bytes = match resp.result.unwrap() {
-        nss_codec::get_inode_response::Result::Ok(res) => res,
-        nss_codec::get_inode_response::Result::ErrNotFound(()) => {
-            return Err(S3Error::NoSuchKey);
-        }
-        nss_codec::get_inode_response::Result::ErrOther(e) => {
-            tracing::error!(e);
-            return Err(S3Error::InternalError);
-        }
-    };
-
-    let object = rkyv::from_bytes::<ObjectLayout, Error>(&object_bytes)?;
-    Ok(object)
+    Ok(parse_get_inode(resp)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -123,33 +112,14 @@ pub async fn list_raw_objects(
     )
     .await?;
 
-    // Process results
-    let inodes = match resp.result.unwrap() {
-        nss_codec::list_inodes_response::Result::Ok(res) => res.inodes,
-        nss_codec::list_inodes_response::Result::Err(e) => {
-            tracing::error!(e);
-            return Err(S3Error::InternalError);
+    let result = parse_list_inodes(resp)?;
+    let mut res = Vec::with_capacity(result.entries.len());
+    for entry in result.entries {
+        if let Some(layout) = entry.layout {
+            res.push((entry.key, layout));
         }
-    };
-
-    let mut res = Vec::with_capacity(inodes.len());
-    for inode in inodes {
-        let object = rkyv::from_bytes::<ObjectLayout, Error>(&inode.inode)?;
-        res.push((inode.key, object));
     }
     Ok(res)
-}
-
-pub fn mpu_get_part_prefix(mut key: String, part_number: u64) -> String {
-    key.push('#');
-    // if part number is 0, we treat it as object key
-    if part_number != 0 {
-        // part numbers range is [1, 10000], which can be encoded as 4 digits
-        // See https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
-        let part_str = format!("{:04}", part_number - 1);
-        key.push_str(&part_str);
-    }
-    key
 }
 
 pub fn mpu_parse_part_number(mpu_key: &str) -> Result<u32, S3Error> {

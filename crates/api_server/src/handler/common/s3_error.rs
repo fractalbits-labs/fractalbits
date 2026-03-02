@@ -926,6 +926,23 @@ impl From<data_types::object_layout::ObjectLayoutError> for S3Error {
     }
 }
 
+impl From<file_ops::NssError> for S3Error {
+    fn from(value: file_ops::NssError) -> Self {
+        match value {
+            file_ops::NssError::NotFound => Self::NoSuchKey,
+            file_ops::NssError::AlreadyExists => Self::BucketAlreadyExists,
+            file_ops::NssError::Internal(e) => {
+                tracing::error!("NssError::Internal: {e}");
+                Self::InternalError
+            }
+            file_ops::NssError::Deserialization(e) => {
+                tracing::error!("NssError::Deserialization: {e}");
+                Self::InternalError
+            }
+        }
+    }
+}
+
 impl From<BlobStorageError> for S3Error {
     fn from(err: BlobStorageError) -> Self {
         tracing::error!("blob storage error: {}", err);

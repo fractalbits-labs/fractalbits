@@ -23,6 +23,7 @@ exclude = [
     "crates/common/rpc_clients/rss/src",
     "crates/common/rpc_codecs/bss_codec/src",
     "crates/common/rpc_codecs/codec_common/src",
+    "crates/common/file_ops/src",
     "crates/common/rpc_codecs/nss_codec/src",
     "crates/common/rpc_codecs/rss_codec/src",
     "crates/common/test_common/src",
@@ -55,6 +56,7 @@ rpc_client_rss = { path = "crates/common/rpc_clients/rss", default-features = fa
 rpc_codec_common = { path = "crates/common/rpc_codecs/codec_common" }
 bss_codec = { path = "crates/common/rpc_codecs/bss_codec" }
 nss_codec = { path = "crates/common/rpc_codecs/nss_codec" }
+file_ops = { path = "crates/common/file_ops" }
 rss_codec = { path = "crates/common/rpc_codecs/rss_codec" }
 test_common = { path = "crates/common/test_common" }
 xtask_common = { path = "xtask/common" }

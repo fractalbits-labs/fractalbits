@@ -162,9 +162,8 @@ async fn fetch_mpu_parts(
         mpus.len(),
         mpu_prefix
     );
-    for (mut mpu_key, mpu) in mpus {
+    for (mpu_key, mpu) in mpus {
         if let (Ok(etag), Ok(size)) = (mpu.etag(), mpu.size()) {
-            assert_eq!(Some('\0'), mpu_key.pop());
             let last_modified = time::format_timestamp(mpu.timestamp);
             let part_number = mpu_parse_part_number(&mpu_key)?;
             let mut part = Part {

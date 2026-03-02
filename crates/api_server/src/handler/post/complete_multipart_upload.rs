@@ -215,8 +215,7 @@ pub async fn complete_multipart_upload_handler(
     let mut checksummer = MpuChecksummer::init(expected_checksum.map(|x| x.algorithm()));
 
     tracing::info!("Found {} mpu objects", mpu_objs.len());
-    for (mut mpu_key, mpu_obj) in mpu_objs {
-        assert_eq!(Some('\0'), mpu_key.pop());
+    for (mpu_key, mpu_obj) in mpu_objs {
         let part_number = mpu_parse_part_number(&mpu_key)?;
         tracing::info!(
             "Processing part {} with size {}",

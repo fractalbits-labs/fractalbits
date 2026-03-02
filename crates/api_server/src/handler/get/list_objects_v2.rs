@@ -1,5 +1,5 @@
 use actix_web::web::Query;
-use nss_codec::list_inodes_response;
+use file_ops::parse_list_inodes;
 use rpc_client_common::nss_rpc_retry;
 use std::sync::Arc;
 
@@ -16,7 +16,6 @@ use crate::{
 };
 use data_types::object_layout::ObjectLayout;
 use data_types::{Bucket, TraceId};
-use rkyv::{self, rancor::Error};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Default)]
@@ -316,52 +315,39 @@ pub async fn list_objects(
     )
     .await?;
 
-    // Process results
-    let (inodes, has_more) = match resp.result.unwrap() {
-        list_inodes_response::Result::Ok(res) => {
-            tracing::debug!(
-                "NSS returned {} inodes, has_more={}",
-                res.inodes.len(),
-                res.has_more
-            );
-            (res.inodes, res.has_more)
-        }
-        list_inodes_response::Result::Err(e) => {
-            tracing::error!("NSS list_inodes error: {}", e);
-            return Err(S3Error::InternalError);
-        }
-    };
+    let result = parse_list_inodes(resp)?;
+    tracing::debug!(
+        "NSS returned {} entries, has_more={}",
+        result.entries.len(),
+        result.has_more
+    );
 
     let mut objs = Vec::new();
     let mut common_prefixes = Vec::new();
-    for inode_with_key in inodes.iter() {
-        if inode_with_key.inode.is_empty() {
-            common_prefixes.push(Prefix {
-                prefix: inode_with_key.key[1..].to_owned(), // remove first "/"
-            });
-            continue;
-        }
-
-        match rkyv::from_bytes::<ObjectLayout, Error>(&inode_with_key.inode) {
-            Err(e) => return Err(e.into()),
-            Ok(obj) => {
-                // Skip objects in non-final states (e.g., in-progress or aborted MPU)
+    let mut last_key = None;
+    for entry in &result.entries {
+        match &entry.layout {
+            None => {
+                // Empty inode = common prefix (directory marker)
+                common_prefixes.push(Prefix {
+                    prefix: entry.key[1..].to_owned(), // remove leading "/"
+                });
+            }
+            Some(obj) => {
                 if !obj.is_listable() {
                     continue;
                 }
-                let mut key = inode_with_key.key[1..].to_owned();
-                assert_eq!(Some('\0'), key.pop()); // removing nss's trailing '\0'
-                objs.push(Object::from_layout_and_key(obj, key)?);
+                let key = entry.key[1..].to_owned(); // remove leading "/"
+                objs.push(Object::from_layout_and_key(obj.clone(), key)?);
             }
         }
+        last_key = Some(&entry.key);
     }
 
-    let next_continuation_token = if !has_more {
+    let next_continuation_token = if !result.has_more {
         None
     } else {
-        inodes
-            .last()
-            .map(|inode| inode.key[1..].trim_end_matches('\0').to_owned())
+        last_key.map(|key| key[1..].to_owned()) // remove leading "/"
     };
 
     Ok((objs, common_prefixes, next_continuation_token))
