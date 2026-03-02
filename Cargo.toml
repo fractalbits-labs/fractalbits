@@ -61,8 +61,6 @@ rss_codec = { path = "crates/common/rpc_codecs/rss_codec" }
 test_common = { path = "crates/common/test_common" }
 xtask_common = { path = "xtask/common" }
 
-tokio-util = { version = "0.7.12", features = ["codec"] }
-tokio-stream = "0.1.16"
 thiserror = "1.0.63"
 fake = "3.0.1"
 bytemuck = { version = "1.18.0", features = ["derive"] }
@@ -74,12 +72,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 prost = "0.13"
 bytes = "1.7.1"
 tracing = "0.1.40"
-tower-http = { version = "0.5.2", features = ["trace", "fs"] }
-console-subscriber = "0.4.0"
-tower = "0.5.1"
 strum = { version = "0.26.3", features = ["derive"] }
 quick-xml = { version = "0.36.2", features = ["serialize"] }
-http-body-util = "0.1.2"
 uuid = { version = "1.11.0", features = ["v4", "v7", "fast-rng"] }
 rkyv = { version = "0.8.8", features = ["uuid-1", "unaligned"] }
 rand = "0.8.5"
@@ -89,58 +83,46 @@ dashmap = "6.1.0"
 httpdate = "1.0.3"
 futures = "0.3.31"
 pin-project-lite = "0.2.15"
-async-trait = "0.1.81"
 serde_json = "1.0.138"
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 clap = { version = "4.5.27", features = ["derive", "env"] }
 hmac = "0.12"
-itertools = "0.13"
 crc32fast = "1.4.2"
 reed-solomon-simd = "3.1.0"
 xxhash-rust = {version = "0.8.15", features = ["xxh3"] }
 blake2 = "0.10.6"
-nom = "7.1"
 base64 = "0.22.1"
 crc32c = "0.6.8"
 crc64fast-nvme = "1.1.0"
-md-5 = "0.10"
 sha1 = "0.10"
 sha2 = { version = "0.10", features = ["asm-aarch64"] }
 url = "2.5.4"
 http-body = "1.0.1"
 serde_bytes = "0.11"
 percent-encoding = "2.3.1"
-sync_wrapper = "1.0.2"
 http-range = "0.1.5"
 aws-config = "1.6.3"
-aws-smithy-http-client = "1.0.6"
 openssl = { version = "0.10.73", features = ["vendored"]}
 rustls = "0.23"
 rustls-pemfile = "2.2"
-aws-lc-rs = "1.11"
 aws-sdk-dynamodb = "1.78.0"
 etcd-client = "0.17"
 log = "0.4.27"
 metrics = "0.24"
 metrics-exporter-statsd = "0.9.0"
 metrics-exporter-prometheus = "0.17.2"
-tokio-retry = "0.3"
 moka = { version = "0.12", features = ["future"] }
 tikv-jemallocator = "0.6"
 parking_lot = "0.12"
-arrayvec = "0.7"
 governor = "0.6"
-nonzero_ext = "0.3"
 config = {version = "0.15", features = ["toml"]}
 socket2 = { version = "0.5", features = ["all"] }
 reqwest = { version = "0.11", features = ["json"] }
-hostname = "0.3"
 futures-util = "0.3.31"
 anyhow = "1.0.89"
 regex = "1.10.6"
 core_affinity = "0.7"
 urlencoding = "2"
-fuse3 = { version = "0.8", features = ["tokio-runtime", "unprivileged"] }
 compio-runtime = { git = "https://github.com/compio-rs/compio", branch = "master", features = ["time"] }
 compio-net = { git = "https://github.com/compio-rs/compio", branch = "master" }
 compio-io = { git = "https://github.com/compio-rs/compio", branch = "master" }
