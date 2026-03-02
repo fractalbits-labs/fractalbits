@@ -31,10 +31,7 @@ pub async fn run_fs_server_tests() -> CmdResult {
         return Err(e);
     }
 
-    println!(
-        "\n{}",
-        "=== Test: Nested Directory Structure ===".bold()
-    );
+    println!("\n{}", "=== Test: Nested Directory Structure ===".bold());
     if let Err(e) = test_nested_directories().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
@@ -65,28 +62,19 @@ pub async fn run_fs_server_tests() -> CmdResult {
         return Err(e);
     }
 
-    println!(
-        "\n{}",
-        "=== Test: Unlink with Open Handle ===".bold()
-    );
+    println!("\n{}", "=== Test: Unlink with Open Handle ===".bold());
     if let Err(e) = test_unlink_open_handle().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
     }
 
-    println!(
-        "\n{}",
-        "=== Test: Overwrite Existing File ===".bold()
-    );
+    println!("\n{}", "=== Test: Overwrite Existing File ===".bold());
     if let Err(e) = test_overwrite_existing().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
     }
 
-    println!(
-        "\n{}",
-        "=== Test: Rename No-Replace (EEXIST) ===".bold()
-    );
+    println!("\n{}", "=== Test: Rename No-Replace (EEXIST) ===".bold());
     if let Err(e) = test_rename_noreplace().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
@@ -98,10 +86,7 @@ pub async fn run_fs_server_tests() -> CmdResult {
         return Err(e);
     }
 
-    println!(
-        "\n{}",
-        "=== Test: Write in Subdirectory ===".bold()
-    );
+    println!("\n{}", "=== Test: Write in Subdirectory ===".bold());
     if let Err(e) = test_write_in_subdirectory().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);

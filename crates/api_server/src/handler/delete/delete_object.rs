@@ -7,8 +7,8 @@ use crate::{
 };
 use actix_web::HttpResponse;
 use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
+use file_ops::parse_delete_inode;
 use metrics_wrapper::histogram;
-use nss_codec::delete_inode_response;
 use rkyv::{self, rancor::Error};
 use rpc_client_common::nss_rpc_retry;
 use tokio::sync::mpsc::Sender;
@@ -33,29 +33,16 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
     )
     .await?;
 
-    let object_bytes = match resp.result.unwrap() {
-        delete_inode_response::Result::Ok(res) => res,
-        delete_inode_response::Result::ErrNotFound(_) => {
-            // Object doesn't exist - S3 returns success for idempotent operations
+    let object_bytes = match parse_delete_inode(resp)? {
+        Some(bytes) => bytes,
+        None => {
+            // Object doesn't exist or already deleted - S3 returns success for idempotent operations
             tracing::debug!(
-                "delete non-existing object {}/{}",
+                "delete non-existing or already-deleted object {}/{}",
                 bucket.bucket_name,
                 ctx.key
             );
             return Ok(HttpResponse::NoContent().finish());
-        }
-        delete_inode_response::Result::ErrAlreadyDeleted(_) => {
-            // Object already deleted - S3 returns success for idempotent operations
-            tracing::warn!(
-                "object {}/{} is already deleted",
-                bucket.bucket_name,
-                ctx.key
-            );
-            return Ok(HttpResponse::NoContent().finish());
-        }
-        delete_inode_response::Result::ErrOther(e) => {
-            tracing::error!("delete_inode error: {}", e);
-            return Err(S3Error::InternalError);
         }
     };
 

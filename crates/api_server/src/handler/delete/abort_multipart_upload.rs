@@ -1,7 +1,7 @@
 use crate::handler::{ObjectRequestContext, common::s3_error::S3Error};
 use actix_web::HttpResponse;
 use bytes::Bytes;
-use nss_codec::get_inode_response;
+use file_ops::{parse_get_inode, parse_put_inode};
 use rkyv::{self, api::high::to_bytes_in, rancor::Error};
 use rpc_client_common::nss_rpc_retry;
 
@@ -37,20 +37,11 @@ pub async fn abort_multipart_upload_handler(
     )
     .await?;
 
-    let object_bytes = match resp.result.unwrap() {
-        get_inode_response::Result::Ok(res) => res,
-        get_inode_response::Result::ErrNotFound(()) => {
-            return Err(S3Error::NoSuchUpload);
-        }
-        get_inode_response::Result::ErrOther(e) => {
-            tracing::error!(e);
-            return Err(S3Error::InternalError);
-        }
+    let mut object = match parse_get_inode(resp) {
+        Ok(layout) => layout,
+        Err(file_ops::NssError::NotFound) => return Err(S3Error::NoSuchUpload),
+        Err(e) => return Err(e.into()),
     };
-
-    // Verify upload_id matches and mark as aborted
-    let mut object =
-        rkyv::from_bytes::<data_types::object_layout::ObjectLayout, Error>(&object_bytes)?;
     if object.version_id.simple().to_string() != upload_id {
         return Err(S3Error::NoSuchUpload);
     }
@@ -73,13 +64,7 @@ pub async fn abort_multipart_upload_handler(
     )
     .await?;
 
-    match resp.result.unwrap() {
-        nss_codec::put_inode_response::Result::Ok(_) => {}
-        nss_codec::put_inode_response::Result::Err(e) => {
-            tracing::error!(e);
-            return Err(S3Error::InternalError);
-        }
-    };
+    parse_put_inode(resp)?;
 
     Ok(HttpResponse::NoContent().finish())
 }

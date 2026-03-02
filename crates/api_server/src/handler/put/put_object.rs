@@ -8,8 +8,8 @@ use actix_web::{HttpResponse, http::header};
 use aws_signature::{STREAMING_PAYLOAD, sigv4::get_signing_key_cached};
 use crc32c::Crc32cHasher as Crc32c;
 use crc32fast::Hasher as Crc32;
+use file_ops::parse_put_inode;
 use futures::{StreamExt, TryStreamExt};
-use nss_codec::put_inode_response;
 use rkyv::{self, api::high::to_bytes_in, rancor::Error};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -481,13 +481,7 @@ async fn put_object_streaming_internal(
 
     // Delete old object if it is an overwrite request
     // But skip deletion for multipart parts (keys containing '#') to avoid race conditions
-    let old_object_bytes = match resp.result.unwrap() {
-        put_inode_response::Result::Ok(res) => res,
-        put_inode_response::Result::Err(e) => {
-            tracing::error!("put_inode error: {}", e);
-            return Err(S3Error::InternalError);
-        }
-    };
+    let old_object_bytes = parse_put_inode(resp)?;
 
     let is_multipart_part = ctx.key.contains('#');
     if !old_object_bytes.is_empty() && !is_multipart_part {
@@ -701,13 +695,7 @@ async fn put_object_with_no_trailer(
 
     // Delete old object if it is an overwrite request
     // But skip deletion for multipart parts (keys containing '#') to avoid race conditions
-    let old_object_bytes = match resp.result.unwrap() {
-        put_inode_response::Result::Ok(res) => res,
-        put_inode_response::Result::Err(e) => {
-            tracing::error!("put_inode error: {}", e);
-            return Err(S3Error::InternalError);
-        }
-    };
+    let old_object_bytes = parse_put_inode(resp)?;
     let is_multipart_part = ctx.key.contains('#');
     if !old_object_bytes.is_empty() && !is_multipart_part {
         let old_object =

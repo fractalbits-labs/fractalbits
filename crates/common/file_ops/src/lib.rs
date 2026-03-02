@@ -125,3 +125,62 @@ pub fn mpu_get_part_prefix(mut key: String, part_number: u64) -> String {
     }
     key
 }
+
+/// Extract (key, ObjectLayout) pairs from a ListInodesResult,
+/// requiring all entries to have non-empty inode data (layouts).
+pub fn parse_mpu_parts(result: ListInodesResult) -> Result<Vec<(String, ObjectLayout)>, NssError> {
+    let mut parts = Vec::with_capacity(result.entries.len());
+    for entry in result.entries {
+        match entry.layout {
+            Some(layout) => parts.push((entry.key, layout)),
+            None => {
+                return Err(NssError::Internal(
+                    "MPU part has empty inode data".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(parts)
+}
+
+/// Create a minimal directory marker ObjectLayout with size=0.
+/// NSS rejects empty values, so we store this sentinel layout for directories.
+pub fn create_dir_marker_layout() -> ObjectLayout {
+    use data_types::DataBlobGuid;
+    use data_types::object_layout::{ObjectCoreMetaData, ObjectMetaData, ObjectState};
+
+    ObjectLayout {
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        version_id: ObjectLayout::gen_version_id(),
+        block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
+        state: ObjectState::Normal(ObjectMetaData {
+            blob_guid: DataBlobGuid {
+                blob_id: uuid::Uuid::nil(),
+                volume_id: 0,
+            },
+            core_meta_data: ObjectCoreMetaData {
+                size: 0,
+                etag: String::new(),
+                headers: vec![],
+                checksum: None,
+            },
+        }),
+    }
+}
+
+/// Enumerate (blob_guid, block_number) pairs that should be deleted for a given ObjectLayout.
+/// Returns an empty vec if the layout has no valid blob_guid or num_blocks.
+pub fn blob_blocks_to_delete(layout: &ObjectLayout) -> Vec<(data_types::DataBlobGuid, u32)> {
+    let blob_guid = match layout.blob_guid() {
+        Ok(g) => g,
+        Err(_) => return vec![],
+    };
+    let num_blocks = match layout.num_blocks() {
+        Ok(n) => n,
+        Err(_) => return vec![],
+    };
+    (0..num_blocks).map(|i| (blob_guid, i as u32)).collect()
+}

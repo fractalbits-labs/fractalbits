@@ -15,7 +15,7 @@ use actix_web::web::Bytes;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use bytes::Buf;
 use data_types::object_layout::{MpuState, ObjectCoreMetaData, ObjectState};
-use nss_codec::put_inode_response;
+use file_ops::parse_put_inode;
 use rkyv::{self, api::high::to_bytes_in, rancor::Error};
 use rpc_client_common::nss_rpc_retry;
 use serde::{Deserialize, Serialize};
@@ -290,13 +290,7 @@ pub async fn complete_multipart_upload_handler(
         &ctx.trace_id
     )
     .await?;
-    match resp.result.unwrap() {
-        put_inode_response::Result::Ok(_) => {}
-        put_inode_response::Result::Err(e) => {
-            tracing::error!("put_inode error: {}", e);
-            return Err(S3Error::InternalError);
-        }
-    };
+    parse_put_inode(resp)?;
 
     let resp = CompleteMultipartUploadResult::default()
         .bucket(bucket.bucket_name.clone())
