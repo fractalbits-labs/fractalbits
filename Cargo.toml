@@ -124,9 +124,9 @@ anyhow = "1.0.102"
 regex = "1.12.3"
 core_affinity = "0.8"
 urlencoding = "2"
-compio-runtime = { git = "https://github.com/compio-rs/compio", branch = "master", features = ["time"] }
-compio-net = { git = "https://github.com/compio-rs/compio", branch = "master" }
-compio-io = { git = "https://github.com/compio-rs/compio", branch = "master" }
+compio-runtime = { version = "0.11", features = ["time"] }
+compio-net = "0.11"
+compio-io = "0.9"
 
 # Dev dependencies
 aws-sdk-s3 = "1.65.0"
@@ -146,7 +146,4 @@ indicatif = "0.18"
 
 # Build dependencies
 prost-build = "0.14"
-
-[patch.crates-io]
-io-uring = { git = "https://github.com/tokio-rs/io-uring", rev = "7ec7ae9" }
 
