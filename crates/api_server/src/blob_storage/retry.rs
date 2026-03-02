@@ -1,6 +1,6 @@
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use metrics_wrapper::{counter, histogram};
-use rand::Rng;
+use rand::RngExt;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
@@ -178,7 +178,7 @@ pub fn calculate_backoff(attempt: u32, config: &S3RetryConfig) -> Duration {
     let capped_backoff = base_backoff.min(config.max_backoff_us as f64);
 
     // Add jitter (0.8x to 1.2x for tighter control)
-    let jitter = rand::thread_rng().gen_range(0.8..1.2);
+    let jitter = rand::rng().random_range(0.8..1.2);
     let final_backoff = (capped_backoff * jitter) as u64;
 
     Duration::from_micros(final_backoff)

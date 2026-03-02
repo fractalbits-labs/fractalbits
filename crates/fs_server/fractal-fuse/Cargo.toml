@@ -12,10 +12,10 @@ compio-net = { git = "https://github.com/compio-rs/compio", branch = "master" }
 compio-io = { git = "https://github.com/compio-rs/compio", branch = "master" }
 compio-buf = { git = "https://github.com/compio-rs/compio", branch = "master" }
 libc = "0.2"
-nix = { version = "0.29", features = ["fs", "socket", "uio"] }
+nix = { version = "0.31", features = ["fs", "socket", "uio"] }
 bytes = { workspace = true }
 tracing = { workspace = true }
-which = "7"
+which = "8"
 pin-project-lite = { workspace = true }
 rpc_codec_common = { workspace = true }
 data_types = { workspace = true }

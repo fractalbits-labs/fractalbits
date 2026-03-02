@@ -413,7 +413,7 @@ fn make_reuseport_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     socket.set_reuse_address(true)?;
     socket.set_reuse_port(true)?;
 
-    socket.set_nodelay(true)?;
+    socket.set_tcp_nodelay(true)?;
     socket.set_recv_buffer_size(16 * 1024 * 1024)?;
     socket.set_send_buffer_size(16 * 1024 * 1024)?;
 

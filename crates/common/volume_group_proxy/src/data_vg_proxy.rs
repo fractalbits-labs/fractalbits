@@ -3,7 +3,7 @@ use bytes::Bytes;
 use data_types::{DataBlobGuid, DataVgInfo, TraceId, Volume, VolumeMode};
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics_wrapper::{counter, histogram};
-use rand::seq::SliceRandom;
+use rand::seq::{IndexedRandom, SliceRandom};
 use reed_solomon_simd::{decode as rs_decode, encode as rs_encode};
 use rpc_client_bss::RpcClientBss;
 use rpc_client_common::RpcError;
@@ -585,7 +585,7 @@ impl DataVgProxy {
         }
 
         let mut bss_node_indices: Vec<usize> = (0..available_nodes.len()).collect();
-        bss_node_indices.shuffle(&mut rand::thread_rng());
+        bss_node_indices.shuffle(&mut rand::rng());
 
         let mut write_futures = FuturesUnordered::new();
         for &index in &bss_node_indices {
@@ -741,7 +741,7 @@ impl DataVgProxy {
         }
 
         let mut bss_node_indices: Vec<usize> = (0..available_nodes.len()).collect();
-        bss_node_indices.shuffle(&mut rand::thread_rng());
+        bss_node_indices.shuffle(&mut rand::rng());
 
         let mut write_futures = FuturesUnordered::new();
         for &index in &bss_node_indices {
@@ -928,7 +928,7 @@ impl DataVgProxy {
 
         // Fast path: try reading from a randomly selected available node
         if !available_nodes.is_empty() {
-            let selected_node = *available_nodes.choose(&mut rand::thread_rng()).unwrap();
+            let selected_node = *available_nodes.choose(&mut rand::rng()).unwrap();
             debug!(
                 "Attempting fast path read from BSS node: {}",
                 selected_node.address

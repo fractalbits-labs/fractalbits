@@ -870,6 +870,13 @@ impl From<quick_xml::DeError> for S3Error {
     }
 }
 
+impl From<quick_xml::SeError> for S3Error {
+    fn from(value: quick_xml::SeError) -> Self {
+        tracing::error!("quick_xml::SeError: {value}");
+        Self::InternalError
+    }
+}
+
 impl From<ToStrError> for S3Error {
     fn from(value: ToStrError) -> Self {
         tracing::error!("ToStrError: {value}");

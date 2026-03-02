@@ -1,4 +1,3 @@
-use rand::Rng;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -10,8 +9,7 @@ impl TraceId {
     }
 
     pub fn new_with_worker_id(worker_id: u8) -> Self {
-        let mut rng = rand::thread_rng();
-        let random_value: u64 = rng.r#gen();
+        let random_value: u64 = rand::random();
         let trace_id = (random_value & 0xFFFFFFFFFFFFFF00) | (worker_id as u64);
         Self(trace_id)
     }

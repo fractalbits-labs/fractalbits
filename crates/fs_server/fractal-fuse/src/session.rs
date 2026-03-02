@@ -221,7 +221,7 @@ async fn run_entry<F: Filesystem>(
 /// Returns (max_write, num_queues).
 fn fuse_init(fuse_fd: BorrowedFd<'_>, opts: &MountOptions) -> io::Result<(u32, usize)> {
     let mut buf = vec![0u8; 8192];
-    let n = nix::unistd::read(fuse_fd.as_raw_fd(), &mut buf).map_err(io::Error::from)?;
+    let n = nix::unistd::read(fuse_fd, &mut buf).map_err(io::Error::from)?;
     if n < std::mem::size_of::<fuse_in_header>() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

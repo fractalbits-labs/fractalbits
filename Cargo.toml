@@ -61,67 +61,67 @@ rss_codec = { path = "crates/common/rpc_codecs/rss_codec" }
 test_common = { path = "crates/common/test_common" }
 xtask_common = { path = "xtask/common" }
 
-thiserror = "1.0.63"
-fake = "3.0.1"
-bytemuck = { version = "1.18.0", features = ["derive"] }
-tokio = { version = "1.39.2", features = ["full"] }
+thiserror = "2.0.18"
+fake = "4.4.0"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+tokio = { version = "1.49.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
-actix-web = { version = "4.11.0", features = ["rustls-0_23"] }
-actix-files = "0.6.6"
+actix-web = { version = "4.13.0", features = ["rustls-0_23"] }
+actix-files = "0.6.10"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-prost = "0.13"
-bytes = "1.7.1"
-tracing = "0.1.40"
-strum = { version = "0.26.3", features = ["derive"] }
-quick-xml = { version = "0.36.2", features = ["serialize"] }
-uuid = { version = "1.11.0", features = ["v4", "v7", "fast-rng"] }
-rkyv = { version = "0.8.8", features = ["uuid-1", "unaligned"] }
-rand = "0.8.5"
+prost = "0.14"
+bytes = "1.11.1"
+tracing = "0.1.44"
+strum = { version = "0.28.0", features = ["derive"] }
+quick-xml = { version = "0.39.2", features = ["serialize"] }
+uuid = { version = "1.21.0", features = ["v4", "v7", "fast-rng"] }
+rkyv = { version = "0.8.15", features = ["uuid-1", "unaligned"] }
+rand = "0.10.0"
 hex = "0.4.3"
-chrono = "0.4.39"
+chrono = "0.4.44"
 dashmap = "6.1.0"
 httpdate = "1.0.3"
-futures = "0.3.31"
-pin-project-lite = "0.2.15"
-serde_json = "1.0.138"
-toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
-clap = { version = "4.5.27", features = ["derive", "env"] }
+futures = "0.3.32"
+pin-project-lite = "0.2.17"
+serde_json = "1.0.149"
+toml = { version = "1.0", default-features = false, features = ["parse", "display", "serde"] }
+clap = { version = "4.5.60", features = ["derive", "env"] }
 hmac = "0.12"
-crc32fast = "1.4.2"
+crc32fast = "1.5.0"
 reed-solomon-simd = "3.1.0"
 xxhash-rust = {version = "0.8.15", features = ["xxh3"] }
 blake2 = "0.10.6"
 base64 = "0.22.1"
 crc32c = "0.6.8"
-crc64fast-nvme = "1.1.0"
+crc64fast-nvme = "1.2.1"
 sha1 = "0.10"
 sha2 = { version = "0.10", features = ["asm-aarch64"] }
-url = "2.5.4"
+url = "2.5.8"
 http-body = "1.0.1"
 serde_bytes = "0.11"
-percent-encoding = "2.3.1"
+percent-encoding = "2.3.2"
 http-range = "0.1.5"
 aws-config = "1.6.3"
-openssl = { version = "0.10.73", features = ["vendored"]}
+openssl = { version = "0.10.75", features = ["vendored"]}
 rustls = "0.23"
 rustls-pemfile = "2.2"
 aws-sdk-dynamodb = "1.78.0"
-etcd-client = "0.17"
-log = "0.4.27"
+etcd-client = "0.18"
+log = "0.4.29"
 metrics = "0.24"
 metrics-exporter-statsd = "0.9.0"
-metrics-exporter-prometheus = "0.17.2"
+metrics-exporter-prometheus = "0.18.1"
 moka = { version = "0.12", features = ["future"] }
 tikv-jemallocator = "0.6"
 parking_lot = "0.12"
-governor = "0.6"
+governor = "0.10"
 config = {version = "0.15", features = ["toml"]}
-socket2 = { version = "0.5", features = ["all"] }
-reqwest = { version = "0.11", features = ["json"] }
-futures-util = "0.3.31"
-anyhow = "1.0.89"
-regex = "1.10.6"
-core_affinity = "0.7"
+socket2 = { version = "0.6", features = ["all"] }
+reqwest = { version = "0.13", features = ["json"] }
+futures-util = "0.3.32"
+anyhow = "1.0.102"
+regex = "1.12.3"
+core_affinity = "0.8"
 urlencoding = "2"
 compio-runtime = { git = "https://github.com/compio-rs/compio", branch = "master", features = ["time"] }
 compio-net = { git = "https://github.com/compio-rs/compio", branch = "master" }
@@ -130,21 +130,21 @@ compio-io = { git = "https://github.com/compio-rs/compio", branch = "master" }
 # Dev dependencies
 aws-sdk-s3 = "1.65.0"
 cmd_lib = { version = "2.0", features = ["tracing"] }
-tracing-test = {version = "0.2.5", features = ["no-env-filter"]}
-env_logger = "0.11.5"
-num_cpus = "1.16.0"
-rayon = "1.10.0"
-rlimit = "0.10.2"
-tempfile = "3.18.0"
-rstest = "0.25.0"
-colored = "2"
-comfy-table = "7.1"
+tracing-test = {version = "0.2.6", features = ["no-env-filter"]}
+env_logger = "0.11.9"
+num_cpus = "1.17.0"
+rayon = "1.11.0"
+rlimit = "0.11.0"
+tempfile = "3.26.0"
+rstest = "0.26.1"
+colored = "3"
+comfy-table = "7.2"
 glob = "0.3"
 dialoguer = "0.12"
-indicatif = "0.17"
+indicatif = "0.18"
 
 # Build dependencies
-prost-build = "0.13"
+prost-build = "0.14"
 
 [patch.crates-io]
 io-uring = { git = "https://github.com/tokio-rs/io-uring", rev = "7ec7ae9" }
