@@ -5,7 +5,7 @@ use crate::handler::{
         s3_error::S3Error,
     },
 };
-use actix_web::web::Query;
+use ntex::web::types::Query;
 use serde::{Deserialize, Serialize};
 
 #[allow(dead_code)]
@@ -73,7 +73,7 @@ struct CommonPrefixes {
 
 pub async fn list_multipart_uploads_handler(
     ctx: ObjectRequestContext,
-) -> Result<actix_web::HttpResponse, S3Error> {
+) -> Result<ntex::web::HttpResponse, S3Error> {
     let _opts = Query::<ListMultipartUploadsOptions>::from_query(ctx.request.query_string())
         .unwrap_or_else(|_| Query(Default::default()));
     Xml(ListMultipartUploadsResult::default()).try_into()

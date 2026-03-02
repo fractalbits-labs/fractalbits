@@ -1,6 +1,7 @@
-use actix_web::{FromRequest, HttpRequest, dev::Payload, http::header::HeaderMap};
 use base64::{Engine, prelude::BASE64_STANDARD};
-use futures::future::{Ready, ready};
+use ntex::http::Payload;
+use ntex::http::header::HeaderMap;
+use ntex::web::{FromRequest, HttpRequest};
 
 use crate::handler::common::{
     checksum::ChecksumValue, s3_error::S3Error, signature::SignatureError, xheader,
@@ -8,15 +9,14 @@ use crate::handler::common::{
 
 pub struct ChecksumValueFromHeaders(pub Option<ChecksumValue>);
 
-impl FromRequest for ChecksumValueFromHeaders {
+impl<Err: ntex::web::ErrorRenderer> FromRequest<Err> for ChecksumValueFromHeaders {
     type Error = S3Error;
-    type Future = Ready<Result<Self, Self::Error>>;
 
-    fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Self::Future {
+    async fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Result<Self, Self::Error> {
         let result = extract_checksum_value_from_headers(req.headers());
         match result {
-            Ok(checksum) => ready(Ok(ChecksumValueFromHeaders(checksum))),
-            Err(e) => ready(Err(e.into())),
+            Ok(checksum) => Ok(ChecksumValueFromHeaders(checksum)),
+            Err(e) => Err(e.into()),
         }
     }
 }
@@ -109,8 +109,8 @@ fn extract_checksum_value_from_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{App, HttpResponse, test, web};
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use ntex::web::{self, App, HttpResponse, test};
 
     async fn handler(checksum: ChecksumValueFromHeaders) -> HttpResponse {
         match checksum.0 {
@@ -133,7 +133,7 @@ mod tests {
         }
     }
 
-    #[actix_web::test]
+    #[ntex::test]
     async fn test_extract_checksum_value_none() {
         let app = test::init_service(App::new().route("/{key:.*}", web::get().to(handler))).await;
 
@@ -145,7 +145,7 @@ mod tests {
         assert_eq!(result, "no_checksum");
     }
 
-    #[actix_web::test]
+    #[ntex::test]
     async fn test_extract_checksum_value_crc32() {
         let app = test::init_service(App::new().route("/{key:.*}", web::get().to(handler))).await;
 
@@ -154,7 +154,7 @@ mod tests {
 
         let req = test::TestRequest::get()
             .uri("/obj1")
-            .insert_header(("x-amz-checksum-crc32", crc32_b64.as_str()))
+            .header("x-amz-checksum-crc32", crc32_b64.as_str())
             .to_request();
 
         let resp = test::call_service(&app, req).await;
@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(result, format!("crc32:{}", crc32_b64));
     }
 
-    #[actix_web::test]
+    #[ntex::test]
     async fn test_extract_checksum_value_multiple_headers_error() {
         let app = test::init_service(App::new().route("/{key:.*}", web::get().to(handler))).await;
 
@@ -172,11 +172,11 @@ mod tests {
 
         let req = test::TestRequest::get()
             .uri("/obj1")
-            .insert_header(("x-amz-checksum-crc32", BASE64_STANDARD.encode(crc32_bytes)))
-            .insert_header((
+            .header("x-amz-checksum-crc32", BASE64_STANDARD.encode(crc32_bytes))
+            .header(
                 "x-amz-checksum-crc32c",
                 BASE64_STANDARD.encode(crc32c_bytes),
-            ))
+            )
             .to_request();
 
         let resp = test::call_service(&app, req).await;

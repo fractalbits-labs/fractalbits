@@ -4,8 +4,8 @@ use std::path::Path;
 use std::sync::LazyLock;
 use strum::{AsRefStr, EnumString};
 
-/// Isolated target directory for fs_server builds to prevent workspace
-/// feature unification from enabling tokio-runtime on compio-only RPC deps.
+/// Isolated target directory for compio-runtime servers (api_server, fs_server)
+/// to prevent workspace feature unification from enabling tokio-runtime.
 pub const COMPIO_TARGET_DIR: &str = "target/compio";
 
 pub static BUILD_ENVS: LazyLock<Vec<String>> =
@@ -133,40 +133,50 @@ pub fn build_zig_servers(opts: ZigBuildOpts) -> CmdResult {
 
 pub fn build_rust_servers(mode: BuildMode) -> CmdResult {
     let build_envs = get_build_envs();
-    let compio_target_dir = COMPIO_TARGET_DIR;
+    let build = mode.as_ref();
     match mode {
         BuildMode::Debug => {
+            // Build compio-runtime binaries with isolated target to prevent
+            // Cargo's workspace feature unification from enabling tokio-runtime.
             run_cmd! {
-                info "Building rust-based servers in debug mode ...";
+                info "Building compio-runtime servers in debug mode ...";
+                CARGO_TARGET_DIR=$COMPIO_TARGET_DIR
+                    $[build_envs] cargo build -p api_server -p fs_server;
+            }?;
+            run_cmd! {
+                info "Building remaining rust servers in debug mode ...";
                 $[build_envs] cargo build --workspace
                     --exclude fractalbits-bootstrap
                     --exclude rewrk*
+                    --exclude api_server
                     --exclude fs_server;
-            }?;
-            run_cmd! {
-                info "Building fs_server (isolated compio build) ...";
-                CARGO_TARGET_DIR=$compio_target_dir
-                $[build_envs] cargo build -p fs_server;
-                cp $compio_target_dir/debug/fs_server target/debug/fs_server;
             }?;
         }
         BuildMode::Release => {
             run_cmd! {
-                info "Building rust-based servers in release mode ...";
+                info "Building compio-runtime servers in release mode ...";
+                CARGO_TARGET_DIR=$COMPIO_TARGET_DIR
+                    $[build_envs] cargo build -p api_server -p fs_server --release;
+            }?;
+            run_cmd! {
+                info "Building remaining rust servers in release mode ...";
                 $[build_envs] cargo build --workspace
                     --exclude container-all-in-one
+                    --exclude api_server
                     --exclude fs_server
                     --release;
             }?;
-            run_cmd! {
-                info "Building fs_server (isolated compio build) ...";
-                CARGO_TARGET_DIR=$compio_target_dir
-                $[build_envs] cargo build -p fs_server --release;
-                cp $compio_target_dir/release/fs_server target/release/fs_server;
-            }?;
         }
     }
-    Ok(())
+    // Copy compio binaries to the standard target directory so that
+    // service management, Docker staging, etc. find them at the expected path.
+    let compio_dir = format!("{COMPIO_TARGET_DIR}/{build}");
+    let target_dir = format!("target/{build}");
+    run_cmd! {
+        mkdir -p $target_dir;
+        cp -f $compio_dir/api_server $target_dir/;
+        cp -f $compio_dir/fs_server $target_dir/;
+    }
 }
 
 pub fn build_ui(region: &str) -> CmdResult {
@@ -210,13 +220,21 @@ pub fn build_for_nightly() -> CmdResult {
 pub fn build_for_docker(release: bool) -> CmdResult {
     let build_envs = get_build_envs();
     let build_flag = if release { "--release" } else { "" };
+    let build = if release { "release" } else { "debug" };
+    let compio_dir = format!("{COMPIO_TARGET_DIR}/{build}");
+    let target_dir = format!("target/{build}");
 
-    // Build packages that always exist
+    // Build compio-runtime binaries with isolated target to prevent feature unification
     run_cmd! {
-        info "Building rust binaries for Docker...";
-        $[build_envs] cargo build $build_flag
-            -p api_server
-            -p container-all-in-one;
+        info "Building compio-runtime binaries for Docker...";
+        CARGO_TARGET_DIR=$COMPIO_TARGET_DIR
+            $[build_envs] cargo build $build_flag -p api_server;
+
+        // Copy to standard target directory
+        mkdir -p $target_dir;
+        cp -f $compio_dir/api_server $target_dir/;
+
+        $[build_envs] cargo build $build_flag -p container-all-in-one;
     }?;
 
     // Build ha packages if they exist
@@ -303,21 +321,26 @@ pub fn build_prebuilt_dev() -> CmdResult {
             info "Zig build complete for $arch";
         }?;
 
+        // Build compio-runtime binaries with isolated target to prevent feature unification
         run_cmd! {
-            info "Building Rust binaries for $arch (size-optimized release mode with zigbuild)...";
+            info "Building compio-runtime Rust binaries for $arch ...";
+            CARGO_TARGET_DIR=$COMPIO_TARGET_DIR
+            RUSTFLAGS="-C target-cpu=$rust_cpu -C opt-level=z -C codegen-units=1 -C strip=symbols"
+            $[build_envs] cargo zigbuild --release --target $rust_target
+                -p api_server -p fs_server;
+        }?;
+        let compio_build_dir = format!("{COMPIO_TARGET_DIR}/{rust_target}/release");
+        run_cmd! {
+            // Copy compio binaries to the standard build directory
+            cp -f $compio_build_dir/api_server $build_dir/;
+            cp -f $compio_build_dir/fs_server $build_dir/;
+
+            info "Building remaining Rust binaries for $arch ...";
             RUSTFLAGS="-C target-cpu=$rust_cpu -C opt-level=z -C codegen-units=1 -C strip=symbols"
             $[build_envs] cargo zigbuild --release --target $rust_target
                 --workspace --exclude fractalbits-bootstrap --exclude rewrk* --exclude fractal-s3
-                --exclude xtask --exclude container-all-in-one --exclude fs_server;
-        }?;
-
-        let compio_target_dir = COMPIO_TARGET_DIR;
-        run_cmd! {
-            info "Building fs_server for $arch (isolated compio build)...";
-            RUSTFLAGS="-C target-cpu=$rust_cpu -C opt-level=z -C codegen-units=1 -C strip=symbols"
-            CARGO_TARGET_DIR=$compio_target_dir
-            $[build_envs] cargo zigbuild --release --target $rust_target -p fs_server;
-            cp $compio_target_dir/$rust_target/release/fs_server $build_dir/fs_server;
+                --exclude xtask --exclude container-all-in-one
+                --exclude api_server --exclude fs_server;
         }?;
 
         info!("Copying binaries to prebuilt/dev/{arch} directory...");

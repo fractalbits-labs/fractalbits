@@ -1,7 +1,7 @@
 #[cfg(not(test))]
 use crate::AppState;
-use actix_web::{FromRequest, HttpRequest, dev::Payload};
-use futures::future::{Ready, ready};
+use ntex::http::Payload;
+use ntex::web::{FromRequest, HttpRequest};
 #[cfg(test)]
 // Minimal fake AppState for testing that only contains what we need
 struct AppState {
@@ -22,7 +22,7 @@ impl BucketAndKeyName {
         let host_str = host_header.to_str().ok()?;
 
         // Get the app state to access config
-        let app_state = req.app_data::<std::sync::Arc<AppState>>()?;
+        let app_state = req.app_state::<std::rc::Rc<AppState>>()?;
         let root_domain = &app_state.config.root_domain;
 
         // Check if this is a virtual-hosted-style request
@@ -63,32 +63,27 @@ impl BucketAndKeyName {
     }
 }
 
-impl FromRequest for BucketAndKeyName {
+impl<Err: ntex::web::ErrorRenderer> FromRequest<Err> for BucketAndKeyName {
     type Error = S3Error;
-    type Future = Ready<Result<Self, Self::Error>>;
 
-    fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Self::Future {
+    async fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Result<Self, Self::Error> {
         let full_key = req.uri().path().to_owned();
 
-        let result = (|| {
-            let (bucket, key) = match Self::buket_name_from_host(req) {
-                // Virtual-hosted-style request
-                Some(bucket) => (bucket, full_key),
-                // Path-style request
-                None => Self::get_bucket_and_key_from_path(&full_key),
-            };
+        let (bucket, key) = match Self::buket_name_from_host(req) {
+            // Virtual-hosted-style request
+            Some(bucket) => (bucket, full_key),
+            // Path-style request
+            None => Self::get_bucket_and_key_from_path(&full_key),
+        };
 
-            // Get the original key from the URL encoded key
-            let key = percent_encoding::percent_decode_str(&key)
-                .decode_utf8()
-                .map_err(|_| S3Error::InvalidURI)?
-                .into_owned();
+        // Get the original key from the URL encoded key
+        let key = percent_encoding::percent_decode_str(&key)
+            .decode_utf8()
+            .map_err(|_| S3Error::InvalidURI)?
+            .into_owned();
 
-            check_key_name(&key)?;
-            Ok(BucketAndKeyName { bucket, key })
-        })();
-
-        ready(result)
+        check_key_name(&key)?;
+        Ok(BucketAndKeyName { bucket, key })
     }
 }
 
@@ -110,24 +105,23 @@ fn check_key_name(n: &str) -> Result<(), S3Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{App, HttpResponse, test, web};
-    use std::sync::Arc;
+    use ntex::web::{self, App, HttpResponse, test};
 
     async fn handler(bucket_key: BucketAndKeyName) -> HttpResponse {
         HttpResponse::Ok().body(bucket_key.bucket)
     }
 
-    fn create_fake_app_state(root_domain: &str) -> Arc<AppState> {
+    fn create_fake_app_state(root_domain: &str) -> std::rc::Rc<AppState> {
         let config = crate::Config {
             root_domain: root_domain.to_string(),
             ..Default::default()
         };
-        Arc::new(AppState {
-            config: Arc::new(config),
+        std::rc::Rc::new(AppState {
+            config: std::sync::Arc::new(config),
         })
     }
 
-    #[actix_web::test]
+    #[ntex::test]
     async fn test_extract_bucket_name_ok() {
         let bucket_name = "my-bucket";
         assert_eq!(send_request_get_body(bucket_name).await, bucket_name);
@@ -138,8 +132,8 @@ mod tests {
 
         let app = test::init_service(
             App::new()
-                .app_data(fake_app_state)
-                .route("/{key:.*}", web::get().to(handler)),
+                .state(fake_app_state)
+                .default_service(web::route().to(handler)),
         )
         .await;
 
@@ -152,21 +146,21 @@ mod tests {
         String::from_utf8(body.to_vec()).unwrap()
     }
 
-    #[actix_web::test]
+    #[ntex::test]
     async fn test_extract_bucket_name_virtual_hosted() {
         let bucket_name = "my-bucket";
         let fake_app_state = create_fake_app_state("localhost");
 
         let app = test::init_service(
             App::new()
-                .app_data(fake_app_state)
-                .route("/{key:.*}", web::get().to(handler)),
+                .state(fake_app_state)
+                .default_service(web::route().to(handler)),
         )
         .await;
 
         let req = test::TestRequest::get()
             .uri("/obj1")
-            .insert_header(("host", format!("{}.localhost", bucket_name)))
+            .header("host", format!("{}.localhost", bucket_name))
             .to_request();
 
         let resp = test::call_service(&app, req).await;
@@ -175,7 +169,7 @@ mod tests {
         assert_eq!(result, bucket_name);
     }
 
-    #[test]
+    #[ntex::test]
     async fn test_get_bucket_and_key_from_path() {
         let (bucket, key) =
             BucketAndKeyName::get_bucket_and_key_from_path("/my-bucket/path/to/object");
@@ -191,7 +185,7 @@ mod tests {
         assert_eq!(key, "///object///");
     }
 
-    #[test]
+    #[ntex::test]
     async fn test_check_key_name() {
         // Valid keys
         assert!(check_key_name("/valid/key").is_ok());

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use crate::{
     AppState,
@@ -16,11 +16,11 @@ use crate::{
         put::put_object_handler,
     },
 };
-use actix_web::http::header::{self, HeaderMap, HeaderValue};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use bytes::Bytes;
 use data_types::object_layout::*;
 use data_types::{ApiKey, TraceId, Versioned};
+use ntex::http::header::{self, HeaderMap, HeaderValue};
 use serde::Serialize;
 
 #[allow(dead_code)]
@@ -193,7 +193,7 @@ impl CopyObjectResult {
 
 pub async fn copy_object_handler(
     ctx: ObjectRequestContext,
-) -> Result<actix_web::HttpResponse, S3Error> {
+) -> Result<ntex::web::HttpResponse, S3Error> {
     let _bucket = ctx.resolve_bucket().await?;
     let api_key = ctx.api_key.ok_or(S3Error::InternalError)?;
     let header_opts = HeaderOpts::from_headers(ctx.request.headers())?;
@@ -226,10 +226,7 @@ pub async fn copy_object_handler(
     );
 
     // Convert the source body to bytes
-    let source_body_bytes = actix_web::body::to_bytes(source_body)
-        .await
-        .map_err(|_| S3Error::InternalError)?;
-    let actix_body_bytes = source_body_bytes;
+    let source_body_bytes = source_body;
 
     // Use the existing put_object handler to store the copied object
     let new_ctx = ObjectRequestContext::new(
@@ -239,7 +236,17 @@ pub async fn copy_object_handler(
         ctx.bucket_name,
         ctx.key,
         ctx.checksum_value, // Pass through the original checksum value
-        actix_web::dev::Payload::from(actix_body_bytes),
+        {
+            let ntex_bytes = ntex::util::Bytes::from(source_body_bytes.to_vec());
+            let payload_stream: std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<ntex::util::Bytes, ntex::http::error::PayloadError>,
+                        >,
+                >,
+            > = Box::pin(futures::stream::once(async move { Ok(ntex_bytes) }));
+            ntex::http::Payload::from(payload_stream)
+        },
         ctx.trace_id,
     );
     let _put_response = put_object_handler(new_ctx).await?;
@@ -252,7 +259,7 @@ pub async fn copy_object_handler(
 }
 
 async fn get_copy_source_object(
-    app: Arc<AppState>,
+    app: Rc<AppState>,
     api_key: &Versioned<ApiKey>,
     copy_source: &str,
     trace_id: TraceId,

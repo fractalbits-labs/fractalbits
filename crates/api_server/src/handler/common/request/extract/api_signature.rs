@@ -1,5 +1,5 @@
-use actix_web::{FromRequest, HttpRequest, dev::Payload, web::Query};
-use futures::future::{Ready, ready};
+use ntex::http::Payload;
+use ntex::web::{FromRequest, HttpRequest, types::Query};
 use serde::Deserialize;
 use std::fmt;
 
@@ -48,11 +48,10 @@ impl std::fmt::Display for ApiSignatureExtractor {
     }
 }
 
-impl FromRequest for ApiSignatureExtractor {
-    type Error = actix_web::Error;
-    type Future = Ready<Result<Self, Self::Error>>;
+impl<Err: ntex::web::ErrorRenderer> FromRequest<Err> for ApiSignatureExtractor {
+    type Error = ntex::web::Error;
 
-    fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Self::Future {
+    async fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Result<Self, Self::Error> {
         let mut api_signature = Query::<ApiSignature>::from_query(req.query_string())
             .unwrap_or_else(|_| Query(Default::default()))
             .into_inner();
@@ -65,21 +64,21 @@ impl FromRequest for ApiSignatureExtractor {
             api_signature.x_amz_copy_source = Some(copy_source.to_string());
         }
 
-        ready(Ok(ApiSignatureExtractor(api_signature)))
+        Ok(ApiSignatureExtractor(api_signature))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{App, HttpResponse, test, web};
+    use ntex::web::{self, App, HttpResponse, test};
 
     async fn handler(api_signature: ApiSignatureExtractor) -> HttpResponse {
         let upload_id = api_signature.0.upload_id.unwrap_or_default();
         HttpResponse::Ok().body(upload_id)
     }
 
-    #[actix_web::test]
+    #[ntex::test]
     async fn test_extract_api_signature_from_query_ok() {
         let api_signature_str = "uploadId=abc123";
         assert_eq!(send_request_get_body(api_signature_str).await, "abc123");
@@ -101,7 +100,7 @@ mod tests {
         String::from_utf8(body.to_vec()).unwrap()
     }
 
-    #[actix_web::test]
+    #[ntex::test]
     async fn test_extract_api_signature_from_header() {
         let app = test::init_service(App::new().route(
             "/{key:.*}",
@@ -114,7 +113,7 @@ mod tests {
 
         let req = test::TestRequest::get()
             .uri("/obj1")
-            .insert_header(("x-amz-copy-source", "bucket/key"))
+            .header("x-amz-copy-source", "bucket/key")
             .to_request();
 
         let resp = test::call_service(&app, req).await;
@@ -123,7 +122,7 @@ mod tests {
         assert_eq!(result, "bucket/key");
     }
 
-    #[test]
+    #[ntex::test]
     async fn test_display_api_signature() {
         let api_signature = ApiSignature {
             upload_id: Some("abc123".to_string()),

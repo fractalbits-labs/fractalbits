@@ -1,4 +1,4 @@
-use actix_web::HttpResponse;
+use ntex::web::HttpResponse;
 use rpc_client_common::RpcError;
 use tracing::info;
 

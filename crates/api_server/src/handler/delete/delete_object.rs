@@ -5,10 +5,10 @@ use crate::{
         common::{list_raw_objects, mpu_get_part_prefix, s3_error::S3Error},
     },
 };
-use actix_web::HttpResponse;
 use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
 use file_ops::parse_delete_inode;
 use metrics_wrapper::histogram;
+use ntex::web::HttpResponse;
 use rkyv::{self, rancor::Error};
 use rpc_client_common::nss_rpc_retry;
 use tokio::sync::mpsc::Sender;

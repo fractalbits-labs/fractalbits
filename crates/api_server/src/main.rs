@@ -1,8 +1,10 @@
-use actix_files::Files;
-use actix_web::{App, HttpServer, middleware::Logger, rt::System, web};
+#![recursion_limit = "256"]
 use api_server::{AppState, CacheCoordinator, Config, api_key_routes, cache_mgmt, handler};
 use clap::Parser;
 use data_types::Versioned;
+use ntex::rt::{DefaultRuntime, System};
+use ntex::web::{self, App, HttpServer, middleware::Logger};
+use ntex_files::Files;
 use rustls::{
     ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer},
@@ -32,7 +34,7 @@ struct Opt {
 
 fn main() -> std::io::Result<()> {
     // AWS SDK suppression filter
-    let third_party_filter = "tower_http=warn,hyper_util=warn,aws_smithy=warn,aws_sdk=warn,actix_web=warn,actix_server=warn,h2=warn";
+    let third_party_filter = "tower_http=warn,hyper_util=warn,aws_smithy=warn,aws_sdk=warn,ntex=warn,ntex_server=warn,h2=warn";
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -199,9 +201,19 @@ fn main() -> std::io::Result<()> {
         None
     };
 
+    // The ntex/compio worker threads need tokio context for the AWS SDK
+    // and moka cache. RPC clients use compio-runtime natively (built with
+    // isolated CARGO_TARGET_DIR to prevent workspace feature unification).
+    let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_name("tokio-rpc")
+        .build()
+        .expect("Failed to build tokio runtime");
+
     let mut handles = Vec::with_capacity(worker_count);
-    let mut server_handles = Vec::new();
-    let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+    let mut server_handles: Vec<ntex::server::Server> = Vec::new();
+    let (handle_tx, handle_rx) = std::sync::mpsc::channel::<ntex::server::Server>();
 
     for (worker_idx, core_id) in worker_cores.into_iter().enumerate() {
         let http_listener = make_reuseport_listener(http_addr)?;
@@ -214,9 +226,10 @@ fn main() -> std::io::Result<()> {
         let web_root = gui_web_root.clone();
         let https_config = https_config.clone();
         let handle_tx = handle_tx.clone();
+        let tokio_handle = tokio_rt.handle().clone();
 
         let handle = thread::Builder::new()
-            .name(format!("actix-core-{worker_idx}"))
+            .name(format!("ntex-core-{worker_idx}"))
             .spawn(move || {
                 if let Some(core_id) = core_id {
                     core_affinity::set_for_current(core_id);
@@ -227,69 +240,82 @@ fn main() -> std::io::Result<()> {
                     );
                 }
 
-                System::new().block_on(async move {
-                    let app_state = Arc::new(AppState::new_per_core_sync(
-                        config.clone(),
-                        cache_coordinator,
-                        az_status_coordinator,
-                        worker_idx as u16,
-                    ));
-
+                System::new("api-server", DefaultRuntime).block_on(async move {
                     let mut server = HttpServer::new(move || {
                         if let Some(core_id) = core_id {
                             core_affinity::set_for_current(core_id);
                         }
 
-                        let app_state = app_state.clone();
-                        let mut app = App::new()
-                            .app_data(web::Data::new(app_state))
-                            .app_data(web::PayloadConfig::default().limit(5_368_709_120))
-                            .wrap(Logger::default())
-                            .service(
-                                web::scope("/mgmt")
-                                    .route("/health", web::get().to(cache_mgmt::mgmt_health))
-                                    .route(
-                                        "/cache/invalidate/bucket/{name}",
-                                        web::post().to(cache_mgmt::invalidate_bucket),
-                                    )
-                                    .route(
-                                        "/cache/invalidate/api_key/{id}",
-                                        web::post().to(cache_mgmt::invalidate_api_key),
-                                    )
-                                    .route(
-                                        "/cache/update/az_status/{id}",
-                                        web::post().to(cache_mgmt::update_az_status),
-                                    )
-                                    .route("/cache/clear", web::post().to(cache_mgmt::clear_cache))
-                                    .route(
-                                        "/nss/update_address",
-                                        web::post().to(cache_mgmt::update_nss_address),
-                                    ),
-                            )
-                            .service(
-                                web::scope("/api_keys")
-                                    .route("/", web::post().to(api_key_routes::create_api_key))
-                                    .route("/", web::get().to(api_key_routes::list_api_keys))
-                                    .route(
-                                        "/{key_id}",
-                                        web::delete().to(api_key_routes::delete_api_key),
-                                    ),
-                            );
+                        // Enter tokio context for AWS SDK and moka cache.
+                        // Leaked to keep context alive for the worker thread's lifetime.
+                        // RPC clients use compio-runtime directly on the ntex worker thread.
+                        let guard = tokio_handle.enter();
+                        std::mem::forget(guard);
 
-                        if let Some(ref web_root) = web_root {
-                            let static_dir = web_root.clone();
-                            app =
-                                app.service(Files::new("/ui", static_dir).index_file("index.html"));
+                        let config = config.clone();
+                        let cache_coordinator = cache_coordinator.clone();
+                        let az_status_coordinator = az_status_coordinator.clone();
+                        let web_root = web_root.clone();
+                        async move {
+                            let app_state = std::rc::Rc::new(AppState::new_per_core_sync(
+                                config,
+                                cache_coordinator,
+                                az_status_coordinator,
+                                worker_idx as u16,
+                            ));
+                            let mut app = App::new()
+                                .state(app_state)
+                                .state(ntex::web::types::PayloadConfig::new(5_368_709_120))
+                                .middleware(Logger::default())
+                                .service(
+                                    web::scope("/mgmt")
+                                        .route("/health", web::get().to(cache_mgmt::mgmt_health))
+                                        .route(
+                                            "/cache/invalidate/bucket/{name}",
+                                            web::post().to(cache_mgmt::invalidate_bucket),
+                                        )
+                                        .route(
+                                            "/cache/invalidate/api_key/{id}",
+                                            web::post().to(cache_mgmt::invalidate_api_key),
+                                        )
+                                        .route(
+                                            "/cache/update/az_status/{id}",
+                                            web::post().to(cache_mgmt::update_az_status),
+                                        )
+                                        .route(
+                                            "/cache/clear",
+                                            web::post().to(cache_mgmt::clear_cache),
+                                        )
+                                        .route(
+                                            "/nss/update_address",
+                                            web::post().to(cache_mgmt::update_nss_address),
+                                        ),
+                                )
+                                .service(
+                                    web::scope("/api_keys")
+                                        .route("/", web::post().to(api_key_routes::create_api_key))
+                                        .route("/", web::get().to(api_key_routes::list_api_keys))
+                                        .route(
+                                            "/{key_id}",
+                                            web::delete().to(api_key_routes::delete_api_key),
+                                        ),
+                                );
+
+                            if let Some(ref web_root) = web_root {
+                                let static_dir = web_root.clone();
+                                app = app.service(
+                                    Files::new("/ui", static_dir).index_file("index.html"),
+                                );
+                            }
+
+                            app.default_service(web::route().to(handler::any_handler))
                         }
-
-                        app.default_service(web::route().to(handler::any_handler))
                     });
 
                     server = server
                         .workers(1)
-                        .max_connections(65536)
-                        .max_connection_rate(65536)
-                        .client_request_timeout(config.client_request_timeout())
+                        .maxconn(65536)
+                        .maxconnrate(65536)
                         .disable_signals();
 
                     server = server.listen(http_listener).unwrap();
@@ -335,14 +361,11 @@ fn main() -> std::io::Result<()> {
                             tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
                         }
 
-                        server = server
-                            .listen_rustls_0_23(https_listener, tls_config)
-                            .unwrap();
+                        server = server.listen_rustls(https_listener, tls_config).unwrap();
                     }
 
                     let server = server.run();
-                    let server_handle = server.handle();
-                    let _ = handle_tx.send(server_handle);
+                    let _ = handle_tx.send(server.clone());
                     drop(handle_tx);
 
                     server.await

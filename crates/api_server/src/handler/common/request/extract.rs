@@ -13,11 +13,11 @@ pub use bucket_name_and_key::BucketAndKeyName;
 pub use checksum_value::ChecksumValueFromHeaders;
 
 use crate::handler::common::checksum::{ChecksumAlgorithm, ChecksumValue};
-use actix_web::{FromRequest, HttpRequest, dev::Payload, web};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use bytes::Bytes;
 use futures::StreamExt;
-use futures::future::{Ready, ready};
+use ntex::http::Payload;
+use ntex::web::{FromRequest, HttpRequest};
 use std::collections::HashMap;
 
 /// Custom extractor that can handle chunked streams with trailers
@@ -26,23 +26,23 @@ pub struct ChunkedBodyWithTrailers {
     pub trailers: HashMap<String, String>,
 }
 
-impl FromRequest for ChunkedBodyWithTrailers {
-    type Error = actix_web::Error;
-    type Future = Ready<Result<Self, Self::Error>>;
+impl<Err: ntex::web::ErrorRenderer> FromRequest<Err> for ChunkedBodyWithTrailers {
+    type Error = ntex::web::Error;
 
-    fn from_request(_req: &HttpRequest, _payload: &mut Payload) -> Self::Future {
+    async fn from_request(_req: &HttpRequest, _payload: &mut Payload) -> Result<Self, Self::Error> {
         // For now, return empty since we're using a different approach in the handler
         // This extractor is mainly for structure but we parse manually in the handler
-        ready(Err(actix_web::error::ErrorNotImplemented(
+        Err(ntex::web::error::ErrorNotImplemented(
             "ChunkedBodyWithTrailers should be created manually in handler",
-        )))
+        )
+        .into())
     }
 }
 
 /// Parse chunked encoding manually to extract trailers
 pub async fn parse_chunked_body_with_trailers(
-    mut payload: web::Payload,
-) -> Result<ChunkedBodyWithTrailers, actix_web::Error> {
+    mut payload: ntex::web::types::Payload,
+) -> Result<ChunkedBodyWithTrailers, ntex::web::Error> {
     let mut trailers = HashMap::new();
     let mut buffer = Vec::new();
 

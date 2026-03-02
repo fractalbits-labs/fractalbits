@@ -4,12 +4,13 @@ use rpc_client_common::nss_rpc_retry;
 use std::hash::Hasher;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use actix_web::{HttpResponse, http::header};
 use aws_signature::{STREAMING_PAYLOAD, sigv4::get_signing_key_cached};
 use crc32c::Crc32cHasher as Crc32c;
 use crc32fast::Hasher as Crc32;
 use file_ops::parse_put_inode;
 use futures::{StreamExt, TryStreamExt};
+use ntex::http::header;
+use ntex::web::HttpResponse;
 use rkyv::{self, api::high::to_bytes_in, rancor::Error};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -35,9 +36,9 @@ use crate::{
 use data_types::object_layout::*;
 
 fn split_chunks_into_blocks(
-    chunks: Vec<actix_web::web::Bytes>,
+    chunks: Vec<bytes::Bytes>,
     block_size: usize,
-) -> Vec<Vec<actix_web::web::Bytes>> {
+) -> Vec<Vec<bytes::Bytes>> {
     let mut blocks = Vec::new();
     let mut current_block = Vec::new();
     let mut current_block_size = 0;
@@ -107,7 +108,7 @@ pub async fn put_object_handler(ctx: ObjectRequestContext) -> Result<HttpRespons
 
 // Helper function to calculate checksum for the given body data
 fn calculate_checksum_for_chunks(
-    chunks: &[actix_web::web::Bytes],
+    chunks: &[bytes::Bytes],
     expected_checksum: &Option<ChecksumValue>,
 ) -> Result<Option<ChecksumValue>, S3Error> {
     match expected_checksum {
@@ -203,7 +204,7 @@ fn calculate_checksum_for_chunks(
 
 // Helper function to calculate checksum for chunks using specific algorithm
 fn calculate_checksum_for_chunks_with_algorithm(
-    chunks: &[actix_web::web::Bytes],
+    chunks: &[bytes::Bytes],
     algorithm: ChecksumAlgorithm,
 ) -> Result<Option<ChecksumValue>, S3Error> {
     match algorithm {
@@ -251,7 +252,7 @@ fn calculate_checksum_for_chunks_with_algorithm(
 }
 
 // Helper function to decide whether to use streaming based on request
-fn should_use_streaming(request: &actix_web::HttpRequest) -> bool {
+fn should_use_streaming(request: &ntex::web::HttpRequest) -> bool {
     // Always stream if trailers present (requires streaming to extract them)
     if request.headers().get("x-amz-trailer").is_some() {
         tracing::debug!("Streaming due to x-amz-trailer header");
@@ -545,8 +546,8 @@ async fn put_object_streaming_internal(
     );
 
     Ok(HttpResponse::Ok()
-        .insert_header((header::ETAG, etag))
-        .insert_header(("X-Amz-Object-Size", total_size.to_string()))
+        .set_header(header::ETAG, etag)
+        .set_header("X-Amz-Object-Size", total_size.to_string())
         .finish())
 }
 
@@ -567,7 +568,7 @@ async fn put_object_with_no_trailer(
 
     let total_size: usize = chunks.iter().map(|c| c.len()).sum();
     tracing::debug!(
-        "PutObject actix handler with resolved bucket: {}/{}, body size: {}",
+        "PutObject handler with resolved bucket: {}/{}, body size: {}",
         ctx.bucket_name,
         ctx.key,
         total_size
@@ -756,8 +757,8 @@ async fn put_object_with_no_trailer(
     );
 
     Ok(HttpResponse::Ok()
-        .insert_header((header::ETAG, etag))
-        .insert_header(("X-Amz-Object-Size", size.to_string()))
+        .set_header(header::ETAG, etag)
+        .set_header("X-Amz-Object-Size", size.to_string())
         .finish())
 }
 

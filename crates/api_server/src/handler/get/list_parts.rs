@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use crate::AppState;
 use crate::handler::ObjectRequestContext;
@@ -10,10 +10,10 @@ use crate::handler::common::{
     s3_error::S3Error,
     time,
 };
-use actix_web::web::Query;
 use base64::prelude::*;
 use data_types::object_layout::{MpuState, ObjectState};
 use data_types::{Bucket, TraceId};
+use ntex::web::types::Query;
 use serde::{Deserialize, Serialize};
 
 #[allow(dead_code)]
@@ -92,7 +92,7 @@ struct Owner {
 
 pub async fn list_parts_handler(
     ctx: ObjectRequestContext,
-) -> Result<actix_web::HttpResponse, S3Error> {
+) -> Result<ntex::web::HttpResponse, S3Error> {
     let bucket = ctx.resolve_bucket().await?;
     let query_opts = Query::<QueryOpts>::from_query(ctx.request.query_string())
         .unwrap_or_else(|_| Query(Default::default()))
@@ -137,7 +137,7 @@ pub async fn list_parts_handler(
 }
 
 async fn fetch_mpu_parts(
-    app: Arc<AppState>,
+    app: Rc<AppState>,
     bucket: &Bucket,
     key: String,
     query_opts: &QueryOpts,

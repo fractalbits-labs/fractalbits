@@ -1,7 +1,7 @@
 use crate::handler::ObjectRequestContext;
 use crate::handler::common::{mpu_get_part_prefix, s3_error::S3Error};
 use crate::handler::put::put_object_handler;
-use actix_web::HttpResponse;
+use ntex::web::HttpResponse;
 use serde::Serialize;
 
 #[allow(dead_code)]
@@ -67,5 +67,5 @@ pub async fn upload_part_handler(
     let _response = put_object_handler(part_ctx).await?;
 
     let etag = format!("{upload_id}{part_number}");
-    Ok(HttpResponse::Ok().insert_header(("ETag", etag)).finish())
+    Ok(HttpResponse::Ok().set_header("ETag", etag).finish())
 }

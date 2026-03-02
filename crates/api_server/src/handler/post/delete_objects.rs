@@ -65,7 +65,7 @@ struct Error {
 
 pub async fn delete_objects_handler(
     ctx: ObjectRequestContext,
-) -> Result<actix_web::HttpResponse, S3Error> {
+) -> Result<ntex::web::HttpResponse, S3Error> {
     let _bucket = ctx.resolve_bucket().await?;
 
     // Extract body from payload using the helper function
@@ -87,7 +87,7 @@ pub async fn delete_objects_handler(
             ctx.bucket_name.clone(),
             key,
             None, // No checksum value needed for delete
-            actix_web::dev::Payload::None,
+            ntex::http::Payload::None,
             ctx.trace_id,
         );
         match delete_object_handler(delete_ctx).await {

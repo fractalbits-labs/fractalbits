@@ -2,16 +2,14 @@ use std::{convert::From, str::Utf8Error};
 
 use super::signature::SignatureError;
 use crate::blob_storage::BlobStorageError;
-use actix_web::{
-    HttpResponse, ResponseError,
-    http::{
-        StatusCode,
-        header::{InvalidHeaderValue, ToStrError},
-        uri::InvalidUri,
-    },
-};
 use data_types::TraceId;
 use http_range::HttpRangeParseError;
+use ntex::http::{
+    StatusCode,
+    header::{InvalidHeaderValue, ToStrError},
+    uri::InvalidUri,
+};
+use ntex::web::{HttpRequest, HttpResponse, WebResponseError};
 use rpc_client_common::RpcError;
 use strum::AsRefStr;
 use thiserror::Error;
@@ -790,7 +788,7 @@ impl S3Error {
         &self,
         resource: &str,
         request_id: TraceId,
-    ) -> actix_web::HttpResponse {
+    ) -> HttpResponse {
         let host_id = std::env::var("HOST_ID")
             .map(|id| format!("    <HostId>{}</HostId>\n", id))
             .unwrap_or_default();
@@ -810,14 +808,18 @@ impl S3Error {
             host_id.trim_end()
         );
 
-        actix_web::HttpResponse::build(self.http_status_code())
+        HttpResponse::build(self.http_status_code())
             .content_type("application/xml")
             .body(body)
     }
 }
 
-impl ResponseError for S3Error {
-    fn error_response(&self) -> HttpResponse {
+impl WebResponseError<ntex::web::DefaultError> for S3Error {
+    fn status_code(&self) -> StatusCode {
+        self.http_status_code()
+    }
+
+    fn error_response(&self, _: &HttpRequest) -> HttpResponse {
         let body = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <Error>
@@ -831,7 +833,7 @@ impl ResponseError for S3Error {
         );
 
         HttpResponse::build(self.http_status_code())
-            .insert_header(("Content-Type", "application/xml"))
+            .header("Content-Type", "application/xml")
             .body(body)
     }
 }
@@ -917,9 +919,9 @@ impl From<HttpRangeParseError> for S3Error {
     }
 }
 
-impl From<actix_web::Error> for S3Error {
-    fn from(value: actix_web::Error) -> Self {
-        tracing::error!("actix_web::Error: {}", value);
+impl From<ntex::web::Error> for S3Error {
+    fn from(value: ntex::web::Error) -> Self {
+        tracing::error!("ntex::web::Error: {}", value);
         Self::InternalError
     }
 }

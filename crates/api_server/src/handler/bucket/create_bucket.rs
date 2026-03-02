@@ -1,5 +1,5 @@
-use actix_web::HttpResponse;
 use bytes::Buf;
+use ntex::web::HttpResponse;
 use rpc_client_common::RpcError;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -85,7 +85,7 @@ pub async fn create_bucket_handler(ctx: BucketRequestContext) -> Result<HttpResp
         Ok(_) => {
             info!("Successfully created bucket: {}", ctx.bucket_name);
             Ok(HttpResponse::Ok()
-                .insert_header(("location", format!("/{}", ctx.bucket_name)))
+                .set_header("location", format!("/{}", ctx.bucket_name))
                 .finish())
         }
         Err(e) => {

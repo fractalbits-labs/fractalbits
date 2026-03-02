@@ -10,12 +10,12 @@ use crate::handler::{
     },
     delete::delete_object_handler,
 };
-use actix_web::http::header::HeaderValue;
-use actix_web::web::Bytes;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use bytes::Buf;
+use bytes::Bytes;
 use data_types::object_layout::{MpuState, ObjectCoreMetaData, ObjectState};
 use file_ops::parse_put_inode;
+use ntex::http::header::HeaderValue;
 use rkyv::{self, api::high::to_bytes_in, rancor::Error};
 use rpc_client_common::nss_rpc_retry;
 use serde::{Deserialize, Serialize};
@@ -166,7 +166,7 @@ impl MpuChecksummer {
 pub async fn complete_multipart_upload_handler(
     ctx: ObjectRequestContext,
     upload_id: String,
-) -> Result<actix_web::HttpResponse, S3Error> {
+) -> Result<ntex::web::HttpResponse, S3Error> {
     let bucket = ctx.resolve_bucket().await?;
     let _headers = extract_metadata_headers(ctx.request.headers())?;
     let _expected_checksum = ctx.checksum_value;
@@ -262,7 +262,7 @@ pub async fn complete_multipart_upload_handler(
             ctx.bucket_name.clone(),
             invalid_key,
             None, // No checksum value needed for delete
-            actix_web::dev::Payload::None,
+            ntex::http::Payload::None,
             ctx.trace_id,
         );
         delete_object_handler(delete_ctx).await?;

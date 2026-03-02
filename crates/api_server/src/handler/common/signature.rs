@@ -11,13 +11,13 @@ use crate::{
     AppState,
     handler::common::{request::extract::Authentication, s3_error::S3Error},
 };
-use actix_web::HttpRequest;
 use data_types::{ApiKey, TraceId, Versioned};
-use std::sync::Arc;
+use ntex::web::HttpRequest;
+use std::rc::Rc;
 use tracing::{debug, error, warn};
 
 pub async fn check_signature(
-    app: Arc<AppState>,
+    app: Rc<AppState>,
     request: &HttpRequest,
     auth: Option<&Authentication<'_>>,
     trace_id: &TraceId,

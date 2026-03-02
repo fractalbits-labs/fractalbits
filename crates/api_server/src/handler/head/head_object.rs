@@ -3,8 +3,8 @@ use crate::handler::{
     common::{get_raw_object, object_headers, s3_error::S3Error},
     get::{GetObjectHeaderOpts, GetObjectQueryOpts, override_headers},
 };
-use actix_web::{HttpResponse, web::Query};
 use futures_util::{StreamExt as _, stream};
+use ntex::web::{HttpResponse, types::Query};
 
 pub async fn head_object_handler(ctx: ObjectRequestContext) -> Result<HttpResponse, S3Error> {
     let bucket = ctx.resolve_bucket().await?;
@@ -25,9 +25,10 @@ pub async fn head_object_handler(ctx: ObjectRequestContext) -> Result<HttpRespon
 
     let object_size = obj.size()?;
     Ok(response
-        .no_chunking(object_size)
-        .body(actix_web::body::SizedStream::new(
+        .no_chunking()
+        .body(ntex::http::body::SizedStream::new(
             object_size,
-            stream::empty::<Result<_, std::io::Error>>().boxed_local(),
+            stream::empty::<Result<ntex::util::Bytes, std::rc::Rc<dyn std::error::Error>>>()
+                .boxed_local(),
         )))
 }

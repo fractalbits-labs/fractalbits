@@ -8,14 +8,14 @@ use data_types::object_layout::ObjectLayout;
 use data_types::{DataBlobGuid, DataVgInfo, TraceId, Volume};
 use metrics_wrapper::histogram;
 use std::{
-    sync::Arc,
+    rc::Rc,
     time::{Duration, Instant},
 };
 use tracing::debug;
 use uuid::Uuid;
 
 pub struct S3HybridSingleAzStorage {
-    data_vg_proxy: Arc<DataVgProxy>,
+    data_vg_proxy: Rc<DataVgProxy>,
     client_s3: S3Client,
     data_blob_in_s3_bucket: String,
 }
@@ -29,7 +29,7 @@ impl S3HybridSingleAzStorage {
     ) -> Result<Self, BlobStorageError> {
         debug!("Initializing S3HybridSingleAzStorage with pre-fetched DataVgInfo");
 
-        let data_vg_proxy = Arc::new(
+        let data_vg_proxy = Rc::new(
             DataVgProxy::new(data_vg_info, rpc_request_timeout, rpc_connection_timeout).map_err(
                 |e| BlobStorageError::Config(format!("Failed to initialize DataVgProxy: {}", e)),
             )?,
@@ -105,7 +105,7 @@ impl S3HybridSingleAzStorage {
         blob_id: Uuid,
         volume_id: u16,
         block_number: u32,
-        chunks: Vec<actix_web::web::Bytes>,
+        chunks: Vec<Bytes>,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         let total_size: usize = chunks.iter().map(|c| c.len()).sum();

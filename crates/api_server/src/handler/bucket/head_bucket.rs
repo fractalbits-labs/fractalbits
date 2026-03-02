@@ -1,4 +1,4 @@
-use actix_web::HttpResponse;
+use ntex::web::HttpResponse;
 
 use super::resolve_bucket;
 use crate::handler::{BucketRequestContext, common::s3_error::S3Error};

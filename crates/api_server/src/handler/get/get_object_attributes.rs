@@ -10,11 +10,9 @@ use crate::handler::{
         time, xheader,
     },
 };
-use actix_web::{
-    http::header::{HeaderMap, HeaderValue},
-    web::Query,
-};
 use base64::{Engine, prelude::BASE64_STANDARD};
+use ntex::http::header::{HeaderMap, HeaderValue};
+use ntex::web::types::Query;
 use serde::{Deserialize, Serialize};
 
 #[allow(dead_code)]
@@ -181,7 +179,7 @@ struct Part {
 
 pub async fn get_object_attributes_handler(
     ctx: ObjectRequestContext,
-) -> Result<actix_web::HttpResponse, S3Error> {
+) -> Result<ntex::web::HttpResponse, S3Error> {
     let bucket = ctx.resolve_bucket().await?;
     let _query_opts = Query::<QueryOpts>::from_query(ctx.request.query_string())
         .unwrap_or_else(|_| Query(Default::default()));
@@ -202,10 +200,10 @@ pub async fn get_object_attributes_handler(
         resp = resp.object_size(obj.size()? as usize);
     }
     // TODO: ObjectParts | StorageClass
-    let mut resp: actix_web::HttpResponse = Xml(resp).try_into()?;
+    let mut resp: ntex::web::HttpResponse = Xml(resp).try_into()?;
     resp.head_mut().headers_mut().insert(
-        actix_web::http::header::LAST_MODIFIED,
-        actix_web::http::header::HeaderValue::from_str(&last_modified)?,
+        ntex::http::header::LAST_MODIFIED,
+        ntex::http::header::HeaderValue::from_str(&last_modified)?,
     );
     Ok(resp)
 }

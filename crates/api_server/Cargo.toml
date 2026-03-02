@@ -4,23 +4,23 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rpc_client_common = { workspace = true, features = ["tokio-runtime"] }
-rpc_client_nss = { workspace = true, features = ["tokio-runtime"] }
-rpc_client_bss = { workspace = true, features = ["tokio-runtime"] }
-rpc_client_rss = { workspace = true, features = ["tokio-runtime"] }
+rpc_client_common = { workspace = true, default-features = false, features = ["compio-runtime"] }
+rpc_client_nss = { workspace = true, default-features = false, features = ["compio-runtime"] }
+rpc_client_bss = { workspace = true, default-features = false, features = ["compio-runtime"] }
+rpc_client_rss = { workspace = true, default-features = false, features = ["compio-runtime"] }
 nss_codec.workspace = true
 file_ops.workspace = true
 aws_signature.workspace = true
 data_types.workspace = true
-data_blob_tracking.workspace = true
-volume_group_proxy = { workspace = true, features = ["tokio-runtime"] }
+data_blob_tracking = { workspace = true, default-features = false, features = ["compio-runtime"] }
+volume_group_proxy = { workspace = true, default-features = false, features = ["compio-runtime"] }
 metrics_wrapper.workspace = true
 metrics = { workspace = true, optional = true }
 
 serde.workspace = true
 config.workspace = true
-actix-web.workspace = true
-actix-files.workspace = true
+ntex.workspace = true
+ntex-files.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 bytes.workspace = true

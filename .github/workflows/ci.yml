@@ -5,6 +5,7 @@ on:
     branches:
     - main
     - axum-dev
+    - feat/ntex-migration
   pull_request:
     branches:
     - main

@@ -3,7 +3,7 @@ use crate::handler::{
     common::{list_raw_objects, mpu_get_part_prefix, s3_error::S3Error},
     delete::delete_object::delete_blob,
 };
-use actix_web::HttpResponse;
+use ntex::web::HttpResponse;
 use file_ops::{parse_delete_inode, parse_get_inode};
 use rpc_client_common::nss_rpc_retry;
 

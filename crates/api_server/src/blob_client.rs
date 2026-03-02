@@ -10,8 +10,8 @@ use data_blob_tracking::DataBlobTracker;
 use data_types::object_layout::ObjectLayout;
 use data_types::{DataBlobGuid, TraceId};
 use moka::future::Cache;
-use std::{sync::Arc, time::Duration};
-use tokio::{sync::mpsc::Receiver, task::JoinHandle};
+use std::{rc::Rc, sync::Arc, time::Duration};
+use tokio::sync::mpsc::Receiver;
 
 #[derive(Debug)]
 pub struct BlobDeletionRequest {
@@ -22,9 +22,7 @@ pub struct BlobDeletionRequest {
 }
 
 pub struct BlobClient {
-    storage: Arc<BlobStorageImpl>,
-    #[allow(dead_code)]
-    blob_deletion_task_handle: JoinHandle<()>,
+    storage: Rc<BlobStorageImpl>,
 }
 
 impl BlobClient {
@@ -55,7 +53,7 @@ impl BlobClient {
         rpc_connection_timeout: Duration,
         data_blob_tracker: Option<Arc<DataBlobTracker>>,
         data_vg_info: data_types::DataVgInfo,
-    ) -> Result<(Arc<BlobStorageImpl>, Option<Arc<Cache<String, String>>>), BlobStorageError> {
+    ) -> Result<(Rc<BlobStorageImpl>, Option<Arc<Cache<String, String>>>), BlobStorageError> {
         let storage = match &blob_storage_config.backend {
             BlobStorageBackend::S3HybridSingleAz => {
                 let s3_hybrid_config = blob_storage_config
@@ -103,7 +101,7 @@ impl BlobClient {
                     .await?,
                 );
 
-                return Ok((Arc::new(storage), Some(az_status_cache)));
+                return Ok((Rc::new(storage), Some(az_status_cache)));
             }
             BlobStorageBackend::AllInBssSingleAz => BlobStorageImpl::AllInBssSingleAz(
                 AllInBssSingleAzStorage::new_with_data_vg_info(
@@ -115,14 +113,15 @@ impl BlobClient {
             ),
         };
 
-        Ok((Arc::new(storage), None))
+        Ok((Rc::new(storage), None))
     }
 
     fn create_client_with_task(
-        storage: Arc<BlobStorageImpl>,
+        storage: Rc<BlobStorageImpl>,
         rx: Receiver<BlobDeletionRequest>,
     ) -> Self {
-        let blob_deletion_task_handle = tokio::spawn({
+        // Spawn the deletion task - dropping the handle detaches it (task continues running)
+        ntex::rt::spawn({
             let storage = storage.clone();
             async move {
                 if let Err(e) = Self::blob_deletion_task(storage, rx).await {
@@ -131,10 +130,7 @@ impl BlobClient {
             }
         });
 
-        Self {
-            storage,
-            blob_deletion_task_handle,
-        }
+        Self { storage }
     }
 
     fn get_s3_express_multi_az_config<'a>(
@@ -152,7 +148,7 @@ impl BlobClient {
     }
 
     async fn blob_deletion_task(
-        storage: Arc<BlobStorageImpl>,
+        storage: Rc<BlobStorageImpl>,
         mut input: Receiver<BlobDeletionRequest>,
     ) -> Result<(), BlobStorageError> {
         while let Some(request) = input.recv().await {
@@ -226,7 +222,7 @@ impl BlobClient {
         tracking_root_blob_name: Option<&str>,
         blob_guid: DataBlobGuid,
         block_number: u32,
-        chunks: Vec<actix_web::web::Bytes>,
+        chunks: Vec<Bytes>,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         self.storage

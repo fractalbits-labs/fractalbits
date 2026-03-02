@@ -1,5 +1,5 @@
 use crate::handler::{ObjectRequestContext, common::s3_error::S3Error};
-use actix_web::{HttpResponse, web::Query};
+use ntex::web::{HttpResponse, types::Query};
 use rpc_client_common::nss_rpc_retry;
 use serde::Deserialize;
 use tracing::error;

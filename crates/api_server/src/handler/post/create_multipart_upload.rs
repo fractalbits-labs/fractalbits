@@ -42,7 +42,7 @@ struct InitiateMultipartUploadResult {
 
 pub async fn create_multipart_upload_handler(
     ctx: ObjectRequestContext,
-) -> Result<actix_web::HttpResponse, S3Error> {
+) -> Result<ntex::web::HttpResponse, S3Error> {
     let bucket = ctx.resolve_bucket().await?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

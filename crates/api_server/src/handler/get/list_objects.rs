@@ -6,7 +6,7 @@ use crate::handler::{
         s3_error::S3Error,
     },
 };
-use actix_web::{HttpResponse, web::Query};
+use ntex::web::{HttpResponse, types::Query};
 use serde::{Deserialize, Serialize};
 
 #[allow(dead_code)]

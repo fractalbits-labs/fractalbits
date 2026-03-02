@@ -8,10 +8,6 @@ mod post;
 mod put;
 
 use crate::{AppState, http_stats::HttpStatsGuard};
-use actix_web::{
-    HttpRequest, HttpResponse,
-    web::{self, Payload},
-};
 use bucket::BucketEndpoint;
 use common::{
     authorization::Authorization, checksum::ChecksumValue, request::extract::*, s3_error::S3Error,
@@ -25,30 +21,32 @@ use head::HeadEndpoint;
 #[cfg(any(feature = "metrics_statsd", feature = "metrics_prometheus"))]
 use metrics_wrapper::{Gauge, gauge};
 use metrics_wrapper::{counter, histogram};
+use ntex::web::types::Payload;
+use ntex::web::{HttpRequest, HttpResponse};
 use post::PostEndpoint;
 use put::PutEndpoint;
 use std::{
-    sync::Arc,
+    rc::Rc,
     time::{Duration, Instant},
 };
 use tracing::{Instrument, debug, error, warn};
 
 pub struct BucketRequestContext {
-    pub app: Arc<AppState>,
+    pub app: Rc<AppState>,
     pub request: HttpRequest,
     pub api_key: Versioned<ApiKey>,
     pub bucket_name: String,
-    pub payload: actix_web::dev::Payload,
+    pub payload: ntex::http::Payload,
     pub trace_id: TraceId,
 }
 
 impl BucketRequestContext {
     pub fn new(
-        app: Arc<AppState>,
+        app: Rc<AppState>,
         request: HttpRequest,
         api_key: Versioned<ApiKey>,
         bucket_name: String,
-        payload: actix_web::dev::Payload,
+        payload: ntex::http::Payload,
         trace_id: TraceId,
     ) -> Self {
         Self {
@@ -67,26 +65,26 @@ impl BucketRequestContext {
 }
 
 pub struct ObjectRequestContext {
-    pub app: Arc<AppState>,
+    pub app: Rc<AppState>,
     pub request: HttpRequest,
     pub api_key: Option<Versioned<ApiKey>>,
     pub bucket_name: String,
     pub key: String,
     pub checksum_value: Option<ChecksumValue>,
-    pub payload: actix_web::dev::Payload,
+    pub payload: ntex::http::Payload,
     pub trace_id: TraceId,
 }
 
 impl ObjectRequestContext {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        app: Arc<AppState>,
+        app: Rc<AppState>,
         request: HttpRequest,
         api_key: Option<Versioned<ApiKey>>,
         bucket_name: String,
         key: String,
         checksum_value: Option<ChecksumValue>,
-        payload: actix_web::dev::Payload,
+        payload: ntex::http::Payload,
         trace_id: TraceId,
     ) -> Self {
         Self {
@@ -111,8 +109,7 @@ impl ObjectRequestContext {
 /// Extracts data from request and returns early with warning log on failure
 macro_rules! extract_or_return {
     ($extractor_type:ty, $req:expr, $trace_id:expr) => {{
-        use actix_web::FromRequest;
-        match <$extractor_type>::from_request($req, &mut actix_web::dev::Payload::None).await {
+        match <$extractor_type as ntex::web::FromRequest<ntex::web::DefaultError>>::from_request($req, &mut ntex::http::Payload::None).await {
             Ok(extracted) => extracted,
             Err(rejection) => {
                 tracing::warn!(
@@ -133,12 +130,12 @@ macro_rules! extract_or_return {
 pub async fn any_handler(req: HttpRequest, payload: Payload) -> Result<HttpResponse, S3Error> {
     let start = Instant::now();
 
-    let app_data = req
-        .app_data::<web::Data<Arc<AppState>>>()
+    let app = req
+        .app_state::<Rc<AppState>>()
+        .cloned()
         .ok_or(S3Error::InternalError)?;
-    let app = app_data.get_ref().clone();
 
-    let trace_id = TraceId::new_with_worker_id(app_data.worker_id as u8);
+    let trace_id = TraceId::new_with_worker_id(app.worker_id as u8);
 
     // Extract all the required data using the macro
     let ApiCommandFromQuery(api_cmd) = extract_or_return!(ApiCommandFromQuery, &req, trace_id);
@@ -158,7 +155,7 @@ pub async fn any_handler(req: HttpRequest, payload: Payload) -> Result<HttpRespo
 
     let client_addr = req
         .connection_info()
-        .realip_remote_addr()
+        .remote()
         .unwrap_or("0.0.0.0:0")
         .to_string();
 
@@ -179,7 +176,7 @@ pub async fn any_handler(req: HttpRequest, payload: Payload) -> Result<HttpRespo
 
     let span = tracing::info_span!("", trace_id = %trace_id);
 
-    let result = tokio::time::timeout(
+    let result = ntex::time::timeout(
         Duration::from_secs(app.config.http_request_timeout_seconds),
         any_handler_inner(
             app,
@@ -225,13 +222,13 @@ pub async fn any_handler(req: HttpRequest, payload: Payload) -> Result<HttpRespo
 
 #[allow(clippy::too_many_arguments)]
 async fn any_handler_inner<'a>(
-    app: Arc<AppState>,
+    app: Rc<AppState>,
     bucket: String,
     key: String,
     auth: Option<Authentication<'a>>,
     checksum_value: Option<ChecksumValue>,
     request: &HttpRequest,
-    payload: actix_web::dev::Payload,
+    payload: ntex::http::Payload,
     endpoint: Endpoint,
     trace_id: &TraceId,
 ) -> Result<HttpResponse, S3Error> {

@@ -351,7 +351,7 @@ where
                     operation_name, attempt, backoff_ms, error_info
                 );
 
-                tokio::time::sleep(backoff).await;
+                ntex::time::sleep(backoff).await;
             }
         }
     }

@@ -1,5 +1,5 @@
 #![allow(unused)]
-use actix_web::HttpResponse;
+use ntex::web::HttpResponse;
 use serde::Serialize;
 
 use crate::handler::common::s3_error::S3Error;
@@ -39,7 +39,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::test;
+    use ntex::web::test;
 
     #[derive(Debug, Serialize, PartialEq, Eq, Default)]
     #[serde(rename_all = "PascalCase")]
@@ -58,7 +58,7 @@ mod tests {
         session_token: String,
     }
 
-    #[tokio::test]
+    #[ntex::test]
     async fn test_response_xml_encode_ok() {
         let output = TestCreateSessionOutput {
             xmlns: Default::default(),
@@ -79,9 +79,14 @@ mod tests {
                 .unwrap()
         );
 
-        let body = resp.into_body();
-        use actix_web::body::MessageBody;
-        let body_bytes = body.try_into_bytes().unwrap();
+        let (_, body) = resp.into_parts();
+        use ntex::http::body::Body::Bytes;
+        use ntex::http::body::ResponseBody;
+        let body_bytes = match body {
+            ResponseBody::Body(Bytes(b)) => b,
+            ResponseBody::Other(Bytes(b)) => b,
+            _ => unreachable!(),
+        };
         let expected = "\
 <?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 <TestCreateSessionOutput xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\

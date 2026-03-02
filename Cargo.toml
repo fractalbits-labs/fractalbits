@@ -69,8 +69,8 @@ fake = "4.4.0"
 bytemuck = { version = "1.25.0", features = ["derive"] }
 tokio = { version = "1.49.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
-actix-web = { version = "4.13.0", features = ["rustls-0_23"] }
-actix-files = "0.6.10"
+ntex = { version = "3.5.1", features = ["compio", "rustls"] }
+ntex-files = "3.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 prost = "0.14"
 bytes = "1.11.1"

@@ -5,16 +5,16 @@ use crate::handler::common::{
     checksum::{ChecksumValue, Checksummer, request_trailer_checksum_algorithm, verify_checksum},
     s3_error::S3Error,
 };
-use actix_web::HttpRequest;
-use actix_web::error::PayloadError;
 use base64::prelude::*;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{Stream, ready};
+use ntex::http::error::PayloadError;
+use ntex::rt::JoinHandle;
+use ntex::web::HttpRequest;
 use pin_project_lite::pin_project;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tracing::{Instrument, Span};
 
 /// Streaming checksum receiver type
@@ -52,13 +52,13 @@ enum S3ChunkState {
 }
 
 pin_project! {
-    /// A wrapper around actix-web's Payload that handles S3-specific streaming features:
+    /// A wrapper around ntex's Payload that handles S3-specific streaming features:
     /// - AWS chunk-signature extensions
     /// - HTTP trailers with checksums
     /// - Streaming checksum calculation
     pub struct S3StreamingPayload {
         #[pin]
-        inner: actix_web::dev::Payload,
+        inner: ntex::http::Payload,
         state: S3ChunkState,
         trailer_buffer: BytesMut,
         checksum_sender: Option<mpsc::UnboundedSender<ChecksumMessage>>,
@@ -72,7 +72,7 @@ impl S3StreamingPayload {
     /// Create a streaming payload with optimized checksum calculation
     /// Avoids task spawning for simple cases (no trailers, small objects)
     pub fn with_checksums(
-        payload: actix_web::dev::Payload,
+        payload: ntex::http::Payload,
         request: &HttpRequest,
         checksum_value: Option<ChecksumValue>,
     ) -> Result<(Self, StreamingChecksumReceiver), S3Error> {
@@ -80,7 +80,7 @@ impl S3StreamingPayload {
     }
 
     pub fn with_checksums_and_signature(
-        payload: actix_web::dev::Payload,
+        payload: ntex::http::Payload,
         request: &HttpRequest,
         checksum_value: Option<ChecksumValue>,
         signature_info: Option<(ChunkSignatureContext, Option<String>)>,
@@ -90,7 +90,7 @@ impl S3StreamingPayload {
 
     /// Full path: complete functionality with task spawning for complex cases
     fn with_checksums_full(
-        payload: actix_web::dev::Payload,
+        payload: ntex::http::Payload,
         request: &HttpRequest,
         checksum_value: Option<ChecksumValue>,
         signature_info: Option<(ChunkSignatureContext, Option<String>)>,
@@ -121,7 +121,7 @@ impl S3StreamingPayload {
         let (checksum_tx, mut checksum_rx) = mpsc::unbounded_channel::<ChecksumMessage>();
 
         // Spawn checksum calculation task
-        let checksum_handle = tokio::spawn(
+        let checksum_handle = ntex::rt::spawn(
             async move {
                 let final_expected = expected_checksum;
                 let mut trailer_checksums: Option<S3Trailers> = None;
@@ -459,11 +459,11 @@ impl Stream for S3StreamingPayload {
                         // Pass through all data directly without chunk parsing
                         match ready!(this.inner.as_mut().poll_next(cx)) {
                             Some(Ok(data)) => {
-                                // Send data to checksum calculator
+                                let std_bytes = bytes::Bytes::from(data.as_ref().to_vec());
                                 if let Some(sender) = &this.checksum_sender {
-                                    let _ = sender.send(ChecksumMessage::Data(data.clone()));
+                                    let _ = sender.send(ChecksumMessage::Data(std_bytes.clone()));
                                 }
-                                return Poll::Ready(Some(Ok(data)));
+                                return Poll::Ready(Some(Ok(std_bytes)));
                             }
                             Some(Err(e)) => {
                                 send_error(
@@ -527,15 +527,16 @@ impl Stream for S3StreamingPayload {
                         }
 
                         // Send data to checksum calculator
+                        let std_bytes = bytes::Bytes::from(chunk_data.as_ref().to_vec());
                         if let Some(sender) = &this.checksum_sender {
-                            let _ = sender.send(ChecksumMessage::Data(chunk_data.clone().into()));
+                            let _ = sender.send(ChecksumMessage::Data(std_bytes.clone()));
                         }
 
                         *this.state = S3ChunkState::ReadingChunkData {
                             remaining: remaining - to_take,
                             chunk_signature: chunk_signature.clone(),
                         };
-                        return Poll::Ready(Some(Ok(chunk_data.into())));
+                        return Poll::Ready(Some(Ok(std_bytes)));
                     }
 
                     // Read more data from the stream
@@ -556,15 +557,16 @@ impl Stream for S3StreamingPayload {
                             }
 
                             // Send data to checksum calculator
+                            let std_bytes = bytes::Bytes::from(chunk_data.as_ref().to_vec());
                             if let Some(sender) = &this.checksum_sender {
-                                let _ = sender.send(ChecksumMessage::Data(chunk_data.clone()));
+                                let _ = sender.send(ChecksumMessage::Data(std_bytes.clone()));
                             }
 
                             *this.state = S3ChunkState::ReadingChunkData {
                                 remaining: remaining - to_take,
                                 chunk_signature: chunk_signature.clone(),
                             };
-                            return Poll::Ready(Some(Ok(chunk_data)));
+                            return Poll::Ready(Some(Ok(std_bytes)));
                         }
                         Some(Err(e)) => {
                             send_error(

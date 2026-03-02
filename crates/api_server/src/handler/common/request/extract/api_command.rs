@@ -1,5 +1,5 @@
-use actix_web::{FromRequest, HttpRequest, dev::Payload};
-use futures::future::{Ready, ready};
+use ntex::http::Payload;
+use ntex::web::{FromRequest, HttpRequest};
 use std::str::FromStr;
 use strum::EnumString;
 
@@ -45,11 +45,10 @@ pub enum ApiCommand {
 #[derive(Debug, Clone)]
 pub struct ApiCommandFromQuery(pub Option<ApiCommand>);
 
-impl FromRequest for ApiCommandFromQuery {
-    type Error = actix_web::Error;
-    type Future = Ready<Result<Self, Self::Error>>;
+impl<Err: ntex::web::ErrorRenderer> FromRequest<Err> for ApiCommandFromQuery {
+    type Error = ntex::web::Error;
 
-    fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Self::Future {
+    async fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Result<Self, Self::Error> {
         // Parse query string to extract API commands
         let query_string = req.query_string();
 
@@ -83,14 +82,14 @@ impl FromRequest for ApiCommandFromQuery {
             Some(api_commands[0])
         };
 
-        ready(Ok(ApiCommandFromQuery(api_command)))
+        Ok(ApiCommandFromQuery(api_command))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{App, HttpResponse, test, web};
+    use ntex::web::{self, App, HttpResponse, test};
 
     async fn handler(ApiCommandFromQuery(api_command): ApiCommandFromQuery) -> HttpResponse {
         let result = match api_command {
@@ -100,25 +99,25 @@ mod tests {
         HttpResponse::Ok().body(result)
     }
 
-    #[actix_web::test]
+    #[ntex::test]
     async fn test_extract_api_command_ok() {
         let api_cmd = "acl";
         assert_eq!(send_request_get_body(api_cmd).await, api_cmd);
     }
 
-    #[actix_web::test]
+    #[ntex::test]
     async fn test_extract_api_command_null() {
         let api_cmd = "";
         assert_eq!(send_request_get_body(api_cmd).await, api_cmd);
     }
 
-    #[actix_web::test]
+    #[ntex::test]
     async fn test_extract_api_command_uploads() {
         let api_cmd = "uploads";
         assert_eq!(send_request_get_body(api_cmd).await, api_cmd);
     }
 
-    #[actix_web::test]
+    #[ntex::test]
     async fn test_extract_api_command_with_empty_value() {
         let api_cmd = "uploads=";
         assert_eq!(send_request_get_body(api_cmd).await, "uploads");
@@ -140,7 +139,7 @@ mod tests {
         String::from_utf8(body.to_vec()).unwrap()
     }
 
-    #[test]
+    #[ntex::test]
     async fn test_api_command_from_str() {
         assert_eq!(ApiCommand::from_str("acl").unwrap(), ApiCommand::Acl);
         assert_eq!(

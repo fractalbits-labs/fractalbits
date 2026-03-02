@@ -2,11 +2,11 @@ use super::{BlobStorageError, DataVgProxy};
 use bytes::Bytes;
 use data_types::{DataBlobGuid, DataVgInfo, TraceId};
 use metrics_wrapper::histogram;
-use std::{sync::Arc, time::Duration};
+use std::{rc::Rc, time::Duration};
 use tracing::debug;
 
 pub struct AllInBssSingleAzStorage {
-    data_vg_proxy: Arc<DataVgProxy>,
+    data_vg_proxy: Rc<DataVgProxy>,
 }
 
 impl AllInBssSingleAzStorage {
@@ -17,7 +17,7 @@ impl AllInBssSingleAzStorage {
     ) -> Result<Self, BlobStorageError> {
         debug!("Initializing AllInBssSingleAzStorage with pre-fetched DataVgInfo");
 
-        let data_vg_proxy = Arc::new(
+        let data_vg_proxy = Rc::new(
             DataVgProxy::new(data_vg_info, rpc_request_timeout, rpc_connection_timeout).map_err(
                 |e| BlobStorageError::Config(format!("Failed to initialize DataVgProxy: {}", e)),
             )?,
@@ -60,7 +60,7 @@ impl AllInBssSingleAzStorage {
         blob_id: uuid::Uuid,
         volume_id: u16,
         block_number: u32,
-        chunks: Vec<actix_web::web::Bytes>,
+        chunks: Vec<Bytes>,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         let total_size: usize = chunks.iter().map(|c| c.len()).sum();

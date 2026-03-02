@@ -1,7 +1,7 @@
-use actix_web::web::Query;
 use file_ops::parse_list_inodes;
+use ntex::web::types::Query;
 use rpc_client_common::nss_rpc_retry;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use crate::{
     AppState,
@@ -193,7 +193,7 @@ pub struct Prefix {
 
 pub async fn list_objects_v2_handler(
     ctx: ObjectRequestContext,
-) -> Result<actix_web::HttpResponse, S3Error> {
+) -> Result<ntex::web::HttpResponse, S3Error> {
     let opts = Query::<QueryOpts>::from_query(ctx.request.query_string())
         .unwrap_or_else(|_| Query(Default::default()))
         .into_inner();
@@ -280,7 +280,7 @@ pub async fn list_objects_v2_handler(
 }
 
 pub async fn list_objects(
-    app: Arc<AppState>,
+    app: Rc<AppState>,
     bucket: &Bucket,
     max_keys: u32,
     prefix: String,

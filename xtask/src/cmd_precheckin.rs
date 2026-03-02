@@ -14,8 +14,12 @@ pub fn run_cmd_precheckin(
 
     if debug_api_server {
         cmd_service::stop_service(ServiceName::ApiServer)?;
+        // Build with isolated target to prevent workspace feature unification
+        let compio_target = cmd_build::COMPIO_TARGET_DIR;
         run_cmd! {
-            cargo build -p api_server;
+            CARGO_TARGET_DIR=$compio_target cargo build -p api_server;
+            mkdir -p target/debug;
+            cp -f $compio_target/debug/api_server target/debug/;
         }?;
     } else {
         cmd_service::stop_service(ServiceName::All)?;
@@ -37,8 +41,10 @@ pub fn run_cmd_precheckin(
     cmd_service::init_service(ServiceName::All, BuildMode::Debug, &init_config)?;
     run_zig_unit_tests(&init_config)?;
     run_cmd! {
-        info "Run cargo tests (except s3 api and fs_server)";
+        info "Run cargo tests (except s3 api)";
         cargo test --workspace --exclude api_server --exclude fs_server;
+        info "Run api_server lib tests";
+        cargo test -p api_server --lib;
     }?;
 
     run_s3_api_tests(&init_config, false)?;

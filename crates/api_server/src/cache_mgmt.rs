@@ -1,9 +1,7 @@
-use actix_web::{
-    HttpResponse, Result,
-    web::{Data, Json, Path},
-};
+use ntex::web::HttpResponse;
+use ntex::web::types::{Json, Path, State};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use tracing::{info, warn};
 
@@ -27,9 +25,9 @@ pub struct NssAddressUpdateRequest {
 
 /// Invalidate a specific bucket from the cache
 pub async fn invalidate_bucket(
-    app: Data<Arc<AppState>>,
+    app: State<Rc<AppState>>,
     path: Path<String>,
-) -> Result<HttpResponse> {
+) -> Result<HttpResponse, ntex::web::Error> {
     let bucket_name = path.into_inner();
     info!("Invalidating bucket cache for: {}", bucket_name);
 
@@ -41,14 +39,14 @@ pub async fn invalidate_bucket(
         message: format!("Bucket '{}' cache invalidated", bucket_name),
     };
 
-    Ok(HttpResponse::Ok().json(response))
+    Ok(HttpResponse::Ok().json(&response))
 }
 
 /// Invalidate a specific API key from the cache
 pub async fn invalidate_api_key(
-    app: Data<Arc<AppState>>,
+    app: State<Rc<AppState>>,
     path: Path<String>,
-) -> Result<HttpResponse> {
+) -> Result<HttpResponse, ntex::web::Error> {
     let key_id = path.into_inner();
     info!("Invalidating API key cache for: {}", key_id);
 
@@ -60,15 +58,15 @@ pub async fn invalidate_api_key(
         message: format!("API key '{}' cache invalidated", key_id),
     };
 
-    Ok(HttpResponse::Ok().json(response))
+    Ok(HttpResponse::Ok().json(&response))
 }
 
 /// Update az_status cache for a specific AZ with new status value
 pub async fn update_az_status(
-    app: Data<Arc<AppState>>,
+    app: State<Rc<AppState>>,
     path: Path<String>,
     request: Json<AzStatusUpdateRequest>,
-) -> Result<HttpResponse> {
+) -> Result<HttpResponse, ntex::web::Error> {
     let az_id = path.into_inner();
     info!(
         "Updating az_status cache for: {} with status: {}",
@@ -81,7 +79,7 @@ pub async fn update_az_status(
             message: "AZ status cache not available for this storage backend".to_string(),
         };
 
-        return Ok(HttpResponse::NotFound().json(response));
+        return Ok(HttpResponse::NotFound().json(&response));
     }
 
     let cache_key = format!("az_status:{}", az_id);
@@ -97,11 +95,11 @@ pub async fn update_az_status(
         ),
     };
 
-    Ok(HttpResponse::Ok().json(response))
+    Ok(HttpResponse::Ok().json(&response))
 }
 
 /// Clear the entire cache
-pub async fn clear_cache(app: Data<Arc<AppState>>) -> Result<HttpResponse> {
+pub async fn clear_cache(app: State<Rc<AppState>>) -> Result<HttpResponse, ntex::web::Error> {
     warn!("Clearing entire cache");
 
     // Invalidate all entries in the cache
@@ -115,14 +113,14 @@ pub async fn clear_cache(app: Data<Arc<AppState>>) -> Result<HttpResponse> {
         message: "All cache entries cleared".to_string(),
     };
 
-    Ok(HttpResponse::Ok().json(response))
+    Ok(HttpResponse::Ok().json(&response))
 }
 
 /// Update NSS address for this api_server instance
 pub async fn update_nss_address(
-    app: Data<Arc<AppState>>,
+    app: State<Rc<AppState>>,
     request: Json<NssAddressUpdateRequest>,
-) -> Result<HttpResponse> {
+) -> Result<HttpResponse, ntex::web::Error> {
     info!("Received NSS address update request: {}", request.address);
 
     app.update_nss_address(request.address.clone()).await;
@@ -132,22 +130,22 @@ pub async fn update_nss_address(
         message: format!("NSS address updated to '{}'", request.address),
     };
 
-    Ok(HttpResponse::Ok().json(response))
+    Ok(HttpResponse::Ok().json(&response))
 }
 
 /// Health check endpoint for management API
-pub async fn mgmt_health(app: Data<Arc<AppState>>) -> Result<HttpResponse> {
+pub async fn mgmt_health(app: State<Rc<AppState>>) -> Result<HttpResponse, ntex::web::Error> {
     let trace_id = data_types::TraceId::new();
     let nss_ready = app.ensure_nss_client_initialized(&trace_id).await;
 
     if nss_ready {
-        Ok(HttpResponse::Ok().json(serde_json::json!({
+        Ok(HttpResponse::Ok().json(&serde_json::json!({
             "status": "healthy",
             "service": "api_server",
             "nss_connected": true
         })))
     } else {
-        Ok(HttpResponse::ServiceUnavailable().json(serde_json::json!({
+        Ok(HttpResponse::ServiceUnavailable().json(&serde_json::json!({
             "status": "unhealthy",
             "service": "api_server",
             "nss_connected": false,

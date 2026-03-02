@@ -56,7 +56,20 @@ fn build_local_docker_image(
         cmd_build::build_for_docker(release)?;
     } else {
         info!("Using prebuilt binaries from prebuilt/ directory");
-        run_cmd!($[build_envs] cargo build $build_flag -p api_server -p container-all-in-one)?;
+        // Build api_server with isolated target to prevent workspace feature unification
+        let compio_target = cmd_build::COMPIO_TARGET_DIR;
+        let compio_dir = format!(
+            "{compio_target}/{}",
+            if release { "release" } else { "debug" }
+        );
+        run_cmd! {
+            CARGO_TARGET_DIR=$compio_target $[build_envs] cargo build $build_flag -p api_server;
+
+            mkdir -p $target_dir;
+            cp -f $compio_dir/api_server $target_dir/;
+
+            $[build_envs] cargo build $build_flag -p container-all-in-one;
+        }?;
     }
 
     // Ensure etcd is available

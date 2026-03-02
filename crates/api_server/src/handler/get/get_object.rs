@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use crate::{AppState, blob_storage::BlobLocation};
 use crate::{
@@ -11,17 +11,14 @@ use crate::{
         },
     },
 };
-use actix_web::{
-    HttpResponse,
-    http::{StatusCode, header, header::HeaderValue},
-    web::Query,
-};
 use bytes::Bytes;
 use data_types::DataBlobGuid;
 use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
 use data_types::{Bucket, TraceId};
 use futures::{StreamExt, TryStreamExt, stream};
 use metrics_wrapper::histogram;
+use ntex::http::{StatusCode, header, header::HeaderValue};
+use ntex::web::{HttpResponse, types::Query};
 use serde::Deserialize;
 use tracing::{Instrument, Span};
 
@@ -116,17 +113,20 @@ pub async fn get_object_handler(ctx: ObjectRequestContext) -> Result<HttpRespons
             object_headers(&mut response, &object, checksum_mode_enabled)?;
             override_headers(&mut response, &query_opts)?;
 
-            // Convert the stream to actix-web compatible format
-            let actix_stream = body_stream.map(|result| {
-                result.map_err(|e| {
-                    tracing::error!("Stream error: {e:?}");
-                    std::io::Error::other(format!("Stream error: {e:?}"))
-                })
+            // Convert the stream to ntex compatible format
+            let ntex_stream = body_stream.map(|result| {
+                result
+                    .map(|b| ntex::util::Bytes::from(b.as_ref().to_vec()))
+                    .map_err(|e| {
+                        tracing::error!("Stream error: {e:?}");
+                        std::rc::Rc::new(std::io::Error::other(format!("Stream error: {e:?}")))
+                            as std::rc::Rc<dyn std::error::Error>
+                    })
             });
 
             Ok(response
-                .no_chunking(body_size)
-                .body(actix_web::body::SizedStream::new(body_size, actix_stream)))
+                .no_chunking()
+                .body(ntex::http::body::SizedStream::new(body_size, ntex_stream)))
         }
         (None, Some(range)) => {
             // Range request with streaming
@@ -140,27 +140,28 @@ pub async fn get_object_handler(ctx: ObjectRequestContext) -> Result<HttpRespons
             // Build response for partial content
             let mut response = HttpResponse::build(StatusCode::PARTIAL_CONTENT);
             object_headers(&mut response, &object, false)?;
-            response.insert_header((header::CONTENT_RANGE, content_range));
-            response.insert_header((header::CONTENT_LENGTH, range_length.to_string()));
+            response.set_header(header::CONTENT_RANGE, content_range);
+            response.set_header(header::CONTENT_LENGTH, range_length.to_string());
             override_headers(&mut response, &query_opts)?;
 
-            // Convert the stream to actix-web compatible format
-            let actix_stream = body_stream.map(|result| {
-                result.map_err(|e| {
-                    tracing::error!("Stream error: {e:?}");
-                    std::io::Error::other(format!("Stream error: {e:?}"))
-                })
+            // Convert the stream to ntex compatible format
+            let ntex_stream = body_stream.map(|result| {
+                result
+                    .map(|b| ntex::util::Bytes::from(b.as_ref().to_vec()))
+                    .map_err(|e| {
+                        tracing::error!("Stream error: {e:?}");
+                        std::io::Error::other(format!("Stream error: {e:?}"))
+                    })
             });
 
-            // Use streaming response
-            Ok(response.streaming(actix_stream))
+            Ok(response.streaming(ntex_stream))
         }
         (Some(_), Some(_)) => Err(S3Error::InvalidArgument1),
     }
 }
 
 pub fn override_headers(
-    resp: &mut actix_web::HttpResponseBuilder,
+    resp: &mut ntex::web::HttpResponseBuilder,
     query_opts: &QueryOpts,
 ) -> Result<(), S3Error> {
     // override headers, see https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html
@@ -184,7 +185,7 @@ pub fn override_headers(
 
     for (hdr, val_opt) in overrides {
         if let Some(val) = val_opt {
-            resp.insert_header((hdr, val.as_str()));
+            resp.set_header(hdr, val.as_str());
         }
     }
 
@@ -192,7 +193,7 @@ pub fn override_headers(
 }
 
 pub async fn get_object_content(
-    app: Arc<AppState>,
+    app: Rc<AppState>,
     bucket: &Bucket,
     object: &ObjectLayout,
     key: String,
@@ -200,7 +201,7 @@ pub async fn get_object_content(
     trace_id: &TraceId,
 ) -> Result<
     (
-        std::pin::Pin<Box<dyn stream::Stream<Item = Result<Bytes, S3Error>> + Send>>,
+        std::pin::Pin<Box<dyn stream::Stream<Item = Result<Bytes, S3Error>>>>,
         u64,
     ),
     S3Error,
@@ -289,13 +290,13 @@ pub async fn get_object_content(
 }
 
 async fn get_object_range_content(
-    app: Arc<AppState>,
+    app: Rc<AppState>,
     bucket: &Bucket,
     object: &ObjectLayout,
     key: String,
     range: &std::ops::Range<usize>,
     trace_id: &TraceId,
-) -> Result<std::pin::Pin<Box<dyn stream::Stream<Item = Result<Bytes, S3Error>> + Send>>, S3Error> {
+) -> Result<std::pin::Pin<Box<dyn stream::Stream<Item = Result<Bytes, S3Error>>>>, S3Error> {
     let blob_client = app
         .get_blob_client()
         .await
@@ -397,7 +398,7 @@ async fn get_object_range_content(
 }
 
 async fn get_full_blob_stream(
-    blob_client: Arc<BlobClient>,
+    blob_client: Rc<BlobClient>,
     blob_guid: DataBlobGuid,
     num_blocks: usize,
     object_size: u64,
@@ -406,7 +407,7 @@ async fn get_full_blob_stream(
     trace_id: TraceId,
 ) -> Result<impl stream::Stream<Item = Result<Bytes, S3Error>>, S3Error> {
     if num_blocks == 0 {
-        return Ok(stream::empty().boxed());
+        return Ok(stream::empty().boxed_local());
     }
 
     let first_block_len = if num_blocks == 1 {
@@ -434,7 +435,7 @@ async fn get_full_blob_stream(
 
     if num_blocks == 1 {
         // Single block optimization - return immediately without streaming overhead
-        return Ok(stream::once(async { Ok(first_block) }).boxed());
+        return Ok(stream::once(async { Ok(first_block) }).boxed_local());
     }
 
     // Multi-block case: stream first block + remaining blocks
@@ -469,12 +470,12 @@ async fn get_full_blob_stream(
     });
 
     let full_stream = stream::once(async { Ok(first_block) }).chain(remaining_stream);
-    Ok(full_stream.boxed())
+    Ok(full_stream.boxed_local())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn get_range_blob_stream(
-    blob_client: Arc<BlobClient>,
+    blob_client: Rc<BlobClient>,
     blob_guid: DataBlobGuid,
     block_size: usize,
     object_size: u64,
@@ -557,7 +558,7 @@ fn get_range_blob_stream(
 }
 
 pub async fn get_object_content_as_bytes(
-    app: Arc<AppState>,
+    app: Rc<AppState>,
     bucket: &Bucket,
     object: &ObjectLayout,
     key: String,

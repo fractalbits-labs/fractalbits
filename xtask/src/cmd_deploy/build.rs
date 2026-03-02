@@ -106,6 +106,7 @@ fn get_aws_cpu_deploy_dir(target: &ArchTarget) -> String {
 fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[String]) -> CmdResult {
     info!("Building Rust projects for all arch targets (generic + AWS CPU-specific)");
     let build_envs = cmd_build::get_build_envs();
+    let compio_target = cmd_build::COMPIO_TARGET_DIR;
 
     // Build for ARCH_TARGETS (generic/baseline builds)
     // container-all-in-one is included in generic builds for Docker image staging
@@ -114,34 +115,32 @@ fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[Str
         let rust_target = target.rust_target;
         let arch = target.arch;
 
-        if api_server_build_env.is_empty() {
-            run_cmd! {
-                info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [generic]";
-                RUSTFLAGS="-C target-cpu=$rust_cpu"
-                $[build_envs] cargo zigbuild
-                    --target $rust_target $rust_build_opt --workspace
-                    --exclude xtask
-                    --exclude fractalbits-bootstrap
-                    --exclude fractal-s3;
-            }?;
-        } else {
-            run_cmd! {
-                info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [generic]";
-                RUSTFLAGS="-C target-cpu=$rust_cpu"
-                $[build_envs] cargo zigbuild
-                    --target $rust_target $rust_build_opt --workspace
-                    --exclude xtask
-                    --exclude fractalbits-bootstrap
-                    --exclude fractal-s3
-                    --exclude api_server;
+        // Build workspace (excluding api_server which needs isolated target)
+        run_cmd! {
+            info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [generic]";
+            RUSTFLAGS="-C target-cpu=$rust_cpu"
+            $[build_envs] cargo zigbuild
+                --target $rust_target $rust_build_opt --workspace
+                --exclude xtask
+                --exclude fractalbits-bootstrap
+                --exclude fractal-s3
+                --exclude api_server;
+        }?;
 
-                info "Building api_server ...";
-                RUSTFLAGS="-C target-cpu=$rust_cpu"
-                $[api_server_build_env] $[build_envs] cargo zigbuild
-                    --target $rust_target $rust_build_opt
-                    --package api_server;
-            }?;
-        }
+        // Build api_server with isolated CARGO_TARGET_DIR to prevent
+        // workspace feature unification from enabling tokio-runtime
+        run_cmd! {
+            info "Building api_server for $rust_target [compio-runtime] ...";
+            CARGO_TARGET_DIR=$compio_target
+            RUSTFLAGS="-C target-cpu=$rust_cpu"
+            $[api_server_build_env] $[build_envs] cargo zigbuild
+                --target $rust_target $rust_build_opt
+                --package api_server;
+        }?;
+        // Copy api_server to standard target location
+        let compio_bin = format!("{compio_target}/{rust_target}/{build_dir}/api_server");
+        let target_bin = format!("target/{rust_target}/{build_dir}/api_server");
+        run_cmd!(cp -f $compio_bin $target_bin)?;
 
         // Copy Rust binaries to generic directory (excluding fractalbits-bootstrap)
         copy_rust_binaries_to_generic(target, rust_target, build_dir)?;
@@ -163,36 +162,31 @@ fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[Str
         let arch = target.arch;
         let cpu_name = target.cpu_name;
 
-        if api_server_build_env.is_empty() {
-            run_cmd! {
-                info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [aws/$cpu_name]";
-                RUSTFLAGS="-C target-cpu=$rust_cpu"
-                $[build_envs] cargo zigbuild
-                    --target $rust_target $rust_build_opt --workspace
-                    --exclude xtask
-                    --exclude fractalbits-bootstrap
-                    --exclude fractal-s3
-                    --exclude container-all-in-one;
-            }?;
-        } else {
-            run_cmd! {
-                info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [aws/$cpu_name]";
-                RUSTFLAGS="-C target-cpu=$rust_cpu"
-                $[build_envs] cargo zigbuild
-                    --target $rust_target $rust_build_opt --workspace
-                    --exclude xtask
-                    --exclude fractalbits-bootstrap
-                    --exclude fractal-s3
-                    --exclude container-all-in-one
-                    --exclude api_server;
+        // Build workspace (excluding api_server which needs isolated target)
+        run_cmd! {
+            info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [aws/$cpu_name]";
+            RUSTFLAGS="-C target-cpu=$rust_cpu"
+            $[build_envs] cargo zigbuild
+                --target $rust_target $rust_build_opt --workspace
+                --exclude xtask
+                --exclude fractalbits-bootstrap
+                --exclude fractal-s3
+                --exclude container-all-in-one
+                --exclude api_server;
+        }?;
 
-                info "Building api_server ...";
-                RUSTFLAGS="-C target-cpu=$rust_cpu"
-                $[api_server_build_env] $[build_envs] cargo zigbuild
-                    --target $rust_target $rust_build_opt
-                    --package api_server;
-            }?;
-        }
+        // Build api_server with isolated CARGO_TARGET_DIR
+        run_cmd! {
+            info "Building api_server for $rust_target [compio-runtime, aws/$cpu_name] ...";
+            CARGO_TARGET_DIR=$compio_target
+            RUSTFLAGS="-C target-cpu=$rust_cpu"
+            $[api_server_build_env] $[build_envs] cargo zigbuild
+                --target $rust_target $rust_build_opt
+                --package api_server;
+        }?;
+        let compio_bin = format!("{compio_target}/{rust_target}/{build_dir}/api_server");
+        let target_bin = format!("target/{rust_target}/{build_dir}/api_server");
+        run_cmd!(cp -f $compio_bin $target_bin)?;
 
         // Copy Rust binaries to AWS CPU-specific directory (excluding bootstrap/etcd/warp)
         copy_rust_binaries_to_aws_cpu(target, rust_target, build_dir)?;

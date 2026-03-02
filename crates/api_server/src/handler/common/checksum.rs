@@ -1,11 +1,11 @@
 use std::hash::Hasher;
 
 use crate::handler::common::{s3_error::S3Error, signature::SignatureError, xheader};
-use actix_web::http::header::HeaderMap;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use crc32c::Crc32cHasher as Crc32c;
 use crc32fast::Hasher as Crc32;
 use crc64fast_nvme::Digest as Crc64Nvme;
+use ntex::http::header::HeaderMap;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
@@ -105,38 +105,38 @@ pub fn request_trailer_checksum_algorithm(
 
 pub fn add_checksum_response_headers(
     checksum: &Option<ChecksumValue>,
-    resp: &mut actix_web::HttpResponseBuilder,
+    resp: &mut ntex::web::HttpResponseBuilder,
 ) -> Result<(), S3Error> {
     match checksum {
         Some(ChecksumValue::Crc32(crc32)) => {
-            resp.insert_header((
+            resp.set_header(
                 xheader::X_AMZ_CHECKSUM_CRC32.as_str(),
                 BASE64_STANDARD.encode(crc32),
-            ));
+            );
         }
         Some(ChecksumValue::Crc32c(crc32c)) => {
-            resp.insert_header((
+            resp.set_header(
                 xheader::X_AMZ_CHECKSUM_CRC32C.as_str(),
                 BASE64_STANDARD.encode(crc32c),
-            ));
+            );
         }
         Some(ChecksumValue::Sha1(sha1)) => {
-            resp.insert_header((
+            resp.set_header(
                 xheader::X_AMZ_CHECKSUM_SHA1.as_str(),
                 BASE64_STANDARD.encode(sha1),
-            ));
+            );
         }
         Some(ChecksumValue::Sha256(sha256)) => {
-            resp.insert_header((
+            resp.set_header(
                 xheader::X_AMZ_CHECKSUM_SHA256.as_str(),
                 BASE64_STANDARD.encode(sha256),
-            ));
+            );
         }
         Some(ChecksumValue::Crc64Nvme(crc64nvme)) => {
-            resp.insert_header((
+            resp.set_header(
                 xheader::X_AMZ_CHECKSUM_CRC64NVME.as_str(),
                 BASE64_STANDARD.encode(crc64nvme),
-            ));
+            );
         }
         None => (),
     }

@@ -1,4 +1,4 @@
-use actix_web::http::header::ToStrError;
+use ntex::http::header::ToStrError;
 use rpc_client_rss::RpcErrorRss;
 use thiserror::Error;
 
