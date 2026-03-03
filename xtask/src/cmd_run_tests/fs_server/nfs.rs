@@ -113,6 +113,12 @@ pub async fn run_nfs_tests() -> CmdResult {
         return Err(e);
     }
 
+    println!("\n{}", "=== NFS Test: Large File Write ===".bold());
+    if let Err(e) = test_nfs_large_file_write().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
     println!("\n{}", "=== NFS Test: Mkdir and Rmdir ===".bold());
     if let Err(e) = test_nfs_mkdir_rmdir().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
@@ -421,6 +427,80 @@ async fn test_nfs_create_write_read() -> CmdResult {
 
     unmount_nfs()?;
     println!("{}", "SUCCESS: NFS create/write/read test passed".green());
+    Ok(())
+}
+
+async fn test_nfs_large_file_write() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    let sizes: Vec<(&str, usize)> = vec![
+        ("small-4k", 4 * 1024),
+        ("medium-512k", 512 * 1024),
+        ("large-2mb", 2 * 1024 * 1024),
+    ];
+
+    println!("  Step 1: Mount NFS in read-write mode");
+    mount_nfs_rw(&bucket)?;
+
+    println!("  Step 2: Write large files via NFS");
+    let mut keys = Vec::new();
+    for (label, size) in &sizes {
+        let key = format!("nfs-write-{label}");
+        let data = generate_test_data(&key, *size);
+        let nfs_path = format!("{}/{}", NFS_MOUNT_POINT, key);
+        std::fs::write(&nfs_path, &data)
+            .map_err(|e| std::io::Error::other(format!("Failed to write {key}: {e}")))?;
+        keys.push((key, data));
+        println!("    Written: {} ({} bytes)", label, size);
+    }
+
+    println!("  Step 3: Read back and verify");
+    let mut passed = 0;
+    let mut failed = 0;
+
+    for (i, (label, _)) in sizes.iter().enumerate() {
+        let (key, expected_data) = &keys[i];
+        let nfs_path = format!("{}/{}", NFS_MOUNT_POINT, key);
+
+        match std::fs::read(&nfs_path) {
+            Ok(actual_data) => {
+                if actual_data == *expected_data {
+                    println!("    {}: OK ({} bytes)", label, actual_data.len());
+                    passed += 1;
+                } else {
+                    let first_diff = actual_data
+                        .iter()
+                        .zip(expected_data.iter())
+                        .position(|(a, b)| a != b);
+                    println!(
+                        "    {}: {} (expected {} bytes, got {}, first diff at {:?})",
+                        label,
+                        "DATA MISMATCH".red(),
+                        expected_data.len(),
+                        actual_data.len(),
+                        first_diff,
+                    );
+                    failed += 1;
+                }
+            }
+            Err(e) => {
+                println!("    {}: {} ({})", label, "READ FAILED".red(), e);
+                failed += 1;
+            }
+        }
+    }
+
+    unmount_nfs()?;
+
+    if failed > 0 {
+        return Err(std::io::Error::other(format!(
+            "{} of {} NFS large file writes failed",
+            failed,
+            passed + failed
+        )));
+    }
+
+    println!("{}", "SUCCESS: NFS large file write test passed".green());
     Ok(())
 }
 
