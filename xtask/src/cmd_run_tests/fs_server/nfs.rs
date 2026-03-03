@@ -11,8 +11,9 @@ use super::{cleanup_objects, generate_test_data, setup_test_bucket};
 const NFS_MOUNT_POINT: &str = "/tmp/nfs_server_test";
 
 fn write_nfs_server_env(bucket: &str, read_write: bool) -> CmdResult {
-    let env_content =
-        format!("FS_SERVER_BUCKET_NAME={bucket}\nFS_SERVER_MODE=nfs\nFS_SERVER_READ_WRITE={read_write}\n");
+    let env_content = format!(
+        "FS_SERVER_BUCKET_NAME={bucket}\nFS_SERVER_MODE=nfs\nFS_SERVER_READ_WRITE={read_write}\n"
+    );
     run_cmd!(mkdir -p data/etc)?;
     std::fs::write("data/etc/fs_server.env", env_content)?;
     Ok(())

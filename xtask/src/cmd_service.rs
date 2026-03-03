@@ -776,7 +776,8 @@ pub fn show_service_status(service: ServiceName) -> CmdResult {
 
             // fs_server is not part of all_services (standalone), show it separately
             let svc_name = ServiceName::FsServer.as_ref();
-            let fs_status = match run_fun!(systemctl --user is-active $svc_name.service 2>/dev/null) {
+            let fs_status = match run_fun!(systemctl --user is-active $svc_name.service 2>/dev/null)
+            {
                 Ok(output) => match output.trim() {
                     "active" => "active".green().to_string(),
                     _ => "inactive (dead)".bright_black().to_string(),
