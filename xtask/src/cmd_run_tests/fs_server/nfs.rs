@@ -3,6 +3,7 @@ use crate::{CmdResult, ServiceName};
 use aws_sdk_s3::primitives::ByteStream;
 use cmd_lib::*;
 use colored::*;
+use std::path::Path;
 use std::time::Duration;
 
 use super::{cleanup_objects, generate_test_data, setup_test_bucket};
@@ -21,7 +22,6 @@ fn mount_nfs(bucket: &str) -> CmdResult {
     mount_nfs_with_opts(bucket, false)
 }
 
-#[allow(dead_code)]
 fn mount_nfs_rw(bucket: &str) -> CmdResult {
     mount_nfs_with_opts(bucket, true)
 }
@@ -103,6 +103,30 @@ pub async fn run_nfs_tests() -> CmdResult {
 
     println!("\n{}", "=== NFS Test: Large File Read ===".bold());
     if let Err(e) = test_nfs_large_file_read().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!("\n{}", "=== NFS Test: Create, Write, Read ===".bold());
+    if let Err(e) = test_nfs_create_write_read().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!("\n{}", "=== NFS Test: Mkdir and Rmdir ===".bold());
+    if let Err(e) = test_nfs_mkdir_rmdir().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!("\n{}", "=== NFS Test: Unlink ===".bold());
+    if let Err(e) = test_nfs_unlink().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!("\n{}", "=== NFS Test: Rename ===".bold());
+    if let Err(e) = test_nfs_rename().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
         return Err(e);
     }
@@ -331,5 +355,190 @@ async fn test_nfs_large_file_read() -> CmdResult {
     }
 
     println!("{}", "SUCCESS: NFS large file read test passed".green());
+    Ok(())
+}
+
+async fn test_nfs_create_write_read() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount NFS in read-write mode");
+    mount_nfs_rw(&bucket)?;
+
+    println!("  Step 2: Create and write files");
+    let test_data = b"Hello from NFS write!";
+    let nfs_path = format!("{}/nfs-write-test.txt", NFS_MOUNT_POINT);
+    std::fs::write(&nfs_path, test_data)
+        .map_err(|e| std::io::Error::other(format!("Failed to write file: {e}")))?;
+    println!(
+        "    Written: nfs-write-test.txt ({} bytes)",
+        test_data.len()
+    );
+
+    println!("  Step 3: Read back and verify");
+    let read_back = std::fs::read(&nfs_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read back: {e}")))?;
+    if read_back != test_data {
+        unmount_nfs()?;
+        return Err(std::io::Error::other(format!(
+            "Data mismatch: expected {} bytes, got {}",
+            test_data.len(),
+            read_back.len()
+        )));
+    }
+    println!("    nfs-write-test.txt content: OK");
+
+    println!("  Step 4: Write a larger file (64KB)");
+    let large_data = generate_test_data("nfs-large-write", 64 * 1024);
+    let large_path = format!("{}/nfs-large-write.bin", NFS_MOUNT_POINT);
+    std::fs::write(&large_path, &large_data)
+        .map_err(|e| std::io::Error::other(format!("Failed to write large file: {e}")))?;
+
+    let large_read = std::fs::read(&large_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read back large file: {e}")))?;
+    if large_read != large_data {
+        unmount_nfs()?;
+        return Err(std::io::Error::other(format!(
+            "Large file data mismatch: expected {} bytes, got {}",
+            large_data.len(),
+            large_read.len()
+        )));
+    }
+    println!("    nfs-large-write.bin (64KB): OK");
+
+    println!("  Step 5: Verify files appear in listing");
+    let entries: Vec<String> = std::fs::read_dir(NFS_MOUNT_POINT)
+        .map_err(|e| std::io::Error::other(format!("Failed to list root: {e}")))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    if !entries.contains(&"nfs-write-test.txt".to_string()) {
+        unmount_nfs()?;
+        return Err(std::io::Error::other(
+            "nfs-write-test.txt not found in listing",
+        ));
+    }
+    println!("    nfs-write-test.txt in listing: OK");
+
+    unmount_nfs()?;
+    println!("{}", "SUCCESS: NFS create/write/read test passed".green());
+    Ok(())
+}
+
+async fn test_nfs_mkdir_rmdir() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount NFS in read-write mode");
+    mount_nfs_rw(&bucket)?;
+
+    println!("  Step 2: Create directory");
+    let dir_path = format!("{}/nfs-testdir", NFS_MOUNT_POINT);
+    std::fs::create_dir(&dir_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to mkdir: {e}")))?;
+    println!("    Created: nfs-testdir/");
+
+    if !Path::new(&dir_path).is_dir() {
+        unmount_nfs()?;
+        return Err(std::io::Error::other("nfs-testdir/ is not a directory"));
+    }
+    println!("    nfs-testdir/ is a directory: OK");
+
+    println!("  Step 3: Create file in directory");
+    let file_path = format!("{}/nfs-testdir/file.txt", NFS_MOUNT_POINT);
+    std::fs::write(&file_path, b"content in dir")
+        .map_err(|e| std::io::Error::other(format!("Failed to write file in dir: {e}")))?;
+    println!("    Created: nfs-testdir/file.txt");
+
+    println!("  Step 4: Remove file then directory");
+    std::fs::remove_file(&file_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to unlink file: {e}")))?;
+    println!("    Removed: nfs-testdir/file.txt");
+
+    std::fs::remove_dir(&dir_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to rmdir: {e}")))?;
+    println!("    Removed: nfs-testdir/");
+
+    if Path::new(&dir_path).exists() {
+        unmount_nfs()?;
+        return Err(std::io::Error::other(
+            "nfs-testdir/ still exists after rmdir",
+        ));
+    }
+    println!("    nfs-testdir/ gone: OK");
+
+    unmount_nfs()?;
+    println!("{}", "SUCCESS: NFS mkdir/rmdir test passed".green());
+    Ok(())
+}
+
+async fn test_nfs_unlink() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount NFS in read-write mode");
+    mount_nfs_rw(&bucket)?;
+
+    println!("  Step 2: Create file then unlink");
+    let file_path = format!("{}/nfs-to-delete.txt", NFS_MOUNT_POINT);
+    std::fs::write(&file_path, b"delete me via NFS")
+        .map_err(|e| std::io::Error::other(format!("Failed to write: {e}")))?;
+    println!("    Created: nfs-to-delete.txt");
+
+    if !Path::new(&file_path).exists() {
+        unmount_nfs()?;
+        return Err(std::io::Error::other("nfs-to-delete.txt should exist"));
+    }
+
+    std::fs::remove_file(&file_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to unlink: {e}")))?;
+    println!("    Unlinked: nfs-to-delete.txt");
+
+    if Path::new(&file_path).exists() {
+        unmount_nfs()?;
+        return Err(std::io::Error::other(
+            "nfs-to-delete.txt still exists after unlink",
+        ));
+    }
+    println!("    nfs-to-delete.txt gone: OK");
+
+    unmount_nfs()?;
+    println!("{}", "SUCCESS: NFS unlink test passed".green());
+    Ok(())
+}
+
+async fn test_nfs_rename() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount NFS in read-write mode");
+    mount_nfs_rw(&bucket)?;
+
+    println!("  Step 2: Create file and rename");
+    let src_path = format!("{}/nfs-original.txt", NFS_MOUNT_POINT);
+    let dst_path = format!("{}/nfs-renamed.txt", NFS_MOUNT_POINT);
+    let content = b"rename me via NFS";
+    std::fs::write(&src_path, content)
+        .map_err(|e| std::io::Error::other(format!("Failed to write: {e}")))?;
+    println!("    Created: nfs-original.txt");
+
+    std::fs::rename(&src_path, &dst_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to rename: {e}")))?;
+    println!("    Renamed: nfs-original.txt -> nfs-renamed.txt");
+
+    if Path::new(&src_path).exists() {
+        unmount_nfs()?;
+        return Err(std::io::Error::other(
+            "nfs-original.txt still exists after rename",
+        ));
+    }
+    println!("    nfs-original.txt gone: OK");
+
+    let read_back = std::fs::read(&dst_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read renamed file: {e}")))?;
+    if read_back != content {
+        unmount_nfs()?;
+        return Err(std::io::Error::other("nfs-renamed.txt content mismatch"));
+    }
+    println!("    nfs-renamed.txt content: OK");
+
+    unmount_nfs()?;
+    println!("{}", "SUCCESS: NFS rename test passed".green());
     Ok(())
 }
