@@ -125,3 +125,17 @@ jobs:
         docker tag fractalbits:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
         docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
         docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+  cleanup-images:
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      packages: write
+    steps:
+    - name: Delete old container images
+      uses: actions/delete-package-versions@v5
+      with:
+        package-name: fractalbits-main
+        package-type: container
+        min-versions-to-keep: 5
