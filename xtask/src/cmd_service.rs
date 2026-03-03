@@ -773,6 +773,17 @@ pub fn show_service_status(service: ServiceName) -> CmdResult {
                     println!("{service_name:<16}: {status}");
                 }
             }
+
+            // fs_server is not part of all_services (standalone), show it separately
+            let svc_name = ServiceName::FsServer.as_ref();
+            let fs_status = match run_fun!(systemctl --user is-active $svc_name.service 2>/dev/null) {
+                Ok(output) => match output.trim() {
+                    "active" => "active".green().to_string(),
+                    _ => "inactive (dead)".bright_black().to_string(),
+                },
+                Err(_) => "inactive (dead)".bright_black().to_string(),
+            };
+            println!("{svc_name:<16}: {fs_status}");
         }
         single_service => {
             if single_service == ServiceName::Bss {
