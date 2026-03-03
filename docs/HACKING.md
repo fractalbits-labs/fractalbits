@@ -96,31 +96,25 @@ docker --version
 docker buildx version
 ```
 
+#### NFS Client (Optional)
+
+Required for running NFS integration tests (`just run-tests fs-server --nfs`).
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install nfs-common
+
+# Fedora
+sudo dnf install nfs-utils
+
+# Arch Linux
+sudo pacman -S nfs-utils
+```
+
 #### Optional Tools
 
 - [aws ssm (session manager) plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/install-plugin-linux-overview.html) for login from terminal to manage ec2 instances after deployment
 - [Nix](https://nixos.org/): recommended for a consistent development environment
-
-### Codebase Organization
-
-```
-fractalbits-main/
-├── core/                   # Zig data plane components (to be open)
-│   ├── bss_server/         # Blob Storage Server
-│   ├── nss_server/         # Namespace Service Server
-│   └── lib/                # Shared Zig libraries
-├── crates/                 # Rust workspace
-│   ├── api_server/         # S3 API frontend
-│   ├── root_server/        # Cluster coordination (to be open)
-│   ├── ha/                 # High availability (to be open)
-│   └── common/             # Shared libraries
-│       ├── aws_signature/  # AWS SigV4 implementation
-│       ├── rpc_clients/    # Client libraries
-│       └── metrics_wrapper/# Observability
-├── vpc/                    # AWS CDK deployment
-└── xtask/                  # Rust for any tasks (Build, Service mgmt, Test ...)
-
-```
 
 ### Development Workflow
 
@@ -132,42 +126,5 @@ fractalbits-main/
 3. Run `just precheckin` to validate
 4. Commit changes with descriptive messages
 5. Submit a pull request
-
-**Commit Message Guidelines:**
-- Use imperative mood ("Add feature" not "Added feature")
-- Keep first line under 72 characters
-- Wrap body at 72 characters
-- Reference issues when applicable
-
-## Contributing
-
-We welcome contributions from the community! Here's how you can help:
-
-### Ways to Contribute
-
-- 🐛 **Report bugs**: Open an issue with reproduction steps
-- 💡 **Suggest features**: Propose new S3 API operations or optimizations
-- 📝 **Improve documentation**: Help make our docs clearer
-- 🔧 **Submit code**: Fix bugs or implement features
-- 🧪 **Add tests**: Improve test coverage
-- 📊 **Performance testing**: Run benchmarks and share results
-
-### Getting Started
-
-1. Fork the repository
-2. Clone your fork: `git clone https://github.com/fractalbits-labs/fractalbits-main.git`
-3. Create a feature branch: `git checkout -b feature/my-feature`
-4. Make your changes following our code style
-5. Run tests: `just precheckin`
-6. Commit and push to your fork
-7. Open a Pull Request
-
-### Code Review Process
-
-All submissions require review. We'll:
-- Check code quality and style
-- Verify tests pass
-- Assess performance impact
-- Ensure documentation is updated
 
 **Note**: Performance is critical to FractalBits. When making changes, always evaluate the performance impact. Our product's success depends on maintaining exceptional performance.

@@ -10,7 +10,7 @@ use super::{MOUNT_POINT, cleanup_objects, generate_test_data, setup_test_bucket}
 
 fn write_fs_server_env(bucket: &str, mount_point: &str, read_write: bool) -> CmdResult {
     let env_content = format!(
-        "FUSE_BUCKET_NAME={bucket}\nFUSE_MOUNT_POINT={mount_point}\nFUSE_READ_WRITE={read_write}\n"
+        "FS_SERVER_BUCKET_NAME={bucket}\nFS_SERVER_MOUNT_POINT={mount_point}\nFS_SERVER_READ_WRITE={read_write}\n"
     );
     run_cmd!(mkdir -p data/etc)?;
     std::fs::write("data/etc/fs_server.env", env_content)?;

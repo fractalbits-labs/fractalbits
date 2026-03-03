@@ -12,7 +12,7 @@ const NFS_MOUNT_POINT: &str = "/tmp/nfs_server_test";
 
 fn write_nfs_server_env(bucket: &str, read_write: bool) -> CmdResult {
     let env_content =
-        format!("FUSE_BUCKET_NAME={bucket}\nFS_SERVER_MODE=nfs\nFUSE_READ_WRITE={read_write}\n");
+        format!("FS_SERVER_BUCKET_NAME={bucket}\nFS_SERVER_MODE=nfs\nFS_SERVER_READ_WRITE={read_write}\n");
     run_cmd!(mkdir -p data/etc)?;
     std::fs::write("data/etc/fs_server.env", env_content)?;
     Ok(())
