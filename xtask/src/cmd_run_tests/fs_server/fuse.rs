@@ -107,6 +107,12 @@ pub async fn run_fuse_tests() -> CmdResult {
         return Err(e);
     }
 
+    println!("\n{}", "=== Test: Large File Write ===".bold());
+    if let Err(e) = test_large_file_write().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
     println!("\n{}", "=== Test: Mkdir and Rmdir ===".bold());
     if let Err(e) = test_mkdir_rmdir().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
@@ -553,6 +559,80 @@ async fn test_create_write_read() -> CmdResult {
 
     unmount_fuse()?;
     println!("{}", "SUCCESS: Create/write/read test passed".green());
+    Ok(())
+}
+
+async fn test_large_file_write() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    let sizes: Vec<(&str, usize)> = vec![
+        ("small-4k", 4 * 1024),
+        ("medium-512k", 512 * 1024),
+        ("large-2mb", 2 * 1024 * 1024),
+    ];
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    println!("  Step 2: Write large files via FUSE");
+    let mut keys = Vec::new();
+    for (label, size) in &sizes {
+        let key = format!("fuse-write-{label}");
+        let data = generate_test_data(&key, *size);
+        let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+        std::fs::write(&fuse_path, &data)
+            .map_err(|e| std::io::Error::other(format!("Failed to write {key}: {e}")))?;
+        keys.push((key, data));
+        println!("    Written: {} ({} bytes)", label, size);
+    }
+
+    println!("  Step 3: Read back and verify");
+    let mut passed = 0;
+    let mut failed = 0;
+
+    for (i, (label, _)) in sizes.iter().enumerate() {
+        let (key, expected_data) = &keys[i];
+        let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+
+        match std::fs::read(&fuse_path) {
+            Ok(actual_data) => {
+                if actual_data == *expected_data {
+                    println!("    {}: OK ({} bytes)", label, actual_data.len());
+                    passed += 1;
+                } else {
+                    let first_diff = actual_data
+                        .iter()
+                        .zip(expected_data.iter())
+                        .position(|(a, b)| a != b);
+                    println!(
+                        "    {}: {} (expected {} bytes, got {}, first diff at {:?})",
+                        label,
+                        "DATA MISMATCH".red(),
+                        expected_data.len(),
+                        actual_data.len(),
+                        first_diff,
+                    );
+                    failed += 1;
+                }
+            }
+            Err(e) => {
+                println!("    {}: {} ({})", label, "READ FAILED".red(), e);
+                failed += 1;
+            }
+        }
+    }
+
+    unmount_fuse()?;
+
+    if failed > 0 {
+        return Err(std::io::Error::other(format!(
+            "{} of {} FUSE large file writes failed",
+            failed,
+            passed + failed
+        )));
+    }
+
+    println!("{}", "SUCCESS: Large file write test passed".green());
     Ok(())
 }
 
