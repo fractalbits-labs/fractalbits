@@ -11,6 +11,7 @@ use crate::vfs::{VfsAttr, VfsCore};
 
 const EVICTION_TTL: Duration = Duration::from_secs(300);
 const EVICTION_INTERVAL_OPS: u64 = 1000;
+const READDIR_MAX_ENTRIES: usize = 128;
 
 pub struct NfsAdapter {
     vfs: VfsCore,
@@ -299,8 +300,10 @@ impl Nfs3Filesystem for NfsAdapter {
     async fn readdir(&self, dir_fh: &NfsFh3, cookie: u64, _count: u32, w: &mut XdrWriter) {
         match self.vfs.vfs_readdir(dir_fh.ino(), cookie).await {
             Ok(entries) => {
+                let eof = entries.len() <= READDIR_MAX_ENTRIES;
                 let nfs_entries: Vec<Entry3> = entries
                     .iter()
+                    .take(READDIR_MAX_ENTRIES)
                     .map(|e| Entry3 {
                         fileid: e.ino,
                         name: e.name.clone(),
@@ -308,7 +311,7 @@ impl Nfs3Filesystem for NfsAdapter {
                     })
                     .collect();
                 let cookieverf = [0u8; 8];
-                nfs3_wire::encode_readdir_ok(w, None, &cookieverf, &nfs_entries, true);
+                nfs3_wire::encode_readdir_ok(w, None, &cookieverf, &nfs_entries, eof);
             }
             Err(e) => {
                 nfs3_wire::encode_readdir_err(w, fs_err_to_nfs(e));
@@ -319,8 +322,10 @@ impl Nfs3Filesystem for NfsAdapter {
     async fn readdirplus(&self, dir_fh: &NfsFh3, cookie: u64, _maxcount: u32, w: &mut XdrWriter) {
         match self.vfs.vfs_readdirplus(dir_fh.ino(), cookie).await {
             Ok(entries) => {
+                let eof = entries.len() <= READDIR_MAX_ENTRIES;
                 let nfs_entries: Vec<Entryplus3> = entries
                     .iter()
+                    .take(READDIR_MAX_ENTRIES)
                     .map(|e| {
                         let fh = NfsFh3::new(e.ino, self.fsid);
                         Entryplus3 {
@@ -333,7 +338,7 @@ impl Nfs3Filesystem for NfsAdapter {
                     })
                     .collect();
                 let cookieverf = [0u8; 8];
-                nfs3_wire::encode_readdirplus_ok(w, None, &cookieverf, &nfs_entries, true);
+                nfs3_wire::encode_readdirplus_ok(w, None, &cookieverf, &nfs_entries, eof);
             }
             Err(e) => {
                 nfs3_wire::encode_readdirplus_err(w, fs_err_to_nfs(e));
@@ -397,6 +402,19 @@ impl Nfs3Filesystem for NfsAdapter {
             }
             Err(e) => {
                 nfs3_wire::encode_pathconf_err(w, fs_err_to_nfs(e));
+            }
+        }
+    }
+
+    async fn commit(&self, fh: &NfsFh3, _offset: u64, _count: u32, w: &mut XdrWriter) {
+        // All writes are FILE_SYNC (committed before reply), so COMMIT is a no-op.
+        match self.vfs.vfs_getattr(fh.ino(), None).await {
+            Ok(attr) => {
+                let fattr = vfs_attr_to_fattr3(&attr, self.fsid);
+                nfs3_wire::encode_commit_ok(w, &fattr, &WRITE_VERF);
+            }
+            Err(e) => {
+                nfs3_wire::encode_commit_err(w, fs_err_to_nfs(e));
             }
         }
     }
