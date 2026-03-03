@@ -620,7 +620,12 @@ pub enum TestType {
     BssNodeFailure,
     NssHaWithMirrord,
     NssHaWithEBS,
-    FsServer,
+    FsServer {
+        #[clap(long, help = "Run only FUSE tests")]
+        fuse: bool,
+        #[clap(long, help = "Run only NFS tests")]
+        nfs: bool,
+    },
 }
 
 #[derive(Parser, Clone, EnumString)]

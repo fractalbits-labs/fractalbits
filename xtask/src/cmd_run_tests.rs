@@ -79,9 +79,11 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         Ok(())
     };
 
-    let test_fs_server = || async {
+    let test_fs_server = |run_fuse: bool, run_nfs: bool| async move {
         fs_server::build_fs_server()?;
-        fs_server::ensure_fuse_uring()?;
+        if run_fuse {
+            fs_server::ensure_fuse_uring()?;
+        }
         cmd_service::init_service(
             ServiceName::All,
             BuildMode::Debug,
@@ -92,8 +94,11 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
             },
         )?;
         cmd_service::start_service(ServiceName::All)?;
-        fs_server::run_fs_server_tests().await?;
-        cmd_service::stop_service(ServiceName::All)
+        let result = fs_server::run_fs_server_tests(run_fuse, run_nfs).await;
+        let _ = cmd_service::stop_service(ServiceName::FsServer);
+        let _ = run_cmd!(pkill -f "fs_server" 2>/dev/null);
+        cmd_service::stop_service(ServiceName::All)?;
+        result
     };
 
     // prepare
@@ -105,7 +110,13 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         TestType::BssNodeFailure => test_bss_node_failure().await,
         TestType::NssHaWithMirrord => test_nss_ha_with_mirrord().await,
         TestType::NssHaWithEBS => test_nss_ha_with_ebs().await,
-        TestType::FsServer => test_fs_server().await,
+        TestType::FsServer { fuse, nfs } => {
+            let (run_fuse, run_nfs) = match (fuse, nfs) {
+                (false, false) => (true, true),
+                other => other,
+            };
+            test_fs_server(run_fuse, run_nfs).await
+        }
         TestType::All => {
             test_leader_election()?;
             multi_az::run_multi_az_tests(MultiAzTestType::All).await
