@@ -680,6 +680,17 @@ enum ToolKind {
         )]
         localdev: bool,
     },
+    #[clap(
+        name = "source-file",
+        about = "Resolve hashed source file IDs from prebuilt Zig binaries"
+    )]
+    SourceFile {
+        #[clap(long, long_help = "Git SHA of the core repo (defaults to HEAD)")]
+        core_sha: Option<String>,
+
+        #[clap(long, long_help = "File hash to look up (hex)")]
+        file_hash: Option<String>,
+    },
 }
 
 #[tokio::main]

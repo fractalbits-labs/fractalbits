@@ -25,6 +25,9 @@ describe-stack *args:
 dump-vg-config *args:
   cargo xtask tools dump-vg-config {{args}}
 
+source-file *args:
+  cargo xtask tools source-file {{args}}
+
 repo *args:
   cargo xtask repo {{args}}
 

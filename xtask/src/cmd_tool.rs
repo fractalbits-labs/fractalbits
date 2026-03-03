@@ -14,6 +14,12 @@ pub fn run_cmd_tool(tool_kind: ToolKind) -> CmdResult {
         ToolKind::DumpVgConfig { localdev } => {
             xtask_common::dump_vg_config(localdev)?;
         }
+        ToolKind::SourceFile {
+            core_sha,
+            file_hash,
+        } => {
+            source_file(core_sha.as_deref(), file_hash.as_deref())?;
+        }
     }
     Ok(())
 }
@@ -239,6 +245,49 @@ fn describe_stack(stack_name: &str) -> CmdResult {
 
     if !nlb_endpoint.is_empty() {
         println!("\n API Server NLB Endpoint: {nlb_endpoint}");
+    }
+
+    Ok(())
+}
+
+fn source_file(core_sha: Option<&str>, file_hash: Option<&str>) -> CmdResult {
+    let core_path = crate::ZIG_REPO_PATH;
+    let sha = match core_sha {
+        Some(s) => s.to_string(),
+        None => run_fun!(git -C $core_path rev-parse HEAD)?,
+    };
+
+    let file_list = run_fun!(git -C $core_path ls-tree -r --name-only $sha)?;
+    let mut mappings: Vec<(String, String)> = Vec::new();
+
+    for path in file_list.lines() {
+        if !path.ends_with(".zig") {
+            continue;
+        }
+        let hash = xxhash_rust::xxh3::xxh3_64(path.as_bytes());
+        mappings.push((format!("{hash:x}"), path.to_string()));
+    }
+
+    mappings.sort_by(|a, b| a.1.cmp(&b.1));
+
+    match file_hash {
+        Some(needle) => {
+            let mut found = false;
+            for (hash, path) in &mappings {
+                if hash == needle {
+                    println!("{hash} => {path}");
+                    found = true;
+                }
+            }
+            if !found {
+                warn!("No file found matching hash: {needle}");
+            }
+        }
+        None => {
+            for (hash, path) in &mappings {
+                println!("{hash} => {path}");
+            }
+        }
     }
 
     Ok(())
