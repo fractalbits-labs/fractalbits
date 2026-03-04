@@ -211,7 +211,6 @@ export const createEc2Asg = (
   minCapacity: number,
   maxCapacity: number,
   serviceType?: string,
-  skipUserData?: boolean,
   deployOS: DeployOS = "al2023",
 ): autoscaling.AutoScalingGroup => {
   if (instanceTypeNames.length === 0) {
@@ -243,7 +242,6 @@ export const createEc2Asg = (
     machineImage: machineImage,
     securityGroup: sg,
     role: role,
-    userData: skipUserData ? undefined : createUserData(scope, deployOS),
   });
 
   if (serviceType) {

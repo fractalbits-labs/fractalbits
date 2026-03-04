@@ -361,7 +361,7 @@ pub fn create_cluster(
         total_nodes, local_s3_url, remote_s3_url
     );
 
-    // Note: Binaries are pre-populated in the Docker image via 'deploy build --for-on-prem'.
+    // Binaries are pre-populated in the Docker image via 'deploy build'.
     // We only need to upload the cluster config file.
 
     let bootstrap_toml = config.to_bootstrap_cluster_toml()?;

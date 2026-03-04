@@ -14,11 +14,9 @@ pub struct VpcConfig {
     pub az: Option<String>,
     pub root_server_ha: bool,
     pub rss_backend: crate::RssBackend,
-    pub ssm_bootstrap: bool,
     pub journal_type: crate::JournalType,
     pub watch_bootstrap: bool,
     pub skip_upload: bool,
-    pub simulate_on_prem: bool,
     pub use_generic_binaries: bool,
     pub deploy_os: crate::DeployOS,
 }

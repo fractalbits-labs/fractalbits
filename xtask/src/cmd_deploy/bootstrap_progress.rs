@@ -9,9 +9,42 @@ use xtask_common::{STAGE_BLUEPRINT_FILE, StageBlueprint, StageBlueprintEntry};
 const POLL_INTERVAL_SECS: u64 = 2;
 const TIMEOUT_SECS: u64 = 600; // 10 minutes
 
-fn get_blueprint(bucket: &str) -> Result<StageBlueprint, Error> {
+/// S3 access configuration for fetching progress data
+struct S3Access {
+    bucket: String,
+    env_vars: Vec<String>,
+}
+
+impl S3Access {
+    fn for_aws(target: DeployTarget) -> Result<Self, Error> {
+        Ok(Self {
+            bucket: get_bootstrap_bucket_name(target)?,
+            env_vars: vec![],
+        })
+    }
+
+    fn for_docker(docker_host_ip: &str) -> Self {
+        Self {
+            bucket: "fractalbits-bootstrap".to_string(),
+            env_vars: vec![
+                "AWS_DEFAULT_REGION=localdev".to_string(),
+                format!("AWS_ENDPOINT_URL_S3=http://{}:8080", docker_host_ip),
+                "AWS_ACCESS_KEY_ID=test_api_key".to_string(),
+                "AWS_SECRET_ACCESS_KEY=test_api_secret".to_string(),
+            ],
+        }
+    }
+
+    fn env_refs(&self) -> Vec<&str> {
+        self.env_vars.iter().map(|s| s.as_str()).collect()
+    }
+}
+
+fn get_blueprint(access: &S3Access) -> Result<StageBlueprint, Error> {
+    let bucket = &access.bucket;
     let s3_path = format!("s3://{bucket}/{STAGE_BLUEPRINT_FILE}");
-    let content = run_fun!(aws s3 cp $s3_path - 2>/dev/null)
+    let env_vars = access.env_refs();
+    let content = run_fun!($[env_vars] aws s3 cp $s3_path - 2>/dev/null)
         .map_err(|e| Error::other(format!("Failed to download {STAGE_BLUEPRINT_FILE}: {e}")))?;
 
     serde_json::from_str(&content)
@@ -25,9 +58,12 @@ struct StageCache {
 }
 
 impl StageCache {
-    fn fetch(bucket: &str, cluster_id: &str) -> Self {
+    fn fetch(access: &S3Access, cluster_id: &str) -> Self {
+        let bucket = &access.bucket;
         let prefix = format!("s3://{bucket}/workflow/{cluster_id}/stages/");
-        let output = run_fun!(aws s3 ls --recursive $prefix 2>/dev/null).unwrap_or_default();
+        let env_vars = access.env_refs();
+        let output =
+            run_fun!($[env_vars] aws s3 ls --recursive $prefix 2>/dev/null).unwrap_or_default();
         let lines = output.lines().map(|s| s.to_string()).collect();
         Self { lines }
     }
@@ -47,8 +83,16 @@ impl StageCache {
 }
 
 pub fn show_progress(target: DeployTarget) -> CmdResult {
-    let bucket = get_bootstrap_bucket_name(target)?;
+    let access = S3Access::for_aws(target)?;
+    show_progress_inner(&access)
+}
 
+pub fn show_progress_from_docker(docker_host_ip: &str) -> CmdResult {
+    let access = S3Access::for_docker(docker_host_ip);
+    show_progress_inner(&access)
+}
+
+fn show_progress_inner(access: &S3Access) -> CmdResult {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::default_spinner()
@@ -59,7 +103,7 @@ pub fn show_progress(target: DeployTarget) -> CmdResult {
     spinner.enable_steady_tick(Duration::from_millis(100));
 
     let blueprint = loop {
-        match get_blueprint(&bucket) {
+        match get_blueprint(access) {
             Ok(bp) => break bp,
             Err(_) => {
                 std::thread::sleep(Duration::from_secs(POLL_INTERVAL_SECS));
@@ -116,7 +160,7 @@ pub fn show_progress(target: DeployTarget) -> CmdResult {
 
     loop {
         // Single S3 call per iteration - fetch all stage data at once
-        let cache = StageCache::fetch(&bucket, cluster_id);
+        let cache = StageCache::fetch(access, cluster_id);
         let mut all_complete = true;
 
         for (pb, stage, finished) in &mut bars {

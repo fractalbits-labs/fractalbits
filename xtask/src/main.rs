@@ -16,6 +16,7 @@ use clap::{ArgAction, Parser};
 use cmd_build::BuildMode;
 use cmd_lib::*;
 use strum::{AsRefStr, EnumString};
+use xtask_common::DeployTarget;
 
 pub const TS_FMT: &str = "%b %d %H:%M:%.S";
 // Need to match with api_server's default config to make authentication work
@@ -245,6 +246,13 @@ pub enum DeployCommand {
 
         #[clap(
             long,
+            value_enum,
+            long_help = "Deploy target: aws (CPU-optimized) or on-prem (generic). Builds both Docker variants if not specified."
+        )]
+        deploy_target: Option<DeployTarget>,
+
+        #[clap(
+            long,
             value_delimiter = ',',
             long_help = "Zig extra build options in format: key=value,key2=value2"
         )]
@@ -256,18 +264,12 @@ pub enum DeployCommand {
             long_help = "Api server extra build environment variables in format: KEY=value,KEY2=value2"
         )]
         api_server_build_env: Vec<String>,
-
-        #[clap(
-            long,
-            long_help = "Pre-populate Docker image with binaries for on-prem deployment"
-        )]
-        for_on_prem: bool,
     },
 
     #[clap(about = "Upload prebuilt binaries to s3 builds bucket")]
     Upload {
         #[clap(long, value_enum, default_value = "aws")]
-        deploy_target: xtask_common::DeployTarget,
+        deploy_target: DeployTarget,
     },
 
     #[clap(about = "Create VPC infrastructure using CDK")]
@@ -325,9 +327,6 @@ pub enum DeployCommand {
         )]
         rss_backend: RssBackend,
 
-        #[clap(long, long_help = "Bootstrap via SSM instead of userData")]
-        ssm_bootstrap: bool,
-
         #[clap(
             long,
             value_enum,
@@ -339,14 +338,11 @@ pub enum DeployCommand {
         #[clap(long, long_help = "Watch bootstrap progress inline after VPC creation")]
         watch_bootstrap: bool,
 
-        #[clap(long, long_help = "Skip uploading binaries (assume already uploaded)")]
-        skip_upload: bool,
-
         #[clap(
             long,
-            long_help = "Simulate on-prem deployment: open SSH internally, deploy Docker bootstrap container on RSS"
+            long_help = "Skip uploading Docker images (assume already uploaded)"
         )]
-        simulate_on_prem: bool,
+        skip_upload: bool,
 
         #[clap(
             long,
@@ -369,7 +365,7 @@ pub enum DeployCommand {
     #[clap(about = "Show bootstrap progress for a cluster deployment")]
     BootstrapProgress {
         #[clap(long, value_enum, default_value = "aws")]
-        deploy_target: xtask_common::DeployTarget,
+        deploy_target: DeployTarget,
     },
 
     #[clap(about = "Create cluster from a cluster.toml config file")]
@@ -825,15 +821,15 @@ async fn main() -> CmdResult {
             DeployCommand::Build {
                 target,
                 release,
+                deploy_target,
                 zig_extra_build,
                 api_server_build_env,
-                for_on_prem,
             } => cmd_deploy::build(
                 target,
                 release,
+                deploy_target,
                 &zig_extra_build,
                 &api_server_build_env,
-                for_on_prem,
             )?,
             DeployCommand::Upload { deploy_target } => cmd_deploy::upload(deploy_target)?,
             DeployCommand::CreateVpc {
@@ -848,11 +844,9 @@ async fn main() -> CmdResult {
                 az,
                 root_server_ha,
                 rss_backend,
-                ssm_bootstrap,
                 journal_type,
                 watch_bootstrap,
                 skip_upload,
-                simulate_on_prem,
                 use_generic_binaries,
                 deploy_os,
             } => cmd_deploy::create_vpc(cmd_deploy::VpcConfig {
@@ -867,11 +861,9 @@ async fn main() -> CmdResult {
                 az,
                 root_server_ha,
                 rss_backend,
-                ssm_bootstrap,
                 journal_type,
                 watch_bootstrap,
                 skip_upload,
-                simulate_on_prem,
                 use_generic_binaries,
                 deploy_os,
             })?,

@@ -4,12 +4,9 @@ import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as autoscaling from "aws-cdk-lib/aws-autoscaling";
-import * as cr from "aws-cdk-lib/custom-resources";
-import * as crypto from "crypto";
 
 import {
   createInstance,
-  createUserData,
   createEc2Asg,
   createEbsVolume,
   createDynamoDbTable,
@@ -20,10 +17,11 @@ import {
   getAzNameFromIdAtBuildTime,
   DeployOS,
 } from "./ec2-utils";
-import {
-  createConfigWithCfnTokens,
-  DataBlobStorage,
-} from "./toml-config-builder";
+
+export type DataBlobStorage =
+  | "all_in_bss_single_az"
+  | "s3_hybrid_single_az"
+  | "s3_express_multi_az";
 
 export interface FractalbitsVpcStackProps extends cdk.StackProps {
   numApiServers: number;
@@ -187,36 +185,17 @@ export class FractalbitsVpcStack extends cdk.Stack {
       );
     }
 
-    // Add ports for simulate-on-prem mode
-    const simulateOnPrem = this.node.tryGetContext("simulateOnPrem") === "true";
-    if (simulateOnPrem) {
-      privateSg.addIngressRule(
-        ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
-        ec2.Port.tcp(22),
-        "Allow SSH access from within VPC (simulate-on-prem)",
-      );
-      privateSg.addIngressRule(
-        ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
-        ec2.Port.tcp(8080),
-        "Allow Docker S3 API access from within VPC (simulate-on-prem)",
-      );
-      privateSg.addIngressRule(
-        ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
-        ec2.Port.tcp(18080),
-        "Allow Docker mgmt API access from within VPC (simulate-on-prem)",
-      );
-      // simulate-on-prem always uses etcd
-      privateSg.addIngressRule(
-        ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
-        ec2.Port.tcp(2379),
-        "Allow etcd client access from within VPC (simulate-on-prem)",
-      );
-      privateSg.addIngressRule(
-        ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
-        ec2.Port.tcp(2380),
-        "Allow etcd peer-to-peer communication within VPC (simulate-on-prem)",
-      );
-    }
+    // Docker S3 ports for bootstrap (Docker host serves binaries to nodes)
+    privateSg.addIngressRule(
+      ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+      ec2.Port.tcp(8080),
+      "Allow Docker S3 API access from within VPC",
+    );
+    privateSg.addIngressRule(
+      ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+      ec2.Port.tcp(18080),
+      "Allow Docker mgmt API access from within VPC",
+    );
 
     // Create data blob bucket only for s3_hybrid_single_az mode
     let dataBlobBucket: s3.Bucket | undefined;
@@ -249,9 +228,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     // Define instance metadata, and create instances
     const nssInstanceType = new ec2.InstanceType(props.nssInstanceType);
-    const rssInstanceType = new ec2.InstanceType(
-      simulateOnPrem ? "c7i.4xlarge" : "c7g.medium",
-    );
+    const rssInstanceType = new ec2.InstanceType("c7g.medium");
     const benchInstanceType = new ec2.InstanceType("c7g.large");
 
     // Get specific subnets for instances to ensure correct AZ placement
@@ -324,8 +301,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
-    // Read skipUserData context for ASGs (SSM-based bootstrap)
-    const skipUserDataCtx = this.node.tryGetContext("skipUserData") === "true";
     // Read useGenericBinaries context (for using on-prem style generic binaries)
     const useGenericBinaries =
       this.node.tryGetContext("useGenericBinaries") === "true";
@@ -339,7 +314,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         specificSubnet: subnet1,
         sg: privateSg,
       });
-      // Create bench_clients in a ASG group
+      // Create bench_clients in a ASG group (no UserData - bootstrap via SSM)
       benchClientAsg = createEc2Asg(
         this,
         "benchClientAsg",
@@ -351,7 +326,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
         props.numBenchClients,
         props.numBenchClients,
         "bench_client",
-        skipUserDataCtx,
         deployOS,
       );
       // Add lifecycle hook for bench_client ASG
@@ -391,7 +365,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
         props.numBssNodes,
         props.numBssNodes,
         "bss_server",
-        skipUserDataCtx,
         deployOS,
       );
     }
@@ -434,7 +407,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       ? nssPrivateLink.endpointDns
       : `${instances["nss-A"].instancePrivateIp}`;
 
-    // Create api_server(s) in a ASG group
+    // Create api_server(s) in a ASG group (no UserData - bootstrap via SSM)
     const apiServerAsg = createEc2Asg(
       this,
       "ApiServerAsg",
@@ -446,7 +419,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
       props.numApiServers,
       props.numApiServers,
       "api_server",
-      skipUserDataCtx,
       deployOS,
     );
 
@@ -514,14 +486,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       }
     }
 
-    // Add UserData to all instances - they will discover their role from TOML config
-    // Skip if skipUserData context is set (for SSM-based bootstrap)
-    const skipUserData = this.node.tryGetContext("skipUserData") === "true";
-    if (!skipUserData) {
-      for (const instance of Object.values(instances)) {
-        instance.addUserData(createUserData(this, deployOS).render());
-      }
-    }
+    // No UserData - all instances are bootstrapped via SSM after Docker host is ready
 
     // Outputs
     if (dataBlobBucket) {
@@ -587,87 +552,22 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
-    // Generate and upload bootstrap TOML config to S3
-    const bootstrapBucket = `fractalbits-bootstrap-${this.region}-${this.account}`;
-
-    // Generate unique workflow cluster ID for S3-based bootstrap coordination
-    // Each deployment gets fresh workflow state to avoid stale barrier objects
-    const workflowClusterId = `fractalbits-${Date.now()}`;
-
-    // Generate shared journal UUID for EBS volumes (used for filesystem UUID and mount point)
-    // Both NSS and mirrord use the same journal UUID
-    const journalUuid =
-      props.journalType === "ebs" ? crypto.randomUUID() : undefined;
-
-    const bootstrapConfigContent = createConfigWithCfnTokens({
-      deployTarget: "aws",
-      region: cdk.Stack.of(this).region,
-      forBench: !!props.benchType,
-      dataBlobStorage: dataBlobStorage,
-      rssHaEnabled: props.rootServerHa,
-      rssBackend: props.rssBackend,
-      journalType: props.journalType,
-      numBssNodes: singleAz ? props.numBssNodes : undefined,
-      numApiServers: props.numApiServers,
-      numBenchClients: props.numBenchClients,
-      dataBlobBucket: dataBlobBucket?.bucketName,
-      localAz: azArray[0],
-      remoteAz: multiAz ? azArray[1] : undefined,
-      nssEndpoint: nssEndpoint,
-      apiServerEndpoint: nlb.loadBalancerDnsName,
-      nssA: { id: instances["nss-A"].instanceId },
-      nssB: instances["nss-B"]
-        ? { id: instances["nss-B"].instanceId }
-        : undefined,
-      volumeAId: ebsVolumeAId,
-      volumeBId: ebsVolumeBId || undefined,
-      journalUuid: journalUuid,
-      rssA: { id: instances["rss-A"].instanceId },
-      rssB:
-        props.rootServerHa && instances["rss-B"]
-          ? { id: instances["rss-B"].instanceId }
-          : undefined,
-      guiServer:
-        props.browserIp && instances["gui_server"]
-          ? { id: instances["gui_server"].instanceId }
-          : undefined,
-      benchServer:
-        props.benchType === "external" && instances["bench_server"]
-          ? { id: instances["bench_server"].instanceId }
-          : undefined,
-      benchClientNum:
-        props.benchType === "external" ? props.numBenchClients : undefined,
-      workflowClusterId: workflowClusterId,
-      bootstrapBucket: bootstrapBucket,
-      useGenericBinaries: useGenericBinaries,
+    // Outputs for Docker host creation (used by xtask deploy)
+    new cdk.CfnOutput(this, "privateSubnetId", {
+      value: subnet1.subnetId,
+      description: "Private subnet ID for Docker host",
     });
-
-    new cr.AwsCustomResource(this, "UploadBootstrapConfig", {
-      onCreate: {
-        service: "S3",
-        action: "putObject",
-        parameters: {
-          Bucket: bootstrapBucket,
-          Key: "bootstrap_cluster.toml",
-          Body: bootstrapConfigContent,
-          ContentType: "text/plain",
-        },
-        physicalResourceId: cr.PhysicalResourceId.of("bootstrap-config"),
-      },
-      onUpdate: {
-        service: "S3",
-        action: "putObject",
-        parameters: {
-          Bucket: bootstrapBucket,
-          Key: "bootstrap_cluster.toml",
-          Body: bootstrapConfigContent,
-          ContentType: "text/plain",
-        },
-        physicalResourceId: cr.PhysicalResourceId.of("bootstrap-config"),
-      },
-      policy: cr.AwsCustomResourcePolicy.fromSdkCalls({
-        resources: cr.AwsCustomResourcePolicy.ANY_RESOURCE,
-      }),
+    new cdk.CfnOutput(this, "privateSgId", {
+      value: privateSg.securityGroupId,
+      description: "Private security group ID for Docker host",
+    });
+    new cdk.CfnOutput(this, "instanceProfileName", {
+      value: ec2Role.roleName,
+      description: "IAM role name for Docker host instance profile",
+    });
+    new cdk.CfnOutput(this, "region", {
+      value: this.region,
+      description: "AWS region",
     });
   }
 }

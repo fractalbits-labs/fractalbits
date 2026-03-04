@@ -1,27 +1,46 @@
 use crate::*;
 
+use super::build::DOCKER_OUTPUT_DIR;
 use super::common::{DeployTarget, get_bootstrap_bucket_name};
 
 pub fn upload(deploy_target: DeployTarget) -> CmdResult {
     upload_with_endpoint(deploy_target, None)
 }
 
-/// Upload Docker images to AWS S3 (for simulate-on-prem mode)
-/// Uploads both architecture-specific images (aarch64 and x86_64)
-pub fn upload_docker_image_only() -> CmdResult {
+/// Upload Docker images to AWS S3
+pub fn upload_docker_images(deploy_target: DeployTarget) -> CmdResult {
     let bucket_name = get_bootstrap_bucket_name(DeployTarget::Aws)?;
+    let variant = match deploy_target {
+        DeployTarget::Aws => "aws",
+        DeployTarget::OnPrem => "onprem",
+    };
 
-    // Upload both architecture-specific images
+    // Create bucket if it doesn't exist
+    let bucket_exists =
+        run_cmd!(aws s3api head-bucket --bucket $bucket_name &>/dev/null).is_ok();
+    if !bucket_exists {
+        run_cmd! {
+            info "Creating bucket $bucket_name";
+            aws s3 mb "s3://$bucket_name";
+        }?;
+    }
+
     for arch in ["aarch64", "x86_64"] {
-        let image_path = format!("target/on-prem/fractalbits-{}.tar.gz", arch);
+        let image_path = format!(
+            "{}/fractalbits-{}-{}.tar.gz",
+            DOCKER_OUTPUT_DIR, variant, arch
+        );
         if std::path::Path::new(&image_path).exists() {
-            let s3_path = format!("s3://{}/docker/fractalbits-{}.tar.gz", bucket_name, arch);
-            info!("Uploading {} Docker image to S3...", arch);
+            let s3_path = format!(
+                "s3://{}/docker/fractalbits-{}-{}.tar.gz",
+                bucket_name, variant, arch
+            );
+            info!("Uploading {} {} Docker image to S3...", variant, arch);
             run_cmd!(aws s3 cp $image_path $s3_path)?;
         } else {
             return Err(std::io::Error::other(format!(
-                "Docker image for {} not found at {}. Run 'just deploy build --for-on-prem' first.",
-                arch, image_path
+                "Docker image not found at {}. Run 'just deploy build' first.",
+                image_path
             )));
         }
     }
@@ -128,13 +147,19 @@ echo "=== Bootstrap completed at $(date) ==="
         }?;
     }
 
-    // Upload Docker images if they exist (both architectures)
-    if deploy_target == DeployTarget::Aws {
+    // Upload Docker images if they exist (both variants, both architectures)
+    for variant in ["onprem", "aws"] {
         for arch in ["aarch64", "x86_64"] {
-            let image_path = format!("target/on-prem/fractalbits-{}.tar.gz", arch);
+            let image_path = format!(
+                "{}/fractalbits-{}-{}.tar.gz",
+                DOCKER_OUTPUT_DIR, variant, arch
+            );
             if std::path::Path::new(&image_path).exists() {
-                let s3_path = format!("s3://{}/docker/fractalbits-{}.tar.gz", bucket_name, arch);
-                info!("Uploading {} Docker image to S3...", arch);
+                let s3_path = format!(
+                    "s3://{}/docker/fractalbits-{}-{}.tar.gz",
+                    bucket_name, variant, arch
+                );
+                info!("Uploading {} {} Docker image to S3...", variant, arch);
                 run_cmd!($[env_vars] aws s3 cp $image_path $s3_path)?;
             }
         }
