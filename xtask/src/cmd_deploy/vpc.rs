@@ -65,44 +65,36 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     // 3. Parse CDK outputs
     let outputs = ssm_utils::parse_cdk_outputs()?;
 
-    // 4. Create temp Docker host
-    let subnet_id = outputs
-        .get("privateSubnetId")
-        .ok_or_else(|| std::io::Error::other("CDK output 'privateSubnetId' not found"))?;
-    let sg_id = outputs
-        .get("privateSgId")
-        .ok_or_else(|| std::io::Error::other("CDK output 'privateSgId' not found"))?;
-    let role_name = outputs
-        .get("instanceProfileName")
-        .ok_or_else(|| std::io::Error::other("CDK output 'instanceProfileName' not found"))?;
+    // 4. Setup Docker on rss-A (downloads slim image + binaries, starts container, uploads to S3)
+    let rss_a_id = outputs
+        .get("rssAId")
+        .ok_or_else(|| std::io::Error::other("CDK output 'rssAId' not found"))?;
 
-    let docker_host = docker_host::create_docker_host(subnet_id, sg_id, role_name)?;
-
-    // 5. Setup Docker on host (downloads AWS image from S3, starts container)
+    ssm_utils::wait_for_ssm_agent_ready(std::slice::from_ref(rss_a_id))?;
     let aws_bucket = get_bootstrap_bucket_name(DeployTarget::Aws)?;
-    docker_host::setup_docker_on_host(&docker_host.instance_id, &aws_bucket, "aws")?;
+    let docker_host = docker_host::setup_docker_on_host(rss_a_id, &aws_bucket, "aws")?;
 
-    // 6. Generate and upload bootstrap config to Docker S3
+    // 5. Generate and upload bootstrap config to Docker S3
     let bootstrap_config = aws_config_gen::generate_bootstrap_config(&outputs, &config)?;
     let config_toml = bootstrap_config
         .to_toml()
         .map_err(|e| std::io::Error::other(format!("Failed to serialize config: {}", e)))?;
     docker_host::upload_config_to_docker_s3(&docker_host.instance_id, &config_toml)?;
 
-    // 7. Bootstrap all nodes via SSM (pointing at Docker S3)
+    // 6. Bootstrap all nodes via SSM (pointing at Docker S3 on rss-A)
     let instance_ids = ssm_utils::collect_all_instance_ids(&outputs)?;
     ssm_utils::wait_for_ssm_agent_ready(&instance_ids)?;
     ssm_bootstrap::ssm_bootstrap_from_docker(&instance_ids, &docker_host.private_ip)?;
 
-    // 8. Wait for bootstrap, then terminate Docker host
+    // 7. Wait for bootstrap, then clean up Docker on rss-A
     if config.watch_bootstrap {
-        bootstrap_progress::show_progress_from_docker(&docker_host.private_ip)?;
+        bootstrap_progress::show_progress_from_docker(&docker_host.instance_id)?;
     } else {
         info!("To monitor bootstrap progress, run:");
         info!("  cargo xtask deploy bootstrap-progress");
     }
 
-    docker_host::terminate_docker_host(&docker_host.instance_id)?;
+    docker_host::cleanup_docker_host(&docker_host.instance_id)?;
 
     Ok(())
 }

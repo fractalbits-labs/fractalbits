@@ -191,19 +191,29 @@ pub fn wait_for_ssm_command(command_id: &str, instance_ids: &[String]) -> Result
 
 /// Send SSM command to a single instance and wait for completion
 pub fn ssm_run_command(instance_id: &str, command: &str, description: &str) -> CmdResult {
+    ssm_run_command_with_timeout(instance_id, command, description, SSM_TIMEOUT_SECS)
+}
+
+pub fn ssm_run_command_with_timeout(
+    instance_id: &str,
+    command: &str,
+    description: &str,
+    timeout_secs: u64,
+) -> CmdResult {
     // Write command to a temp file as JSON to avoid shell quoting issues
     let params_json = serde_json::json!({"commands": [command]});
     let params_file = "/tmp/ssm-command-params.json";
     std::fs::write(params_file, params_json.to_string())
         .map_err(|e| Error::other(format!("Failed to write SSM params file: {}", e)))?;
 
+    let ssm_timeout = timeout_secs.to_string();
     let params_arg = format!("file://{}", params_file);
     let command_id = run_fun!(
         aws ssm send-command
             --document-name "AWS-RunShellScript"
             --targets "Key=InstanceIds,Values=$instance_id"
             --parameters $params_arg
-            --timeout-seconds 600
+            --timeout-seconds $ssm_timeout
             --comment $description
             --query "Command.CommandId"
             --output text
@@ -213,15 +223,19 @@ pub fn ssm_run_command(instance_id: &str, command: &str, description: &str) -> C
     let command_id = command_id.trim();
     info!("SSM command sent with ID: {}", command_id);
 
-    wait_for_single_instance_command(command_id, instance_id)?;
+    wait_for_single_instance_command(command_id, instance_id, timeout_secs)?;
 
     Ok(())
 }
 
 /// Wait for SSM command on a single instance (with error output on failure)
-fn wait_for_single_instance_command(command_id: &str, instance_id: &str) -> Result<(), Error> {
+fn wait_for_single_instance_command(
+    command_id: &str,
+    instance_id: &str,
+    timeout_secs: u64,
+) -> Result<(), Error> {
     let start_time = Instant::now();
-    let timeout = Duration::from_secs(SSM_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(timeout_secs);
 
     info!(
         "Waiting for SSM command {} to complete on instance {}...",
@@ -232,7 +246,7 @@ fn wait_for_single_instance_command(command_id: &str, instance_id: &str) -> Resu
         if start_time.elapsed() > timeout {
             return Err(Error::other(format!(
                 "SSM command {} timed out after {}s",
-                command_id, SSM_TIMEOUT_SECS
+                command_id, timeout_secs
             )));
         }
 

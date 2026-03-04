@@ -228,7 +228,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     // Define instance metadata, and create instances
     const nssInstanceType = new ec2.InstanceType(props.nssInstanceType);
-    const rssInstanceType = new ec2.InstanceType("c7g.medium");
+    const rssInstanceType = new ec2.InstanceType("c7g.xlarge");
     const benchInstanceType = new ec2.InstanceType("c7g.large");
 
     // Get specific subnets for instances to ensure correct AZ placement
@@ -244,12 +244,19 @@ export class FractalbitsVpcStack extends cdk.Stack {
         : subnet1; // Use first subnet for single-AZ mode
     const publicSubnet1 = publicSubnets[0]; // First AZ (public)
 
-    const instanceConfigs = [
+    const instanceConfigs: {
+      id: string;
+      instanceType: ec2.InstanceType;
+      specificSubnet: ec2.ISubnet;
+      sg: ec2.SecurityGroup;
+      rootVolumeSize?: number;
+    }[] = [
       {
         id: "rss-A",
         instanceType: rssInstanceType,
         specificSubnet: subnet1,
         sg: privateSg,
+        rootVolumeSize: 30,
       },
       {
         id: "nss-A",
@@ -338,18 +345,21 @@ export class FractalbitsVpcStack extends cdk.Stack {
       );
     }
     const instances: Record<string, ec2.Instance> = {};
-    instanceConfigs.forEach(({ id, instanceType, sg, specificSubnet }) => {
-      instances[id] = createInstance(
-        this,
-        this.vpc,
-        id,
-        specificSubnet,
-        instanceType,
-        sg,
-        ec2Role,
-        deployOS,
-      );
-    });
+    instanceConfigs.forEach(
+      ({ id, instanceType, sg, specificSubnet, rootVolumeSize }) => {
+        instances[id] = createInstance(
+          this,
+          this.vpc,
+          id,
+          specificSubnet,
+          instanceType,
+          sg,
+          ec2Role,
+          deployOS,
+          rootVolumeSize,
+        );
+      },
+    );
 
     // Create BSS nodes in ASG (dynamic cluster discovery via S3)
     let bssAsg: autoscaling.AutoScalingGroup | undefined;
@@ -560,10 +570,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
     new cdk.CfnOutput(this, "privateSgId", {
       value: privateSg.securityGroupId,
       description: "Private security group ID for Docker host",
-    });
-    new cdk.CfnOutput(this, "instanceProfileName", {
-      value: ec2Role.roleName,
-      description: "IAM role name for Docker host instance profile",
     });
     new cdk.CfnOutput(this, "region", {
       value: this.region,

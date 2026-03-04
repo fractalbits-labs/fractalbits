@@ -151,12 +151,24 @@ export const createInstance = (
   sg: ec2.SecurityGroup,
   role: iam.Role,
   deployOS: DeployOS = "al2023",
+  rootVolumeSize?: number,
 ): ec2.Instance => {
   const arch =
     instanceType.architecture === ec2.InstanceArchitecture.ARM_64
       ? "arm64"
       : "amd64";
   const machineImage = getMachineImage(arch, deployOS);
+
+  const blockDevices = rootVolumeSize
+    ? [
+        {
+          deviceName: "/dev/xvda",
+          volume: ec2.BlockDeviceVolume.ebs(rootVolumeSize, {
+            volumeType: ec2.EbsDeviceVolumeType.GP3,
+          }),
+        },
+      ]
+    : undefined;
 
   return new ec2.Instance(scope, id, {
     vpc: vpc,
@@ -165,6 +177,7 @@ export const createInstance = (
     vpcSubnets: { subnets: [specificSubnet] },
     securityGroup: sg,
     role: role,
+    blockDevices: blockDevices,
   });
 };
 

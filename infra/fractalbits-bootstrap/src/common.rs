@@ -138,11 +138,53 @@ fn get_cpu_target() -> FunResult {
     Ok(get_cpu_target_from_instance_type(&instance_type).to_string())
 }
 
+/// Returns inline env vars for Docker S3 authentication.
+/// When DOCKER_S3_AUTH is set, S3 calls need test credentials since the Docker S3
+/// (container api_server) only accepts test_api_key/test_api_secret.
+/// Non-S3 AWS calls (DynamoDB) must use IAM role credentials.
+pub fn s3_env_overrides() -> Vec<String> {
+    if std::env::var("DOCKER_S3_AUTH").is_ok() {
+        vec![
+            "AWS_ACCESS_KEY_ID=test_api_key".to_string(),
+            "AWS_SECRET_ACCESS_KEY=test_api_secret".to_string(),
+            "AWS_DEFAULT_REGION=localdev".to_string(),
+        ]
+    } else {
+        vec![]
+    }
+}
+
+/// Clear Docker S3 credentials from the global environment.
+/// Called at bootstrap binary startup so that DynamoDB and other AWS calls
+/// use IAM role credentials instead of the test credentials.
+pub fn clear_docker_s3_global_credentials() {
+    if std::env::var("DOCKER_S3_AUTH").is_ok() {
+        info!("Docker S3 mode: clearing global test credentials (S3 uses inline creds)");
+        // SAFETY: bootstrap is single-threaded at this point (called before spawning threads)
+        unsafe {
+            std::env::remove_var("AWS_ACCESS_KEY_ID");
+            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+        }
+    }
+}
+
 pub fn download_from_s3(s3_path: &str, local_path: &str) -> CmdResult {
-    run_cmd!(
-        info "Downloading from $s3_path to $local_path";
-        aws s3 cp --no-progress $s3_path $local_path
-    )
+    info!("Downloading from {s3_path} to {local_path}");
+    let s3_env = s3_env_overrides();
+    run_cmd!($[s3_env] aws s3 cp --no-progress $s3_path $local_path)
+}
+
+/// Upload a string to S3 via a temp file.
+/// Avoids piped commands (`echo | aws s3 cp -`) because cmd_lib's `$[env]`
+/// only applies env vars to the first command in a pipe.
+pub fn upload_string_to_s3(content: &str, s3_path: &str) -> CmdResult {
+    let tmp = "/tmp/.s3_upload_tmp";
+    std::fs::write(tmp, content)?;
+    let s3_env = s3_env_overrides();
+    let result = run_cmd!($[s3_env] aws s3 cp $tmp $s3_path --quiet);
+    let _ = std::fs::remove_file(tmp);
+    result
 }
 
 pub fn backup_config_to_workflow(config: &BootstrapConfig, cluster_id: &str) -> CmdResult {
@@ -151,13 +193,15 @@ pub fn backup_config_to_workflow(config: &BootstrapConfig, cluster_id: &str) -> 
     let workflow_path = format!("{bucket}/workflow/{cluster_id}/{BOOTSTRAP_CLUSTER_CONFIG}");
 
     // Check if already backed up (only first instance needs to do this)
-    let exists = run_fun!(aws s3 ls $workflow_path 2>/dev/null);
+    let s3_env = s3_env_overrides();
+    let exists = run_fun!($[s3_env] aws s3 ls $workflow_path 2>/dev/null);
     if exists.is_ok() && !exists.unwrap().trim().is_empty() {
         return Ok(());
     }
 
     info!("Backing up bootstrap config to {workflow_path}");
-    run_cmd!(aws s3 cp $local_path $workflow_path --quiet)?;
+    let s3_env = s3_env_overrides();
+    run_cmd!($[s3_env] aws s3 cp $local_path $workflow_path --quiet)?;
     Ok(())
 }
 

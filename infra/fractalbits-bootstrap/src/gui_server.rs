@@ -1,4 +1,5 @@
 use crate::api_server;
+use crate::common::s3_env_overrides;
 use crate::config::BootstrapConfig;
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use crate::*;
@@ -9,7 +10,8 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
 
     download_binaries(config, &["api_server"])?;
     let bootstrap_bucket = config.get_bootstrap_bucket();
-    run_cmd!(aws s3 cp --no-progress $bootstrap_bucket/ui $GUI_WEB_ROOT --recursive)?;
+    let s3_env = s3_env_overrides();
+    run_cmd!($[s3_env] aws s3 cp --no-progress $bootstrap_bucket/ui $GUI_WEB_ROOT --recursive)?;
 
     api_server::create_config(config)?;
     // setup_cloudwatch_agent()?;

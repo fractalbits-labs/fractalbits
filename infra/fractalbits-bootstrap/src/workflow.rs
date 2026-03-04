@@ -4,7 +4,7 @@
 //! objects to S3. This provides clear dependency ordering and visibility
 //! into bootstrap progress.
 
-use crate::common::{get_instance_id, get_private_ip};
+use crate::common::{get_instance_id, get_private_ip, s3_env_overrides, upload_string_to_s3};
 use crate::config::BootstrapConfig;
 use cmd_lib::*;
 use serde::{Deserialize, Serialize};
@@ -118,7 +118,7 @@ impl WorkflowBarrier {
 
         let s3_path = self.instance_stage_path(stage);
         info!("Completing stage '{stage}' at {s3_path}");
-        run_cmd!(echo $json | aws s3 cp - $s3_path --quiet)?;
+        upload_string_to_s3(&json, &s3_path)?;
 
         Ok(())
     }
@@ -142,7 +142,7 @@ impl WorkflowBarrier {
 
         let s3_path = format!("{}.json", self.stage_path(stage));
         info!("Completing global stage '{stage}' at {s3_path}");
-        run_cmd!(echo $json | aws s3 cp - $s3_path --quiet)?;
+        upload_string_to_s3(&json, &s3_path)?;
 
         Ok(())
     }
@@ -164,7 +164,9 @@ impl WorkflowBarrier {
             }
 
             // Check if the file exists
-            let result = run_fun!(aws s3api head-object --bucket $bucket --key $key 2>/dev/null);
+            let s3_env = s3_env_overrides();
+            let result =
+                run_fun!($[s3_env] aws s3api head-object --bucket $bucket --key $key 2>/dev/null);
             if result.is_ok() {
                 info!("Global stage '{stage}' is complete");
                 return Ok(());
@@ -212,7 +214,8 @@ impl WorkflowBarrier {
     pub fn get_stage_completions(&self, stage: &str) -> Result<Vec<StageCompletion>, Error> {
         let stage_prefix = format!("{}/", self.stage_path(stage));
 
-        let output = run_fun!(aws s3 ls $stage_prefix 2>/dev/null).unwrap_or_default();
+        let s3_env = s3_env_overrides();
+        let output = run_fun!($[s3_env] aws s3 ls $stage_prefix 2>/dev/null).unwrap_or_default();
         if output.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -224,7 +227,8 @@ impl WorkflowBarrier {
                 let filename = parts[3];
                 if filename.ends_with(".json") {
                     let s3_path = format!("{}{}", stage_prefix, filename);
-                    match run_fun!(aws s3 cp $s3_path - 2>/dev/null) {
+                    let s3_env = s3_env_overrides();
+                    match run_fun!($[s3_env] aws s3 cp $s3_path - 2>/dev/null) {
                         Ok(content) => {
                             if let Ok(completion) =
                                 serde_json::from_str::<StageCompletion>(&content)
@@ -265,7 +269,7 @@ impl WorkflowBarrier {
 
         let s3_path = format!("{}{}.json", self.etcd_nodes_prefix(), my_ip);
         info!("Registering etcd node at {s3_path}");
-        run_cmd!(echo $json | aws s3 cp - $s3_path --quiet)?;
+        upload_string_to_s3(&json, &s3_path)?;
 
         Ok(())
     }
@@ -274,7 +278,8 @@ impl WorkflowBarrier {
     pub fn get_etcd_nodes(&self) -> Result<Vec<EtcdNodeInfo>, Error> {
         let prefix = self.etcd_nodes_prefix();
 
-        let output = run_fun!(aws s3 ls $prefix 2>/dev/null).unwrap_or_default();
+        let s3_env = s3_env_overrides();
+        let output = run_fun!($[s3_env] aws s3 ls $prefix 2>/dev/null).unwrap_or_default();
         if output.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -286,7 +291,8 @@ impl WorkflowBarrier {
                 let filename = parts[3];
                 if filename.ends_with(".json") {
                     let s3_path = format!("{}{}", prefix, filename);
-                    match run_fun!(aws s3 cp $s3_path - 2>/dev/null) {
+                    let s3_env = s3_env_overrides();
+                    match run_fun!($[s3_env] aws s3 cp $s3_path - 2>/dev/null) {
                         Ok(content) => {
                             if let Ok(node_info) = serde_json::from_str::<EtcdNodeInfo>(&content) {
                                 nodes.push(node_info);

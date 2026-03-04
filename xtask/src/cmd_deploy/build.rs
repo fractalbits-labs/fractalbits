@@ -1,22 +1,18 @@
 use crate::docker_utils::{
-    BinarySources, DockerBuildConfig, build_docker_image, get_host_arch, stage_binaries_for_docker,
-    wait_for_container_ready,
+    BinarySources, DockerBuildConfig, build_docker_image, stage_binaries_for_docker,
 };
 use crate::etcd_utils::download_etcd_for_deploy;
 use crate::etcd_utils::resolve_etcd_dir_for_arch;
 use crate::*;
 use std::path::Path;
-use xtask_common::DeployTarget as UploadTarget;
 
-use super::common::{ARCH_TARGETS, AWS_CPU_TARGETS, ArchTarget, RUST_BINS, ZIG_BINS};
-use super::upload::upload_with_endpoint;
+use super::common::{ARCH_TARGETS, AWS_CPU_TARGETS, ArchTarget, DeployTarget, RUST_BINS, ZIG_BINS};
 
 pub const DOCKER_OUTPUT_DIR: &str = "target/docker";
 
 pub fn build(
     target: DeployBuildTarget,
     release_mode: bool,
-    docker_variant: Option<UploadTarget>,
     zig_extra_build: &[String],
     api_server_build_env: &[String],
 ) -> CmdResult {
@@ -74,11 +70,6 @@ pub fn build(
     if target == DeployBuildTarget::All {
         download_warp_binaries()?;
         download_etcd_for_deploy()?;
-    }
-
-    // Build Docker images when building everything
-    if target == DeployBuildTarget::All {
-        build_docker_images(docker_variant)?;
     }
 
     info!("Deploy build is done");
@@ -401,28 +392,19 @@ fn download_warp_binaries() -> CmdResult {
     Ok(())
 }
 
-/// Build Docker image variants with pre-populated binaries.
+/// Build slim Docker images (without pre-populated data) and pack binaries as tgz.
 ///
-/// If `variant` is specified, builds only that variant. Otherwise builds both.
-/// - On-prem: generic binaries for both architectures
-/// - AWS: generic shared binaries + CPU-specific binaries for both architectures
-fn build_docker_images(variant: Option<UploadTarget>) -> CmdResult {
-    let build_onprem = variant.is_none() || variant == Some(UploadTarget::OnPrem);
-    let build_aws = variant.is_none() || variant == Some(UploadTarget::Aws);
-
-    info!(
-        "Building Docker images ({})...",
-        match variant {
-            Some(UploadTarget::OnPrem) => "on-prem variant",
-            Some(UploadTarget::Aws) => "AWS variant",
-            None => "on-prem and AWS variants",
-        }
-    );
+/// The Docker images contain only container-all-in-one + etcd (the orchestrator).
+/// Binaries are packed separately as tgz files and uploaded to the container's S3
+/// at deploy time on the Docker host.
+pub fn build_docker_images() -> CmdResult {
+    info!("Building slim Docker images...");
 
     let staging_dir = "target/docker-staging";
     run_cmd!(rm -rf $staging_dir)?;
 
-    // Stage binaries and build base images for each architecture
+    run_cmd!(mkdir -p $DOCKER_OUTPUT_DIR)?;
+
     for target in ARCH_TARGETS {
         let arch = target.arch;
         let generic_dir = get_generic_deploy_dir(target);
@@ -437,8 +419,9 @@ fn build_docker_images(variant: Option<UploadTarget>) -> CmdResult {
         };
         stage_binaries_for_docker(&sources, staging_dir, &bin_subdir)?;
 
+        let image_name = "fractalbits";
         let config = DockerBuildConfig {
-            image_name: "fractalbits-base",
+            image_name,
             tag: arch,
             arch: Some(arch),
             platform: Some(target.docker_platform),
@@ -448,102 +431,65 @@ fn build_docker_images(variant: Option<UploadTarget>) -> CmdResult {
             data_source: None,
         };
         build_docker_image(&config)?;
-    }
 
-    run_cmd!(mkdir -p $DOCKER_OUTPUT_DIR)?;
+        let image_tag = format!("{}:{}", image_name, arch);
+        let output_file = format!("{}/fractalbits-{}.tar.gz", DOCKER_OUTPUT_DIR, arch);
+        info!("Exporting {} image to {}...", arch, output_file);
+        run_cmd!(docker save $image_tag | gzip > $output_file)?;
 
-    if build_onprem {
-        build_docker_variant("onprem", UploadTarget::OnPrem, staging_dir)?;
-    }
-
-    if build_aws {
-        build_docker_variant("aws", UploadTarget::Aws, staging_dir)?;
-    }
-
-    // Clean up base images
-    for target in ARCH_TARGETS {
-        let base_image = format!("fractalbits-base:{}", target.arch);
-        let _ = run_cmd!(docker rmi $base_image 2>/dev/null);
+        let _ = run_cmd!(docker rmi $image_tag 2>/dev/null);
     }
 
     info!("Docker images exported to {}/", DOCKER_OUTPUT_DIR);
     Ok(())
 }
 
-fn build_docker_variant(
-    variant: &str,
-    deploy_target: UploadTarget,
-    staging_dir: &str,
-) -> CmdResult {
-    const CONTAINER_NAME: &str = "fractalbits-prepopulate";
+/// Pack deployment binaries into tgz bundles for upload to Docker S3 at deploy time.
+///
+/// Creates:
+/// - target/docker/binaries-onprem.tar.gz: generic binaries for both arches
+/// - target/docker/binaries-aws.tar.gz: generic shared + AWS CPU-specific binaries
+pub fn pack_binaries(deploy_target: Option<DeployTarget>) -> CmdResult {
+    let pack_onprem = deploy_target.is_none() || deploy_target == Some(DeployTarget::OnPrem);
+    let pack_aws = deploy_target.is_none() || deploy_target == Some(DeployTarget::Aws);
 
-    let host_arch = get_host_arch();
-    let base_image = format!("fractalbits-base:{}", host_arch);
+    run_cmd!(mkdir -p $DOCKER_OUTPUT_DIR)?;
 
-    // Clean up any existing container
-    let _ = run_cmd!(ignore docker stop $CONTAINER_NAME 2>/dev/null);
-    let _ = run_cmd!(ignore docker rm -f $CONTAINER_NAME 2>/dev/null);
-
-    info!(
-        "Starting Docker container for {} variant pre-population...",
-        variant
-    );
-    run_cmd!(
-        docker run -d --privileged --name $CONTAINER_NAME
-            -p 8080:8080 -p 18080:18080
-            $base_image
-    )?;
-
-    wait_for_container_ready(CONTAINER_NAME)?;
-
-    info!("Uploading {} binaries to container S3...", variant);
-    upload_with_endpoint(deploy_target, Some("localhost:8080"))?;
-
-    info!("Stopping container...");
-    run_cmd!(docker stop $CONTAINER_NAME)?;
-
-    info!("Extracting pre-populated data for {} variant...", variant);
-    let data_extract_dir = format!("{}/data-extract-{}", staging_dir, variant);
-    run_cmd! {
-        rm -rf $data_extract_dir;
-        mkdir -p $data_extract_dir;
-        docker cp $CONTAINER_NAME:/data $data_extract_dir/;
-    }?;
-
-    run_cmd!(docker rm -f $CONTAINER_NAME)?;
-
-    info!(
-        "Building final {} images with pre-populated data...",
-        variant
-    );
-    for target in ARCH_TARGETS {
-        let arch = target.arch;
-        let bin_subdir = format!("bin-{}", arch);
-        let data_source = format!("data-extract-{}/data", variant);
-        let image_name = format!("fractalbits-{}", variant);
-        let final_image = format!("{}:{}", image_name, arch);
-
-        let config = DockerBuildConfig {
-            image_name: &image_name,
-            tag: arch,
-            arch: Some(arch),
-            platform: Some(target.docker_platform),
-            staging_dir,
-            bin_subdir: &bin_subdir,
-            include_volume: false,
-            data_source: Some(&data_source),
-        };
-        build_docker_image(&config)?;
-
-        let output_file = format!(
-            "{}/fractalbits-{}-{}.tar.gz",
-            DOCKER_OUTPUT_DIR, variant, arch
-        );
-        info!("Exporting {} image to {}...", arch, output_file);
-        run_cmd!(docker save $final_image | gzip > $output_file)?;
-
-        let _ = run_cmd!(docker rmi $final_image 2>/dev/null);
+    if pack_onprem {
+        pack_binaries_onprem()?;
+    }
+    if pack_aws {
+        pack_binaries_aws()?;
     }
 
+    Ok(())
+}
+
+fn pack_binaries_onprem() -> CmdResult {
+    let output = format!("{}/binaries-onprem.tar.gz", DOCKER_OUTPUT_DIR);
+    info!("Packing on-prem binaries to {}...", output);
+
+    // Pack generic binaries for both arches + UI
+    run_cmd!(
+        tar -czf $output
+            -C prebuilt/deploy
+            generic/
+            ui/
+    )?;
+    Ok(())
+}
+
+fn pack_binaries_aws() -> CmdResult {
+    let output = format!("{}/binaries-aws.tar.gz", DOCKER_OUTPUT_DIR);
+    info!("Packing AWS binaries to {}...", output);
+
+    // Pack generic + aws CPU-specific binaries + UI
+    run_cmd!(
+        tar -czf $output
+            -C prebuilt/deploy
+            generic/
+            aws/
+            ui/
+    )?;
     Ok(())
 }
