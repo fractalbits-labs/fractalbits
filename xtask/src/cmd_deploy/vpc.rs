@@ -94,6 +94,9 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         info!("  cargo xtask deploy bootstrap-progress");
     }
 
+    // 8. Persist workflow data to AWS S3 for later inspection
+    docker_host::sync_workflow_to_aws_s3(&docker_host.instance_id, &aws_bucket)?;
+
     docker_host::cleanup_docker_host(&docker_host.instance_id)?;
 
     Ok(())

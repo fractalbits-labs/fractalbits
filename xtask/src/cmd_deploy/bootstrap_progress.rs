@@ -115,8 +115,17 @@ pub fn show_progress_from_docker(docker_host_id: &str) -> CmdResult {
     result
 }
 
-/// Show bootstrap progress using the rss-A instance from CDK outputs.
+/// Show bootstrap progress using AWS S3 (persisted data) or SSM tunnel fallback.
+///
+/// Tries AWS S3 first (works after Docker cleanup), then falls back to
+/// SSM tunnel to Docker S3 if the blueprint hasn't been synced yet.
 pub fn show_progress_from_cdk_outputs() -> CmdResult {
+    let aws_access = S3Access::for_aws(DeployTarget::Aws)?;
+    if get_blueprint(&aws_access).is_ok() {
+        return show_progress_inner(&aws_access);
+    }
+
+    // Fall back to SSM tunnel (Docker still running)
     let outputs = ssm_utils::parse_cdk_outputs()?;
     let rss_a_id = outputs
         .get("rssAId")

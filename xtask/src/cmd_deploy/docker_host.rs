@@ -225,6 +225,42 @@ echo "Bootstrap config uploaded successfully"
     Ok(())
 }
 
+/// Sync workflow data from Docker S3 to real AWS S3 before Docker cleanup.
+///
+/// Copies stage_blueprint.json and workflow/ directory from the Docker container's
+/// S3 service to the real AWS S3 bucket so progress can be checked after Docker is gone.
+pub fn sync_workflow_to_aws_s3(instance_id: &str, aws_bucket: &str) -> CmdResult {
+    info!("Syncing workflow data from Docker S3 to AWS S3...");
+
+    let script = format!(
+        r#"#!/bin/bash
+set -ex
+
+# Download from Docker S3 (localhost:8080)
+export AWS_DEFAULT_REGION=localdev
+export AWS_ENDPOINT_URL_S3=http://localhost:8080
+export AWS_ACCESS_KEY_ID=test_api_key
+export AWS_SECRET_ACCESS_KEY=test_api_secret
+
+aws s3 cp s3://fractalbits-bootstrap/stage_blueprint.json /tmp/stage_blueprint.json
+aws s3 sync s3://fractalbits-bootstrap/workflow/ /tmp/workflow/
+
+# Upload to real AWS S3
+unset AWS_ENDPOINT_URL_S3 AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION
+
+aws s3 cp /tmp/stage_blueprint.json "s3://{aws_bucket}/stage_blueprint.json"
+aws s3 sync /tmp/workflow/ "s3://{aws_bucket}/workflow/"
+
+rm -rf /tmp/stage_blueprint.json /tmp/workflow/
+echo "Workflow data synced to AWS S3"
+"#
+    );
+
+    ssm_utils::ssm_run_command(instance_id, &script, "Sync workflow to AWS S3")?;
+    info!("Workflow data persisted to s3://{aws_bucket}/");
+    Ok(())
+}
+
 /// Clean up Docker on rss-A (best-effort, before VPC destruction).
 pub fn cleanup_docker_host(instance_id: &str) -> CmdResult {
     info!("Cleaning up Docker on {instance_id}...");
