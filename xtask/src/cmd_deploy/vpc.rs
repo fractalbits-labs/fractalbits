@@ -3,53 +3,22 @@ use colored::*;
 use dialoguer::Input;
 use std::path::Path;
 
+use super::aws_config_gen;
 use super::bootstrap_progress;
 use super::common::{DeployTarget, VpcConfig, get_bootstrap_bucket_name};
-use super::simulate_on_prem;
+use super::docker_host;
 use super::ssm_bootstrap;
-use super::upload::upload;
+use super::ssm_utils;
+use super::upload;
 
 pub fn create_vpc(config: VpcConfig) -> CmdResult {
-    let VpcConfig {
-        template,
-        num_api_servers,
-        num_bench_clients,
-        num_bss_nodes,
-        with_bench,
-        bss_instance_type,
-        api_server_instance_type,
-        bench_client_instance_type,
-        az,
-        root_server_ha,
-        rss_backend,
-        ssm_bootstrap,
-        journal_type,
-        watch_bootstrap,
-        skip_upload,
-        simulate_on_prem,
-        use_generic_binaries,
-        deploy_os,
-    } = config;
-
-    // Override settings for simulate-on-prem mode
-    let (rss_backend, journal_type) = if simulate_on_prem {
-        (crate::RssBackend::Etcd, crate::JournalType::Nvme)
-    } else {
-        (rss_backend, journal_type)
-    };
-
-    if !skip_upload {
-        if simulate_on_prem {
-            info!("Uploading Docker image to S3 bootstrap bucket (simulate-on-prem mode)...");
-            super::upload::upload_docker_image_only()?;
-        } else {
-            info!("Uploading binaries to S3 bootstrap bucket...");
-            upload(DeployTarget::Aws)?;
-        }
+    // 1. Upload Docker images to AWS S3
+    if !config.skip_upload {
+        info!("Uploading Docker images to AWS S3...");
+        upload::upload_docker_images(DeployTarget::Aws)?;
     }
 
-    // Note: Template-based configuration is handled in CDK (vpc/fractalbits-cdk/bin/fractalbits-vpc.ts)
-    // The values passed here may be overridden by the template in CDK
+    // 2. CDK deploy (no UserData, all bootstrap via SSM)
     let cdk_dir = "infra/fractalbits-cdk";
 
     // Check if node_modules exists, if not run npm install
@@ -81,97 +50,59 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         }?;
     }
 
-    // Build CDK context parameters (each --context flag and value must be separate arguments)
-    let mut context_params = Vec::new();
-    let mut add_context = |key: &str, value: String| {
-        context_params.push("--context".to_string());
-        context_params.push(format!("{}={}", key, value));
-    };
+    // Build CDK context parameters
+    let context_params = build_cdk_context(&config);
 
-    add_context("numApiServers", num_api_servers.to_string());
-    add_context("numBenchClients", num_bench_clients.to_string());
-    add_context("numBssNodes", num_bss_nodes.to_string());
-    add_context("bssInstanceTypes", bss_instance_type);
-    add_context("apiServerInstanceType", api_server_instance_type);
-    add_context("benchClientInstanceType", bench_client_instance_type);
-    if with_bench {
-        add_context("benchType", "external".to_string());
-    }
-    if let Some(template_val) = template {
-        add_context("vpcTemplate", template_val.as_ref().to_string());
-    }
-    if let Some(az_val) = az {
-        add_context("az", az_val);
-    }
-    if root_server_ha {
-        add_context("rootServerHa", "true".to_string());
-    }
-    add_context("rssBackend", rss_backend.as_ref().to_string());
-    add_context("journalType", journal_type.as_ref().to_string());
+    info!("Deploying FractalbitsVpcStack...");
+    let outputs_file = "/tmp/cdk-outputs.json";
+    run_cmd!(
+        cd $cdk_dir;
+        npx cdk deploy FractalbitsVpcStack $[context_params]
+            --outputs-file $outputs_file --require-approval never 2>&1
+    )?;
+    info!("VPC deployment completed successfully");
 
-    // Add skipUserData context for SSM-based bootstrap
-    if ssm_bootstrap {
-        add_context("skipUserData", "true".to_string());
-    }
+    // 3. Parse CDK outputs
+    let outputs = ssm_utils::parse_cdk_outputs()?;
 
-    // Add simulate-on-prem context parameters
-    if simulate_on_prem {
-        add_context("simulateOnPrem", "true".to_string());
-        add_context("skipUserData", "true".to_string()); // Skip normal bootstrap
-    }
+    // 4. Create temp Docker host
+    let subnet_id = outputs
+        .get("privateSubnetId")
+        .ok_or_else(|| std::io::Error::other("CDK output 'privateSubnetId' not found"))?;
+    let sg_id = outputs
+        .get("privateSgId")
+        .ok_or_else(|| std::io::Error::other("CDK output 'privateSgId' not found"))?;
+    let role_name = outputs
+        .get("instanceProfileName")
+        .ok_or_else(|| std::io::Error::other("CDK output 'instanceProfileName' not found"))?;
 
-    // Use generic binaries (no CPU-specific paths)
-    if use_generic_binaries {
-        add_context("useGenericBinaries", "true".to_string());
-    }
+    let docker_host = docker_host::create_docker_host(subnet_id, sg_id, role_name)?;
 
-    add_context("deployOS", deploy_os.as_ref().to_string());
+    // 5. Setup Docker on host (downloads AWS image from S3, starts container)
+    let aws_bucket = get_bootstrap_bucket_name(DeployTarget::Aws)?;
+    docker_host::setup_docker_on_host(&docker_host.instance_id, &aws_bucket, "aws")?;
 
-    // Deploy the VPC stack
-    if simulate_on_prem {
-        run_cmd! {
-            info "Deploying FractalbitsVpcStack (simulate-on-prem mode)...";
-            cd $cdk_dir;
-            npx cdk deploy FractalbitsVpcStack
-                $[context_params]
-                --outputs-file /tmp/cdk-outputs.json
-                --require-approval never 2>&1;
-            info "VPC deployment completed successfully";
-        }?;
+    // 6. Generate and upload bootstrap config to Docker S3
+    let bootstrap_config = aws_config_gen::generate_bootstrap_config(&outputs, &config)?;
+    let config_toml = bootstrap_config
+        .to_toml()
+        .map_err(|e| std::io::Error::other(format!("Failed to serialize config: {}", e)))?;
+    docker_host::upload_config_to_docker_s3(&docker_host.instance_id, &config_toml)?;
 
-        // Set up on-prem simulation
-        simulate_on_prem::setup_on_prem_simulation()?;
-        return Ok(());
-    } else if ssm_bootstrap {
-        run_cmd! {
-            info "Deploying FractalbitsVpcStack (SSM bootstrap mode)...";
-            cd $cdk_dir;
-            npx cdk deploy FractalbitsVpcStack
-                $[context_params]
-                --outputs-file /tmp/cdk-outputs.json
-                --require-approval never 2>&1;
-            info "VPC deployment completed successfully";
-        }?;
+    // 7. Bootstrap all nodes via SSM (pointing at Docker S3)
+    let instance_ids = ssm_utils::collect_all_instance_ids(&outputs)?;
+    ssm_utils::wait_for_ssm_agent_ready(&instance_ids)?;
+    ssm_bootstrap::ssm_bootstrap_from_docker(&instance_ids, &docker_host.private_ip)?;
 
-        // Bootstrap via SSM
-        ssm_bootstrap::ssm_bootstrap_cluster()?;
-    } else {
-        run_cmd! {
-            info "Deploying FractalbitsVpcStack...";
-            cd $cdk_dir;
-            npx cdk deploy FractalbitsVpcStack
-                $[context_params]
-                --require-approval never 2>&1;
-            info "VPC deployment completed successfully";
-        }?;
-    }
-
-    if watch_bootstrap {
-        bootstrap_progress::show_progress(DeployTarget::Aws)?;
+    // 8. Wait for bootstrap, then terminate Docker host
+    if config.watch_bootstrap {
+        bootstrap_progress::show_progress_from_docker(&docker_host.private_ip)?;
     } else {
         info!("To monitor bootstrap progress, run:");
         info!("  cargo xtask deploy bootstrap-progress");
     }
+
+    docker_host::terminate_docker_host(&docker_host.instance_id)?;
 
     Ok(())
 }
@@ -215,11 +146,51 @@ pub fn destroy_vpc() -> CmdResult {
     Ok(())
 }
 
+fn build_cdk_context(config: &VpcConfig) -> Vec<String> {
+    let mut params = Vec::new();
+    let mut add = |key: &str, value: String| {
+        params.push("--context".to_string());
+        params.push(format!("{}={}", key, value));
+    };
+
+    add("numApiServers", config.num_api_servers.to_string());
+    add("numBenchClients", config.num_bench_clients.to_string());
+    add("numBssNodes", config.num_bss_nodes.to_string());
+    add("bssInstanceTypes", config.bss_instance_type.clone());
+    add(
+        "apiServerInstanceType",
+        config.api_server_instance_type.clone(),
+    );
+    add(
+        "benchClientInstanceType",
+        config.bench_client_instance_type.clone(),
+    );
+    if config.with_bench {
+        add("benchType", "external".to_string());
+    }
+    if let Some(ref template_val) = config.template {
+        add("vpcTemplate", template_val.as_ref().to_string());
+    }
+    if let Some(ref az_val) = config.az {
+        add("az", az_val.clone());
+    }
+    if config.root_server_ha {
+        add("rootServerHa", "true".to_string());
+    }
+    add("rssBackend", config.rss_backend.as_ref().to_string());
+    add("journalType", config.journal_type.as_ref().to_string());
+    if config.use_generic_binaries {
+        add("useGenericBinaries", "true".to_string());
+    }
+    add("deployOS", config.deploy_os.as_ref().to_string());
+
+    params
+}
+
 fn cleanup_bootstrap_bucket() -> CmdResult {
     let bucket_name = get_bootstrap_bucket_name(DeployTarget::Aws)?;
     let bucket = format!("s3://{bucket_name}");
 
-    // Check if the bucket exists
     let bucket_exists = run_cmd!(aws s3api head-bucket --bucket $bucket_name &>/dev/null).is_ok();
     if !bucket_exists {
         info!("Bucket {bucket} does not exist, nothing to clean up");
