@@ -127,68 +127,6 @@ pub fn ssm_send_command(
     Ok(command_id.trim().to_string())
 }
 
-/// Wait for SSM command to complete on multiple instances
-pub fn wait_for_ssm_command(command_id: &str, instance_ids: &[String]) -> Result<(), Error> {
-    let start_time = Instant::now();
-    let timeout = Duration::from_secs(SSM_TIMEOUT_SECS);
-
-    info!(
-        "Waiting for SSM command {} to complete on {} instances...",
-        command_id,
-        instance_ids.len()
-    );
-
-    loop {
-        if start_time.elapsed() > timeout {
-            return Err(Error::other(format!(
-                "SSM command {} timed out after {}s",
-                command_id, SSM_TIMEOUT_SECS
-            )));
-        }
-
-        let mut all_complete = true;
-        let mut failed_instances: Vec<String> = Vec::new();
-
-        for instance_id in instance_ids {
-            let status = run_fun!(
-                aws ssm get-command-invocation
-                    --command-id $command_id
-                    --instance-id $instance_id
-                    --query "Status"
-                    --output text
-                    2>/dev/null
-            )
-            .unwrap_or_else(|_| "Pending".to_string());
-
-            let status = status.trim();
-
-            match status {
-                "Success" => {}
-                "Failed" | "Cancelled" | "TimedOut" => {
-                    failed_instances.push(format!("{}:{}", instance_id, status));
-                }
-                _ => {
-                    all_complete = false;
-                }
-            }
-        }
-
-        if !failed_instances.is_empty() {
-            return Err(Error::other(format!(
-                "SSM command failed on instances: {}",
-                failed_instances.join(", ")
-            )));
-        }
-
-        if all_complete {
-            info!("SSM command {} completed successfully", command_id);
-            return Ok(());
-        }
-
-        std::thread::sleep(Duration::from_secs(SSM_POLL_INTERVAL_SECS));
-    }
-}
-
 /// Send SSM command to a single instance and wait for completion
 pub fn ssm_run_command(instance_id: &str, command: &str, description: &str) -> CmdResult {
     ssm_run_command_with_timeout(instance_id, command, description, SSM_TIMEOUT_SECS)

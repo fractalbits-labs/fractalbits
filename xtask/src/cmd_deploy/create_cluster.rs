@@ -418,12 +418,16 @@ pub fn create_cluster(
             }
 
             let handle = std::thread::spawn(move || -> Result<(), String> {
+                // Run bootstrap in background on the remote host so SSH returns immediately.
+                // The workflow barrier system coordinates inter-node dependencies.
                 let bootstrap_cmd = format!(
-                    "export AWS_DEFAULT_REGION=localdev && \
+                    "nohup bash -c '\
+                     export AWS_DEFAULT_REGION=localdev && \
                      export AWS_ENDPOINT_URL_S3=http://{} && \
                      export AWS_ACCESS_KEY_ID=test_api_key && \
                      export AWS_SECRET_ACCESS_KEY=test_api_secret && \
-                     aws s3 cp --no-progress s3://fractalbits-bootstrap/bootstrap.sh - | sudo -E sh",
+                     aws s3 cp --no-progress s3://fractalbits-bootstrap/bootstrap.sh - | sudo -E sh\
+                     ' >> /var/log/fractalbits-bootstrap.log 2>&1 &",
                     remote_url
                 );
 
@@ -440,11 +444,11 @@ pub fn create_cluster(
                 match result {
                     Ok(status) if status.success() => Ok(()),
                     Ok(status) => Err(format!(
-                        "Bootstrap failed for {} with exit code {:?}",
+                        "SSH session failed for {} with exit code {:?}",
                         node_ip,
                         status.code()
                     )),
-                    Err(e) => Err(format!("Failed to bootstrap {}: {}", node_ip, e)),
+                    Err(e) => Err(format!("Failed to SSH to {}: {}", node_ip, e)),
                 }
             });
 
@@ -452,31 +456,33 @@ pub fn create_cluster(
         }
     }
 
-    // Wait for all bootstrap threads to complete
+    // Wait for all SSH sessions to complete (they return immediately since bootstrap is backgrounded)
     let mut errors = Vec::new();
     for (node_ip, service, handle) in handles {
         match handle.join() {
-            Ok(Ok(())) => info!("Node {} ({}) bootstrapped successfully", node_ip, service),
+            Ok(Ok(())) => info!("Bootstrap initiated on {} ({})", node_ip, service),
             Ok(Err(e)) => errors.push(e),
-            Err(_) => errors.push(format!("Bootstrap thread panicked for {}", node_ip)),
+            Err(_) => errors.push(format!("SSH thread panicked for {}", node_ip)),
         }
     }
 
     if !errors.is_empty() {
         return Err(Error::other(format!(
-            "Bootstrap failed for some nodes:\n{}",
+            "Failed to initiate bootstrap on some nodes:\n{}",
             errors.join("\n")
         )));
     }
 
-    info!("Cluster creation completed for {} nodes", total_nodes);
+    info!("Bootstrap commands sent to {} nodes", total_nodes);
 
     if watch_bootstrap {
         super::bootstrap_progress::show_progress(xtask_common::DeployTarget::OnPrem)?;
     } else {
         info!("To monitor bootstrap progress, run:");
-        info!("  cargo xtask deploy bootstrap-progress --vpc-target on-prem");
+        info!("  cargo xtask deploy bootstrap-progress --deploy-target on-prem");
     }
+
+    info!("View your deployed stack with: just describe-stack");
 
     Ok(())
 }

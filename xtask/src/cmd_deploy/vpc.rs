@@ -86,7 +86,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     ssm_utils::wait_for_ssm_agent_ready(&instance_ids)?;
     ssm_bootstrap::ssm_bootstrap_from_docker(&instance_ids, &docker_host.private_ip)?;
 
-    // 7. Wait for bootstrap, then clean up Docker on rss-A
+    // 7. Optionally watch bootstrap progress inline
     if config.watch_bootstrap {
         bootstrap_progress::show_progress_from_docker(&docker_host.instance_id)?;
     } else {
@@ -94,10 +94,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         info!("  cargo xtask deploy bootstrap-progress");
     }
 
-    // 8. Persist workflow data to AWS S3 for later inspection
-    docker_host::sync_workflow_to_aws_s3(&docker_host.instance_id, &aws_bucket)?;
-
-    docker_host::cleanup_docker_host(&docker_host.instance_id)?;
+    info!("View your deployed stack with: just describe-stack");
 
     Ok(())
 }

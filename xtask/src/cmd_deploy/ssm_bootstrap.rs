@@ -29,8 +29,7 @@ pub fn ssm_bootstrap_from_docker(instance_ids: &[String], docker_host_ip: &str) 
         "Bootstrap fractalbits (Docker)",
     )?;
 
-    info!("All instances bootstrapped successfully via SSM (Docker S3)");
-
+    info!("SSM bootstrap commands sent (not waiting for completion)");
     Ok(())
 }
 
@@ -46,8 +45,6 @@ fn send_batched_ssm_commands(
         batches.len(),
         SSM_BATCH_SIZE
     );
-
-    let mut command_results: Vec<(String, Vec<String>)> = Vec::new();
 
     for (batch_idx, batch) in batches.iter().enumerate() {
         let batch_vec: Vec<String> = batch.to_vec();
@@ -65,11 +62,6 @@ fn send_batched_ssm_commands(
             command_id,
             batch.len()
         );
-        command_results.push((command_id, batch_vec));
-    }
-
-    for (command_id, ids) in &command_results {
-        ssm_utils::wait_for_ssm_command(command_id, ids)?;
     }
 
     Ok(())

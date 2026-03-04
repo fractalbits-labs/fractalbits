@@ -38,10 +38,115 @@ pub fn bootstrap(config: &BootstrapConfig, is_leader: bool, for_bench: bool) -> 
             num_bss_nodes,
             ha_enabled,
             for_bench,
-        )
+        )?;
+        post_bootstrap_cleanup(config)?;
+        Ok(())
     } else {
         bootstrap_follower(config, nss_endpoint, ha_enabled)
     }
+}
+
+/// Post-bootstrap cleanup for the RSS leader.
+///
+/// Waits for all nodes to reach SERVICES_READY, then:
+/// - AWS: syncs workflow data from Docker S3 to real AWS S3, then cleans up Docker
+/// - On-prem: copies workflow data from Docker S3 to local filesystem
+///
+/// Errors are best-effort (logged as warnings, never fail bootstrap).
+fn post_bootstrap_cleanup(config: &BootstrapConfig) -> CmdResult {
+    let total_nodes = {
+        let blueprint = xtask_common::generate_blueprint(config);
+        blueprint
+            .stages
+            .iter()
+            .find(|s| s.name == stages::SERVICES_READY)
+            .map(|s| s.expected)
+            .unwrap_or(1)
+    };
+
+    info!("Waiting for all {total_nodes} nodes to complete SERVICES_READY before cleanup...");
+    let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Rss)?;
+    if let Err(e) = barrier.wait_for_nodes(stages::SERVICES_READY, total_nodes, 600) {
+        warn!("Timed out waiting for all nodes: {e}");
+        warn!("Proceeding with cleanup anyway");
+    }
+
+    match config.global.deploy_target {
+        DeployTarget::Aws if std::env::var("DOCKER_S3_AUTH").is_ok() => {
+            if let Err(e) = sync_workflow_to_aws_s3_and_cleanup() {
+                warn!("Post-bootstrap AWS cleanup failed (best-effort): {e}");
+            }
+        }
+        DeployTarget::OnPrem => {
+            if let Err(e) = copy_workflow_to_local() {
+                warn!("Post-bootstrap workflow copy failed (best-effort): {e}");
+            }
+        }
+        _ => {}
+    }
+
+    info!("Post-bootstrap cleanup complete");
+    Ok(())
+}
+
+/// Sync workflow data from Docker S3 to real AWS S3, then clean up Docker.
+fn sync_workflow_to_aws_s3_and_cleanup() -> CmdResult {
+    let region = get_current_aws_region()?;
+    let account_id = get_account_id()?;
+    let aws_bucket = format!("fractalbits-bootstrap-{region}-{account_id}");
+
+    info!("Syncing workflow data from Docker S3 to s3://{aws_bucket}/...");
+
+    // Download from Docker S3 (uses s3_env_overrides for credentials, AWS_ENDPOINT_URL_S3 from env)
+    let s3_env = s3_env_overrides();
+    let blueprint_src = "s3://fractalbits-bootstrap/stage_blueprint.json";
+    let workflow_src = "s3://fractalbits-bootstrap/workflow/";
+    let s3_env2 = s3_env_overrides();
+    run_cmd!($[s3_env] aws s3 cp $blueprint_src /tmp/stage_blueprint.json)?;
+    run_cmd!($[s3_env2] aws s3 sync $workflow_src /tmp/workflow/)?;
+
+    // Clear Docker S3 endpoint so real AWS S3 is used for upload.
+    // SAFETY: called after all bootstrap S3 operations are complete; no concurrent S3 access.
+    unsafe {
+        std::env::remove_var("AWS_ENDPOINT_URL_S3");
+    }
+
+    // Upload to real AWS S3 (using IAM role credentials from EC2 instance profile)
+    let blueprint_dst = format!("s3://{aws_bucket}/stage_blueprint.json");
+    let workflow_dst = format!("s3://{aws_bucket}/workflow/");
+    run_cmd!(aws s3 cp /tmp/stage_blueprint.json $blueprint_dst --region $region)?;
+    run_cmd!(aws s3 sync /tmp/workflow/ $workflow_dst --region $region)?;
+    run_cmd!(rm -rf /tmp/stage_blueprint.json /tmp/workflow/)?;
+
+    info!("Workflow data synced to s3://{aws_bucket}/");
+
+    // Clean up Docker
+    info!("Cleaning up Docker bootstrap container...");
+    let _ = run_cmd!(docker stop fractalbits-bootstrap 2>/dev/null);
+    let _ = run_cmd!(docker rm fractalbits-bootstrap 2>/dev/null);
+    let _ = run_cmd!(systemctl stop docker 2>/dev/null);
+    info!("Docker cleanup complete");
+
+    Ok(())
+}
+
+/// Copy workflow data from Docker S3 to local filesystem for on-prem.
+/// On-prem bootstrap inherits Docker S3 env vars (AWS_ENDPOINT_URL_S3, credentials),
+/// so aws s3 commands naturally hit the Docker S3 endpoint.
+fn copy_workflow_to_local() -> CmdResult {
+    let log_dir = "/var/log/fractalbits-bootstrap";
+
+    info!("Copying workflow data from Docker S3 to {log_dir}/...");
+    run_cmd!(mkdir -p $log_dir)?;
+    let blueprint_src = "s3://fractalbits-bootstrap/stage_blueprint.json";
+    let blueprint_dst = format!("{log_dir}/stage_blueprint.json");
+    let workflow_src = "s3://fractalbits-bootstrap/workflow/";
+    let workflow_dst = format!("{log_dir}/workflow/");
+    run_cmd!(aws s3 cp $blueprint_src $blueprint_dst)?;
+    run_cmd!(aws s3 sync $workflow_src $workflow_dst)?;
+
+    info!("Workflow data copied to {log_dir}/");
+    Ok(())
 }
 
 fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: bool) -> CmdResult {
