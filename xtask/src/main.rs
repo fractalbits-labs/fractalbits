@@ -246,13 +246,6 @@ pub enum DeployCommand {
 
         #[clap(
             long,
-            value_enum,
-            long_help = "Deploy target: aws (CPU-optimized) or on-prem (generic). Builds both Docker variants if not specified."
-        )]
-        deploy_target: Option<DeployTarget>,
-
-        #[clap(
-            long,
             value_delimiter = ',',
             long_help = "Zig extra build options in format: key=value,key2=value2"
         )]
@@ -821,16 +814,9 @@ async fn main() -> CmdResult {
             DeployCommand::Build {
                 target,
                 release,
-                deploy_target,
                 zig_extra_build,
                 api_server_build_env,
-            } => cmd_deploy::build(
-                target,
-                release,
-                deploy_target,
-                &zig_extra_build,
-                &api_server_build_env,
-            )?,
+            } => cmd_deploy::build(target, release, &zig_extra_build, &api_server_build_env)?,
             DeployCommand::Upload { deploy_target } => cmd_deploy::upload(deploy_target)?,
             DeployCommand::CreateVpc {
                 template,
@@ -868,9 +854,12 @@ async fn main() -> CmdResult {
                 deploy_os,
             })?,
             DeployCommand::DestroyVpc => cmd_deploy::destroy_vpc()?,
-            DeployCommand::BootstrapProgress { deploy_target } => {
-                cmd_deploy::bootstrap_progress::show_progress(deploy_target)?
-            }
+            DeployCommand::BootstrapProgress { deploy_target } => match deploy_target {
+                DeployTarget::Aws => {
+                    cmd_deploy::bootstrap_progress::show_progress_from_cdk_outputs()?
+                }
+                _ => cmd_deploy::bootstrap_progress::show_progress(deploy_target)?,
+            },
             DeployCommand::CreateCluster {
                 config,
                 bootstrap_s3_url,

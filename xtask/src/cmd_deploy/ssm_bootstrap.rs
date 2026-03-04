@@ -18,6 +18,7 @@ pub fn ssm_bootstrap_from_docker(instance_ids: &[String], docker_host_ip: &str) 
          export AWS_ENDPOINT_URL_S3=http://{docker_host_ip}:8080 && \
          export AWS_ACCESS_KEY_ID=test_api_key && \
          export AWS_SECRET_ACCESS_KEY=test_api_secret && \
+         export DOCKER_S3_AUTH=1 && \
          aws s3 cp --no-progress s3://fractalbits-bootstrap/bootstrap.sh - | bash 2>&1 | \
          tee -a /var/log/cloud-init-output.log"
     );

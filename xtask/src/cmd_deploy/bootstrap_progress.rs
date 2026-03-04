@@ -1,4 +1,5 @@
 use super::common::{DeployTarget, get_bootstrap_bucket_name};
+use super::ssm_utils;
 use crate::CmdResult;
 use cmd_lib::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -23,12 +24,12 @@ impl S3Access {
         })
     }
 
-    fn for_docker(docker_host_ip: &str) -> Self {
+    fn for_local_tunnel(local_port: u16) -> Self {
         Self {
             bucket: "fractalbits-bootstrap".to_string(),
             env_vars: vec![
                 "AWS_DEFAULT_REGION=localdev".to_string(),
-                format!("AWS_ENDPOINT_URL_S3=http://{}:8080", docker_host_ip),
+                format!("AWS_ENDPOINT_URL_S3=http://localhost:{local_port}"),
                 "AWS_ACCESS_KEY_ID=test_api_key".to_string(),
                 "AWS_SECRET_ACCESS_KEY=test_api_secret".to_string(),
             ],
@@ -87,9 +88,40 @@ pub fn show_progress(target: DeployTarget) -> CmdResult {
     show_progress_inner(&access)
 }
 
-pub fn show_progress_from_docker(docker_host_ip: &str) -> CmdResult {
-    let access = S3Access::for_docker(docker_host_ip);
-    show_progress_inner(&access)
+/// Monitor bootstrap progress via SSM port-forwarding tunnel to Docker S3.
+///
+/// Starts an SSM session that forwards a local port to port 8080 on the
+/// Docker host instance, then polls the Docker S3 for workflow stage data.
+pub fn show_progress_from_docker(docker_host_id: &str) -> CmdResult {
+    let local_port = find_available_port()?;
+    info!(
+        "Starting SSM tunnel to Docker S3 on {} (local port {})...",
+        docker_host_id, local_port
+    );
+
+    let mut tunnel = start_ssm_tunnel(docker_host_id, local_port)?;
+
+    // Wait for tunnel to be ready
+    wait_for_tunnel_ready(local_port)?;
+    info!("SSM tunnel established");
+
+    let access = S3Access::for_local_tunnel(local_port);
+    let result = show_progress_inner(&access);
+
+    // Clean up tunnel
+    let _ = tunnel.kill();
+    let _ = tunnel.wait();
+
+    result
+}
+
+/// Show bootstrap progress using the rss-A instance from CDK outputs.
+pub fn show_progress_from_cdk_outputs() -> CmdResult {
+    let outputs = ssm_utils::parse_cdk_outputs()?;
+    let rss_a_id = outputs
+        .get("rssAId")
+        .ok_or_else(|| Error::other("CDK output 'rssAId' not found"))?;
+    show_progress_from_docker(rss_a_id)
 }
 
 fn show_progress_inner(access: &S3Access) -> CmdResult {
@@ -224,4 +256,52 @@ fn show_progress_inner(access: &S3Access) -> CmdResult {
     info!("Bootstrap completed");
 
     Ok(())
+}
+
+fn find_available_port() -> Result<u16, Error> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| Error::other(format!("Failed to find available port: {e}")))?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+fn start_ssm_tunnel(instance_id: &str, local_port: u16) -> Result<std::process::Child, Error> {
+    let port_str = local_port.to_string();
+    std::process::Command::new("aws")
+        .args([
+            "ssm",
+            "start-session",
+            "--target",
+            instance_id,
+            "--document-name",
+            "AWS-StartPortForwardingSession",
+            "--parameters",
+            &format!("{{\"portNumber\":[\"8080\"],\"localPortNumber\":[\"{port_str}\"]}}"),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| Error::other(format!("Failed to start SSM tunnel: {e}")))
+}
+
+fn wait_for_tunnel_ready(local_port: u16) -> Result<(), Error> {
+    let start = Instant::now();
+    let timeout = Duration::from_secs(30);
+
+    while start.elapsed() < timeout {
+        if std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{local_port}").parse().unwrap(),
+            Duration::from_millis(500),
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    Err(Error::other(format!(
+        "SSM tunnel not ready after {timeout:?}"
+    )))
 }

@@ -722,7 +722,7 @@ fn upload_stage_blueprint(config: &BootstrapConfig) -> CmdResult {
     let bucket = config.get_bootstrap_bucket();
     let s3_path = format!("{bucket}/{STAGE_BLUEPRINT_FILE}");
     info!("Uploading {STAGE_BLUEPRINT_FILE} to {s3_path}");
-    run_cmd!(echo $blueprint_json | aws s3 cp - $s3_path --quiet)?;
+    upload_string_to_s3(&blueprint_json, &s3_path)?;
     info!("{STAGE_BLUEPRINT_FILE} uploaded successfully");
     Ok(())
 }

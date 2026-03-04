@@ -7,17 +7,15 @@ pub fn upload(deploy_target: DeployTarget) -> CmdResult {
     upload_with_endpoint(deploy_target, None)
 }
 
-/// Upload Docker images to AWS S3
+/// Build slim Docker images and binaries bundle, then upload to AWS S3.
 pub fn upload_docker_images(deploy_target: DeployTarget) -> CmdResult {
+    super::build::build_docker_images()?;
+    super::build::pack_binaries(Some(deploy_target))?;
+
     let bucket_name = get_bootstrap_bucket_name(DeployTarget::Aws)?;
-    let variant = match deploy_target {
-        DeployTarget::Aws => "aws",
-        DeployTarget::OnPrem => "onprem",
-    };
 
     // Create bucket if it doesn't exist
-    let bucket_exists =
-        run_cmd!(aws s3api head-bucket --bucket $bucket_name &>/dev/null).is_ok();
+    let bucket_exists = run_cmd!(aws s3api head-bucket --bucket $bucket_name &>/dev/null).is_ok();
     if !bucket_exists {
         run_cmd! {
             info "Creating bucket $bucket_name";
@@ -25,32 +23,32 @@ pub fn upload_docker_images(deploy_target: DeployTarget) -> CmdResult {
         }?;
     }
 
+    // Upload slim Docker images (one per arch)
     for arch in ["aarch64", "x86_64"] {
-        let image_path = format!(
-            "{}/fractalbits-{}-{}.tar.gz",
-            DOCKER_OUTPUT_DIR, variant, arch
-        );
-        if std::path::Path::new(&image_path).exists() {
-            let s3_path = format!(
-                "s3://{}/docker/fractalbits-{}-{}.tar.gz",
-                bucket_name, variant, arch
-            );
-            info!("Uploading {} {} Docker image to S3...", variant, arch);
-            run_cmd!(aws s3 cp $image_path $s3_path)?;
-        } else {
-            return Err(std::io::Error::other(format!(
-                "Docker image not found at {}. Run 'just deploy build' first.",
-                image_path
-            )));
-        }
+        let image_path = format!("{}/fractalbits-{}.tar.gz", DOCKER_OUTPUT_DIR, arch);
+        let s3_path = format!("s3://{}/docker/fractalbits-{}.tar.gz", bucket_name, arch);
+        info!("Uploading {} Docker image to S3...", arch);
+        run_cmd!(aws s3 cp $image_path $s3_path)?;
     }
+
+    // Upload binaries bundle
+    let variant = match deploy_target {
+        DeployTarget::Aws => "aws",
+        DeployTarget::OnPrem => "onprem",
+    };
+    let binaries_path = format!("{}/binaries-{}.tar.gz", DOCKER_OUTPUT_DIR, variant);
+    let s3_path = format!("s3://{}/docker/binaries-{}.tar.gz", bucket_name, variant);
+    info!("Uploading {} binaries bundle to S3...", variant);
+    run_cmd!(aws s3 cp $binaries_path $s3_path)?;
 
     Ok(())
 }
 
 pub fn upload_with_endpoint(deploy_target: DeployTarget, s3_endpoint: Option<&str>) -> CmdResult {
+    // Docker S3 always uses the simple bucket name (no region/account suffix).
+    // AWS S3 uses the qualified name to avoid cross-account collisions.
     let bucket_name = if s3_endpoint.is_some() {
-        get_bootstrap_bucket_name(deploy_target)?
+        get_bootstrap_bucket_name(DeployTarget::OnPrem)?
     } else {
         get_bootstrap_bucket_name(DeployTarget::Aws)?
     };
@@ -145,24 +143,6 @@ echo "=== Bootstrap completed at $(date) ==="
             info "Syncing UI to S3 bucket $bucket_name";
             $[env_vars] aws s3 sync prebuilt/deploy/ui "s3://$bucket_name/ui";
         }?;
-    }
-
-    // Upload Docker images if they exist (both variants, both architectures)
-    for variant in ["onprem", "aws"] {
-        for arch in ["aarch64", "x86_64"] {
-            let image_path = format!(
-                "{}/fractalbits-{}-{}.tar.gz",
-                DOCKER_OUTPUT_DIR, variant, arch
-            );
-            if std::path::Path::new(&image_path).exists() {
-                let s3_path = format!(
-                    "s3://{}/docker/fractalbits-{}-{}.tar.gz",
-                    bucket_name, variant, arch
-                );
-                info!("Uploading {} {} Docker image to S3...", variant, arch);
-                run_cmd!($[env_vars] aws s3 cp $image_path $s3_path)?;
-            }
-        }
     }
 
     info!("Syncing all binaries is done");

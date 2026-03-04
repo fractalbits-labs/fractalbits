@@ -62,6 +62,10 @@ fn generic_bootstrap() -> CmdResult {
 
     let config = config::download_and_parse(bucket_name)?;
 
+    // Clear Docker S3 test credentials from global env so DynamoDB/other AWS
+    // calls use IAM role credentials. S3 calls use inline creds via s3_env_overrides().
+    clear_docker_s3_global_credentials();
+
     // Backup config to workflow directory for progress tracking
     if let Some(cluster_id) = &config.global.workflow_cluster_id {
         let _ = backup_config_to_workflow(&config, cluster_id);
