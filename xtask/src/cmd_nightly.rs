@@ -101,7 +101,7 @@ fn run_single_nightly_test(
         }
     }
     .inspect_err(|_| {
-        let _ = run_cmd!(tail $nightly_log);
+        run_cmd! { ignore tail $nightly_log; }.ok();
     });
 
     // Stop all services regardless of test result

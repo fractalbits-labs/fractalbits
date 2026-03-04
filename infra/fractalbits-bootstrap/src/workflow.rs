@@ -164,7 +164,7 @@ impl WorkflowBarrier {
             }
 
             // Check if the file exists
-            let s3_env = s3_env_overrides();
+            let s3_env = &s3_env_overrides();
             let result =
                 run_fun!($[s3_env] aws s3api head-object --bucket $bucket --key $key 2>/dev/null);
             if result.is_ok() {
@@ -214,7 +214,7 @@ impl WorkflowBarrier {
     pub fn get_stage_completions(&self, stage: &str) -> Result<Vec<StageCompletion>, Error> {
         let stage_prefix = format!("{}/", self.stage_path(stage));
 
-        let s3_env = s3_env_overrides();
+        let s3_env = &s3_env_overrides();
         let output = run_fun!($[s3_env] aws s3 ls $stage_prefix 2>/dev/null).unwrap_or_default();
         if output.trim().is_empty() {
             return Ok(Vec::new());
@@ -227,7 +227,6 @@ impl WorkflowBarrier {
                 let filename = parts[3];
                 if filename.ends_with(".json") {
                     let s3_path = format!("{}{}", stage_prefix, filename);
-                    let s3_env = s3_env_overrides();
                     match run_fun!($[s3_env] aws s3 cp $s3_path - 2>/dev/null) {
                         Ok(content) => {
                             if let Ok(completion) =
@@ -278,7 +277,7 @@ impl WorkflowBarrier {
     pub fn get_etcd_nodes(&self) -> Result<Vec<EtcdNodeInfo>, Error> {
         let prefix = self.etcd_nodes_prefix();
 
-        let s3_env = s3_env_overrides();
+        let s3_env = &s3_env_overrides();
         let output = run_fun!($[s3_env] aws s3 ls $prefix 2>/dev/null).unwrap_or_default();
         if output.trim().is_empty() {
             return Ok(Vec::new());
@@ -291,7 +290,6 @@ impl WorkflowBarrier {
                 let filename = parts[3];
                 if filename.ends_with(".json") {
                     let s3_path = format!("{}{}", prefix, filename);
-                    let s3_env = s3_env_overrides();
                     match run_fun!($[s3_env] aws s3 cp $s3_path - 2>/dev/null) {
                         Ok(content) => {
                             if let Ok(node_info) = serde_json::from_str::<EtcdNodeInfo>(&content) {

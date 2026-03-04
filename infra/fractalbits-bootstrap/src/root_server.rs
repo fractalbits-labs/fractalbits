@@ -98,34 +98,35 @@ fn sync_workflow_to_aws_s3_and_cleanup() -> CmdResult {
     info!("Syncing workflow data from Docker S3 to s3://{aws_bucket}/...");
 
     // Download from Docker S3 (uses s3_env_overrides for credentials, AWS_ENDPOINT_URL_S3 from env)
-    let s3_env = s3_env_overrides();
+    let s3_env = &s3_env_overrides();
     let blueprint_src = "s3://fractalbits-bootstrap/stage_blueprint.json";
     let workflow_src = "s3://fractalbits-bootstrap/workflow/";
-    let s3_env2 = s3_env_overrides();
-    run_cmd!($[s3_env] aws s3 cp $blueprint_src /tmp/stage_blueprint.json)?;
-    run_cmd!($[s3_env2] aws s3 sync $workflow_src /tmp/workflow/)?;
+    run_cmd! {
+        $[s3_env] aws s3 cp $blueprint_src /tmp/stage_blueprint.json;
+        $[s3_env] aws s3 sync $workflow_src /tmp/workflow/;
+    }?;
 
-    // Clear Docker S3 endpoint so real AWS S3 is used for upload.
-    // SAFETY: called after all bootstrap S3 operations are complete; no concurrent S3 access.
-    unsafe {
-        std::env::remove_var("AWS_ENDPOINT_URL_S3");
-    }
-
-    // Upload to real AWS S3 (using IAM role credentials from EC2 instance profile)
+    // Upload to real AWS S3 (override Docker S3 endpoint with real AWS S3)
+    let real_s3_env = &vec![format!(
+        "AWS_ENDPOINT_URL_S3=https://s3.{region}.amazonaws.com"
+    )];
     let blueprint_dst = format!("s3://{aws_bucket}/stage_blueprint.json");
     let workflow_dst = format!("s3://{aws_bucket}/workflow/");
-    run_cmd!(aws s3 cp /tmp/stage_blueprint.json $blueprint_dst --region $region)?;
-    run_cmd!(aws s3 sync /tmp/workflow/ $workflow_dst --region $region)?;
-    run_cmd!(rm -rf /tmp/stage_blueprint.json /tmp/workflow/)?;
-
-    info!("Workflow data synced to s3://{aws_bucket}/");
+    run_cmd! {
+        $[real_s3_env] aws s3 cp /tmp/stage_blueprint.json $blueprint_dst --region $region;
+        $[real_s3_env] aws s3 sync /tmp/workflow/ $workflow_dst --region $region;
+        rm -rf /tmp/stage_blueprint.json /tmp/workflow/;
+        info "Workflow data synced to s3://${aws_bucket}/";
+    }?;
 
     // Clean up Docker
-    info!("Cleaning up Docker bootstrap container...");
-    let _ = run_cmd!(docker stop fractalbits-bootstrap 2>/dev/null);
-    let _ = run_cmd!(docker rm fractalbits-bootstrap 2>/dev/null);
-    let _ = run_cmd!(systemctl stop docker 2>/dev/null);
-    info!("Docker cleanup complete");
+    run_cmd! {
+        info "Cleaning up Docker bootstrap container...";
+        ignore docker stop fractalbits-bootstrap 2>/dev/null;
+        ignore docker rm fractalbits-bootstrap 2>/dev/null;
+        ignore systemctl stop docker 2>/dev/null;
+        info "Docker cleanup complete";
+    }?;
 
     Ok(())
 }
@@ -136,17 +137,17 @@ fn sync_workflow_to_aws_s3_and_cleanup() -> CmdResult {
 fn copy_workflow_to_local() -> CmdResult {
     let log_dir = "/var/log/fractalbits-bootstrap";
 
-    info!("Copying workflow data from Docker S3 to {log_dir}/...");
-    run_cmd!(mkdir -p $log_dir)?;
     let blueprint_src = "s3://fractalbits-bootstrap/stage_blueprint.json";
     let blueprint_dst = format!("{log_dir}/stage_blueprint.json");
     let workflow_src = "s3://fractalbits-bootstrap/workflow/";
     let workflow_dst = format!("{log_dir}/workflow/");
-    run_cmd!(aws s3 cp $blueprint_src $blueprint_dst)?;
-    run_cmd!(aws s3 sync $workflow_src $workflow_dst)?;
-
-    info!("Workflow data copied to {log_dir}/");
-    Ok(())
+    run_cmd! {
+        info "Copying workflow data from Docker S3 to ${log_dir}/...";
+        mkdir -p $log_dir;
+        aws s3 cp $blueprint_src $blueprint_dst;
+        aws s3 sync $workflow_src $workflow_dst;
+        info "Workflow data copied to ${log_dir}/";
+    }
 }
 
 fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: bool) -> CmdResult {

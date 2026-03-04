@@ -65,11 +65,12 @@ fn mount_fuse_with_opts(bucket: &str, read_write: bool) -> CmdResult {
 
 pub fn unmount_fuse() -> CmdResult {
     let mount_point = MOUNT_POINT;
-    if run_cmd!(fusermount3 -u $mount_point 2>/dev/null).is_err() {
-        let _ = run_cmd!(fusermount -u $mount_point 2>/dev/null);
-    }
+    run_cmd! {
+        ignore fusermount3 -u $mount_point 2>/dev/null;
+        ignore fusermount -u $mount_point 2>/dev/null;
+    }?;
     let _ = cmd_service::stop_service(ServiceName::FsServer);
-    let _ = run_cmd!(pkill -f "fs_server" 2>/dev/null);
+    run_cmd! { ignore pkill -f "fs_server" 2>/dev/null; }?;
     std::thread::sleep(Duration::from_millis(500));
     Ok(())
 }

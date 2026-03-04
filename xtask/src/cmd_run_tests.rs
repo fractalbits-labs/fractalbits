@@ -96,7 +96,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         cmd_service::start_service(ServiceName::All)?;
         let result = fs_server::run_fs_server_tests(run_fuse, run_nfs).await;
         let _ = cmd_service::stop_service(ServiceName::FsServer);
-        let _ = run_cmd!(pkill -f "fs_server" 2>/dev/null);
+        run_cmd! { ignore pkill -f "fs_server" 2>/dev/null; }?;
         cmd_service::stop_service(ServiceName::All)?;
         result
     };

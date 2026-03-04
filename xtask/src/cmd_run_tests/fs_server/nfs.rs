@@ -70,7 +70,7 @@ fn mount_nfs_with_opts(bucket: &str, read_write: bool) -> CmdResult {
         }
     }
 
-    let _ = run_cmd!(sudo umount $mount_point 2>/dev/null);
+    run_cmd! { ignore sudo umount $mount_point 2>/dev/null; }?;
     let _ = cmd_service::stop_service(ServiceName::FsServer);
     Err(std::io::Error::other(format!(
         "NFS mount at {} not ready after 7 seconds",
@@ -80,9 +80,9 @@ fn mount_nfs_with_opts(bucket: &str, read_write: bool) -> CmdResult {
 
 fn unmount_nfs() -> CmdResult {
     let mount_point = NFS_MOUNT_POINT;
-    let _ = run_cmd!(sudo umount $mount_point 2>/dev/null);
+    run_cmd! { ignore sudo umount $mount_point 2>/dev/null; }?;
     let _ = cmd_service::stop_service(ServiceName::FsServer);
-    let _ = run_cmd!(pkill -f "fs_server" 2>/dev/null);
+    run_cmd! { ignore pkill -f "fs_server" 2>/dev/null; }?;
     std::thread::sleep(Duration::from_millis(500));
     Ok(())
 }

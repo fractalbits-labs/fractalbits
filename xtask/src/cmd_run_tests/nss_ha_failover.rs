@@ -87,8 +87,10 @@ fn verify_process_running(binary_name: &str) -> bool {
 }
 
 fn kill_nss_process() -> CmdResult {
-    info!("Killing nss_server process...");
-    let _ = run_cmd!(pkill -SIGKILL nss_server);
+    run_cmd! {
+        info "Killing nss_server process...";
+        ignore pkill -SIGKILL nss_server;
+    }?;
     std::thread::sleep(Duration::from_millis(500));
     Ok(())
 }

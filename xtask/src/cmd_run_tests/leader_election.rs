@@ -99,11 +99,11 @@ impl TestProcessTracker {
         if let Some(pid) = self.process_pids.remove(instance_id) {
             info!("Killing process {instance_id} with PID {pid}");
             // Try graceful termination first
-            let _ = run_cmd!(kill $pid);
+            run_cmd! { ignore kill $pid; }?;
             // Wait a moment for graceful shutdown
             sleep(std::time::Duration::from_secs(2));
             // Force kill if still running
-            let _ = run_cmd!(kill -9 $pid);
+            run_cmd! { ignore kill -9 $pid; }?;
         }
         Ok(())
     }
@@ -112,11 +112,11 @@ impl TestProcessTracker {
         if let Some(pid) = self.process_pids.remove(instance_id) {
             info!("Gracefully terminating process {instance_id} with PID {pid}");
             // Send SIGTERM and wait longer for resignation
-            let _ = run_cmd!(kill -TERM $pid);
+            run_cmd! { ignore kill -TERM $pid; }?;
             // Wait longer for graceful shutdown and resignation
             sleep(std::time::Duration::from_secs(8));
             // Force kill if still running
-            let _ = run_cmd!(kill -9 $pid);
+            run_cmd! { ignore kill -9 $pid; }?;
         }
         Ok(())
     }
@@ -134,10 +134,9 @@ fn setup_test_table(table_name: &str, backend: RssBackend) -> CmdResult {
     match backend {
         RssBackend::Ddb => {
             // Clean up any existing table
-            let _ = run_cmd! {
-                $[LOCAL_DDB_ENVS]
-                aws dynamodb delete-table --table-name $table_name 2>/dev/null
-            };
+            run_cmd! {
+                $[LOCAL_DDB_ENVS] ignore aws dynamodb delete-table --table-name $table_name 2>/dev/null;
+            }?;
 
             // Wait longer for deletion to complete - DDB Local can be slow
             sleep(Duration::from_secs(3));
@@ -162,7 +161,7 @@ fn setup_test_table(table_name: &str, backend: RssBackend) -> CmdResult {
                 table_name.trim_start_matches("fractalbits-leader-election-test-"),
             );
             let etcdctl = resolve_etcd_bin("etcdctl");
-            let _ = run_cmd!($etcdctl del --prefix $key_prefix >/dev/null);
+            run_cmd! { ignore $etcdctl del --prefix $key_prefix >/dev/null; }?;
             sleep(Duration::from_secs(1));
         }
     }
@@ -172,20 +171,14 @@ fn setup_test_table(table_name: &str, backend: RssBackend) -> CmdResult {
 fn cleanup_test_table(table_name: &str, backend: RssBackend) -> CmdResult {
     match backend {
         RssBackend::Ddb => {
-            // First try to clear any remaining items
-            let _ = run_cmd! {
-                $[LOCAL_DDB_ENVS]
-                aws dynamodb delete-item
+            // Clear any remaining items, then delete the table
+            run_cmd! {
+                $[LOCAL_DDB_ENVS] ignore aws dynamodb delete-item
                     --table-name $table_name
                     --key "{\"key\":{\"S\":\"$LEADER_KEY\"}}"
-                    --output json | jq -c
-            };
-
-            // Then delete the table
-            let _ = run_cmd! {
-                $[LOCAL_DDB_ENVS]
-                aws dynamodb delete-table --table-name $table_name --output json | jq -c
-            };
+                    --output json | jq -c;
+                $[LOCAL_DDB_ENVS] ignore aws dynamodb delete-table --table-name $table_name --output json | jq -c;
+            }?;
 
             // Wait for cleanup to complete
             sleep(Duration::from_secs(2));
@@ -195,7 +188,7 @@ fn cleanup_test_table(table_name: &str, backend: RssBackend) -> CmdResult {
                 table_name.trim_start_matches("fractalbits-leader-election-test-"),
             );
             let etcdctl = resolve_etcd_bin("etcdctl");
-            let _ = run_cmd!($etcdctl del --prefix $key_prefix >/dev/null);
+            run_cmd! { ignore $etcdctl del --prefix $key_prefix >/dev/null; }?;
             sleep(Duration::from_secs(1));
         }
     }

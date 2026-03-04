@@ -235,7 +235,7 @@ fn run_docker_tests() -> CmdResult {
         let test_result = run_cmd!(cargo test --package api_server);
         if test_result.is_err() {
             info!("Tests failed, showing container logs...");
-            let _ = run_cmd!(docker logs fractalbits-dev 2>&1 | tail -200);
+            run_cmd! { ignore docker logs fractalbits-dev 2>&1 | tail -200; }?;
         }
         test_result?;
 

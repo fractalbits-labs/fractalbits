@@ -802,7 +802,7 @@ pub fn show_service_status(service: ServiceName) -> CmdResult {
                 let nss_services = get_nss_service_names();
                 for (i, service_name) in nss_services.iter().enumerate() {
                     println!("=== {} ===", service_name);
-                    let _ = run_cmd!(systemctl --user status $service_name.service --no-pager);
+                    run_cmd! { ignore systemctl --user status $service_name.service --no-pager; }?;
                     if i < nss_services.len() - 1 {
                         println!();
                     }
@@ -812,7 +812,7 @@ pub fn show_service_status(service: ServiceName) -> CmdResult {
                 let mirrord_services = get_mirrord_service_names();
                 for (i, service_name) in mirrord_services.iter().enumerate() {
                     println!("=== {} ===", service_name);
-                    let _ = run_cmd!(systemctl --user status $service_name.service --no-pager);
+                    run_cmd! { ignore systemctl --user status $service_name.service --no-pager; }?;
                     if i < mirrord_services.len() - 1 {
                         println!();
                     }

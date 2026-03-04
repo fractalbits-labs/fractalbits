@@ -24,7 +24,7 @@ third_party/minio/
 third_party/*.tar.gz
 
 # Claude Code configuration
-.claude/
+.claude
 
 # Python virtual environments
 .venv/

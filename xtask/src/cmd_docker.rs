@@ -154,13 +154,12 @@ fn run_docker_container(
 
 fn stop_docker_container(name: Option<&str>) -> CmdResult {
     let container_name = name.unwrap_or(DEFAULT_CONTAINER_NAME);
-    info!("Stopping Docker container: {}", container_name);
-
-    run_cmd!(docker stop $container_name)?;
-    let _ = run_cmd!(docker rm $container_name 2>/dev/null);
-
-    info!("Container stopped: {}", container_name);
-    Ok(())
+    run_cmd! {
+        info "Stopping Docker container: ${container_name}";
+        docker stop $container_name;
+        ignore docker rm $container_name 2>/dev/null;
+        info "Container stopped: ${container_name}";
+    }
 }
 
 fn show_docker_logs(name: Option<&str>, follow: bool) -> CmdResult {

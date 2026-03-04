@@ -437,7 +437,7 @@ pub fn build_docker_images() -> CmdResult {
         info!("Exporting {} image to {}...", arch, output_file);
         run_cmd!(docker save $image_tag | gzip > $output_file)?;
 
-        let _ = run_cmd!(docker rmi $image_tag 2>/dev/null);
+        run_cmd! { ignore docker rmi $image_tag 2>/dev/null; }?;
     }
 
     info!("Docker images exported to {}/", DOCKER_OUTPUT_DIR);

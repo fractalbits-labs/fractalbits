@@ -10,7 +10,7 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
 
     download_binaries(config, &["api_server"])?;
     let bootstrap_bucket = config.get_bootstrap_bucket();
-    let s3_env = s3_env_overrides();
+    let s3_env = &s3_env_overrides();
     run_cmd!($[s3_env] aws s3 cp --no-progress $bootstrap_bucket/ui $GUI_WEB_ROOT --recursive)?;
 
     api_server::create_config(config)?;

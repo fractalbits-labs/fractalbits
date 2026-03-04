@@ -171,7 +171,7 @@ pub fn clear_docker_s3_global_credentials() {
 
 pub fn download_from_s3(s3_path: &str, local_path: &str) -> CmdResult {
     info!("Downloading from {s3_path} to {local_path}");
-    let s3_env = s3_env_overrides();
+    let s3_env = &s3_env_overrides();
     run_cmd!($[s3_env] aws s3 cp --no-progress $s3_path $local_path)
 }
 
@@ -181,7 +181,7 @@ pub fn download_from_s3(s3_path: &str, local_path: &str) -> CmdResult {
 pub fn upload_string_to_s3(content: &str, s3_path: &str) -> CmdResult {
     let tmp = "/tmp/.s3_upload_tmp";
     std::fs::write(tmp, content)?;
-    let s3_env = s3_env_overrides();
+    let s3_env = &s3_env_overrides();
     let result = run_cmd!($[s3_env] aws s3 cp $tmp $s3_path --quiet);
     let _ = std::fs::remove_file(tmp);
     result
@@ -193,15 +193,16 @@ pub fn backup_config_to_workflow(config: &BootstrapConfig, cluster_id: &str) -> 
     let workflow_path = format!("{bucket}/workflow/{cluster_id}/{BOOTSTRAP_CLUSTER_CONFIG}");
 
     // Check if already backed up (only first instance needs to do this)
-    let s3_env = s3_env_overrides();
+    let s3_env = &s3_env_overrides();
     let exists = run_fun!($[s3_env] aws s3 ls $workflow_path 2>/dev/null);
     if exists.is_ok() && !exists.unwrap().trim().is_empty() {
         return Ok(());
     }
 
-    info!("Backing up bootstrap config to {workflow_path}");
-    let s3_env = s3_env_overrides();
-    run_cmd!($[s3_env] aws s3 cp $local_path $workflow_path --quiet)?;
+    run_cmd! {
+        info "Backing up bootstrap config to ${workflow_path}";
+        $[s3_env] aws s3 cp $local_path $workflow_path --quiet;
+    }?;
     Ok(())
 }
 
