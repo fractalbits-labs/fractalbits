@@ -168,6 +168,18 @@ pub async fn run_fuse_tests() -> CmdResult {
         return Err(e);
     }
 
+    println!("\n{}", "=== Test: Fsync Persistence ===".bold());
+    if let Err(e) = test_fsync_persistence().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!("\n{}", "=== Test: Truncate to Non-Zero Size ===".bold());
+    if let Err(e) = test_truncate_nonzero().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
     println!("\n{}", "=== All FUSE Tests PASSED ===".green().bold());
     Ok(())
 }
@@ -1067,5 +1079,232 @@ async fn test_rename_directory() -> CmdResult {
 
     unmount_fuse()?;
     println!("{}", "SUCCESS: Rename directory test passed".green());
+    Ok(())
+}
+
+/// Test that fsync flushes data to the backend so it survives a remount.
+async fn test_fsync_persistence() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    println!("  Step 2: Write file and fsync");
+    let file_path = format!("{}/fsync-test.txt", MOUNT_POINT);
+    let content = b"fsync persisted data";
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&file_path)
+            .map_err(|e| std::io::Error::other(format!("Failed to create file: {e}")))?;
+        file.write_all(content)
+            .map_err(|e| std::io::Error::other(format!("Failed to write: {e}")))?;
+        file.sync_all()
+            .map_err(|e| std::io::Error::other(format!("Failed to fsync: {e}")))?;
+        println!(
+            "    Written and fsynced: fsync-test.txt ({} bytes)",
+            content.len()
+        );
+    }
+
+    println!("  Step 3: Verify file is readable before remount");
+    let read_back = std::fs::read(&file_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read before remount: {e}")))?;
+    if read_back != content {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "Pre-remount mismatch: expected {} bytes, got {}",
+            content.len(),
+            read_back.len()
+        )));
+    }
+    println!("    Pre-remount read: OK");
+
+    println!("  Step 4: Remount and verify data persisted");
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket)?;
+
+    let persisted = std::fs::read(&file_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read after remount: {e}")))?;
+    if persisted != content {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "Post-remount mismatch: expected {} bytes, got {}",
+            content.len(),
+            persisted.len()
+        )));
+    }
+    println!("    Post-remount read: OK ({} bytes)", persisted.len());
+
+    println!("  Step 5: Test sync_data (fdatasync)");
+    let file_path2 = format!("{}/fdatasync-test.txt", MOUNT_POINT);
+    let content2 = b"fdatasync persisted data";
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&file_path2)
+            .map_err(|e| std::io::Error::other(format!("Failed to create file2: {e}")))?;
+        file.write_all(content2)
+            .map_err(|e| std::io::Error::other(format!("Failed to write file2: {e}")))?;
+        file.sync_data()
+            .map_err(|e| std::io::Error::other(format!("Failed to fdatasync: {e}")))?;
+        println!("    Written and fdatasynced: fdatasync-test.txt");
+    }
+
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket)?;
+
+    let persisted2 = std::fs::read(&file_path2).map_err(|e| {
+        std::io::Error::other(format!("Failed to read fdatasync file after remount: {e}"))
+    })?;
+    if persisted2 != content2 {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "fdatasync post-remount mismatch: expected {} bytes, got {}",
+            content2.len(),
+            persisted2.len()
+        )));
+    }
+    println!("    fdatasync post-remount: OK");
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: Fsync persistence test passed".green());
+    Ok(())
+}
+
+/// Test truncating a file to non-zero sizes (shrink and extend).
+async fn test_truncate_nonzero() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    println!("  Step 2: Create a file with known content");
+    let file_path = format!("{}/trunc-size.txt", MOUNT_POINT);
+    let original = b"0123456789ABCDEF";
+    std::fs::write(&file_path, original)
+        .map_err(|e| std::io::Error::other(format!("Failed to write: {e}")))?;
+    println!("    Created: trunc-size.txt ({} bytes)", original.len());
+
+    println!("  Step 3: Truncate to 10 bytes (shrink)");
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .map_err(|e| std::io::Error::other(format!("Failed to open for truncate: {e}")))?;
+        file.set_len(10)
+            .map_err(|e| std::io::Error::other(format!("Failed to set_len(10): {e}")))?;
+    }
+    let data = std::fs::read(&file_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read after shrink: {e}")))?;
+    if data != b"0123456789" {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "Shrink mismatch: expected {:?}, got {:?}",
+            "0123456789",
+            String::from_utf8_lossy(&data)
+        )));
+    }
+    println!(
+        "    Shrink to 10 bytes: OK ({:?})",
+        String::from_utf8_lossy(&data)
+    );
+
+    println!("  Step 4: Extend to 16 bytes (zero-filled)");
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .map_err(|e| std::io::Error::other(format!("Failed to open for extend: {e}")))?;
+        file.set_len(16)
+            .map_err(|e| std::io::Error::other(format!("Failed to set_len(16): {e}")))?;
+    }
+    let data = std::fs::read(&file_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read after extend: {e}")))?;
+    if data.len() != 16 {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "Extend length mismatch: expected 16, got {}",
+            data.len()
+        )));
+    }
+    if data[..10] != b"0123456789"[..] {
+        unmount_fuse()?;
+        return Err(std::io::Error::other("Extend corrupted existing data"));
+    }
+    if data[10..] != [0u8; 6] {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "Extended region not zero-filled: {:?}",
+            &data[10..]
+        )));
+    }
+    println!("    Extend to 16 bytes: OK (first 10 preserved, last 6 zeroed)");
+
+    println!("  Step 5: Truncate to zero");
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .map_err(|e| std::io::Error::other(format!("Failed to open for truncate-zero: {e}")))?;
+        file.set_len(0)
+            .map_err(|e| std::io::Error::other(format!("Failed to set_len(0): {e}")))?;
+    }
+    let data = std::fs::read(&file_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read after truncate-zero: {e}")))?;
+    if !data.is_empty() {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "Truncate-to-zero failed: got {} bytes",
+            data.len()
+        )));
+    }
+    println!("    Truncate to 0: OK (empty)");
+
+    println!("  Step 6: Verify truncated file persists after remount");
+    let file_path2 = format!("{}/trunc-persist.txt", MOUNT_POINT);
+    std::fs::write(&file_path2, b"ABCDEFGHIJKLMNOP")
+        .map_err(|e| std::io::Error::other(format!("Failed to write persist file: {e}")))?;
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path2)
+            .map_err(|e| std::io::Error::other(format!("Failed to open persist file: {e}")))?;
+        file.set_len(8)
+            .map_err(|e| std::io::Error::other(format!("Failed to truncate persist file: {e}")))?;
+        file.sync_all()
+            .map_err(|e| std::io::Error::other(format!("Failed to fsync persist file: {e}")))?;
+    }
+
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket)?;
+
+    let persisted = std::fs::read(&file_path2).map_err(|e| {
+        std::io::Error::other(format!("Failed to read persist file after remount: {e}"))
+    })?;
+    if persisted != b"ABCDEFGH" {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "Truncate+remount mismatch: expected 'ABCDEFGH', got {:?} ({} bytes)",
+            String::from_utf8_lossy(&persisted),
+            persisted.len()
+        )));
+    }
+    println!(
+        "    Truncate+fsync+remount: OK ({:?})",
+        String::from_utf8_lossy(&persisted)
+    );
+
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: Truncate to non-zero size test passed".green()
+    );
     Ok(())
 }
