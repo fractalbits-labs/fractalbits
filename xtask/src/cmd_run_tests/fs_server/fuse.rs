@@ -12,12 +12,13 @@ fn write_fs_server_env(bucket: &str, mount_point: &str, read_write: bool) -> Cmd
     let env_content = format!(
         "FS_SERVER_BUCKET_NAME={bucket}\nFS_SERVER_MOUNT_POINT={mount_point}\nFS_SERVER_READ_WRITE={read_write}\n"
     );
-    run_cmd!(mkdir -p data/etc)?;
-    std::fs::write("data/etc/fs_server.env", env_content)?;
-    Ok(())
+    run_cmd! {
+        mkdir -p data/etc;
+        echo $env_content > data/etc/fs_server.env;
+    }
 }
 
-pub fn mount_fuse(bucket: &str) -> CmdResult {
+pub fn mount_fuse_ro(bucket: &str) -> CmdResult {
     mount_fuse_with_opts(bucket, false)
 }
 
@@ -29,7 +30,6 @@ fn mount_fuse_with_opts(bucket: &str, read_write: bool) -> CmdResult {
     let mount_point = MOUNT_POINT;
 
     run_cmd!(mkdir -p $mount_point)?;
-
     write_fs_server_env(bucket, mount_point, read_write)?;
     cmd_service::init_service(
         ServiceName::FsServer,
@@ -214,40 +214,20 @@ async fn test_basic_file_read() -> CmdResult {
             .body(ByteStream::from(data.clone()))
             .send()
             .await
-            .map_err(|e| std::io::Error::other(format!("Failed to put {key}: {e}")))?;
+            .unwrap_or_else(|e| panic!("Failed to put {key}: {e}"));
         println!("    Uploaded: {} ({} bytes)", key, data.len());
     }
 
     println!("  Step 2: Mount FUSE filesystem");
-    mount_fuse(&bucket)?;
+    mount_fuse_ro(&bucket)?;
 
     println!("  Step 3: Read and verify files mount");
-    let mut passed = 0;
-    let mut failed = 0;
-
     for (key, expected_data) in &test_files {
         let fuse_path = format!("{}/{}", MOUNT_POINT, key);
-        match std::fs::read(&fuse_path) {
-            Ok(actual_data) => {
-                if actual_data == *expected_data {
-                    println!("    {}: OK ({} bytes)", key, actual_data.len());
-                    passed += 1;
-                } else {
-                    println!(
-                        "    {}: {} (expected {} bytes, got {} bytes)",
-                        key,
-                        "DATA MISMATCH".red(),
-                        expected_data.len(),
-                        actual_data.len()
-                    );
-                    failed += 1;
-                }
-            }
-            Err(e) => {
-                println!("    {}: {} ({})", key, "READ FAILED".red(), e);
-                failed += 1;
-            }
-        }
+        let actual_data =
+            std::fs::read(&fuse_path).unwrap_or_else(|e| panic!("Failed to read {key}: {e}"));
+        assert_eq!(actual_data, *expected_data, "{key}: data mismatch");
+        println!("    {}: OK ({} bytes)", key, actual_data.len());
     }
 
     unmount_fuse()?;
@@ -257,14 +237,6 @@ async fn test_basic_file_read() -> CmdResult {
         &test_files.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
     )
     .await;
-
-    if failed > 0 {
-        return Err(std::io::Error::other(format!(
-            "{} of {} file reads failed",
-            failed,
-            passed + failed
-        )));
-    }
 
     println!("{}", "SUCCESS: Basic file read test passed".green());
     Ok(())
@@ -292,16 +264,16 @@ async fn test_directory_listing() -> CmdResult {
             .body(ByteStream::from(data.into_bytes()))
             .send()
             .await
-            .map_err(|e| std::io::Error::other(format!("Failed to put {key}: {e}")))?;
+            .unwrap_or_else(|e| panic!("Failed to put {key}: {e}"));
     }
     println!("    Uploaded {} objects", keys.len());
 
     println!("  Step 2: Mount FUSE filesystem");
-    mount_fuse(&bucket)?;
+    mount_fuse_ro(&bucket)?;
 
     println!("  Step 3: Verify root directory listing");
     let root_entries: Vec<String> = std::fs::read_dir(MOUNT_POINT)
-        .map_err(|e| std::io::Error::other(format!("Failed to list root: {e}")))?
+        .expect("Failed to list root")
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
@@ -310,20 +282,17 @@ async fn test_directory_listing() -> CmdResult {
 
     let expected_root = vec!["top-level.txt", "docs", "src"];
     for expected in &expected_root {
-        if !root_entries.contains(&expected.to_string()) {
-            unmount_fuse()?;
-            cleanup_objects(&ctx, &bucket, &keys.to_vec()).await;
-            return Err(std::io::Error::other(format!(
-                "Missing root entry: {expected}"
-            )));
-        }
+        assert!(
+            root_entries.contains(&expected.to_string()),
+            "Missing root entry: {expected}"
+        );
         println!("    Found: {}", expected);
     }
 
     println!("  Step 4: Verify subdirectory listing");
     let docs_path = format!("{}/docs", MOUNT_POINT);
     let docs_entries: Vec<String> = std::fs::read_dir(&docs_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to list docs/: {e}")))?
+        .expect("Failed to list docs/")
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
@@ -331,26 +300,19 @@ async fn test_directory_listing() -> CmdResult {
     println!("    docs/ entries: {:?}", docs_entries);
 
     for expected in &["readme.md", "guide.md"] {
-        if !docs_entries.contains(&expected.to_string()) {
-            unmount_fuse()?;
-            cleanup_objects(&ctx, &bucket, &keys.to_vec()).await;
-            return Err(std::io::Error::other(format!(
-                "Missing docs/ entry: {expected}"
-            )));
-        }
+        assert!(
+            docs_entries.contains(&expected.to_string()),
+            "Missing docs/ entry: {expected}"
+        );
     }
 
     println!("  Step 5: Verify file content in subdirectory");
     let readme_path = format!("{}/docs/readme.md", MOUNT_POINT);
-    let content = std::fs::read_to_string(&readme_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read docs/readme.md: {e}")))?;
-    if content != "content of docs/readme.md" {
-        unmount_fuse()?;
-        cleanup_objects(&ctx, &bucket, &keys.to_vec()).await;
-        return Err(std::io::Error::other(format!(
-            "Content mismatch for docs/readme.md: got '{content}'"
-        )));
-    }
+    let content = std::fs::read_to_string(&readme_path).expect("Failed to read docs/readme.md");
+    assert_eq!(
+        content, "content of docs/readme.md",
+        "Content mismatch for docs/readme.md"
+    );
     println!("    docs/readme.md content: OK");
 
     unmount_fuse()?;
@@ -381,62 +343,28 @@ async fn test_large_file_read() -> CmdResult {
             .body(ByteStream::from(data))
             .send()
             .await
-            .map_err(|e| std::io::Error::other(format!("Failed to put {key}: {e}")))?;
+            .unwrap_or_else(|e| panic!("Failed to put {key}: {e}"));
         upload_keys.push(key);
         println!("    Uploaded: {} ({} bytes)", label, size);
     }
 
     println!("  Step 2: Mount FUSE filesystem");
-    mount_fuse(&bucket)?;
+    mount_fuse_ro(&bucket)?;
 
     println!("  Step 3: Read and verify large files");
-    let mut passed = 0;
-    let mut failed = 0;
-
     for (i, (label, size)) in sizes.iter().enumerate() {
         let key = &upload_keys[i];
         let expected_data = generate_test_data(key, *size);
         let fuse_path = format!("{}/{}", MOUNT_POINT, key);
-
-        match std::fs::read(&fuse_path) {
-            Ok(actual_data) => {
-                if actual_data == expected_data {
-                    println!("    {}: OK ({} bytes)", label, actual_data.len());
-                    passed += 1;
-                } else {
-                    let first_diff = actual_data
-                        .iter()
-                        .zip(expected_data.iter())
-                        .position(|(a, b)| a != b);
-                    println!(
-                        "    {}: {} (expected {} bytes, got {}, first diff at {:?})",
-                        label,
-                        "DATA MISMATCH".red(),
-                        expected_data.len(),
-                        actual_data.len(),
-                        first_diff,
-                    );
-                    failed += 1;
-                }
-            }
-            Err(e) => {
-                println!("    {}: {} ({})", label, "READ FAILED".red(), e);
-                failed += 1;
-            }
-        }
+        let actual_data =
+            std::fs::read(&fuse_path).unwrap_or_else(|e| panic!("Failed to read {key}: {e}"));
+        assert_eq!(actual_data, expected_data, "{label}: data mismatch");
+        println!("    {}: OK ({} bytes)", label, actual_data.len());
     }
 
     unmount_fuse()?;
     let key_refs: Vec<&str> = upload_keys.iter().map(|k| k.as_str()).collect();
     cleanup_objects(&ctx, &bucket, &key_refs).await;
-
-    if failed > 0 {
-        return Err(std::io::Error::other(format!(
-            "{} of {} large file reads failed",
-            failed,
-            passed + failed
-        )));
-    }
 
     println!("{}", "SUCCESS: Large file read test passed".green());
     Ok(())
@@ -457,63 +385,45 @@ async fn test_nested_directories() -> CmdResult {
             .body(ByteStream::from(data.into_bytes()))
             .send()
             .await
-            .map_err(|e| std::io::Error::other(format!("Failed to put {key}: {e}")))?;
+            .unwrap_or_else(|e| panic!("Failed to put {key}: {e}"));
     }
     println!("    Uploaded {} objects", keys.len());
 
     println!("  Step 2: Mount FUSE filesystem");
-    mount_fuse(&bucket)?;
+    mount_fuse_ro(&bucket)?;
 
     println!("  Step 3: Verify nested directory traversal");
 
     let a_path = format!("{}/a", MOUNT_POINT);
-    if !Path::new(&a_path).is_dir() {
-        unmount_fuse()?;
-        cleanup_objects(&ctx, &bucket, &keys.to_vec()).await;
-        return Err(std::io::Error::other("a/ should be a directory"));
-    }
+    assert!(Path::new(&a_path).is_dir(), "a/ should be a directory");
     println!("    a/ is a directory: OK");
 
     let top_path = format!("{}/a/top.txt", MOUNT_POINT);
-    let content = std::fs::read_to_string(&top_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read a/top.txt: {e}")))?;
-    if content != "nested:a/top.txt" {
-        unmount_fuse()?;
-        cleanup_objects(&ctx, &bucket, &keys.to_vec()).await;
-        return Err(std::io::Error::other(format!(
-            "a/top.txt content mismatch: '{content}'"
-        )));
-    }
+    let content = std::fs::read_to_string(&top_path).expect("Failed to read a/top.txt");
+    assert_eq!(content, "nested:a/top.txt", "a/top.txt content mismatch");
     println!("    a/top.txt content: OK");
 
     let deep_path = format!("{}/a/b/c/deep.txt", MOUNT_POINT);
-    let content = std::fs::read_to_string(&deep_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read a/b/c/deep.txt: {e}")))?;
-    if content != "nested:a/b/c/deep.txt" {
-        unmount_fuse()?;
-        cleanup_objects(&ctx, &bucket, &keys.to_vec()).await;
-        return Err(std::io::Error::other(format!(
-            "a/b/c/deep.txt content mismatch: '{content}'"
-        )));
-    }
+    let content = std::fs::read_to_string(&deep_path).expect("Failed to read a/b/c/deep.txt");
+    assert_eq!(
+        content, "nested:a/b/c/deep.txt",
+        "a/b/c/deep.txt content mismatch"
+    );
     println!("    a/b/c/deep.txt content: OK");
 
     let ab_path = format!("{}/a/b", MOUNT_POINT);
     let ab_entries: Vec<String> = std::fs::read_dir(&ab_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to list a/b/: {e}")))?
+        .expect("Failed to list a/b/")
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
     println!("    a/b/ entries: {:?}", ab_entries);
 
     for expected in &["c", "sibling.txt"] {
-        if !ab_entries.contains(&expected.to_string()) {
-            unmount_fuse()?;
-            cleanup_objects(&ctx, &bucket, &keys.to_vec()).await;
-            return Err(std::io::Error::other(format!(
-                "Missing a/b/ entry: {expected}"
-            )));
-        }
+        assert!(
+            ab_entries.contains(&expected.to_string()),
+            "Missing a/b/ entry: {expected}"
+        );
     }
 
     unmount_fuse()?;
@@ -535,51 +445,33 @@ async fn test_create_write_read() -> CmdResult {
     println!("  Step 2: Create and write files");
     let test_data = b"Hello from FUSE write!";
     let fuse_path = format!("{}/write-test.txt", MOUNT_POINT);
-    std::fs::write(&fuse_path, test_data)
-        .map_err(|e| std::io::Error::other(format!("Failed to write file: {e}")))?;
+    std::fs::write(&fuse_path, test_data).expect("Failed to write file");
     println!("    Written: write-test.txt ({} bytes)", test_data.len());
 
     println!("  Step 3: Read back and verify");
-    let read_back = std::fs::read(&fuse_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read back: {e}")))?;
-    if read_back != test_data {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "Data mismatch: expected {} bytes, got {}",
-            test_data.len(),
-            read_back.len()
-        )));
-    }
+    let read_back = std::fs::read(&fuse_path).expect("Failed to read back");
+    assert_eq!(read_back, test_data, "write-test.txt data mismatch");
     println!("    write-test.txt content: OK");
 
     println!("  Step 4: Write a larger file (64KB)");
     let large_data = generate_test_data("large-write", 64 * 1024);
     let large_path = format!("{}/large-write.bin", MOUNT_POINT);
-    std::fs::write(&large_path, &large_data)
-        .map_err(|e| std::io::Error::other(format!("Failed to write large file: {e}")))?;
+    std::fs::write(&large_path, &large_data).expect("Failed to write large file");
 
-    let large_read = std::fs::read(&large_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read back large file: {e}")))?;
-    if large_read != large_data {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "Large file data mismatch: expected {} bytes, got {}",
-            large_data.len(),
-            large_read.len()
-        )));
-    }
+    let large_read = std::fs::read(&large_path).expect("Failed to read back large file");
+    assert_eq!(large_read, large_data, "large-write.bin data mismatch");
     println!("    large-write.bin (64KB): OK");
 
     println!("  Step 5: Verify files appear in listing");
     let entries: Vec<String> = std::fs::read_dir(MOUNT_POINT)
-        .map_err(|e| std::io::Error::other(format!("Failed to list root: {e}")))?
+        .expect("Failed to list root")
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
-    if !entries.contains(&"write-test.txt".to_string()) {
-        unmount_fuse()?;
-        return Err(std::io::Error::other("write-test.txt not found in listing"));
-    }
+    assert!(
+        entries.contains(&"write-test.txt".to_string()),
+        "write-test.txt not found in listing"
+    );
     println!("    write-test.txt in listing: OK");
 
     unmount_fuse()?;
@@ -605,57 +497,22 @@ async fn test_large_file_write() -> CmdResult {
         let key = format!("fuse-write-{label}");
         let data = generate_test_data(&key, *size);
         let fuse_path = format!("{}/{}", MOUNT_POINT, key);
-        std::fs::write(&fuse_path, &data)
-            .map_err(|e| std::io::Error::other(format!("Failed to write {key}: {e}")))?;
+        std::fs::write(&fuse_path, &data).unwrap_or_else(|e| panic!("Failed to write {key}: {e}"));
         keys.push((key, data));
         println!("    Written: {} ({} bytes)", label, size);
     }
 
     println!("  Step 3: Read back and verify");
-    let mut passed = 0;
-    let mut failed = 0;
-
     for (i, (label, _)) in sizes.iter().enumerate() {
         let (key, expected_data) = &keys[i];
         let fuse_path = format!("{}/{}", MOUNT_POINT, key);
-
-        match std::fs::read(&fuse_path) {
-            Ok(actual_data) => {
-                if actual_data == *expected_data {
-                    println!("    {}: OK ({} bytes)", label, actual_data.len());
-                    passed += 1;
-                } else {
-                    let first_diff = actual_data
-                        .iter()
-                        .zip(expected_data.iter())
-                        .position(|(a, b)| a != b);
-                    println!(
-                        "    {}: {} (expected {} bytes, got {}, first diff at {:?})",
-                        label,
-                        "DATA MISMATCH".red(),
-                        expected_data.len(),
-                        actual_data.len(),
-                        first_diff,
-                    );
-                    failed += 1;
-                }
-            }
-            Err(e) => {
-                println!("    {}: {} ({})", label, "READ FAILED".red(), e);
-                failed += 1;
-            }
-        }
+        let actual_data =
+            std::fs::read(&fuse_path).unwrap_or_else(|e| panic!("Failed to read {key}: {e}"));
+        assert_eq!(actual_data, *expected_data, "{label}: data mismatch");
+        println!("    {}: OK ({} bytes)", label, actual_data.len());
     }
 
     unmount_fuse()?;
-
-    if failed > 0 {
-        return Err(std::io::Error::other(format!(
-            "{} of {} FUSE large file writes failed",
-            failed,
-            passed + failed
-        )));
-    }
 
     println!("{}", "SUCCESS: Large file write test passed".green());
     Ok(())
@@ -669,52 +526,31 @@ async fn test_mkdir_rmdir() -> CmdResult {
 
     println!("  Step 2: Create directory");
     let dir_path = format!("{}/testdir", MOUNT_POINT);
-    std::fs::create_dir(&dir_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to mkdir: {e}")))?;
+    std::fs::create_dir(&dir_path).expect("Failed to mkdir");
     println!("    Created: testdir/");
 
-    if !Path::new(&dir_path).is_dir() {
-        unmount_fuse()?;
-        return Err(std::io::Error::other("testdir/ is not a directory"));
-    }
+    assert!(Path::new(&dir_path).is_dir(), "testdir/ is not a directory");
     println!("    testdir/ is a directory: OK");
 
     println!("  Step 3: Remove empty directory");
-    std::fs::remove_dir(&dir_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to rmdir: {e}")))?;
+    std::fs::remove_dir(&dir_path).expect("Failed to rmdir");
     println!("    Removed: testdir/");
 
-    if Path::new(&dir_path).exists() {
-        unmount_fuse()?;
-        return Err(std::io::Error::other("testdir/ still exists after rmdir"));
-    }
+    assert!(
+        !Path::new(&dir_path).exists(),
+        "testdir/ still exists after rmdir"
+    );
     println!("    testdir/ gone: OK");
 
     println!("  Step 4: Verify non-empty rmdir fails");
     let dir2_path = format!("{}/testdir2", MOUNT_POINT);
-    std::fs::create_dir(&dir2_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to mkdir testdir2: {e}")))?;
+    std::fs::create_dir(&dir2_path).expect("Failed to mkdir testdir2");
     let file_in_dir = format!("{}/testdir2/file.txt", MOUNT_POINT);
-    std::fs::write(&file_in_dir, b"content")
-        .map_err(|e| std::io::Error::other(format!("Failed to write file in dir: {e}")))?;
+    std::fs::write(&file_in_dir, b"content").expect("Failed to write file in dir");
 
-    match std::fs::remove_dir(&dir2_path) {
-        Err(e) if e.raw_os_error() == Some(39) => {
-            println!("    Non-empty rmdir correctly returned ENOTEMPTY");
-        }
-        Err(e) => {
-            println!(
-                "    Non-empty rmdir returned error: {} (expected ENOTEMPTY)",
-                e
-            );
-        }
-        Ok(()) => {
-            unmount_fuse()?;
-            return Err(std::io::Error::other(
-                "Non-empty rmdir should have failed but succeeded",
-            ));
-        }
-    }
+    let err = std::fs::remove_dir(&dir2_path).expect_err("Non-empty rmdir should fail");
+    assert_eq!(err.raw_os_error(), Some(39), "Expected ENOTEMPTY");
+    println!("    Non-empty rmdir correctly returned ENOTEMPTY");
 
     unmount_fuse()?;
     println!("{}", "SUCCESS: Mkdir/rmdir test passed".green());
@@ -729,25 +565,18 @@ async fn test_unlink() -> CmdResult {
 
     println!("  Step 2: Create file then unlink");
     let file_path = format!("{}/to-delete.txt", MOUNT_POINT);
-    std::fs::write(&file_path, b"delete me")
-        .map_err(|e| std::io::Error::other(format!("Failed to write: {e}")))?;
+    std::fs::write(&file_path, b"delete me").expect("Failed to write");
     println!("    Created: to-delete.txt");
 
-    if !Path::new(&file_path).exists() {
-        unmount_fuse()?;
-        return Err(std::io::Error::other("to-delete.txt should exist"));
-    }
+    assert!(Path::new(&file_path).exists(), "to-delete.txt should exist");
 
-    std::fs::remove_file(&file_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to unlink: {e}")))?;
+    std::fs::remove_file(&file_path).expect("Failed to unlink");
     println!("    Unlinked: to-delete.txt");
 
-    if Path::new(&file_path).exists() {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(
-            "to-delete.txt still exists after unlink",
-        ));
-    }
+    assert!(
+        !Path::new(&file_path).exists(),
+        "to-delete.txt still exists after unlink"
+    );
     println!("    to-delete.txt gone: OK");
 
     unmount_fuse()?;
@@ -765,28 +594,20 @@ async fn test_rename() -> CmdResult {
     let src_path = format!("{}/original.txt", MOUNT_POINT);
     let dst_path = format!("{}/renamed.txt", MOUNT_POINT);
     let content = b"rename me";
-    std::fs::write(&src_path, content)
-        .map_err(|e| std::io::Error::other(format!("Failed to write: {e}")))?;
+    std::fs::write(&src_path, content).expect("Failed to write");
     println!("    Created: original.txt");
 
-    std::fs::rename(&src_path, &dst_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to rename: {e}")))?;
+    std::fs::rename(&src_path, &dst_path).expect("Failed to rename");
     println!("    Renamed: original.txt -> renamed.txt");
 
-    if Path::new(&src_path).exists() {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(
-            "original.txt still exists after rename",
-        ));
-    }
+    assert!(
+        !Path::new(&src_path).exists(),
+        "original.txt still exists after rename"
+    );
     println!("    original.txt gone: OK");
 
-    let read_back = std::fs::read(&dst_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read renamed file: {e}")))?;
-    if read_back != content {
-        unmount_fuse()?;
-        return Err(std::io::Error::other("renamed.txt content mismatch"));
-    }
+    let read_back = std::fs::read(&dst_path).expect("Failed to read renamed file");
+    assert_eq!(read_back, content, "renamed.txt content mismatch");
     println!("    renamed.txt content: OK");
 
     unmount_fuse()?;
@@ -803,42 +624,34 @@ async fn test_unlink_open_handle() -> CmdResult {
     println!("  Step 2: Create file and open a read handle");
     let file_path = format!("{}/open-del.txt", MOUNT_POINT);
     let content = b"still readable after unlink";
-    std::fs::write(&file_path, content)
-        .map_err(|e| std::io::Error::other(format!("Failed to write: {e}")))?;
+    std::fs::write(&file_path, content).expect("Failed to write");
     println!("    Created: open-del.txt");
 
-    let mut file = std::fs::File::open(&file_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to open: {e}")))?;
+    let mut file = std::fs::File::open(&file_path).expect("Failed to open");
     println!("    Opened read handle");
 
     println!("  Step 3: Unlink while handle is open");
-    std::fs::remove_file(&file_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to unlink: {e}")))?;
+    std::fs::remove_file(&file_path).expect("Failed to unlink");
     println!("    Unlinked: open-del.txt");
 
-    if Path::new(&file_path).exists() {
-        drop(file);
-        unmount_fuse()?;
-        return Err(std::io::Error::other(
-            "open-del.txt still exists after unlink",
-        ));
-    }
+    assert!(
+        !Path::new(&file_path).exists(),
+        "open-del.txt still exists after unlink"
+    );
     println!("    Path is gone (ENOENT): OK");
 
     println!("  Step 4: Read from open handle after unlink");
     use std::io::Read;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)
-        .map_err(|e| std::io::Error::other(format!("Failed to read from open handle: {e}")))?;
-    if buf != content {
-        drop(file);
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "Content mismatch from open handle: expected {} bytes, got {}",
-            content.len(),
-            buf.len()
-        )));
-    }
+        .expect("Failed to read from open handle");
+    assert_eq!(
+        buf,
+        content,
+        "Content mismatch from open handle: expected {} bytes, got {}",
+        content.len(),
+        buf.len()
+    );
     println!("    Read from open handle: OK ({} bytes)", buf.len());
 
     drop(file);
@@ -858,8 +671,7 @@ async fn test_overwrite_existing() -> CmdResult {
     println!("  Step 2: Create original file");
     let file_path = format!("{}/overwrite.txt", MOUNT_POINT);
     let original = b"0123456789";
-    std::fs::write(&file_path, original)
-        .map_err(|e| std::io::Error::other(format!("Failed to write original: {e}")))?;
+    std::fs::write(&file_path, original).expect("Failed to write original");
     println!("    Created: overwrite.txt (10 bytes)");
 
     println!("  Step 3: Partial overwrite at offset 3");
@@ -868,28 +680,23 @@ async fn test_overwrite_existing() -> CmdResult {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(&file_path)
-            .map_err(|e| std::io::Error::other(format!("Failed to open for write: {e}")))?;
-        file.seek(SeekFrom::Start(3))
-            .map_err(|e| std::io::Error::other(format!("Failed to seek: {e}")))?;
-        file.write_all(b"XYZ")
-            .map_err(|e| std::io::Error::other(format!("Failed to write: {e}")))?;
-        file.flush()
-            .map_err(|e| std::io::Error::other(format!("Failed to flush: {e}")))?;
+            .expect("Failed to open for write");
+        file.seek(SeekFrom::Start(3)).expect("Failed to seek");
+        file.write_all(b"XYZ").expect("Failed to write");
+        file.flush().expect("Failed to flush");
     }
     println!("    Wrote 'XYZ' at offset 3");
 
     println!("  Step 4: Verify merged content");
-    let result = std::fs::read(&file_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read back: {e}")))?;
+    let result = std::fs::read(&file_path).expect("Failed to read back");
     let expected = b"012XYZ6789";
-    if result != expected {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "Content mismatch: expected {:?}, got {:?}",
-            String::from_utf8_lossy(expected),
-            String::from_utf8_lossy(&result)
-        )));
-    }
+    assert_eq!(
+        result,
+        expected,
+        "Content mismatch: expected {:?}, got {:?}",
+        String::from_utf8_lossy(expected),
+        String::from_utf8_lossy(&result)
+    );
     println!(
         "    Content after overwrite: OK ({:?})",
         String::from_utf8_lossy(&result)
@@ -909,46 +716,24 @@ async fn test_rename_noreplace() -> CmdResult {
     println!("  Step 2: Create source and destination files");
     let src_path = format!("{}/rename-src.txt", MOUNT_POINT);
     let dst_path = format!("{}/rename-dst.txt", MOUNT_POINT);
-    std::fs::write(&src_path, b"source content")
-        .map_err(|e| std::io::Error::other(format!("Failed to write src: {e}")))?;
-    std::fs::write(&dst_path, b"destination content")
-        .map_err(|e| std::io::Error::other(format!("Failed to write dst: {e}")))?;
+    std::fs::write(&src_path, b"source content").expect("Failed to write src");
+    std::fs::write(&dst_path, b"destination content").expect("Failed to write dst");
     println!("    Created: rename-src.txt and rename-dst.txt");
 
     println!("  Step 3: Rename with existing destination should return EEXIST");
-    match std::fs::rename(&src_path, &dst_path) {
-        Err(e) if e.raw_os_error() == Some(17) => {
-            println!("    Rename correctly returned EEXIST");
-        }
-        Err(e) => {
-            unmount_fuse()?;
-            return Err(std::io::Error::other(format!(
-                "Expected EEXIST, got error: {} (raw_os_error={:?})",
-                e,
-                e.raw_os_error()
-            )));
-        }
-        Ok(()) => {
-            unmount_fuse()?;
-            return Err(std::io::Error::other(
-                "Rename should have failed with EEXIST but succeeded",
-            ));
-        }
-    }
+    let err =
+        std::fs::rename(&src_path, &dst_path).expect_err("Rename should have failed with EEXIST");
+    assert_eq!(err.raw_os_error(), Some(17), "Expected EEXIST");
+    println!("    Rename correctly returned EEXIST");
 
     println!("  Step 4: Verify both files are unchanged");
-    let src_data = std::fs::read(&src_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read src: {e}")))?;
-    let dst_data = std::fs::read(&dst_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read dst: {e}")))?;
-    if src_data != b"source content" {
-        unmount_fuse()?;
-        return Err(std::io::Error::other("Source file content changed"));
-    }
-    if dst_data != b"destination content" {
-        unmount_fuse()?;
-        return Err(std::io::Error::other("Destination file content changed"));
-    }
+    let src_data = std::fs::read(&src_path).expect("Failed to read src");
+    let dst_data = std::fs::read(&dst_path).expect("Failed to read dst");
+    assert_eq!(src_data, b"source content", "Source file content changed");
+    assert_eq!(
+        dst_data, b"destination content",
+        "Destination file content changed"
+    );
     println!("    Both files unchanged: OK");
 
     unmount_fuse()?;
@@ -967,26 +752,16 @@ async fn test_truncate_write() -> CmdResult {
 
     println!("  Step 2: Create original file");
     let file_path = format!("{}/trunc.txt", MOUNT_POINT);
-    std::fs::write(&file_path, b"original long content here")
-        .map_err(|e| std::io::Error::other(format!("Failed to write original: {e}")))?;
+    std::fs::write(&file_path, b"original long content here").expect("Failed to write original");
     println!("    Created: trunc.txt (26 bytes)");
 
     println!("  Step 3: Overwrite with O_TRUNC (shorter content)");
-    std::fs::write(&file_path, b"short")
-        .map_err(|e| std::io::Error::other(format!("Failed to truncate-write: {e}")))?;
+    std::fs::write(&file_path, b"short").expect("Failed to truncate-write");
     println!("    Wrote 'short' with O_TRUNC");
 
     println!("  Step 4: Verify truncated content");
-    let result = std::fs::read(&file_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read back: {e}")))?;
-    if result != b"short" {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "Content mismatch: expected 'short', got {:?} ({} bytes)",
-            String::from_utf8_lossy(&result),
-            result.len()
-        )));
-    }
+    let result = std::fs::read(&file_path).expect("Failed to read back");
+    assert_eq!(result, b"short", "Content mismatch after truncate");
     println!(
         "    Content after truncate: OK ({:?})",
         String::from_utf8_lossy(&result)
@@ -1005,46 +780,37 @@ async fn test_write_in_subdirectory() -> CmdResult {
 
     println!("  Step 2: Create subdirectory");
     let dir_path = format!("{}/subdir", MOUNT_POINT);
-    std::fs::create_dir(&dir_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to mkdir: {e}")))?;
+    std::fs::create_dir(&dir_path).expect("Failed to mkdir");
     println!("    Created: subdir/");
 
     println!("  Step 3: Write files into subdirectory");
     let file1 = format!("{}/subdir/file1.txt", MOUNT_POINT);
     let file2 = format!("{}/subdir/file2.txt", MOUNT_POINT);
-    std::fs::write(&file1, b"content one")
-        .map_err(|e| std::io::Error::other(format!("Failed to write file1: {e}")))?;
-    std::fs::write(&file2, b"content two")
-        .map_err(|e| std::io::Error::other(format!("Failed to write file2: {e}")))?;
+    std::fs::write(&file1, b"content one").expect("Failed to write file1");
+    std::fs::write(&file2, b"content two").expect("Failed to write file2");
     println!("    Written: subdir/file1.txt and subdir/file2.txt");
 
     println!("  Step 4: Read back and verify");
-    let data1 = std::fs::read(&file1)
-        .map_err(|e| std::io::Error::other(format!("Failed to read file1: {e}")))?;
-    let data2 = std::fs::read(&file2)
-        .map_err(|e| std::io::Error::other(format!("Failed to read file2: {e}")))?;
-    if data1 != b"content one" || data2 != b"content two" {
-        unmount_fuse()?;
-        return Err(std::io::Error::other("Subdirectory file content mismatch"));
-    }
+    let data1 = std::fs::read(&file1).expect("Failed to read file1");
+    let data2 = std::fs::read(&file2).expect("Failed to read file2");
+    assert_eq!(data1, b"content one", "file1 content mismatch");
+    assert_eq!(data2, b"content two", "file2 content mismatch");
     println!("    Content verified: OK");
 
     println!("  Step 5: Remount and verify subdirectory listing");
     unmount_fuse()?;
     mount_fuse_rw(&bucket)?;
     let entries: Vec<String> = std::fs::read_dir(&dir_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to list subdir: {e}")))?
+        .expect("Failed to list subdir")
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
     println!("    Listing: {:?}", entries);
     for expected in &["file1.txt", "file2.txt"] {
-        if !entries.contains(&expected.to_string()) {
-            unmount_fuse()?;
-            return Err(std::io::Error::other(format!(
-                "Missing entry in subdir listing: {expected}"
-            )));
-        }
+        assert!(
+            entries.contains(&expected.to_string()),
+            "Missing entry in subdir listing: {expected}"
+        );
     }
 
     unmount_fuse()?;
@@ -1060,33 +826,26 @@ async fn test_rename_directory() -> CmdResult {
 
     println!("  Step 2: Create directory with files");
     let src_dir = format!("{}/srcdir", MOUNT_POINT);
-    std::fs::create_dir(&src_dir)
-        .map_err(|e| std::io::Error::other(format!("Failed to mkdir srcdir: {e}")))?;
+    std::fs::create_dir(&src_dir).expect("Failed to mkdir srcdir");
     let child_file = format!("{}/srcdir/child.txt", MOUNT_POINT);
-    std::fs::write(&child_file, b"child content")
-        .map_err(|e| std::io::Error::other(format!("Failed to write child: {e}")))?;
+    std::fs::write(&child_file, b"child content").expect("Failed to write child");
     println!("    Created: srcdir/child.txt");
 
     println!("  Step 3: Rename directory");
     let dst_dir = format!("{}/dstdir", MOUNT_POINT);
-    std::fs::rename(&src_dir, &dst_dir)
-        .map_err(|e| std::io::Error::other(format!("Failed to rename dir: {e}")))?;
+    std::fs::rename(&src_dir, &dst_dir).expect("Failed to rename dir");
     println!("    Renamed: srcdir/ -> dstdir/");
 
-    if Path::new(&src_dir).exists() {
-        unmount_fuse()?;
-        return Err(std::io::Error::other("srcdir still exists after rename"));
-    }
+    assert!(
+        !Path::new(&src_dir).exists(),
+        "srcdir still exists after rename"
+    );
     println!("    srcdir/ gone: OK");
 
     println!("  Step 4: Verify child at new path");
     let new_child = format!("{}/dstdir/child.txt", MOUNT_POINT);
-    let data = std::fs::read(&new_child)
-        .map_err(|e| std::io::Error::other(format!("Failed to read dstdir/child.txt: {e}")))?;
-    if data != b"child content" {
-        unmount_fuse()?;
-        return Err(std::io::Error::other("dstdir/child.txt content mismatch"));
-    }
+    let data = std::fs::read(&new_child).expect("Failed to read dstdir/child.txt");
+    assert_eq!(data, b"child content", "dstdir/child.txt content mismatch");
     println!("    dstdir/child.txt content: OK");
 
     unmount_fuse()?;
@@ -1106,62 +865,41 @@ async fn test_dd_fsync() -> CmdResult {
     run_cmd!(dd if=/dev/zero of=$dd_path bs=4096 count=100 conv=fsync 2>&1)?;
 
     println!("  Step 3: Verify file size");
-    let meta = std::fs::metadata(&dd_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to stat dd-test: {e}")))?;
-    if meta.len() != 409600 {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "dd-test size mismatch: expected 409600, got {}",
-            meta.len()
-        )));
-    }
+    let meta = std::fs::metadata(&dd_path).expect("Failed to stat dd-test");
+    assert_eq!(meta.len(), 409600, "dd-test size mismatch");
     println!("    dd-test size: OK (409600 bytes)");
 
     println!("  Step 4: Verify all bytes are zero");
-    let data = std::fs::read(&dd_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read dd-test: {e}")))?;
-    if data.iter().any(|&b| b != 0) {
-        unmount_fuse()?;
-        return Err(std::io::Error::other("dd-test contains non-zero bytes"));
-    }
+    let data = std::fs::read(&dd_path).expect("Failed to read dd-test");
+    assert!(
+        data.iter().all(|&b| b == 0),
+        "dd-test contains non-zero bytes"
+    );
     println!("    dd-test content: OK (all zeros)");
 
     println!("  Step 5: Remount and verify persistence");
     unmount_fuse()?;
     mount_fuse_rw(&bucket)?;
 
-    let persisted = std::fs::metadata(&dd_path)
-        .map_err(|e| std::io::Error::other(format!("dd-test gone after remount: {e}")))?;
-    if persisted.len() != 409600 {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "dd-test size after remount: expected 409600, got {}",
-            persisted.len()
-        )));
-    }
-    let persisted_data = std::fs::read(&dd_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read dd-test after remount: {e}")))?;
-    if persisted_data.iter().any(|&b| b != 0) {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(
-            "dd-test contains non-zero bytes after remount",
-        ));
-    }
+    let persisted = std::fs::metadata(&dd_path).expect("dd-test gone after remount");
+    assert_eq!(
+        persisted.len(),
+        409600,
+        "dd-test size after remount mismatch"
+    );
+    let persisted_data = std::fs::read(&dd_path).expect("Failed to read dd-test after remount");
+    assert!(
+        persisted_data.iter().all(|&b| b == 0),
+        "dd-test contains non-zero bytes after remount"
+    );
     println!("    dd-test after remount: OK (409600 bytes, all zeros)");
 
     println!("  Step 6: dd with urandom pattern");
     let urandom_path = format!("{}/dd-urandom", MOUNT_POINT);
     run_cmd!(dd if=/dev/urandom of=$urandom_path bs=4096 count=10 conv=fsync 2>&1)?;
 
-    let urandom_data = std::fs::read(&urandom_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read dd-urandom: {e}")))?;
-    if urandom_data.len() != 40960 {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "dd-urandom size mismatch: expected 40960, got {}",
-            urandom_data.len()
-        )));
-    }
+    let urandom_data = std::fs::read(&urandom_path).expect("Failed to read dd-urandom");
+    assert_eq!(urandom_data.len(), 40960, "dd-urandom size mismatch");
     println!("    dd-urandom size: OK (40960 bytes)");
 
     unmount_fuse()?;
@@ -1182,8 +920,7 @@ async fn test_mmap_write() -> CmdResult {
     let file_path = format!("{}/mmap-test.bin", MOUNT_POINT);
     let size: usize = 4096;
     let original = vec![b'A'; size];
-    std::fs::write(&file_path, &original)
-        .map_err(|e| std::io::Error::other(format!("Failed to write mmap-test.bin: {e}")))?;
+    std::fs::write(&file_path, &original).expect("Failed to write mmap-test.bin");
     println!("    Created: mmap-test.bin ({} bytes)", size);
 
     println!("  Step 3: mmap the file and modify bytes");
@@ -1192,7 +929,7 @@ async fn test_mmap_write() -> CmdResult {
             .read(true)
             .write(true)
             .open(&file_path)
-            .map_err(|e| std::io::Error::other(format!("Failed to open for mmap: {e}")))?;
+            .expect("Failed to open for mmap");
         let fd = file.as_raw_fd();
 
         unsafe {
@@ -1204,13 +941,12 @@ async fn test_mmap_write() -> CmdResult {
                 fd,
                 0,
             );
-            if ptr == libc::MAP_FAILED {
-                unmount_fuse()?;
-                return Err(std::io::Error::other(format!(
-                    "mmap failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
+            assert_ne!(
+                ptr,
+                libc::MAP_FAILED,
+                "mmap failed: {}",
+                std::io::Error::last_os_error()
+            );
 
             // Write 'X' at offsets 0, 100, 1000, 4095
             let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
@@ -1220,14 +956,7 @@ async fn test_mmap_write() -> CmdResult {
             slice[4095] = b'X';
 
             let ret = libc::msync(ptr, size, libc::MS_SYNC);
-            if ret != 0 {
-                libc::munmap(ptr, size);
-                unmount_fuse()?;
-                return Err(std::io::Error::other(format!(
-                    "msync failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
+            assert_eq!(ret, 0, "msync failed: {}", std::io::Error::last_os_error());
             println!("    msync: OK");
 
             libc::munmap(ptr, size);
@@ -1236,35 +965,25 @@ async fn test_mmap_write() -> CmdResult {
     println!("    mmap write + msync + munmap: OK");
 
     println!("  Step 4: Read back and verify modifications");
-    let readback = std::fs::read(&file_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read back mmap-test.bin: {e}")))?;
-    if readback.len() != size {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "mmap-test.bin size mismatch: expected {}, got {}",
-            size,
-            readback.len()
-        )));
-    }
+    let readback = std::fs::read(&file_path).expect("Failed to read back mmap-test.bin");
+    assert_eq!(readback.len(), size, "mmap-test.bin size mismatch");
 
     let modified_offsets = [0, 100, 1000, 4095];
     for &offset in &modified_offsets {
-        if readback[offset] != b'X' {
-            unmount_fuse()?;
-            return Err(std::io::Error::other(format!(
-                "mmap-test.bin[{}]: expected 'X' (0x58), got 0x{:02x}",
-                offset, readback[offset]
-            )));
-        }
+        assert_eq!(
+            readback[offset], b'X',
+            "mmap-test.bin[{}]: expected 'X' (0x58), got 0x{:02x}",
+            offset, readback[offset]
+        );
     }
     // Verify unmodified bytes are still 'A'
     for (i, &byte) in readback.iter().enumerate() {
-        if !modified_offsets.contains(&i) && byte != b'A' {
-            unmount_fuse()?;
-            return Err(std::io::Error::other(format!(
+        if !modified_offsets.contains(&i) {
+            assert_eq!(
+                byte, b'A',
                 "mmap-test.bin[{}]: expected 'A' (0x41), got 0x{:02x}",
                 i, byte
-            )));
+            );
         }
     }
     println!("    Readback verified: 4 bytes modified, rest unchanged");
@@ -1273,24 +992,18 @@ async fn test_mmap_write() -> CmdResult {
     unmount_fuse()?;
     mount_fuse_rw(&bucket)?;
 
-    let persisted = std::fs::read(&file_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read after remount: {e}")))?;
-    if persisted.len() != size {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "mmap-test.bin size after remount: expected {}, got {}",
-            size,
-            persisted.len()
-        )));
-    }
+    let persisted = std::fs::read(&file_path).expect("Failed to read after remount");
+    assert_eq!(
+        persisted.len(),
+        size,
+        "mmap-test.bin size after remount mismatch"
+    );
     for &offset in &modified_offsets {
-        if persisted[offset] != b'X' {
-            unmount_fuse()?;
-            return Err(std::io::Error::other(format!(
-                "mmap-test.bin[{}] after remount: expected 'X', got 0x{:02x}",
-                offset, persisted[offset]
-            )));
-        }
+        assert_eq!(
+            persisted[offset], b'X',
+            "mmap-test.bin[{}] after remount: expected 'X', got 0x{:02x}",
+            offset, persisted[offset]
+        );
     }
     println!("    Post-remount: OK (modifications persisted)");
 
@@ -1316,11 +1029,9 @@ async fn test_fsync_persistence() -> CmdResult {
             .write(true)
             .truncate(true)
             .open(&file_path)
-            .map_err(|e| std::io::Error::other(format!("Failed to create file: {e}")))?;
-        file.write_all(content)
-            .map_err(|e| std::io::Error::other(format!("Failed to write: {e}")))?;
-        file.sync_all()
-            .map_err(|e| std::io::Error::other(format!("Failed to fsync: {e}")))?;
+            .expect("Failed to create file");
+        file.write_all(content).expect("Failed to write");
+        file.sync_all().expect("Failed to fsync");
         println!(
             "    Written and fsynced: fsync-test.txt ({} bytes)",
             content.len()
@@ -1328,32 +1039,16 @@ async fn test_fsync_persistence() -> CmdResult {
     }
 
     println!("  Step 3: Verify file is readable before remount");
-    let read_back = std::fs::read(&file_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read before remount: {e}")))?;
-    if read_back != content {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "Pre-remount mismatch: expected {} bytes, got {}",
-            content.len(),
-            read_back.len()
-        )));
-    }
+    let read_back = std::fs::read(&file_path).expect("Failed to read before remount");
+    assert_eq!(read_back, content, "Pre-remount content mismatch");
     println!("    Pre-remount read: OK");
 
     println!("  Step 4: Remount and verify data persisted");
     unmount_fuse()?;
     mount_fuse_rw(&bucket)?;
 
-    let persisted = std::fs::read(&file_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read after remount: {e}")))?;
-    if persisted != content {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "Post-remount mismatch: expected {} bytes, got {}",
-            content.len(),
-            persisted.len()
-        )));
-    }
+    let persisted = std::fs::read(&file_path).expect("Failed to read after remount");
+    assert_eq!(persisted, content, "Post-remount content mismatch");
     println!("    Post-remount read: OK ({} bytes)", persisted.len());
 
     println!("  Step 5: Test sync_data (fdatasync)");
@@ -1366,28 +1061,21 @@ async fn test_fsync_persistence() -> CmdResult {
             .write(true)
             .truncate(true)
             .open(&file_path2)
-            .map_err(|e| std::io::Error::other(format!("Failed to create file2: {e}")))?;
-        file.write_all(content2)
-            .map_err(|e| std::io::Error::other(format!("Failed to write file2: {e}")))?;
-        file.sync_data()
-            .map_err(|e| std::io::Error::other(format!("Failed to fdatasync: {e}")))?;
+            .expect("Failed to create file2");
+        file.write_all(content2).expect("Failed to write file2");
+        file.sync_data().expect("Failed to fdatasync");
         println!("    Written and fdatasynced: fdatasync-test.txt");
     }
 
     unmount_fuse()?;
     mount_fuse_rw(&bucket)?;
 
-    let persisted2 = std::fs::read(&file_path2).map_err(|e| {
-        std::io::Error::other(format!("Failed to read fdatasync file after remount: {e}"))
-    })?;
-    if persisted2 != content2 {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "fdatasync post-remount mismatch: expected {} bytes, got {}",
-            content2.len(),
-            persisted2.len()
-        )));
-    }
+    let persisted2 =
+        std::fs::read(&file_path2).expect("Failed to read fdatasync file after remount");
+    assert_eq!(
+        persisted2, content2,
+        "fdatasync post-remount content mismatch"
+    );
     println!("    fdatasync post-remount: OK");
 
     unmount_fuse()?;
@@ -1405,8 +1093,7 @@ async fn test_truncate_nonzero() -> CmdResult {
     println!("  Step 2: Create a file with known content");
     let file_path = format!("{}/trunc-size.txt", MOUNT_POINT);
     let original = b"0123456789ABCDEF";
-    std::fs::write(&file_path, original)
-        .map_err(|e| std::io::Error::other(format!("Failed to write: {e}")))?;
+    std::fs::write(&file_path, original).expect("Failed to write");
     println!("    Created: trunc-size.txt ({} bytes)", original.len());
 
     println!("  Step 3: Truncate to 10 bytes (shrink)");
@@ -1414,20 +1101,11 @@ async fn test_truncate_nonzero() -> CmdResult {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(&file_path)
-            .map_err(|e| std::io::Error::other(format!("Failed to open for truncate: {e}")))?;
-        file.set_len(10)
-            .map_err(|e| std::io::Error::other(format!("Failed to set_len(10): {e}")))?;
+            .expect("Failed to open for truncate");
+        file.set_len(10).expect("Failed to set_len(10)");
     }
-    let data = std::fs::read(&file_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read after shrink: {e}")))?;
-    if data != b"0123456789" {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "Shrink mismatch: expected {:?}, got {:?}",
-            "0123456789",
-            String::from_utf8_lossy(&data)
-        )));
-    }
+    let data = std::fs::read(&file_path).expect("Failed to read after shrink");
+    assert_eq!(data, b"0123456789", "Shrink content mismatch");
     println!(
         "    Shrink to 10 bytes: OK ({:?})",
         String::from_utf8_lossy(&data)
@@ -1438,30 +1116,17 @@ async fn test_truncate_nonzero() -> CmdResult {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(&file_path)
-            .map_err(|e| std::io::Error::other(format!("Failed to open for extend: {e}")))?;
-        file.set_len(16)
-            .map_err(|e| std::io::Error::other(format!("Failed to set_len(16): {e}")))?;
+            .expect("Failed to open for extend");
+        file.set_len(16).expect("Failed to set_len(16)");
     }
-    let data = std::fs::read(&file_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read after extend: {e}")))?;
-    if data.len() != 16 {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "Extend length mismatch: expected 16, got {}",
-            data.len()
-        )));
-    }
-    if data[..10] != b"0123456789"[..] {
-        unmount_fuse()?;
-        return Err(std::io::Error::other("Extend corrupted existing data"));
-    }
-    if data[10..] != [0u8; 6] {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "Extended region not zero-filled: {:?}",
-            &data[10..]
-        )));
-    }
+    let data = std::fs::read(&file_path).expect("Failed to read after extend");
+    assert_eq!(data.len(), 16, "Extend length mismatch");
+    assert_eq!(
+        data[..10],
+        b"0123456789"[..],
+        "Extend corrupted existing data"
+    );
+    assert_eq!(data[10..], [0u8; 6], "Extended region not zero-filled");
     println!("    Extend to 16 bytes: OK (first 10 preserved, last 6 zeroed)");
 
     println!("  Step 5: Truncate to zero");
@@ -1469,50 +1134,39 @@ async fn test_truncate_nonzero() -> CmdResult {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(&file_path)
-            .map_err(|e| std::io::Error::other(format!("Failed to open for truncate-zero: {e}")))?;
-        file.set_len(0)
-            .map_err(|e| std::io::Error::other(format!("Failed to set_len(0): {e}")))?;
+            .expect("Failed to open for truncate-zero");
+        file.set_len(0).expect("Failed to set_len(0)");
     }
-    let data = std::fs::read(&file_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to read after truncate-zero: {e}")))?;
-    if !data.is_empty() {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "Truncate-to-zero failed: got {} bytes",
-            data.len()
-        )));
-    }
+    let data = std::fs::read(&file_path).expect("Failed to read after truncate-zero");
+    assert!(
+        data.is_empty(),
+        "Truncate-to-zero failed: got {} bytes",
+        data.len()
+    );
     println!("    Truncate to 0: OK (empty)");
 
     println!("  Step 6: Verify truncated file persists after remount");
     let file_path2 = format!("{}/trunc-persist.txt", MOUNT_POINT);
-    std::fs::write(&file_path2, b"ABCDEFGHIJKLMNOP")
-        .map_err(|e| std::io::Error::other(format!("Failed to write persist file: {e}")))?;
+    std::fs::write(&file_path2, b"ABCDEFGHIJKLMNOP").expect("Failed to write persist file");
     {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(&file_path2)
-            .map_err(|e| std::io::Error::other(format!("Failed to open persist file: {e}")))?;
-        file.set_len(8)
-            .map_err(|e| std::io::Error::other(format!("Failed to truncate persist file: {e}")))?;
-        file.sync_all()
-            .map_err(|e| std::io::Error::other(format!("Failed to fsync persist file: {e}")))?;
+            .expect("Failed to open persist file");
+        file.set_len(8).expect("Failed to truncate persist file");
+        file.sync_all().expect("Failed to fsync persist file");
     }
 
     unmount_fuse()?;
     mount_fuse_rw(&bucket)?;
 
-    let persisted = std::fs::read(&file_path2).map_err(|e| {
-        std::io::Error::other(format!("Failed to read persist file after remount: {e}"))
-    })?;
-    if persisted != b"ABCDEFGH" {
-        unmount_fuse()?;
-        return Err(std::io::Error::other(format!(
-            "Truncate+remount mismatch: expected 'ABCDEFGH', got {:?} ({} bytes)",
-            String::from_utf8_lossy(&persisted),
-            persisted.len()
-        )));
-    }
+    let persisted = std::fs::read(&file_path2).expect("Failed to read persist file after remount");
+    assert_eq!(
+        persisted,
+        b"ABCDEFGH",
+        "Truncate+remount mismatch: expected 'ABCDEFGH', got {:?}",
+        String::from_utf8_lossy(&persisted)
+    );
     println!(
         "    Truncate+fsync+remount: OK ({:?})",
         String::from_utf8_lossy(&persisted)
