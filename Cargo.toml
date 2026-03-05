@@ -128,6 +128,7 @@ urlencoding = "2"
 compio-runtime = { version = "0.11", features = ["time"] }
 compio-net = "0.11"
 compio-io = "0.9"
+libc = "0.2"
 
 # Dev dependencies
 aws-sdk-s3 = "1.65.0"

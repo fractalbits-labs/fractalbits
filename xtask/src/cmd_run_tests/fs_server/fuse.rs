@@ -168,6 +168,18 @@ pub async fn run_fuse_tests() -> CmdResult {
         return Err(e);
     }
 
+    println!("\n{}", "=== Test: dd + fsync Write ===".bold());
+    if let Err(e) = test_dd_fsync().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
+    println!("\n{}", "=== Test: mmap Write ===".bold());
+    if let Err(e) = test_mmap_write().await {
+        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+        return Err(e);
+    }
+
     println!("\n{}", "=== Test: Fsync Persistence ===".bold());
     if let Err(e) = test_fsync_persistence().await {
         eprintln!("{}: {}", "Test FAILED".red().bold(), e);
@@ -1079,6 +1091,211 @@ async fn test_rename_directory() -> CmdResult {
 
     unmount_fuse()?;
     println!("{}", "SUCCESS: Rename directory test passed".green());
+    Ok(())
+}
+
+/// Test dd-style buffered write + fsync exercises the writeback cache path.
+async fn test_dd_fsync() -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    println!("  Step 2: dd 400KB of zeros with conv=fsync");
+    let dd_path = format!("{}/dd-test", MOUNT_POINT);
+    run_cmd!(dd if=/dev/zero of=$dd_path bs=4096 count=100 conv=fsync 2>&1)?;
+
+    println!("  Step 3: Verify file size");
+    let meta = std::fs::metadata(&dd_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to stat dd-test: {e}")))?;
+    if meta.len() != 409600 {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "dd-test size mismatch: expected 409600, got {}",
+            meta.len()
+        )));
+    }
+    println!("    dd-test size: OK (409600 bytes)");
+
+    println!("  Step 4: Verify all bytes are zero");
+    let data = std::fs::read(&dd_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read dd-test: {e}")))?;
+    if data.iter().any(|&b| b != 0) {
+        unmount_fuse()?;
+        return Err(std::io::Error::other("dd-test contains non-zero bytes"));
+    }
+    println!("    dd-test content: OK (all zeros)");
+
+    println!("  Step 5: Remount and verify persistence");
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket)?;
+
+    let persisted = std::fs::metadata(&dd_path)
+        .map_err(|e| std::io::Error::other(format!("dd-test gone after remount: {e}")))?;
+    if persisted.len() != 409600 {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "dd-test size after remount: expected 409600, got {}",
+            persisted.len()
+        )));
+    }
+    let persisted_data = std::fs::read(&dd_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read dd-test after remount: {e}")))?;
+    if persisted_data.iter().any(|&b| b != 0) {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(
+            "dd-test contains non-zero bytes after remount",
+        ));
+    }
+    println!("    dd-test after remount: OK (409600 bytes, all zeros)");
+
+    println!("  Step 6: dd with urandom pattern");
+    let urandom_path = format!("{}/dd-urandom", MOUNT_POINT);
+    run_cmd!(dd if=/dev/urandom of=$urandom_path bs=4096 count=10 conv=fsync 2>&1)?;
+
+    let urandom_data = std::fs::read(&urandom_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read dd-urandom: {e}")))?;
+    if urandom_data.len() != 40960 {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "dd-urandom size mismatch: expected 40960, got {}",
+            urandom_data.len()
+        )));
+    }
+    println!("    dd-urandom size: OK (40960 bytes)");
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: dd + fsync write test passed".green());
+    Ok(())
+}
+
+/// Test mmap write via libc exercises the writeback cache mmap path.
+async fn test_mmap_write() -> CmdResult {
+    use std::os::unix::io::AsRawFd;
+
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket)?;
+
+    println!("  Step 2: Create file with known content (4096 bytes of 'A')");
+    let file_path = format!("{}/mmap-test.bin", MOUNT_POINT);
+    let size: usize = 4096;
+    let original = vec![b'A'; size];
+    std::fs::write(&file_path, &original)
+        .map_err(|e| std::io::Error::other(format!("Failed to write mmap-test.bin: {e}")))?;
+    println!("    Created: mmap-test.bin ({} bytes)", size);
+
+    println!("  Step 3: mmap the file and modify bytes");
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .map_err(|e| std::io::Error::other(format!("Failed to open for mmap: {e}")))?;
+        let fd = file.as_raw_fd();
+
+        unsafe {
+            let ptr = libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            if ptr == libc::MAP_FAILED {
+                unmount_fuse()?;
+                return Err(std::io::Error::other(format!(
+                    "mmap failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+
+            // Write 'X' at offsets 0, 100, 1000, 4095
+            let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
+            slice[0] = b'X';
+            slice[100] = b'X';
+            slice[1000] = b'X';
+            slice[4095] = b'X';
+
+            let ret = libc::msync(ptr, size, libc::MS_SYNC);
+            if ret != 0 {
+                libc::munmap(ptr, size);
+                unmount_fuse()?;
+                return Err(std::io::Error::other(format!(
+                    "msync failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            println!("    msync: OK");
+
+            libc::munmap(ptr, size);
+        }
+    }
+    println!("    mmap write + msync + munmap: OK");
+
+    println!("  Step 4: Read back and verify modifications");
+    let readback = std::fs::read(&file_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read back mmap-test.bin: {e}")))?;
+    if readback.len() != size {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "mmap-test.bin size mismatch: expected {}, got {}",
+            size,
+            readback.len()
+        )));
+    }
+
+    let modified_offsets = [0, 100, 1000, 4095];
+    for &offset in &modified_offsets {
+        if readback[offset] != b'X' {
+            unmount_fuse()?;
+            return Err(std::io::Error::other(format!(
+                "mmap-test.bin[{}]: expected 'X' (0x58), got 0x{:02x}",
+                offset, readback[offset]
+            )));
+        }
+    }
+    // Verify unmodified bytes are still 'A'
+    for (i, &byte) in readback.iter().enumerate() {
+        if !modified_offsets.contains(&i) && byte != b'A' {
+            unmount_fuse()?;
+            return Err(std::io::Error::other(format!(
+                "mmap-test.bin[{}]: expected 'A' (0x41), got 0x{:02x}",
+                i, byte
+            )));
+        }
+    }
+    println!("    Readback verified: 4 bytes modified, rest unchanged");
+
+    println!("  Step 5: Remount and verify persistence");
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket)?;
+
+    let persisted = std::fs::read(&file_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to read after remount: {e}")))?;
+    if persisted.len() != size {
+        unmount_fuse()?;
+        return Err(std::io::Error::other(format!(
+            "mmap-test.bin size after remount: expected {}, got {}",
+            size,
+            persisted.len()
+        )));
+    }
+    for &offset in &modified_offsets {
+        if persisted[offset] != b'X' {
+            unmount_fuse()?;
+            return Err(std::io::Error::other(format!(
+                "mmap-test.bin[{}] after remount: expected 'X', got 0x{:02x}",
+                offset, persisted[offset]
+            )));
+        }
+    }
+    println!("    Post-remount: OK (modifications persisted)");
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: mmap write test passed".green());
     Ok(())
 }
 
