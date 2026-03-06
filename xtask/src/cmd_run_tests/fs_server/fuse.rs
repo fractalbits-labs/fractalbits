@@ -162,6 +162,16 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     run_test!("Fsync Persistence", test_fsync_persistence);
     run_test!("Truncate to Non-Zero Size", test_truncate_nonzero);
 
+    // Disk-cache-specific tests (only run when disk_cache is enabled)
+    if disk_cache {
+        run_test!("Disk Cache Populates on Read", test_disk_cache_populates);
+        run_test!("Disk Cache Hit on Re-read", test_disk_cache_hit_reread);
+        run_test!(
+            "Disk Cache Cold Start After Remount",
+            test_disk_cache_cold_start
+        );
+    }
+
     Ok(())
 }
 
@@ -1049,6 +1059,192 @@ async fn test_fsync_persistence(disk_cache: bool) -> CmdResult {
 
     unmount_fuse()?;
     println!("{}", "SUCCESS: Fsync persistence test passed".green());
+    Ok(())
+}
+
+// ── Disk-cache-specific integration tests ──────────────────────────
+
+/// Test that reading files via FUSE populates the disk cache directory.
+async fn test_disk_cache_populates(disk_cache: bool) -> CmdResult {
+    assert!(disk_cache, "this test requires disk cache");
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    // Clean disk cache directory
+    let dc_path = disk_cache_path();
+    let _ = std::fs::remove_dir_all(&dc_path);
+
+    println!("  Step 1: Upload test file via S3 API");
+    let key = "dc-populate.bin";
+    let data = generate_test_data(key, 64 * 1024);
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(data.clone()))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("Failed to put {key}: {e}"));
+    println!("    Uploaded: {} ({} bytes)", key, data.len());
+
+    println!("  Step 2: Mount FUSE with disk cache");
+    mount_fuse_ro(&bucket, disk_cache)?;
+
+    println!("  Step 3: Read file to populate cache");
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let actual = std::fs::read(&fuse_path).expect("Failed to read via FUSE");
+    assert_eq!(actual, data, "data mismatch");
+    println!("    Read: OK ({} bytes)", actual.len());
+
+    println!("  Step 4: Verify cache files exist on disk");
+    let cache_files: Vec<_> = std::fs::read_dir(&dc_path)
+        .expect("Failed to list disk cache dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .collect();
+    assert!(
+        !cache_files.is_empty(),
+        "disk cache should contain files after a read"
+    );
+    println!(
+        "    Disk cache files: {} (expected > 0)",
+        cache_files.len()
+    );
+
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: Disk cache populates on read test passed".green()
+    );
+    Ok(())
+}
+
+/// Test that a second read of the same file is served from disk cache.
+/// Verifies by reading twice and checking the file is readable both times.
+async fn test_disk_cache_hit_reread(disk_cache: bool) -> CmdResult {
+    assert!(disk_cache, "this test requires disk cache");
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    // Clean disk cache directory
+    let dc_path = disk_cache_path();
+    let _ = std::fs::remove_dir_all(&dc_path);
+
+    println!("  Step 1: Upload test file via S3 API");
+    let key = "dc-reread.bin";
+    let data = generate_test_data(key, 128 * 1024);
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(data.clone()))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("Failed to put {key}: {e}"));
+
+    println!("  Step 2: Mount FUSE with disk cache");
+    mount_fuse_ro(&bucket, disk_cache)?;
+
+    println!("  Step 3: First read (populates cache)");
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let first_read = std::fs::read(&fuse_path).expect("Failed first read");
+    assert_eq!(first_read, data, "first read data mismatch");
+    println!("    First read: OK ({} bytes)", first_read.len());
+
+    println!("  Step 4: Second read (should hit cache)");
+    let second_read = std::fs::read(&fuse_path).expect("Failed second read");
+    assert_eq!(second_read, data, "second read data mismatch");
+    println!("    Second read: OK ({} bytes)", second_read.len());
+
+    // Verify cache directory is non-empty
+    let cache_file_count = std::fs::read_dir(&dc_path)
+        .expect("Failed to list disk cache dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .count();
+    assert!(
+        cache_file_count > 0,
+        "disk cache should have files after reads"
+    );
+    println!("    Cache files present: {}", cache_file_count);
+
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: Disk cache hit on re-read test passed".green()
+    );
+    Ok(())
+}
+
+/// Test that remounting with an existing disk cache directory performs
+/// cold-start scan and serves reads from cache.
+async fn test_disk_cache_cold_start(disk_cache: bool) -> CmdResult {
+    assert!(disk_cache, "this test requires disk cache");
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    // Clean disk cache directory
+    let dc_path = disk_cache_path();
+    let _ = std::fs::remove_dir_all(&dc_path);
+
+    println!("  Step 1: Upload test file via S3 API");
+    let key = "dc-coldstart.bin";
+    let data = generate_test_data(key, 64 * 1024);
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(data.clone()))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("Failed to put {key}: {e}"));
+
+    println!("  Step 2: Mount, read to populate cache, then unmount");
+    mount_fuse_ro(&bucket, disk_cache)?;
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let first_read = std::fs::read(&fuse_path).expect("Failed to read");
+    assert_eq!(first_read, data, "first read data mismatch");
+    println!("    Read and cached: OK ({} bytes)", first_read.len());
+
+    // Count cache files before unmount
+    let cache_count_before = std::fs::read_dir(&dc_path)
+        .expect("Failed to list disk cache dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .count();
+    println!("    Cache files before unmount: {}", cache_count_before);
+    assert!(cache_count_before > 0, "cache should have files");
+
+    unmount_fuse()?;
+
+    println!("  Step 3: Remount (cold-start scan should find cached files)");
+    mount_fuse_ro(&bucket, disk_cache)?;
+
+    // Verify cache files are still on disk (not cleaned up)
+    let cache_count_after = std::fs::read_dir(&dc_path)
+        .expect("Failed to list disk cache dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .count();
+    println!("    Cache files after remount: {}", cache_count_after);
+    assert_eq!(
+        cache_count_before, cache_count_after,
+        "cache file count changed after remount"
+    );
+
+    println!("  Step 4: Read file again (should use cached data)");
+    let second_read = std::fs::read(&fuse_path).expect("Failed to read after remount");
+    assert_eq!(second_read, data, "post-remount data mismatch");
+    println!("    Post-remount read: OK ({} bytes)", second_read.len());
+
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: Disk cache cold start after remount test passed".green()
+    );
     Ok(())
 }
 
