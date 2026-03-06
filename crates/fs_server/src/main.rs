@@ -1,6 +1,7 @@
 mod backend;
 mod cache;
 mod config;
+mod disk_cache;
 mod error;
 mod fuse_server;
 mod inode;

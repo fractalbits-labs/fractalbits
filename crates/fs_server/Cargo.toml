@@ -45,3 +45,4 @@ config.workspace = true
 rand.workspace = true
 xxhash-rust.workspace = true
 libc = "0.2"
+nix = { version = "0.31", features = ["fs"] }
