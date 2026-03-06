@@ -33,7 +33,7 @@ pub fn run_cmd_bench(
         BenchService::NssRpc => {
             *service_name = ServiceName::Nss;
             build_bench_rpc()?;
-            init_service(*service_name, build_mode, InitConfig::default())?;
+            init_service(*service_name, build_mode, &InitConfig::default())?;
             start_service(ServiceName::Bss)?;
             start_service(ServiceName::Nss)?;
             uri = "127.0.0.1:8087";
@@ -55,7 +55,7 @@ pub fn run_cmd_bench(
             init_service(
                 *service_name,
                 build_mode,
-                InitConfig {
+                &InitConfig {
                     data_blob_storage: DataBlobStorage::S3HybridSingleAz,
                     bss_count: 1,
                     ..Default::default()

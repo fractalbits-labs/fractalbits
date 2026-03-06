@@ -10,7 +10,7 @@ pub async fn run_multi_az_tests(test_type: MultiAzTestType) -> CmdResult {
         cmd_service::init_service(
             ServiceName::All,
             BuildMode::Debug,
-            InitConfig {
+            &InitConfig {
                 data_blob_storage: crate::DataBlobStorage::S3ExpressMultiAz,
                 bss_count: 0, // No BSS services in multi-AZ mode
                 ..Default::default()

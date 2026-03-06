@@ -55,7 +55,7 @@ fn run_single_nightly_test(
 
     // Initialize all services (includes nss, mirrord formatting)
     run_cmd!(info "Initializing services for nss_failover_test...")?;
-    cmd_service::init_service(ServiceName::All, BuildMode::Release, init_config)?;
+    cmd_service::init_service(ServiceName::All, BuildMode::Release, &init_config)?;
 
     // Start only etcd, rss, bss - nss/mirrord are managed by the test
     run_cmd!(info "Starting etcd, rss, bss services...")?;

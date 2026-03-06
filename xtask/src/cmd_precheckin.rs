@@ -27,21 +27,21 @@ pub fn run_cmd_precheckin(
     }
 
     if s3_api_only {
-        return run_s3_api_tests(init_config, debug_api_server);
+        return run_s3_api_tests(&init_config, debug_api_server);
     }
 
     if zig_unit_tests_only {
-        return run_zig_unit_tests(init_config);
+        return run_zig_unit_tests(&init_config);
     }
 
-    cmd_service::init_service(ServiceName::All, BuildMode::Debug, init_config)?;
-    run_zig_unit_tests(init_config)?;
+    cmd_service::init_service(ServiceName::All, BuildMode::Debug, &init_config)?;
+    run_zig_unit_tests(&init_config)?;
     run_cmd! {
         info "Run cargo tests (except s3 api and fs_server)";
         cargo test --workspace --exclude api_server --exclude fs_server;
     }?;
 
-    run_s3_api_tests(init_config, false)?;
+    run_s3_api_tests(&init_config, false)?;
 
     if with_fractal_art_tests {
         run_fractal_art_tests()?;
@@ -110,7 +110,7 @@ fn run_fractal_art_tests() -> CmdResult {
     Ok(())
 }
 
-fn run_s3_api_tests(init_config: InitConfig, debug_api_server: bool) -> CmdResult {
+fn run_s3_api_tests(init_config: &InitConfig, debug_api_server: bool) -> CmdResult {
     if debug_api_server {
         cmd_service::start_service(ServiceName::ApiServer)?;
         run_cmd! {
@@ -129,10 +129,10 @@ fn run_s3_api_tests(init_config: InitConfig, debug_api_server: bool) -> CmdResul
     // Test with DDB backend
     let ddb_config = InitConfig {
         rss_backend: RssBackend::Ddb,
-        ..init_config
+        ..init_config.clone()
     };
     info!("Testing with DDB backend...");
-    cmd_service::init_service(ServiceName::All, BuildMode::Debug, ddb_config)?;
+    cmd_service::init_service(ServiceName::All, BuildMode::Debug, &ddb_config)?;
     cmd_service::start_service(ServiceName::All)?;
     run_cmd! {
         info "Run cargo tests (s3 api tests - DDB backend)";
@@ -151,10 +151,10 @@ fn run_s3_api_tests(init_config: InitConfig, debug_api_server: bool) -> CmdResul
     // Test with etcd backend
     let etcd_config = InitConfig {
         rss_backend: RssBackend::Etcd,
-        ..init_config
+        ..init_config.clone()
     };
     info!("Testing with etcd backend...");
-    cmd_service::init_service(ServiceName::All, BuildMode::Debug, etcd_config)?;
+    cmd_service::init_service(ServiceName::All, BuildMode::Debug, &etcd_config)?;
     cmd_service::start_service(ServiceName::All)?;
     run_cmd! {
         info "Run cargo tests (s3 api tests - etcd backend)";
@@ -173,7 +173,7 @@ fn run_s3_api_tests(init_config: InitConfig, debug_api_server: bool) -> CmdResul
     Ok(())
 }
 
-pub fn run_zig_unit_tests(init_config: InitConfig) -> CmdResult {
+pub fn run_zig_unit_tests(init_config: &InitConfig) -> CmdResult {
     if !std::path::Path::new(&format!("{ZIG_REPO_PATH}/build.zig")).exists() {
         info!("Skipping zig unit-tests");
         return Ok(());

@@ -163,7 +163,7 @@ async fn test_full_stack_initialization(backend: RssBackend) -> CmdResult {
         nss_disable_restart_limit: true,
         ..Default::default()
     };
-    init_service(ServiceName::All, BuildMode::Debug, init_config)?;
+    init_service(ServiceName::All, BuildMode::Debug, &init_config)?;
     start_service(ServiceName::All)?;
 
     // Verify initial state is active_standby
@@ -754,7 +754,7 @@ async fn test_ebs_full_stack_initialization(backend: RssBackend) -> CmdResult {
         nss_disable_restart_limit: true,
         ..Default::default()
     };
-    init_service(ServiceName::All, BuildMode::Debug, init_config)?;
+    init_service(ServiceName::All, BuildMode::Debug, &init_config)?;
     start_service(ServiceName::All)?;
 
     let state = wait_for_observer_state(backend, ObserverState::ActiveStandby, 15);

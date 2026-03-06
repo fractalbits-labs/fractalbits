@@ -19,7 +19,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
             rss_backend: RssBackend::Ddb,
             ..Default::default()
         };
-        cmd_service::init_service(ServiceName::All, BuildMode::Debug, ddb_config)?;
+        cmd_service::init_service(ServiceName::All, BuildMode::Debug, &ddb_config)?;
         cmd_service::start_service(ServiceName::DdbLocal)?;
         leader_election::run_leader_election_tests(RssBackend::Ddb)?;
         leader_election::cleanup_test_root_server_instances()?;
@@ -31,7 +31,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
             rss_backend: RssBackend::Etcd,
             ..Default::default()
         };
-        cmd_service::init_service(ServiceName::All, BuildMode::Debug, etcd_config)?;
+        cmd_service::init_service(ServiceName::All, BuildMode::Debug, &etcd_config)?;
         cmd_service::start_service(ServiceName::Etcd)?;
         leader_election::run_leader_election_tests(RssBackend::Etcd)?;
         leader_election::cleanup_test_root_server_instances()?;
@@ -44,7 +44,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         cmd_service::init_service(
             ServiceName::All,
             BuildMode::Debug,
-            InitConfig {
+            &InitConfig {
                 data_blob_storage: DataBlobStorage::AllInBssSingleAz,
                 bss_count: 6,
                 ..Default::default()
@@ -87,7 +87,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         cmd_service::init_service(
             ServiceName::All,
             BuildMode::Debug,
-            InitConfig {
+            &InitConfig {
                 data_blob_storage: DataBlobStorage::AllInBssSingleAz,
                 bss_count: 6,
                 ..Default::default()

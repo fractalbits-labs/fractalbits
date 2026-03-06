@@ -518,7 +518,7 @@ pub enum NightlyJournalType {
     Both,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub struct InitConfig {
     pub for_gui: bool,
     pub data_blob_storage: DataBlobStorage,
@@ -527,6 +527,18 @@ pub struct InitConfig {
     pub nss_disable_restart_limit: bool,
     pub rss_backend: RssBackend,
     pub journal_type: JournalType,
+    pub fs_server: FsServerConfig,
+}
+
+#[derive(Clone, Default)]
+pub struct FsServerConfig {
+    pub bucket_name: String,
+    pub mount_point: String,
+    pub mode: String,
+    pub read_write: bool,
+    pub disk_cache_enabled: bool,
+    pub disk_cache_path: String,
+    pub disk_cache_size_gb: u64,
 }
 
 impl Default for InitConfig {
@@ -539,6 +551,7 @@ impl Default for InitConfig {
             nss_disable_restart_limit: false,
             rss_backend: Default::default(),
             journal_type: Default::default(),
+            fs_server: Default::default(),
         }
     }
 }
@@ -703,7 +716,7 @@ async fn main() -> CmdResult {
                 BuildCommand::All => cmd_build::build_all(release)?,
                 BuildCommand::Zig { command } => match command {
                     Some(ZigCommand::Test) => {
-                        cmd_precheckin::run_zig_unit_tests(InitConfig::default())?
+                        cmd_precheckin::run_zig_unit_tests(&InitConfig::default())?
                     }
                     None => {
                         let mode = cmd_build::build_mode(release);
@@ -794,8 +807,9 @@ async fn main() -> CmdResult {
                     nss_disable_restart_limit,
                     rss_backend,
                     journal_type,
+                    fs_server: Default::default(),
                 };
-                cmd_service::init_service(service, cmd_build::build_mode(release), init_config)?;
+                cmd_service::init_service(service, cmd_build::build_mode(release), &init_config)?;
             }
             ServiceCommand::Stop { service } => {
                 cmd_service::stop_service(service)?;

@@ -1,5 +1,5 @@
 use crate::cmd_service;
-use crate::{CmdResult, ServiceName};
+use crate::{CmdResult, FsServerConfig, InitConfig, ServiceName};
 use aws_sdk_s3::primitives::ByteStream;
 use cmd_lib::*;
 use colored::*;
@@ -9,15 +9,6 @@ use std::time::Duration;
 use super::{cleanup_objects, generate_test_data, setup_test_bucket};
 
 const NFS_MOUNT_POINT: &str = "/tmp/nfs_server_test";
-
-fn write_nfs_server_env(bucket: &str, read_write: bool) -> CmdResult {
-    let env_content = format!(
-        "FS_SERVER_BUCKET_NAME={bucket}\nFS_SERVER_MODE=nfs\nFS_SERVER_READ_WRITE={read_write}\n"
-    );
-    run_cmd!(mkdir -p data/etc)?;
-    std::fs::write("data/etc/fs_server.env", env_content)?;
-    Ok(())
-}
 
 fn mount_nfs(bucket: &str) -> CmdResult {
     mount_nfs_with_opts(bucket, false)
@@ -32,11 +23,20 @@ fn mount_nfs_with_opts(bucket: &str, read_write: bool) -> CmdResult {
 
     run_cmd!(mkdir -p $mount_point)?;
 
-    write_nfs_server_env(bucket, read_write)?;
+    let init_config = InitConfig {
+        fs_server: FsServerConfig {
+            bucket_name: bucket.to_string(),
+            mount_point: mount_point.to_string(),
+            mode: "nfs".to_string(),
+            read_write,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     cmd_service::init_service(
         ServiceName::FsServer,
         crate::cmd_build::BuildMode::Debug,
-        crate::InitConfig::default(),
+        &init_config,
     )?;
     cmd_service::start_service(ServiceName::FsServer)?;
 

@@ -15,7 +15,7 @@ use xtask_common::{
 pub fn init_service(
     service: ServiceName,
     build_mode: BuildMode,
-    init_config: InitConfig,
+    init_config: &InitConfig,
 ) -> CmdResult {
     stop_service(service)?;
 
@@ -964,7 +964,7 @@ fn start_all_services() -> CmdResult {
 fn create_systemd_unit_files_for_init(
     service: ServiceName,
     build_mode: BuildMode,
-    init_config: InitConfig,
+    init_config: &InitConfig,
 ) -> CmdResult {
     let api_server_service = if init_config.for_gui {
         ServiceName::GuiServer
@@ -1018,7 +1018,7 @@ fn create_systemd_unit_files_for_init(
 fn create_systemd_unit_file(
     service: ServiceName,
     build_mode: BuildMode,
-    init_config: InitConfig,
+    init_config: &InitConfig,
 ) -> CmdResult {
     let pwd = run_fun!(pwd)?;
     let build = build_mode.as_ref();
@@ -1181,7 +1181,18 @@ Environment="MINIO_REGION=localdev""##
             )
         }
         ServiceName::FsServer => {
-            env_settings += &format!("\nEnvironmentFile=-{pwd}/data/etc/fs_server.env");
+            let fs = &init_config.fs_server;
+            env_settings += &format!("\nEnvironment=\"FS_SERVER_BUCKET_NAME={}\"", fs.bucket_name);
+            env_settings += &format!("\nEnvironment=\"FS_SERVER_MOUNT_POINT={}\"", fs.mount_point);
+            if !fs.mode.is_empty() {
+                env_settings += &format!("\nEnvironment=\"FS_SERVER_MODE={}\"", fs.mode);
+            }
+            env_settings += &format!("\nEnvironment=\"FS_SERVER_READ_WRITE={}\"", fs.read_write);
+            if fs.disk_cache_enabled {
+                env_settings += "\nEnvironment=\"FS_SERVER_DISK_CACHE_ENABLED=true\"";
+                env_settings += &format!("\nEnvironment=\"FS_SERVER_DISK_CACHE_PATH={}\"", fs.disk_cache_path);
+                env_settings += &format!("\nEnvironment=\"FS_SERVER_DISK_CACHE_SIZE_GB={}\"", fs.disk_cache_size_gb);
+            }
             resolve_binary_path("fs_server", build_mode)
         }
         _ => unreachable!(),

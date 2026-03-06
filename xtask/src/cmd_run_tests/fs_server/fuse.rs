@@ -1,5 +1,5 @@
 use crate::cmd_service;
-use crate::{CmdResult, ServiceName};
+use crate::{CmdResult, FsServerConfig, InitConfig, ServiceName};
 use aws_sdk_s3::primitives::ByteStream;
 use cmd_lib::*;
 use colored::*;
@@ -15,25 +15,19 @@ fn disk_cache_path() -> String {
         .to_string()
 }
 
-fn write_fs_server_env(
-    bucket: &str,
-    mount_point: &str,
-    read_write: bool,
-    disk_cache: bool,
-) -> CmdResult {
-    let mut env_content = format!(
-        "FS_SERVER_BUCKET_NAME={bucket}\nFS_SERVER_MOUNT_POINT={mount_point}\nFS_SERVER_READ_WRITE={read_write}\n"
-    );
+fn fs_server_config(bucket: &str, read_write: bool, disk_cache: bool) -> FsServerConfig {
+    let mut cfg = FsServerConfig {
+        bucket_name: bucket.to_string(),
+        mount_point: MOUNT_POINT.to_string(),
+        read_write,
+        ..Default::default()
+    };
     if disk_cache {
-        env_content.push_str(&format!(
-            "FS_SERVER_DISK_CACHE_ENABLED=true\nFS_SERVER_DISK_CACHE_PATH={}\nFS_SERVER_DISK_CACHE_SIZE_GB=1\n",
-            disk_cache_path()
-        ));
+        cfg.disk_cache_enabled = true;
+        cfg.disk_cache_path = disk_cache_path();
+        cfg.disk_cache_size_gb = 1;
     }
-    run_cmd! {
-        mkdir -p data/etc;
-        echo $env_content > data/etc/fs_server.env;
-    }
+    cfg
 }
 
 fn mount_fuse_ro(bucket: &str, disk_cache: bool) -> CmdResult {
@@ -57,11 +51,14 @@ fn mount_fuse_with_opts(bucket: &str, read_write: bool, disk_cache: bool) -> Cmd
         let dc_path = disk_cache_path();
         run_cmd!(mkdir -p $dc_path)?;
     }
-    write_fs_server_env(bucket, mount_point, read_write, disk_cache)?;
+    let init_config = InitConfig {
+        fs_server: fs_server_config(bucket, read_write, disk_cache),
+        ..Default::default()
+    };
     cmd_service::init_service(
         ServiceName::FsServer,
         crate::cmd_build::BuildMode::Debug,
-        crate::InitConfig::default(),
+        &init_config,
     )?;
     cmd_service::start_service(ServiceName::FsServer)?;
 
@@ -117,7 +114,7 @@ pub async fn run_fuse_tests_with_disk_cache(disk_cache_only: bool) -> CmdResult 
         cmd_service::init_service(
             ServiceName::All,
             crate::cmd_build::BuildMode::Debug,
-            crate::InitConfig::default(),
+            &crate::InitConfig::default(),
         )?;
         cmd_service::start_service(ServiceName::All)?;
     }
