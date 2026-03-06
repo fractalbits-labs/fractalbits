@@ -1190,8 +1190,14 @@ Environment="MINIO_REGION=localdev""##
             env_settings += &format!("\nEnvironment=\"FS_SERVER_READ_WRITE={}\"", fs.read_write);
             if fs.disk_cache_enabled {
                 env_settings += "\nEnvironment=\"FS_SERVER_DISK_CACHE_ENABLED=true\"";
-                env_settings += &format!("\nEnvironment=\"FS_SERVER_DISK_CACHE_PATH={}\"", fs.disk_cache_path);
-                env_settings += &format!("\nEnvironment=\"FS_SERVER_DISK_CACHE_SIZE_GB={}\"", fs.disk_cache_size_gb);
+                env_settings += &format!(
+                    "\nEnvironment=\"FS_SERVER_DISK_CACHE_PATH={}\"",
+                    fs.disk_cache_path
+                );
+                env_settings += &format!(
+                    "\nEnvironment=\"FS_SERVER_DISK_CACHE_SIZE_GB={}\"",
+                    fs.disk_cache_size_gb
+                );
             }
             resolve_binary_path("fs_server", build_mode)
         }
