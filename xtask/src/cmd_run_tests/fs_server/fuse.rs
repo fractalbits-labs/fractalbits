@@ -8,29 +8,56 @@ use std::time::Duration;
 
 use super::{MOUNT_POINT, cleanup_objects, generate_test_data, setup_test_bucket};
 
-fn write_fs_server_env(bucket: &str, mount_point: &str, read_write: bool) -> CmdResult {
-    let env_content = format!(
+fn disk_cache_path() -> String {
+    let base = std::env::current_dir().expect("Failed to get cwd");
+    base.join("data/fuse_test_disk_cache")
+        .to_string_lossy()
+        .to_string()
+}
+
+fn write_fs_server_env(
+    bucket: &str,
+    mount_point: &str,
+    read_write: bool,
+    disk_cache: bool,
+) -> CmdResult {
+    let mut env_content = format!(
         "FS_SERVER_BUCKET_NAME={bucket}\nFS_SERVER_MOUNT_POINT={mount_point}\nFS_SERVER_READ_WRITE={read_write}\n"
     );
+    if disk_cache {
+        env_content.push_str(&format!(
+            "FS_SERVER_DISK_CACHE_ENABLED=true\nFS_SERVER_DISK_CACHE_PATH={}\nFS_SERVER_DISK_CACHE_SIZE_GB=1\n",
+            disk_cache_path()
+        ));
+    }
     run_cmd! {
         mkdir -p data/etc;
         echo $env_content > data/etc/fs_server.env;
     }
 }
 
-pub fn mount_fuse_ro(bucket: &str) -> CmdResult {
-    mount_fuse_with_opts(bucket, false)
+fn mount_fuse_ro(bucket: &str, disk_cache: bool) -> CmdResult {
+    mount_fuse_with_opts(bucket, false, disk_cache)
 }
 
-fn mount_fuse_rw(bucket: &str) -> CmdResult {
-    mount_fuse_with_opts(bucket, true)
+fn mount_fuse_rw(bucket: &str, disk_cache: bool) -> CmdResult {
+    mount_fuse_with_opts(bucket, true, disk_cache)
 }
 
-fn mount_fuse_with_opts(bucket: &str, read_write: bool) -> CmdResult {
+fn mount_fuse_with_opts(bucket: &str, read_write: bool, disk_cache: bool) -> CmdResult {
     let mount_point = MOUNT_POINT;
 
+    // Clean up any stale FUSE mount (e.g. "Transport endpoint is not connected").
+    run_cmd! {
+        ignore fusermount3 -u $mount_point 2>/dev/null;
+        ignore fusermount -u $mount_point 2>/dev/null;
+    }?;
     run_cmd!(mkdir -p $mount_point)?;
-    write_fs_server_env(bucket, mount_point, read_write)?;
+    if disk_cache {
+        let dc_path = disk_cache_path();
+        run_cmd!(mkdir -p $dc_path)?;
+    }
+    write_fs_server_env(bucket, mount_point, read_write, disk_cache)?;
     cmd_service::init_service(
         ServiceName::FsServer,
         crate::cmd_build::BuildMode::Debug,
@@ -70,133 +97,78 @@ pub fn unmount_fuse() -> CmdResult {
         ignore fusermount -u $mount_point 2>/dev/null;
     }?;
     let _ = cmd_service::stop_service(ServiceName::FsServer);
-    run_cmd! { ignore pkill -f "fs_server" 2>/dev/null; }?;
+    run_cmd! { ignore pkill -x fs_server 2>/dev/null; }?;
     std::thread::sleep(Duration::from_millis(500));
     Ok(())
 }
 
-pub async fn run_fuse_tests() -> CmdResult {
+pub async fn run_fuse_tests_with_disk_cache(disk_cache_only: bool) -> CmdResult {
     info!("Running FUSE integration tests...");
 
-    println!("\n{}", "=== Test: Basic File Read ===".bold());
-    if let Err(e) = test_basic_file_read().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
+    if !disk_cache_only {
+        println!(
+            "\n{}",
+            ">>> Running FUSE tests WITHOUT disk cache <<<".bold()
+        );
+        run_fuse_test_suite(false).await?;
+
+        // Reinit services to clear stale state from the first suite.
+        cmd_service::stop_service(ServiceName::All)?;
+        cmd_service::init_service(
+            ServiceName::All,
+            crate::cmd_build::BuildMode::Debug,
+            crate::InitConfig::default(),
+        )?;
+        cmd_service::start_service(ServiceName::All)?;
     }
 
-    println!("\n{}", "=== Test: Directory Listing ===".bold());
-    if let Err(e) = test_directory_listing().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Large File Read ===".bold());
-    if let Err(e) = test_large_file_read().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Nested Directory Structure ===".bold());
-    if let Err(e) = test_nested_directories().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Create, Write, Read ===".bold());
-    if let Err(e) = test_create_write_read().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Large File Write ===".bold());
-    if let Err(e) = test_large_file_write().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Mkdir and Rmdir ===".bold());
-    if let Err(e) = test_mkdir_rmdir().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Unlink ===".bold());
-    if let Err(e) = test_unlink().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Rename ===".bold());
-    if let Err(e) = test_rename().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Unlink with Open Handle ===".bold());
-    if let Err(e) = test_unlink_open_handle().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Overwrite Existing File ===".bold());
-    if let Err(e) = test_overwrite_existing().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Rename No-Replace (EEXIST) ===".bold());
-    if let Err(e) = test_rename_noreplace().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Truncate Write ===".bold());
-    if let Err(e) = test_truncate_write().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Write in Subdirectory ===".bold());
-    if let Err(e) = test_write_in_subdirectory().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Rename Directory ===".bold());
-    if let Err(e) = test_rename_directory().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: dd + fsync Write ===".bold());
-    if let Err(e) = test_dd_fsync().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: mmap Write ===".bold());
-    if let Err(e) = test_mmap_write().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Fsync Persistence ===".bold());
-    if let Err(e) = test_fsync_persistence().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
-
-    println!("\n{}", "=== Test: Truncate to Non-Zero Size ===".bold());
-    if let Err(e) = test_truncate_nonzero().await {
-        eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-        return Err(e);
-    }
+    println!("\n{}", ">>> Running FUSE tests WITH disk cache <<<".bold());
+    run_fuse_test_suite(true).await?;
 
     println!("\n{}", "=== All FUSE Tests PASSED ===".green().bold());
     Ok(())
 }
 
-async fn test_basic_file_read() -> CmdResult {
+async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
+    let dc_label = if disk_cache { " [disk-cache]" } else { "" };
+
+    macro_rules! run_test {
+        ($name:expr, $func:ident) => {
+            println!(
+                "\n{}",
+                format!("=== Test: {}{} ===", $name, dc_label).bold()
+            );
+            if let Err(e) = $func(disk_cache).await {
+                eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+                return Err(e);
+            }
+        };
+    }
+
+    run_test!("Basic File Read", test_basic_file_read);
+    run_test!("Directory Listing", test_directory_listing);
+    run_test!("Large File Read", test_large_file_read);
+    run_test!("Nested Directory Structure", test_nested_directories);
+    run_test!("Create, Write, Read", test_create_write_read);
+    run_test!("Large File Write", test_large_file_write);
+    run_test!("Mkdir and Rmdir", test_mkdir_rmdir);
+    run_test!("Unlink", test_unlink);
+    run_test!("Rename", test_rename);
+    run_test!("Unlink with Open Handle", test_unlink_open_handle);
+    run_test!("Overwrite Existing File", test_overwrite_existing);
+    run_test!("Rename No-Replace (EEXIST)", test_rename_noreplace);
+    run_test!("Truncate Write", test_truncate_write);
+    run_test!("Write in Subdirectory", test_write_in_subdirectory);
+    run_test!("Rename Directory", test_rename_directory);
+    run_test!("dd + fsync Write", test_dd_fsync);
+    run_test!("mmap Write", test_mmap_write);
+    run_test!("Fsync Persistence", test_fsync_persistence);
+    run_test!("Truncate to Non-Zero Size", test_truncate_nonzero);
+
+    Ok(())
+}
+
+async fn test_basic_file_read(disk_cache: bool) -> CmdResult {
     let (ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Upload test objects via S3 API");
@@ -219,7 +191,7 @@ async fn test_basic_file_read() -> CmdResult {
     }
 
     println!("  Step 2: Mount FUSE filesystem");
-    mount_fuse_ro(&bucket)?;
+    mount_fuse_ro(&bucket, disk_cache)?;
 
     println!("  Step 3: Read and verify files mount");
     for (key, expected_data) in &test_files {
@@ -242,7 +214,7 @@ async fn test_basic_file_read() -> CmdResult {
     Ok(())
 }
 
-async fn test_directory_listing() -> CmdResult {
+async fn test_directory_listing(disk_cache: bool) -> CmdResult {
     let (ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Upload objects with directory structure");
@@ -269,7 +241,7 @@ async fn test_directory_listing() -> CmdResult {
     println!("    Uploaded {} objects", keys.len());
 
     println!("  Step 2: Mount FUSE filesystem");
-    mount_fuse_ro(&bucket)?;
+    mount_fuse_ro(&bucket, disk_cache)?;
 
     println!("  Step 3: Verify root directory listing");
     let root_entries: Vec<String> = std::fs::read_dir(MOUNT_POINT)
@@ -322,7 +294,7 @@ async fn test_directory_listing() -> CmdResult {
     Ok(())
 }
 
-async fn test_large_file_read() -> CmdResult {
+async fn test_large_file_read(disk_cache: bool) -> CmdResult {
     let (ctx, bucket) = setup_test_bucket().await;
 
     let sizes: Vec<(&str, usize)> = vec![
@@ -349,7 +321,7 @@ async fn test_large_file_read() -> CmdResult {
     }
 
     println!("  Step 2: Mount FUSE filesystem");
-    mount_fuse_ro(&bucket)?;
+    mount_fuse_ro(&bucket, disk_cache)?;
 
     println!("  Step 3: Read and verify large files");
     for (i, (label, size)) in sizes.iter().enumerate() {
@@ -370,7 +342,7 @@ async fn test_large_file_read() -> CmdResult {
     Ok(())
 }
 
-async fn test_nested_directories() -> CmdResult {
+async fn test_nested_directories(disk_cache: bool) -> CmdResult {
     let (ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Upload deeply nested objects");
@@ -390,7 +362,7 @@ async fn test_nested_directories() -> CmdResult {
     println!("    Uploaded {} objects", keys.len());
 
     println!("  Step 2: Mount FUSE filesystem");
-    mount_fuse_ro(&bucket)?;
+    mount_fuse_ro(&bucket, disk_cache)?;
 
     println!("  Step 3: Verify nested directory traversal");
 
@@ -436,11 +408,11 @@ async fn test_nested_directories() -> CmdResult {
     Ok(())
 }
 
-async fn test_create_write_read() -> CmdResult {
+async fn test_create_write_read(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create and write files");
     let test_data = b"Hello from FUSE write!";
@@ -479,7 +451,7 @@ async fn test_create_write_read() -> CmdResult {
     Ok(())
 }
 
-async fn test_large_file_write() -> CmdResult {
+async fn test_large_file_write(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     let sizes: Vec<(&str, usize)> = vec![
@@ -489,7 +461,7 @@ async fn test_large_file_write() -> CmdResult {
     ];
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Write large files via FUSE");
     let mut keys = Vec::new();
@@ -518,11 +490,11 @@ async fn test_large_file_write() -> CmdResult {
     Ok(())
 }
 
-async fn test_mkdir_rmdir() -> CmdResult {
+async fn test_mkdir_rmdir(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create directory");
     let dir_path = format!("{}/testdir", MOUNT_POINT);
@@ -557,11 +529,11 @@ async fn test_mkdir_rmdir() -> CmdResult {
     Ok(())
 }
 
-async fn test_unlink() -> CmdResult {
+async fn test_unlink(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create file then unlink");
     let file_path = format!("{}/to-delete.txt", MOUNT_POINT);
@@ -584,11 +556,11 @@ async fn test_unlink() -> CmdResult {
     Ok(())
 }
 
-async fn test_rename() -> CmdResult {
+async fn test_rename(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create file and rename");
     let src_path = format!("{}/original.txt", MOUNT_POINT);
@@ -615,11 +587,11 @@ async fn test_rename() -> CmdResult {
     Ok(())
 }
 
-async fn test_unlink_open_handle() -> CmdResult {
+async fn test_unlink_open_handle(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create file and open a read handle");
     let file_path = format!("{}/open-del.txt", MOUNT_POINT);
@@ -662,11 +634,11 @@ async fn test_unlink_open_handle() -> CmdResult {
     Ok(())
 }
 
-async fn test_overwrite_existing() -> CmdResult {
+async fn test_overwrite_existing(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create original file");
     let file_path = format!("{}/overwrite.txt", MOUNT_POINT);
@@ -707,11 +679,11 @@ async fn test_overwrite_existing() -> CmdResult {
     Ok(())
 }
 
-async fn test_rename_noreplace() -> CmdResult {
+async fn test_rename_noreplace(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create source and destination files");
     let src_path = format!("{}/rename-src.txt", MOUNT_POINT);
@@ -744,11 +716,11 @@ async fn test_rename_noreplace() -> CmdResult {
     Ok(())
 }
 
-async fn test_truncate_write() -> CmdResult {
+async fn test_truncate_write(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create original file");
     let file_path = format!("{}/trunc.txt", MOUNT_POINT);
@@ -772,11 +744,11 @@ async fn test_truncate_write() -> CmdResult {
     Ok(())
 }
 
-async fn test_write_in_subdirectory() -> CmdResult {
+async fn test_write_in_subdirectory(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create subdirectory");
     let dir_path = format!("{}/subdir", MOUNT_POINT);
@@ -799,7 +771,7 @@ async fn test_write_in_subdirectory() -> CmdResult {
 
     println!("  Step 5: Remount and verify subdirectory listing");
     unmount_fuse()?;
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
     let entries: Vec<String> = std::fs::read_dir(&dir_path)
         .expect("Failed to list subdir")
         .filter_map(|e| e.ok())
@@ -818,11 +790,11 @@ async fn test_write_in_subdirectory() -> CmdResult {
     Ok(())
 }
 
-async fn test_rename_directory() -> CmdResult {
+async fn test_rename_directory(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create directory with files");
     let src_dir = format!("{}/srcdir", MOUNT_POINT);
@@ -854,11 +826,11 @@ async fn test_rename_directory() -> CmdResult {
 }
 
 /// Test dd-style buffered write + fsync exercises the writeback cache path.
-async fn test_dd_fsync() -> CmdResult {
+async fn test_dd_fsync(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: dd 400KB of zeros with conv=fsync");
     let dd_path = format!("{}/dd-test", MOUNT_POINT);
@@ -879,7 +851,7 @@ async fn test_dd_fsync() -> CmdResult {
 
     println!("  Step 5: Remount and verify persistence");
     unmount_fuse()?;
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     let persisted = std::fs::metadata(&dd_path).expect("dd-test gone after remount");
     assert_eq!(
@@ -908,13 +880,13 @@ async fn test_dd_fsync() -> CmdResult {
 }
 
 /// Test mmap write via libc exercises the writeback cache mmap path.
-async fn test_mmap_write() -> CmdResult {
+async fn test_mmap_write(disk_cache: bool) -> CmdResult {
     use std::os::unix::io::AsRawFd;
 
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create file with known content (4096 bytes of 'A')");
     let file_path = format!("{}/mmap-test.bin", MOUNT_POINT);
@@ -990,7 +962,7 @@ async fn test_mmap_write() -> CmdResult {
 
     println!("  Step 5: Remount and verify persistence");
     unmount_fuse()?;
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     let persisted = std::fs::read(&file_path).expect("Failed to read after remount");
     assert_eq!(
@@ -1013,11 +985,11 @@ async fn test_mmap_write() -> CmdResult {
 }
 
 /// Test that fsync flushes data to the backend so it survives a remount.
-async fn test_fsync_persistence() -> CmdResult {
+async fn test_fsync_persistence(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Write file and fsync");
     let file_path = format!("{}/fsync-test.txt", MOUNT_POINT);
@@ -1045,7 +1017,7 @@ async fn test_fsync_persistence() -> CmdResult {
 
     println!("  Step 4: Remount and verify data persisted");
     unmount_fuse()?;
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     let persisted = std::fs::read(&file_path).expect("Failed to read after remount");
     assert_eq!(persisted, content, "Post-remount content mismatch");
@@ -1068,7 +1040,7 @@ async fn test_fsync_persistence() -> CmdResult {
     }
 
     unmount_fuse()?;
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     let persisted2 =
         std::fs::read(&file_path2).expect("Failed to read fdatasync file after remount");
@@ -1084,11 +1056,11 @@ async fn test_fsync_persistence() -> CmdResult {
 }
 
 /// Test truncating a file to non-zero sizes (shrink and extend).
-async fn test_truncate_nonzero() -> CmdResult {
+async fn test_truncate_nonzero(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create a file with known content");
     let file_path = format!("{}/trunc-size.txt", MOUNT_POINT);
@@ -1158,7 +1130,7 @@ async fn test_truncate_nonzero() -> CmdResult {
     }
 
     unmount_fuse()?;
-    mount_fuse_rw(&bucket)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     let persisted = std::fs::read(&file_path2).expect("Failed to read persist file after remount");
     assert_eq!(
