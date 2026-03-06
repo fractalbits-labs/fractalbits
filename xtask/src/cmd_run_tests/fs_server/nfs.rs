@@ -82,7 +82,7 @@ fn unmount_nfs() -> CmdResult {
     let mount_point = NFS_MOUNT_POINT;
     run_cmd! { ignore sudo umount $mount_point 2>/dev/null; }?;
     let _ = cmd_service::stop_service(ServiceName::FsServer);
-    run_cmd! { ignore pkill -f "fs_server" 2>/dev/null; }?;
+    run_cmd! { ignore pkill -x fs_server 2>/dev/null; }?;
     std::thread::sleep(Duration::from_millis(500));
     Ok(())
 }

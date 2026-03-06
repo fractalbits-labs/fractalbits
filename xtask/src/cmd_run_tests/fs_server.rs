@@ -8,10 +8,10 @@ use test_common::*;
 pub const MOUNT_POINT: &str = "/tmp/fs_server_test";
 const BUCKET_NAME: &str = "test-file-server";
 
-pub async fn run_fs_server_tests(run_fuse: bool, run_nfs: bool) -> CmdResult {
+pub async fn run_fs_server_tests(run_fuse: bool, run_nfs: bool, disk_cache: bool) -> CmdResult {
     info!("Running fs_server integration tests...");
     if run_fuse {
-        fuse::run_fuse_tests().await?;
+        fuse::run_fuse_tests_with_disk_cache(disk_cache).await?;
     }
     if run_nfs {
         nfs::run_nfs_tests().await?;

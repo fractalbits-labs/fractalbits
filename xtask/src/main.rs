@@ -614,6 +614,8 @@ pub enum TestType {
         fuse: bool,
         #[clap(long, help = "Run only NFS tests")]
         nfs: bool,
+        #[clap(long, help = "Run only with disk cache enabled")]
+        disk_cache_only: bool,
     },
 }
 
