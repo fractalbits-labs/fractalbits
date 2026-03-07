@@ -114,7 +114,7 @@ log = "0.4.29"
 metrics = "0.24"
 metrics-exporter-statsd = "0.9.0"
 metrics-exporter-prometheus = "0.18.1"
-moka = { version = "0.12", features = ["future"] }
+moka = "0.12"
 tikv-jemallocator = "0.6"
 parking_lot = "0.12"
 governor = "0.10"
@@ -129,7 +129,11 @@ urlencoding = "2"
 compio-runtime = { version = "0.11", features = ["time"] }
 compio-net = "0.11"
 compio-io = "0.9"
+compio-buf = "0.8"
+compio-fs = "0.11"
+compio-macros = "0.1"
 libc = "0.2"
+nix = { version = "0.31", features = ["fs"] }
 
 # Dev dependencies
 aws-sdk-s3 = "1.65.0"

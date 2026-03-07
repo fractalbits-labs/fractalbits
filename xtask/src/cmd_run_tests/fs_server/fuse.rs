@@ -1105,10 +1105,7 @@ async fn test_disk_cache_populates(disk_cache: bool) -> CmdResult {
         !cache_files.is_empty(),
         "disk cache should contain files after a read"
     );
-    println!(
-        "    Disk cache files: {} (expected > 0)",
-        cache_files.len()
-    );
+    println!("    Disk cache files: {} (expected > 0)", cache_files.len());
 
     unmount_fuse()?;
     cleanup_objects(&ctx, &bucket, &[key]).await;

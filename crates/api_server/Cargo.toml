@@ -55,7 +55,7 @@ rustls.workspace = true
 rustls-pemfile.workspace = true
 metrics-exporter-statsd = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
-moka.workspace = true
+moka = { workspace = true, features = ["future"] }
 tikv-jemallocator.workspace = true
 governor.workspace = true
 futures-util.workspace = true
