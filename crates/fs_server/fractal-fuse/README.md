@@ -86,7 +86,7 @@ compio's single-threaded model) and default to returning `ENOSYS`. The trait
 itself is `Send + Sync` for sharing via `Arc` across ring threads.
 
 Supported operations follow the low-level
-[FUSE API](https://libfuse.github.io/doxygen/structfuse__operations.html):
+[FUSE API](https://libfuse.github.io/doxygen/structfuse__lowlevel__ops.html):
 
 ### Filesystem
 

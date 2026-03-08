@@ -560,6 +560,41 @@ pub struct fuse_uring_cmd_req {
     pub padding: [u8; 6],
 }
 
+// ---------- Notification constants ----------
+// Used for userspace-initiated cache invalidation via writes to /dev/fuse.
+// The kernel dispatches on these in fuse_dev_do_write().
+
+pub const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
+pub const FUSE_NOTIFY_INVAL_ENTRY: i32 = 3;
+pub const FUSE_NOTIFY_DELETE: i32 = 6;
+
+// ---------- Notification structures ----------
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct fuse_notify_inval_inode_out {
+    pub ino: u64,
+    pub off: i64,
+    pub len: i64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct fuse_notify_inval_entry_out {
+    pub parent: u64,
+    pub namelen: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct fuse_notify_delete_out {
+    pub parent: u64,
+    pub child: u64,
+    pub namelen: u32,
+    pub padding: u32,
+}
+
 // Alignment helper for fuse_dirent/fuse_direntplus
 pub const fn fuse_dirent_align(x: usize) -> usize {
     (x + 7) & !7

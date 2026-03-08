@@ -1,15 +1,16 @@
 use fractal_fuse::*;
 use std::ffi::OsStr;
+use std::sync::Arc;
 
 use crate::error::FsError;
 use crate::vfs::{TTL, VfsAttr, VfsCore};
 
 pub struct FuseServer {
-    vfs: VfsCore,
+    vfs: Arc<VfsCore>,
 }
 
 impl FuseServer {
-    pub fn new(vfs: VfsCore) -> Self {
+    pub fn new(vfs: Arc<VfsCore>) -> Self {
         Self { vfs }
     }
 }

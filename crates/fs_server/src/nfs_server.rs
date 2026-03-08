@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -15,13 +16,13 @@ const EVICTION_INTERVAL_OPS: u64 = 1000;
 const READDIR_MAX_ENTRIES: usize = 128;
 
 pub struct NfsAdapter {
-    vfs: VfsCore,
+    vfs: Arc<VfsCore>,
     fsid: u64,
     op_counter: AtomicU64,
 }
 
 impl NfsAdapter {
-    pub fn new(vfs: VfsCore, fsid: u64) -> Self {
+    pub fn new(vfs: Arc<VfsCore>, fsid: u64) -> Self {
         Self {
             vfs,
             fsid,
