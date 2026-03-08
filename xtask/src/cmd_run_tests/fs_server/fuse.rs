@@ -4,9 +4,12 @@ use aws_sdk_s3::primitives::ByteStream;
 use cmd_lib::*;
 use colored::*;
 use std::path::Path;
+use std::process::{Child, Command};
 use std::time::Duration;
 
 use super::{MOUNT_POINT, cleanup_objects, generate_test_data, setup_test_bucket};
+
+const MOUNT_POINT_B: &str = "/tmp/fs_server_test_b";
 
 fn disk_cache_path() -> String {
     let base = std::env::current_dir().expect("Failed to get cwd");
@@ -99,6 +102,78 @@ pub fn unmount_fuse() -> CmdResult {
     Ok(())
 }
 
+// ── Second fs_server instance helpers ──────────────────────────────
+//
+// Spawns a second fs_server process directly (not via systemd) with
+// a different mount point on the same bucket. Used for cross-instance
+// cache invalidation tests.
+
+fn spawn_second_fuse(bucket: &str, read_write: bool) -> std::io::Result<Child> {
+    let mount_point = MOUNT_POINT_B;
+
+    // Clean up any stale mount
+    let _ = std::process::Command::new("fusermount3")
+        .args(["-u", mount_point])
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = std::process::Command::new("fusermount")
+        .args(["-u", mount_point])
+        .stderr(std::process::Stdio::null())
+        .status();
+    std::fs::create_dir_all(mount_point)?;
+
+    let binary = format!(
+        "{}/target/debug/fs_server",
+        std::env::current_dir()?.display()
+    );
+    let child = Command::new(&binary)
+        .env("FS_SERVER_BUCKET_NAME", bucket)
+        .env("FS_SERVER_MOUNT_POINT", mount_point)
+        .env("FS_SERVER_MODE", "fuse")
+        .env("FS_SERVER_READ_WRITE", read_write.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    // Wait for mount to appear
+    for i in 0..20 {
+        std::thread::sleep(Duration::from_millis(500));
+        let status = std::process::Command::new("mountpoint")
+            .arg("-q")
+            .arg(mount_point)
+            .status();
+        if let Ok(s) = status
+            && s.success()
+        {
+            println!(
+                "    Second FUSE mounted at {} (after {}ms)",
+                mount_point,
+                (i + 1) * 500
+            );
+            return Ok(child);
+        }
+    }
+
+    Err(std::io::Error::other(format!(
+        "Second FUSE mount at {} not ready after 10 seconds",
+        mount_point
+    )))
+}
+
+fn stop_second_fuse(mut child: Child) {
+    let mount_point = MOUNT_POINT_B;
+    let _ = std::process::Command::new("fusermount3")
+        .args(["-u", mount_point])
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = std::process::Command::new("fusermount")
+        .args(["-u", mount_point])
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 pub async fn run_fuse_tests_with_disk_cache(disk_cache_only: bool) -> CmdResult {
     info!("Running FUSE integration tests...");
 
@@ -161,6 +236,42 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     run_test!("mmap Write", test_mmap_write);
     run_test!("Fsync Persistence", test_fsync_persistence);
     run_test!("Truncate to Non-Zero Size", test_truncate_nonzero);
+
+    // Cache staleness tests: verify FUSE sees external S3 mutations after TTL
+    run_test!(
+        "External Create Visibility",
+        test_external_create_visibility
+    );
+    run_test!(
+        "External Overwrite Visibility",
+        test_external_overwrite_visibility
+    );
+    run_test!(
+        "External Delete Visibility",
+        test_external_delete_visibility
+    );
+    run_test!(
+        "External Rename Visibility",
+        test_external_rename_visibility
+    );
+
+    // Cross-instance tests: two FUSE mounts on same bucket
+    run_test!(
+        "Cross-Instance Write Visibility",
+        test_cross_instance_write_visibility
+    );
+    run_test!(
+        "Cross-Instance Rename Visibility",
+        test_cross_instance_rename_visibility
+    );
+    run_test!(
+        "Cross-Instance Delete Visibility",
+        test_cross_instance_delete_visibility
+    );
+    run_test!(
+        "Cross-Instance Overwrite Visibility",
+        test_cross_instance_overwrite_visibility
+    );
 
     // Disk-cache-specific tests (only run when disk_cache is enabled)
     if disk_cache {
@@ -1059,6 +1170,513 @@ async fn test_fsync_persistence(disk_cache: bool) -> CmdResult {
 
     unmount_fuse()?;
     println!("{}", "SUCCESS: Fsync persistence test passed".green());
+    Ok(())
+}
+
+// ── Cache staleness tests ───────────────────────────────────────────
+//
+// These tests verify that FUSE sees mutations made externally via the
+// S3 API (bypassing FUSE). With TTL-based caching (FUSE entry TTL=1s,
+// DirCache TTL=5s), we must wait for the cache to expire before the
+// kernel re-issues LOOKUP/readdir. These tests establish the baseline
+// behavior; once FUSE cache invalidation (FUSE_NOTIFY_INVAL_ENTRY /
+// FUSE_NOTIFY_INVAL_INODE) is implemented, the sleep can be reduced
+// or removed.
+
+/// Time to wait for FUSE entry TTL + DirCache TTL to expire.
+const CACHE_TTL_WAIT: Duration = Duration::from_secs(7);
+
+/// Test that a file created externally via S3 becomes visible through FUSE.
+async fn test_external_create_visibility(disk_cache: bool) -> CmdResult {
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-only mode");
+    mount_fuse_ro(&bucket, disk_cache)?;
+
+    println!("  Step 2: List root to populate DirCache");
+    let entries_before: Vec<String> = std::fs::read_dir(MOUNT_POINT)
+        .expect("Failed to list root")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    println!("    Root entries before: {:?}", entries_before);
+
+    println!("  Step 3: Create file externally via S3 API");
+    let key = "ext-created.txt";
+    let data = b"created externally";
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(data.to_vec()))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("Failed to put {key}: {e}"));
+    println!("    Uploaded: {key}");
+
+    println!("  Step 4: Wait for cache TTL to expire");
+    std::thread::sleep(CACHE_TTL_WAIT);
+
+    println!("  Step 5: Verify file is now visible through FUSE");
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let content =
+        std::fs::read(&fuse_path).unwrap_or_else(|e| panic!("Failed to read {key} via FUSE: {e}"));
+    assert_eq!(content, data, "{key}: content mismatch");
+    println!("    {key} visible and content matches: OK");
+
+    println!("  Step 6: Verify it appears in directory listing");
+    let entries_after: Vec<String> = std::fs::read_dir(MOUNT_POINT)
+        .expect("Failed to list root")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        entries_after.contains(&key.to_string()),
+        "{key} not in directory listing: {:?}",
+        entries_after
+    );
+    println!("    {key} in directory listing: OK");
+
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: External create visibility test passed".green()
+    );
+    Ok(())
+}
+
+/// Test that an externally overwritten file's new content is visible through FUSE.
+async fn test_external_overwrite_visibility(disk_cache: bool) -> CmdResult {
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Upload initial file via S3 API");
+    let key = "ext-overwrite.txt";
+    let original = b"original content";
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(original.to_vec()))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("Failed to put {key}: {e}"));
+
+    println!("  Step 2: Mount FUSE and read the file (cache it)");
+    mount_fuse_ro(&bucket, disk_cache)?;
+
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let content = std::fs::read(&fuse_path).expect("Failed to read original");
+    assert_eq!(content, original, "Original content mismatch");
+    println!("    Original read: OK ({} bytes)", content.len());
+
+    println!("  Step 3: Overwrite file externally via S3 API");
+    let updated = b"updated content after overwrite";
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(updated.to_vec()))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("Failed to overwrite {key}: {e}"));
+    println!("    Overwritten via S3 API");
+
+    println!("  Step 4: Wait for cache TTL to expire");
+    std::thread::sleep(CACHE_TTL_WAIT);
+
+    println!("  Step 5: Verify updated content is visible through FUSE");
+    let new_content = std::fs::read(&fuse_path).expect("Failed to read after overwrite");
+    assert_eq!(new_content, updated, "Overwritten content mismatch");
+    println!(
+        "    Updated content visible: OK ({} bytes)",
+        new_content.len()
+    );
+
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: External overwrite visibility test passed".green()
+    );
+    Ok(())
+}
+
+/// Test that a file deleted externally via S3 becomes invisible through FUSE.
+async fn test_external_delete_visibility(disk_cache: bool) -> CmdResult {
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Upload file via S3 API");
+    let key = "ext-delete.txt";
+    let data = b"to be deleted externally";
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(data.to_vec()))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("Failed to put {key}: {e}"));
+
+    println!("  Step 2: Mount FUSE and verify file exists");
+    mount_fuse_ro(&bucket, disk_cache)?;
+
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let content = std::fs::read(&fuse_path).expect("Failed to read file");
+    assert_eq!(content, data, "Initial content mismatch");
+    println!("    File readable: OK");
+
+    println!("  Step 3: Delete file externally via S3 API");
+    ctx.client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("Failed to delete {key}: {e}"));
+    println!("    Deleted via S3 API");
+
+    println!("  Step 4: Wait for cache TTL to expire");
+    std::thread::sleep(CACHE_TTL_WAIT);
+
+    println!("  Step 5: Verify file is gone from directory listing");
+    let entries: Vec<String> = std::fs::read_dir(MOUNT_POINT)
+        .expect("Failed to list root")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        !entries.contains(&key.to_string()),
+        "{key} still in directory listing after delete: {:?}",
+        entries
+    );
+    println!("    {key} gone from listing: OK");
+
+    println!("  Step 6: Verify direct access returns ENOENT");
+    let err = std::fs::read(&fuse_path).expect_err("Read should fail after external delete");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::NotFound,
+        "Expected NotFound, got: {err}"
+    );
+    println!("    Direct access returns ENOENT: OK");
+
+    unmount_fuse()?;
+
+    println!(
+        "{}",
+        "SUCCESS: External delete visibility test passed".green()
+    );
+    Ok(())
+}
+
+/// Test that a file renamed externally via S3 (delete old + create new)
+/// becomes visible under the new name through FUSE.
+async fn test_external_rename_visibility(disk_cache: bool) -> CmdResult {
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Upload file via S3 API");
+    let old_key = "ext-rename-old.txt";
+    let new_key = "ext-rename-new.txt";
+    let data = b"content that gets renamed";
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(old_key)
+        .body(ByteStream::from(data.to_vec()))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("Failed to put {old_key}: {e}"));
+
+    println!("  Step 2: Mount FUSE and read the file (cache it)");
+    mount_fuse_ro(&bucket, disk_cache)?;
+
+    let old_path = format!("{}/{}", MOUNT_POINT, old_key);
+    let content = std::fs::read(&old_path).expect("Failed to read old key");
+    assert_eq!(content, data, "Original content mismatch");
+    println!("    Old key readable: OK");
+
+    println!("  Step 3: Simulate rename via S3 API (copy + delete)");
+    // Create new key with same content
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(new_key)
+        .body(ByteStream::from(data.to_vec()))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("Failed to put {new_key}: {e}"));
+    // Delete old key
+    ctx.client
+        .delete_object()
+        .bucket(&bucket)
+        .key(old_key)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("Failed to delete {old_key}: {e}"));
+    println!("    Renamed via S3 API: {old_key} -> {new_key}");
+
+    println!("  Step 4: Wait for cache TTL to expire");
+    std::thread::sleep(CACHE_TTL_WAIT);
+
+    println!("  Step 5: Verify old name is gone");
+    let entries: Vec<String> = std::fs::read_dir(MOUNT_POINT)
+        .expect("Failed to list root")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        !entries.contains(&old_key.to_string()),
+        "{old_key} still visible after rename: {:?}",
+        entries
+    );
+    println!("    Old name gone from listing: OK");
+
+    println!("  Step 6: Verify new name is visible with correct content");
+    let new_path = format!("{}/{}", MOUNT_POINT, new_key);
+    let new_content =
+        std::fs::read(&new_path).unwrap_or_else(|e| panic!("Failed to read {new_key}: {e}"));
+    assert_eq!(new_content, data, "Renamed content mismatch");
+    println!("    New name readable with correct content: OK");
+
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[new_key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: External rename visibility test passed".green()
+    );
+    Ok(())
+}
+
+// ── Cross-instance cache invalidation tests ────────────────────────
+//
+// These tests run two fs_server FUSE instances on the same bucket.
+// Instance A (systemd) uses MOUNT_POINT, instance B (direct process)
+// uses MOUNT_POINT_B. Mutations on one instance should become visible
+// on the other after the DirCache TTL expires.
+//
+// Currently these rely on TTL-based expiry (FUSE TTL=1s, DirCache
+// TTL=5s). Once NSS-mediated WatchChanges is implemented, the
+// staleness window should drop to ~100ms.
+
+/// Test that a file written via FUSE on instance A becomes visible
+/// on instance B after cache expiry.
+async fn test_cross_instance_write_visibility(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount instance A (read-write)");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Spawn instance B (read-only) on same bucket");
+    let child_b = spawn_second_fuse(&bucket, false)?;
+
+    println!("  Step 3: Create file on instance A");
+    let key = "cross-write.txt";
+    let content = b"written on instance A";
+    let path_a = format!("{}/{}", MOUNT_POINT, key);
+    std::fs::write(&path_a, content).expect("Failed to write on A");
+    println!("    Written: {key} on instance A");
+
+    println!("  Step 4: Wait for cache TTL to expire on instance B");
+    std::thread::sleep(CACHE_TTL_WAIT);
+
+    println!("  Step 5: Verify file visible on instance B");
+    let path_b = format!("{}/{}", MOUNT_POINT_B, key);
+    let read_b =
+        std::fs::read(&path_b).unwrap_or_else(|e| panic!("Failed to read {key} on B: {e}"));
+    assert_eq!(read_b, content, "Content mismatch on instance B");
+    println!("    {key} visible on instance B: OK");
+
+    stop_second_fuse(child_b);
+    unmount_fuse()?;
+
+    println!(
+        "{}",
+        "SUCCESS: Cross-instance write visibility test passed".green()
+    );
+    Ok(())
+}
+
+/// Test that a file renamed via FUSE on instance A is reflected on
+/// instance B (old name gone, new name visible).
+async fn test_cross_instance_rename_visibility(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount instance A (read-write)");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Create file on instance A");
+    let old_key = "cross-rename-old.txt";
+    let new_key = "cross-rename-new.txt";
+    let content = b"rename me across instances";
+    let old_path_a = format!("{}/{}", MOUNT_POINT, old_key);
+    std::fs::write(&old_path_a, content).expect("Failed to write on A");
+    println!("    Created: {old_key} on instance A");
+
+    println!("  Step 3: Spawn instance B (read-only) on same bucket");
+    let child_b = spawn_second_fuse(&bucket, false)?;
+
+    println!("  Step 4: Verify file visible on instance B before rename");
+    let old_path_b = format!("{}/{}", MOUNT_POINT_B, old_key);
+    let read_b = std::fs::read(&old_path_b).expect("Failed to read old key on B");
+    assert_eq!(read_b, content, "Pre-rename content mismatch on B");
+    println!("    {old_key} visible on B: OK");
+
+    println!("  Step 5: Rename file on instance A");
+    let new_path_a = format!("{}/{}", MOUNT_POINT, new_key);
+    std::fs::rename(&old_path_a, &new_path_a).expect("Failed to rename on A");
+    println!("    Renamed: {old_key} -> {new_key} on A");
+
+    println!("  Step 6: Wait for cache TTL to expire on instance B");
+    std::thread::sleep(CACHE_TTL_WAIT);
+
+    println!("  Step 7: Verify old name gone and new name visible on B");
+    let entries_b: Vec<String> = std::fs::read_dir(MOUNT_POINT_B)
+        .expect("Failed to list B")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        !entries_b.contains(&old_key.to_string()),
+        "{old_key} still visible on B: {:?}",
+        entries_b
+    );
+    println!("    {old_key} gone from B: OK");
+
+    let new_path_b = format!("{}/{}", MOUNT_POINT_B, new_key);
+    let new_read_b =
+        std::fs::read(&new_path_b).unwrap_or_else(|e| panic!("Failed to read {new_key} on B: {e}"));
+    assert_eq!(new_read_b, content, "Renamed content mismatch on B");
+    println!("    {new_key} visible on B with correct content: OK");
+
+    stop_second_fuse(child_b);
+    unmount_fuse()?;
+
+    println!(
+        "{}",
+        "SUCCESS: Cross-instance rename visibility test passed".green()
+    );
+    Ok(())
+}
+
+/// Test that a file deleted via FUSE on instance A disappears from
+/// instance B after cache expiry.
+async fn test_cross_instance_delete_visibility(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount instance A (read-write)");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Create file on instance A");
+    let key = "cross-delete.txt";
+    let content = b"delete me across instances";
+    let path_a = format!("{}/{}", MOUNT_POINT, key);
+    std::fs::write(&path_a, content).expect("Failed to write on A");
+    println!("    Created: {key} on instance A");
+
+    println!("  Step 3: Spawn instance B (read-only) on same bucket");
+    let child_b = spawn_second_fuse(&bucket, false)?;
+
+    println!("  Step 4: Verify file visible on instance B");
+    let path_b = format!("{}/{}", MOUNT_POINT_B, key);
+    let read_b = std::fs::read(&path_b).expect("Failed to read on B");
+    assert_eq!(read_b, content, "Pre-delete content mismatch on B");
+    println!("    {key} visible on B: OK");
+
+    println!("  Step 5: Delete file on instance A");
+    std::fs::remove_file(&path_a).expect("Failed to delete on A");
+    println!("    Deleted: {key} on A");
+
+    println!("  Step 6: Wait for cache TTL to expire on instance B");
+    std::thread::sleep(CACHE_TTL_WAIT);
+
+    println!("  Step 7: Verify file gone from instance B");
+    let entries_b: Vec<String> = std::fs::read_dir(MOUNT_POINT_B)
+        .expect("Failed to list B")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        !entries_b.contains(&key.to_string()),
+        "{key} still in listing on B: {:?}",
+        entries_b
+    );
+    println!("    {key} gone from B listing: OK");
+
+    let err = std::fs::read(&path_b).expect_err("Read should fail on B after delete");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::NotFound,
+        "Expected NotFound on B, got: {err}"
+    );
+    println!("    Direct access on B returns ENOENT: OK");
+
+    stop_second_fuse(child_b);
+    unmount_fuse()?;
+
+    println!(
+        "{}",
+        "SUCCESS: Cross-instance delete visibility test passed".green()
+    );
+    Ok(())
+}
+
+/// Test that overwriting a file on instance A causes instance B to see the
+/// new *content* (not just a new dentry). This exercises `invalidate_inode`
+/// which drops the kernel page cache, ensuring stale cached file data is
+/// not served after a remote overwrite.
+async fn test_cross_instance_overwrite_visibility(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount instance A (read-write)");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Create file on instance A with initial content");
+    let key = "cross-overwrite.txt";
+    let content_v1 = b"version-1: original content";
+    let path_a = format!("{}/{}", MOUNT_POINT, key);
+    std::fs::write(&path_a, content_v1).expect("Failed to write v1 on A");
+    println!("    Written v1: {key} ({} bytes)", content_v1.len());
+
+    println!("  Step 3: Spawn instance B (read-only) on same bucket");
+    let child_b = spawn_second_fuse(&bucket, false)?;
+
+    println!("  Step 4: Read file on instance B to cache dentry + page cache");
+    let path_b = format!("{}/{}", MOUNT_POINT_B, key);
+    let read_v1 =
+        std::fs::read(&path_b).unwrap_or_else(|e| panic!("Failed to read {key} on B: {e}"));
+    assert_eq!(read_v1, content_v1, "Initial content mismatch on B");
+    println!("    B cached v1: OK");
+
+    println!("  Step 5: Overwrite file on instance A with new content");
+    let content_v2 = b"version-2: updated content with different length!";
+    std::fs::write(&path_a, content_v2).expect("Failed to write v2 on A");
+    println!("    Written v2: {key} ({} bytes)", content_v2.len());
+
+    println!("  Step 6: Wait for cache invalidation on instance B");
+    std::thread::sleep(CACHE_TTL_WAIT);
+
+    println!("  Step 7: Read file on instance B - should see v2 content");
+    let read_v2 =
+        std::fs::read(&path_b).unwrap_or_else(|e| panic!("Failed to read {key} on B after overwrite: {e}"));
+    assert_eq!(
+        read_v2, content_v2,
+        "Instance B still sees stale content after overwrite.\n  Expected: {:?}\n  Got:      {:?}",
+        String::from_utf8_lossy(content_v2),
+        String::from_utf8_lossy(&read_v2)
+    );
+    println!("    B sees v2: OK ({} bytes)", read_v2.len());
+
+    stop_second_fuse(child_b);
+    unmount_fuse()?;
+
+    println!(
+        "{}",
+        "SUCCESS: Cross-instance overwrite visibility test passed".green()
+    );
     Ok(())
 }
 
