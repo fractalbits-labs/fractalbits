@@ -1660,10 +1660,11 @@ async fn test_cross_instance_overwrite_visibility(disk_cache: bool) -> CmdResult
     std::thread::sleep(CACHE_TTL_WAIT);
 
     println!("  Step 7: Read file on instance B - should see v2 content");
-    let read_v2 =
-        std::fs::read(&path_b).unwrap_or_else(|e| panic!("Failed to read {key} on B after overwrite: {e}"));
+    let read_v2 = std::fs::read(&path_b)
+        .unwrap_or_else(|e| panic!("Failed to read {key} on B after overwrite: {e}"));
     assert_eq!(
-        read_v2, content_v2,
+        read_v2,
+        content_v2,
         "Instance B still sees stale content after overwrite.\n  Expected: {:?}\n  Got:      {:?}",
         String::from_utf8_lossy(content_v2),
         String::from_utf8_lossy(&read_v2)

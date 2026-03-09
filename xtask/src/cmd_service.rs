@@ -1242,6 +1242,18 @@ StartLimitBurst=100
         )
     };
 
+    // Propagate LLVM_PROFILE_FILE to services for coverage instrumentation.
+    // When running under `cargo llvm-cov`, this ensures service binaries write
+    // profraw files to the location that `cargo llvm-cov report` discovers.
+    // Replace `%Nm` (continuous mmap mode) with `%m` (merge-on-exit) since
+    // mmap-based continuous profiling doesn't work reliably under systemd.
+    if let Ok(profile_file) = std::env::var("LLVM_PROFILE_FILE") {
+        let profile_file = regex::Regex::new(r"%\d+m").map_or(profile_file.clone(), |re| {
+            re.replace(&profile_file, "%m").into_owned()
+        });
+        env_settings += &format!("\nEnvironment=\"LLVM_PROFILE_FILE={}\"", profile_file);
+    }
+
     let systemd_unit_content = format!(
         r##"[Unit]
 Description={service_name} Service
