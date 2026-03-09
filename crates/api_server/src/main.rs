@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 use std::{fs::File, io::BufReader};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info};
@@ -342,6 +343,7 @@ fn main() -> std::io::Result<()> {
                     let server = server.run();
                     let server_handle = server.handle();
                     let _ = handle_tx.send(server_handle);
+                    drop(handle_tx);
 
                     server.await
                 })
@@ -378,8 +380,21 @@ fn main() -> std::io::Result<()> {
 
             SHUTDOWN.store(true, Ordering::Release);
 
-            for server_handle in server_handles {
-                server_handle.stop(true).await;
+            // Give in-flight requests up to 3 seconds to finish, then force stop.
+            // systemd's TimeoutStopSec=5 will SIGKILL us if we take too long.
+            let graceful = async {
+                for server_handle in &server_handles {
+                    server_handle.stop(true).await;
+                }
+            };
+            if tokio::time::timeout(Duration::from_secs(3), graceful)
+                .await
+                .is_err()
+            {
+                info!("Graceful shutdown timed out, forcing stop");
+                for server_handle in &server_handles {
+                    server_handle.stop(false).await;
+                }
             }
             info!("All servers stopped");
         });
