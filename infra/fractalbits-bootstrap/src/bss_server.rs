@@ -151,7 +151,7 @@ fn bootstrap_etcd(
 }
 
 fn setup_volume_directories(config: &BootstrapConfig, use_etcd: bool) -> CmdResult {
-    let instance_id = get_instance_id_from_config(config)?;
+    let instance_id = get_instance_id(config.global.deploy_target)?;
     info!("BSS instance ID: {instance_id}");
 
     let assignments = match wait_for_volume_configs(config, use_etcd) {
@@ -200,34 +200,45 @@ set_thread_affinity = true
     Ok(())
 }
 
+/// Get a config value from the appropriate backend (etcd, Firestore, or DDB).
+fn get_backend_config(config: &BootstrapConfig, use_etcd: bool, key: &str) -> FunResult {
+    if use_etcd {
+        get_etcd_config(config, key)
+    } else if config.is_firestore_backend() {
+        firestore_get_document_value(config, DDB_SERVICE_DISCOVERY_TABLE, key)
+    } else {
+        get_ddb_config(key)
+    }
+}
+
+fn backend_name(config: &BootstrapConfig, use_etcd: bool) -> &'static str {
+    if use_etcd {
+        "etcd"
+    } else if config.is_firestore_backend() {
+        "Firestore"
+    } else {
+        "DDB"
+    }
+}
+
 fn wait_for_volume_configs(config: &BootstrapConfig, use_etcd: bool) -> CmdResult {
     const TIMEOUT_SECS: u64 = 300;
     const POLL_INTERVAL_SECS: u64 = 1;
 
-    let backend_name = if use_etcd { "etcd" } else { "DDB" };
-    info!("Waiting for BSS volume configurations in {backend_name}...");
+    let name = backend_name(config, use_etcd);
+    info!("Waiting for BSS volume configurations in {name}...");
     let start = std::time::Instant::now();
 
     while start.elapsed().as_secs() < TIMEOUT_SECS {
-        // Check if both configs exist AND contain valid JSON
-        let data_result = if use_etcd {
-            get_etcd_config(config, BSS_DATA_VG_CONFIG_KEY)
-        } else {
-            get_ddb_config(BSS_DATA_VG_CONFIG_KEY)
-        };
-
-        let metadata_result = if use_etcd {
-            get_etcd_config(config, BSS_METADATA_VG_CONFIG_KEY)
-        } else {
-            get_ddb_config(BSS_METADATA_VG_CONFIG_KEY)
-        };
+        let data_result = get_backend_config(config, use_etcd, BSS_DATA_VG_CONFIG_KEY);
+        let metadata_result = get_backend_config(config, use_etcd, BSS_METADATA_VG_CONFIG_KEY);
 
         if let (Ok(data_config), Ok(metadata_config)) = (data_result, metadata_result) {
             // Verify the configs contain valid JSON
             if serde_json::from_str::<serde_json::Value>(&data_config).is_ok()
                 && serde_json::from_str::<serde_json::Value>(&metadata_config).is_ok()
             {
-                info!("Volume configurations found in {backend_name}");
+                info!("Volume configurations found in {name}");
                 return Ok(());
             }
         }
@@ -235,7 +246,7 @@ fn wait_for_volume_configs(config: &BootstrapConfig, use_etcd: bool) -> CmdResul
     }
 
     Err(Error::other(format!(
-        "Timeout waiting for volume configs in {backend_name}"
+        "Timeout waiting for volume configs in {name}"
     )))
 }
 
@@ -269,8 +280,14 @@ fn get_etcd_config(config: &BootstrapConfig, service_key: &str) -> FunResult {
         .ok_or_else(|| Error::other("workflow_cluster_id not configured"))?;
 
     let bucket = &config.bootstrap_bucket;
-    let instance_id = get_instance_id_from_config(config)?;
-    let barrier = WorkflowBarrier::new(bucket, cluster_id, &instance_id, "bss_server");
+    let instance_id = get_instance_id(config.global.deploy_target)?;
+    let barrier = WorkflowBarrier::new(
+        bucket,
+        cluster_id,
+        &instance_id,
+        "bss_server",
+        config.global.deploy_target,
+    );
 
     let nodes = barrier.get_etcd_nodes()?;
     let etcd_endpoints = nodes
@@ -300,9 +317,9 @@ fn get_volume_assignments(
     instance_id: &str,
     use_etcd: bool,
 ) -> Result<VolumeAssignments, Error> {
-    // For etcd backend, configs use IP addresses as identifiers
+    // For etcd/firestore backend, configs use IP addresses as identifiers
     // For DDB backend, configs use instance IDs
-    let my_ip = if use_etcd {
+    let my_ip = if use_etcd || config.is_firestore_backend() {
         Some(get_private_ip_from_config(config, instance_id)?)
     } else {
         None
@@ -336,18 +353,10 @@ fn get_volume_assignments(
 
     let mut assignments = VolumeAssignments::default();
 
-    let data_config = if use_etcd {
-        get_etcd_config(config, BSS_DATA_VG_CONFIG_KEY)?
-    } else {
-        get_ddb_config(BSS_DATA_VG_CONFIG_KEY)?
-    };
+    let data_config = get_backend_config(config, use_etcd, BSS_DATA_VG_CONFIG_KEY)?;
     assignments.data_volume = find_volume(&data_config)?;
 
-    let metadata_config = if use_etcd {
-        get_etcd_config(config, BSS_METADATA_VG_CONFIG_KEY)?
-    } else {
-        get_ddb_config(BSS_METADATA_VG_CONFIG_KEY)?
-    };
+    let metadata_config = get_backend_config(config, use_etcd, BSS_METADATA_VG_CONFIG_KEY)?;
     assignments.metadata_volume = find_volume(&metadata_config)?;
 
     Ok(assignments)
@@ -375,7 +384,7 @@ fn create_volume_directories(assignments: &VolumeAssignments) -> CmdResult {
 
         shards.par_iter().try_for_each(|&i| {
             let shard_dir = format!("{}/{}", volume_dir, i);
-            fs::create_dir(&shard_dir)
+            fs::create_dir_all(&shard_dir)
                 .map_err(|e| Error::other(format!("Failed to create {shard_dir}: {e}")))
         })?;
 

@@ -2,7 +2,9 @@ use cmd_lib::*;
 use std::io::Error;
 use std::time::{Duration, Instant};
 
-use crate::common::{BOOTSTRAP_CLUSTER_CONFIG, ETC_PATH, download_from_s3, get_instance_id};
+use crate::common::{
+    BOOTSTRAP_CLUSTER_CONFIG, ETC_PATH, download_from_s3, ensure_ec2_metadata, get_instance_id,
+};
 
 // Re-export types from xtask_common
 pub use xtask_common::{
@@ -44,11 +46,8 @@ pub fn download_and_parse(bucket_name: &str) -> Result<BootstrapClusterConfig, E
         let config: BootstrapClusterConfig =
             toml::from_str(&content).map_err(|e| Error::other(format!("TOML parse error: {e}")))?;
 
-        let instance_id = match config.global.deploy_target {
-            DeployTarget::OnPrem => run_fun!(hostname)?,
-            DeployTarget::Aws => get_instance_id()?,
-            DeployTarget::Gcp => crate::common::get_gcp_instance_id()?,
-        };
+        ensure_ec2_metadata(config.global.deploy_target)?;
+        let instance_id = get_instance_id(config.global.deploy_target)?;
 
         if config.contains_instance(&instance_id) {
             info!("Found instance {instance_id} in bootstrap config");

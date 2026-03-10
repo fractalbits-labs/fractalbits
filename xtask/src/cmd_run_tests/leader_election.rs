@@ -11,6 +11,7 @@ pub fn run_leader_election_tests(backend: RssBackend) -> CmdResult {
     let backend_name = match backend {
         RssBackend::Ddb => "DynamoDB",
         RssBackend::Etcd => "etcd",
+        RssBackend::Firestore => "Firestore",
     };
     info!("Running leader election tests with {backend_name} backend...");
 
@@ -78,6 +79,14 @@ fn get_etcd_key_prefix(test_name: &str) -> String {
 }
 
 const LEADER_KEY: &str = "test-leader";
+
+const FIRESTORE_EMULATOR_BASE: &str =
+    "http://localhost:8282/v1/projects/test-project/databases/fractalbits/documents";
+const FIRESTORE_LEADER_COLLECTION: &str = "fractalbits-leader-election";
+
+fn firestore_leader_doc_url() -> String {
+    format!("{FIRESTORE_EMULATOR_BASE}/{FIRESTORE_LEADER_COLLECTION}/{LEADER_KEY}")
+}
 
 // Process tracker for test instances
 struct TestProcessTracker {
@@ -164,6 +173,12 @@ fn setup_test_table(table_name: &str, backend: RssBackend) -> CmdResult {
             run_cmd! { ignore $etcdctl del --prefix $key_prefix >/dev/null; }?;
             sleep(Duration::from_secs(1));
         }
+        RssBackend::Firestore => {
+            // Delete any existing leader document
+            let url = firestore_leader_doc_url();
+            run_cmd! { ignore curl -sf -X DELETE $url >/dev/null; }?;
+            sleep(Duration::from_secs(1));
+        }
     }
     Ok(())
 }
@@ -191,6 +206,10 @@ fn cleanup_test_table(table_name: &str, backend: RssBackend) -> CmdResult {
             run_cmd! { ignore $etcdctl del --prefix $key_prefix >/dev/null; }?;
             sleep(Duration::from_secs(1));
         }
+        RssBackend::Firestore => {
+            let url = firestore_leader_doc_url();
+            run_cmd! { ignore curl -sf -X DELETE $url >/dev/null; }?;
+        }
     }
     Ok(())
 }
@@ -199,6 +218,7 @@ fn get_current_leader(table_name: &str, backend: RssBackend) -> Option<String> {
     match backend {
         RssBackend::Ddb => get_current_leader_ddb(table_name),
         RssBackend::Etcd => get_current_leader_etcd(table_name),
+        RssBackend::Firestore => get_current_leader_firestore(),
     }
 }
 
@@ -322,6 +342,56 @@ fn get_current_leader_etcd(table_name: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn get_current_leader_firestore() -> Option<String> {
+    let url = firestore_leader_doc_url();
+    let result = run_fun!(curl -sf $url);
+
+    match result {
+        Ok(output) => {
+            let output = output.trim();
+            if output.is_empty() {
+                println!("No Firestore document found for {LEADER_KEY}");
+                return None;
+            }
+
+            println!("Firestore document found: {output}");
+
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(output) {
+                let fields = json.get("fields")?;
+                let instance_id = fields.get("instance_id")?.get("stringValue")?.as_str()?;
+                let lease_expiry_str = fields.get("lease_expiry")?.get("integerValue")?.as_str()?;
+                let lease_expiry = lease_expiry_str.parse::<u64>().ok()?;
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+
+                println!(
+                    "Lease check: expiry={}, now={}, valid={}",
+                    lease_expiry,
+                    now,
+                    lease_expiry > now
+                );
+
+                if lease_expiry > now {
+                    Some(instance_id.to_string())
+                } else {
+                    println!("Lease expired for instance {instance_id}");
+                    None
+                }
+            } else {
+                println!("Failed to parse Firestore response");
+                None
+            }
+        }
+        Err(e) => {
+            println!("Firestore get error (document may not exist): {e:?}");
+            None
+        }
+    }
 }
 
 fn start_test_instance(
@@ -533,6 +603,19 @@ fn test_fence_token_prevents_split_brain(backend: RssBackend) -> CmdResult {
             run_cmd!($etcdctl put $leader_key $leader_json >/dev/null)
                 .expect("Failed to create manual leader");
         }
+        RssBackend::Firestore => {
+            let url = firestore_leader_doc_url();
+            let doc_json = format!(
+                r#"{{"fields":{{"instance_id":{{"stringValue":"manual-leader"}},"ip_address":{{"stringValue":"127.0.0.1"}},"port":{{"integerValue":"8086"}},"lease_expiry":{{"integerValue":"{lease_expiry}"}},"fence_token":{{"integerValue":"{high_fence_token}"}},"renewal_count":{{"integerValue":"1"}},"last_heartbeat":{{"integerValue":"{now}"}},"version":{{"stringValue":"test"}}}}}}"#
+            );
+            run_cmd!(
+                curl -sf -X PATCH $url
+                    -H "Content-Type: application/json"
+                    -d $doc_json
+                    >/dev/null
+            )
+            .expect("Failed to create manual leader in Firestore");
+        }
     }
 
     // Try to start an instance - it should not become leader due to fence token
@@ -613,6 +696,19 @@ fn test_clock_skew_detection(backend: RssBackend) -> CmdResult {
             run_cmd!($etcdctl put $leader_key $leader_json >/dev/null)
                 .expect("Failed to create skewed leader");
         }
+        RssBackend::Firestore => {
+            let url = firestore_leader_doc_url();
+            let doc_json = format!(
+                r#"{{"fields":{{"instance_id":{{"stringValue":"skewed-leader"}},"ip_address":{{"stringValue":"127.0.0.1"}},"port":{{"integerValue":"8086"}},"lease_expiry":{{"integerValue":"{lease_expiry}"}},"fence_token":{{"integerValue":"1"}},"renewal_count":{{"integerValue":"1"}},"last_heartbeat":{{"integerValue":"{skewed_time}"}},"version":{{"stringValue":"test"}}}}}}"#
+            );
+            run_cmd!(
+                curl -sf -X PATCH $url
+                    -H "Content-Type: application/json"
+                    -d $doc_json
+                    >/dev/null
+            )
+            .expect("Failed to create skewed leader in Firestore");
+        }
     }
 
     // Start an instance - it should detect clock skew
@@ -657,30 +753,47 @@ fn start_test_root_server_instance(
     let backend_str = match backend {
         RssBackend::Ddb => "ddb",
         RssBackend::Etcd => "etcd",
+        RssBackend::Firestore => "firestore",
     };
 
     // For etcd, use the key prefix instead of table name
     let leader_table_or_prefix = match backend {
-        RssBackend::Ddb => table_name.to_string(),
+        RssBackend::Ddb | RssBackend::Firestore => table_name.to_string(),
         RssBackend::Etcd => {
             get_etcd_key_prefix(table_name.trim_start_matches("fractalbits-leader-election-test-"))
         }
     };
 
-    let proc = spawn! {
-        RUST_LOG=info,root_server=debug
-        AWS_ACCESS_KEY_ID=fakeMyKeyId
-        AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
-        INSTANCE_ID=$instance_id
-        RSS_SERVER_PORT=$server_port
-        RSS_HEALTH_PORT=$health_port
-        RSS_METRICS_PORT=$metrics_port
-        RSS_BACKEND=$backend_str
-        LEADER_TABLE_NAME=$leader_table_or_prefix
-        LEADER_KEY=test-leader
-        LEADER_LEASE_DURATION=20
-        ./target/debug/root_server |& ts -m "%b %d %H:%M:%.S" > $log_path
-    }?;
+    let proc = match backend {
+        RssBackend::Firestore => spawn! {
+            RUST_LOG=info,root_server=debug
+            FIRESTORE_EMULATOR_HOST=localhost:8282
+            GCP_PROJECT_ID=test-project
+            INSTANCE_ID=$instance_id
+            RSS_SERVER_PORT=$server_port
+            RSS_HEALTH_PORT=$health_port
+            RSS_METRICS_PORT=$metrics_port
+            RSS_BACKEND=$backend_str
+            LEADER_TABLE_NAME=$leader_table_or_prefix
+            LEADER_KEY=test-leader
+            LEADER_LEASE_DURATION=20
+            ./target/debug/root_server |& ts -m "%b %d %H:%M:%.S" > $log_path
+        }?,
+        _ => spawn! {
+            RUST_LOG=info,root_server=debug
+            AWS_ACCESS_KEY_ID=fakeMyKeyId
+            AWS_SECRET_ACCESS_KEY=fakeSecretAccessKey
+            INSTANCE_ID=$instance_id
+            RSS_SERVER_PORT=$server_port
+            RSS_HEALTH_PORT=$health_port
+            RSS_METRICS_PORT=$metrics_port
+            RSS_BACKEND=$backend_str
+            LEADER_TABLE_NAME=$leader_table_or_prefix
+            LEADER_KEY=test-leader
+            LEADER_LEASE_DURATION=20
+            ./target/debug/root_server |& ts -m "%b %d %H:%M:%.S" > $log_path
+        }?,
+    };
 
     // Give the instance a moment to start
     sleep(std::time::Duration::from_secs(2));
@@ -767,6 +880,7 @@ fn test_manual_leadership_resignation(backend: RssBackend) -> CmdResult {
     let backend_name = match backend {
         RssBackend::Ddb => "DDB",
         RssBackend::Etcd => "etcd",
+        RssBackend::Firestore => "Firestore",
     };
 
     // Note: We expect either the second instance to be leader, or no leader (if the second instance

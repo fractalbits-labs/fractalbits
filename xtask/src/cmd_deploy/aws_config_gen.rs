@@ -15,6 +15,7 @@ fn to_common_rss_backend(backend: crate::RssBackend) -> xtask_common::RssBackend
     match backend {
         crate::RssBackend::Etcd => xtask_common::RssBackend::Etcd,
         crate::RssBackend::Ddb => xtask_common::RssBackend::Ddb,
+        crate::RssBackend::Firestore => xtask_common::RssBackend::Firestore,
     }
 }
 

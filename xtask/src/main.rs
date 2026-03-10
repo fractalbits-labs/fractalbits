@@ -11,6 +11,7 @@ mod cmd_service;
 mod cmd_tool;
 mod docker_utils;
 mod etcd_utils;
+mod firestore_utils;
 
 use clap::{ArgAction, Parser};
 use cmd_build::BuildMode;
@@ -265,8 +266,16 @@ pub enum DeployCommand {
         deploy_target: DeployTarget,
     },
 
-    #[clap(about = "Create VPC infrastructure using CDK")]
+    #[clap(about = "Create VPC infrastructure (AWS via CDK, GCP via Terraform)")]
     CreateVpc {
+        #[clap(
+            long,
+            value_enum,
+            long_help = "Cloud provider (aws or gcp)",
+            default_value = "aws"
+        )]
+        provider: CloudProvider,
+
         #[clap(
             long,
             value_enum,
@@ -350,10 +359,42 @@ pub enum DeployCommand {
             default_value = "al2023"
         )]
         deploy_os: DeployOS,
+
+        #[clap(long, long_help = "GCP project ID (overrides GCP_PROJECT_ID env var)")]
+        gcp_project: Option<String>,
+
+        #[clap(
+            long,
+            long_help = "GCP zone (overrides GCP_ZONE env var, default: us-central1-a)"
+        )]
+        gcp_zone: Option<String>,
     },
 
     #[clap(about = "Destroy VPC infrastructure (including s3 builds bucket cleanup)")]
-    DestroyVpc,
+    DestroyVpc {
+        #[clap(
+            long,
+            value_enum,
+            long_help = "Cloud provider (aws or gcp)",
+            default_value = "aws"
+        )]
+        provider: CloudProvider,
+
+        #[clap(long, long_help = "GCP project ID (overrides GCP_PROJECT_ID env var)")]
+        gcp_project: Option<String>,
+
+        #[clap(
+            long,
+            long_help = "GCP zone (overrides GCP_ZONE env var, default: us-central1-a)"
+        )]
+        gcp_zone: Option<String>,
+
+        #[clap(
+            long,
+            long_help = "Delete the entire GCP project (removes all resources including buckets and Firestore)"
+        )]
+        delete_project: bool,
+    },
 
     #[clap(about = "Show bootstrap progress for a cluster deployment")]
     BootstrapProgress {
@@ -427,6 +468,7 @@ pub enum ServiceName {
     MinioAz2,
     DdbLocal,
     Etcd,
+    FirestoreEmulator,
     FsServer,
 }
 
@@ -463,6 +505,16 @@ pub enum RssBackend {
     Ddb,
     #[default]
     Etcd,
+    Firestore,
+}
+
+#[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
+#[strum(serialize_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum CloudProvider {
+    #[default]
+    Aws,
+    Gcp,
 }
 
 #[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
@@ -835,6 +887,7 @@ async fn main() -> CmdResult {
             } => cmd_deploy::build(target, release, &zig_extra_build, &api_server_build_env)?,
             DeployCommand::Upload { deploy_target } => cmd_deploy::upload(deploy_target)?,
             DeployCommand::CreateVpc {
+                provider,
                 template,
                 num_api_servers,
                 num_bench_clients,
@@ -851,25 +904,45 @@ async fn main() -> CmdResult {
                 skip_upload,
                 use_generic_binaries,
                 deploy_os,
-            } => cmd_deploy::create_vpc(cmd_deploy::VpcConfig {
-                template,
-                num_api_servers,
-                num_bench_clients,
-                num_bss_nodes,
-                with_bench,
-                bss_instance_type,
-                api_server_instance_type,
-                bench_client_instance_type,
-                az,
-                root_server_ha,
-                rss_backend,
-                journal_type,
-                watch_bootstrap,
-                skip_upload,
-                use_generic_binaries,
-                deploy_os,
-            })?,
-            DeployCommand::DestroyVpc => cmd_deploy::destroy_vpc()?,
+                gcp_project,
+                gcp_zone,
+            } => {
+                let vpc_config = cmd_deploy::VpcConfig {
+                    template,
+                    num_api_servers,
+                    num_bench_clients,
+                    num_bss_nodes,
+                    with_bench,
+                    bss_instance_type,
+                    api_server_instance_type,
+                    bench_client_instance_type,
+                    az,
+                    root_server_ha,
+                    rss_backend,
+                    journal_type,
+                    watch_bootstrap,
+                    skip_upload,
+                    use_generic_binaries,
+                    deploy_os,
+                    gcp_project,
+                    gcp_zone,
+                };
+                match provider {
+                    CloudProvider::Aws => cmd_deploy::create_vpc(vpc_config)?,
+                    CloudProvider::Gcp => cmd_deploy::create_gcp_vpc(vpc_config)?,
+                }
+            }
+            DeployCommand::DestroyVpc {
+                provider,
+                gcp_project,
+                gcp_zone,
+                delete_project,
+            } => match provider {
+                CloudProvider::Aws => cmd_deploy::destroy_vpc()?,
+                CloudProvider::Gcp => {
+                    cmd_deploy::destroy_gcp_vpc(gcp_project, gcp_zone, delete_project)?
+                }
+            },
             DeployCommand::BootstrapProgress { deploy_target } => match deploy_target {
                 DeployTarget::Aws => {
                     cmd_deploy::bootstrap_progress::show_progress_from_cdk_outputs()?

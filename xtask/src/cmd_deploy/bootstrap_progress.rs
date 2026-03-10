@@ -102,8 +102,47 @@ pub fn show_progress_from_docker(docker_host_id: &str) -> CmdResult {
     let mut tunnel = start_ssm_tunnel(docker_host_id, local_port)?;
 
     // Wait for tunnel to be ready
-    wait_for_tunnel_ready(local_port)?;
+    wait_for_tunnel_ready(local_port, 30)?;
     info!("SSM tunnel established");
+
+    let access = S3Access::for_local_tunnel(local_port);
+    let result = show_progress_inner(&access);
+
+    // Clean up tunnel
+    let _ = tunnel.kill();
+    let _ = tunnel.wait();
+
+    result
+}
+
+/// Monitor bootstrap progress via IAP tunnel to Docker S3 on a GCP instance.
+pub fn show_progress_from_gcp_docker(instance_name: &str, zone: &str, project: &str) -> CmdResult {
+    let local_port = find_available_port()?;
+    info!(
+        "Starting IAP tunnel to Docker S3 on {} (local port {})...",
+        instance_name, local_port
+    );
+
+    let mut tunnel = std::process::Command::new("gcloud")
+        .args([
+            "compute",
+            "start-iap-tunnel",
+            instance_name,
+            "8080",
+            &format!("--local-host-port=localhost:{local_port}"),
+            "--zone",
+            zone,
+            "--project",
+            project,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| Error::other(format!("Failed to start IAP tunnel: {e}")))?;
+
+    // Wait for tunnel to be ready (IAP tunnels take longer than SSM)
+    wait_for_tunnel_ready(local_port, 90)?;
+    info!("IAP tunnel established");
 
     let access = S3Access::for_local_tunnel(local_port);
     let result = show_progress_inner(&access);
@@ -294,9 +333,9 @@ fn start_ssm_tunnel(instance_id: &str, local_port: u16) -> Result<std::process::
         .map_err(|e| Error::other(format!("Failed to start SSM tunnel: {e}")))
 }
 
-fn wait_for_tunnel_ready(local_port: u16) -> Result<(), Error> {
+fn wait_for_tunnel_ready(local_port: u16, timeout_secs: u64) -> Result<(), Error> {
     let start = Instant::now();
-    let timeout = Duration::from_secs(30);
+    let timeout = Duration::from_secs(timeout_secs);
 
     while start.elapsed() < timeout {
         if std::net::TcpStream::connect_timeout(

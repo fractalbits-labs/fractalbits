@@ -18,10 +18,7 @@ target/
 data/
 
 # Third party downloaded dependencies
-third_party/dynamodb_local/
-third_party/etcd-*/
-third_party/minio/
-third_party/*.tar.gz
+third_party/
 
 # Claude Code configuration
 .claude

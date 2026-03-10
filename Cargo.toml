@@ -136,6 +136,7 @@ compio-macros = "0.1"
 libc = "0.2"
 nix = { version = "0.31", features = ["fs"] }
 firestore = "0.43"
+gcloud-sdk = { version = "0.25.8", default-features = false }
 
 # Dev dependencies
 aws-sdk-s3 = "1.65.0"

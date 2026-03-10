@@ -5,7 +5,7 @@
 //! into bootstrap progress.
 
 use crate::common::{get_instance_id, get_private_ip, s3_env_overrides, upload_string_to_s3};
-use crate::config::BootstrapConfig;
+use crate::config::{BootstrapConfig, DeployTarget};
 use cmd_lib::*;
 use serde::{Deserialize, Serialize};
 use std::io::Error;
@@ -54,16 +54,24 @@ pub struct WorkflowBarrier {
     cluster_id: String,
     instance_id: String,
     service_type: String,
+    deploy_target: DeployTarget,
 }
 
 impl WorkflowBarrier {
     /// Create a new workflow barrier
-    pub fn new(bucket: &str, cluster_id: &str, instance_id: &str, service_type: &str) -> Self {
+    pub fn new(
+        bucket: &str,
+        cluster_id: &str,
+        instance_id: &str,
+        service_type: &str,
+        deploy_target: DeployTarget,
+    ) -> Self {
         Self {
             bucket: bucket.to_string(),
             cluster_id: cluster_id.to_string(),
             instance_id: instance_id.to_string(),
             service_type: service_type.to_string(),
+            deploy_target,
         }
     }
 
@@ -79,12 +87,13 @@ impl WorkflowBarrier {
             .ok_or_else(|| Error::other("workflow_cluster_id not configured"))?;
 
         let bucket = &config.bootstrap_bucket;
-        let instance_id = get_instance_id()?;
+        let instance_id = get_instance_id(config.global.deploy_target)?;
         Ok(Self::new(
             bucket,
             cluster_id,
             &instance_id,
             service_type.as_str(),
+            config.global.deploy_target,
         ))
     }
 
@@ -251,7 +260,7 @@ impl WorkflowBarrier {
 
     /// Register an etcd node in the workflow S3 structure
     pub fn register_etcd_node(&self) -> CmdResult {
-        let my_ip = get_private_ip()?;
+        let my_ip = get_private_ip(self.deploy_target)?;
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

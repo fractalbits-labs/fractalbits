@@ -12,6 +12,23 @@ pub fn upload_docker_images(deploy_target: DeployTarget) -> CmdResult {
     super::build::build_docker_images()?;
     super::build::pack_binaries(Some(deploy_target))?;
 
+    let variant = match deploy_target {
+        DeployTarget::Aws => "aws",
+        DeployTarget::OnPrem => "onprem",
+        DeployTarget::Gcp => "gcp",
+    };
+
+    upload_docker_images_to_aws(variant)
+}
+
+/// Build slim Docker images and binaries bundle, then upload to GCS.
+pub fn upload_docker_images_gcp(project_id: &str) -> CmdResult {
+    super::build::build_docker_images()?;
+    super::build::pack_binaries(Some(DeployTarget::Gcp))?;
+    upload_docker_images_to_gcs("gcp", project_id)
+}
+
+fn upload_docker_images_to_aws(variant: &str) -> CmdResult {
     let bucket_name = get_bootstrap_bucket_name(DeployTarget::Aws)?;
 
     // Create bucket if it doesn't exist
@@ -31,16 +48,38 @@ pub fn upload_docker_images(deploy_target: DeployTarget) -> CmdResult {
         run_cmd!(aws s3 cp $image_path $s3_path)?;
     }
 
-    // Upload binaries bundle
-    let variant = match deploy_target {
-        DeployTarget::Aws => "aws",
-        DeployTarget::OnPrem => "onprem",
-        DeployTarget::Gcp => "gcp",
-    };
     let binaries_path = format!("{}/binaries-{}.tar.gz", DOCKER_OUTPUT_DIR, variant);
     let s3_path = format!("s3://{}/docker/binaries-{}.tar.gz", bucket_name, variant);
     info!("Uploading {} binaries bundle to S3...", variant);
     run_cmd!(aws s3 cp $binaries_path $s3_path)?;
+
+    Ok(())
+}
+
+fn upload_docker_images_to_gcs(variant: &str, project_id: &str) -> CmdResult {
+    let bucket_name = format!("{project_id}-deploy-staging");
+    let gcs_bucket = format!("gs://{bucket_name}");
+
+    // Create bucket if it doesn't exist
+    let bucket_exists = run_cmd!(gcloud storage ls $gcs_bucket &>/dev/null).is_ok();
+    if !bucket_exists {
+        run_cmd! {
+            info "Creating GCS bucket $gcs_bucket";
+            gcloud storage buckets create --location=us-central1 $gcs_bucket;
+        }?;
+    }
+
+    for arch in ["aarch64", "x86_64"] {
+        let image_path = format!("{}/fractalbits-{}.tar.gz", DOCKER_OUTPUT_DIR, arch);
+        let gcs_path = format!("{}/docker/fractalbits-{}.tar.gz", gcs_bucket, arch);
+        info!("Uploading {} Docker image to GCS...", arch);
+        run_cmd!(gcloud storage cp $image_path $gcs_path)?;
+    }
+
+    let binaries_path = format!("{}/binaries-{}.tar.gz", DOCKER_OUTPUT_DIR, variant);
+    let gcs_path = format!("{}/docker/binaries-{}.tar.gz", gcs_bucket, variant);
+    info!("Uploading {} binaries bundle to GCS...", variant);
+    run_cmd!(gcloud storage cp $binaries_path $gcs_path)?;
 
     Ok(())
 }

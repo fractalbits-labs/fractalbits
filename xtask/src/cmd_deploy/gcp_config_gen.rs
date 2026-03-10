@@ -41,11 +41,11 @@ pub fn generate_bootstrap_config(
     let rss_a_ip = get_output(outputs, "rss_a_ip")?;
     let nss_a_name = get_output(outputs, "nss_a_name")?;
     let nss_a_ip = get_output(outputs, "nss_a_ip")?;
-    let nss_b_name = get_output(outputs, "nss_b_name")?;
-    let nss_b_ip = get_output(outputs, "nss_b_ip")?;
+    let nss_b_name = outputs.get("nss_b_name").filter(|v| !v.is_empty()).cloned();
+    let nss_b_ip = outputs.get("nss_b_ip").filter(|v| !v.is_empty()).cloned();
 
-    let rss_b_name = outputs.get("rss_b_name").cloned();
-    let rss_b_ip = outputs.get("rss_b_ip").cloned();
+    let rss_b_name = outputs.get("rss_b_name").filter(|v| !v.is_empty()).cloned();
+    let rss_b_ip = outputs.get("rss_b_ip").filter(|v| !v.is_empty()).cloned();
 
     let nss_endpoint = nss_a_ip.clone();
 
@@ -78,7 +78,9 @@ pub fn generate_bootstrap_config(
             });
     }
 
-    // NSS nodes (NVMe journal on GCP persistent disk)
+    // NSS nodes (pd-ssd journal on GCP persistent disk)
+    // volume_id uses "gcp:" prefix for GCP device path resolution
+    let nss_volume_id = Some("gcp:nss-journal".to_string());
     nodes
         .entry("nss_server".to_string())
         .or_default()
@@ -86,21 +88,23 @@ pub fn generate_bootstrap_config(
             id: nss_a_name.clone(),
             private_ip: Some(nss_a_ip),
             role: None,
-            volume_id: None,
+            volume_id: nss_volume_id.clone(),
             journal_uuid: Some(journal_uuid.clone()),
             bench_client_num: None,
         });
-    nodes
-        .entry("nss_server".to_string())
-        .or_default()
-        .push(NodeEntry {
-            id: nss_b_name.clone(),
-            private_ip: Some(nss_b_ip),
-            role: None,
-            volume_id: None,
-            journal_uuid: Some(journal_uuid),
-            bench_client_num: None,
-        });
+    if let (Some(name), Some(ip)) = (&nss_b_name, &nss_b_ip) {
+        nodes
+            .entry("nss_server".to_string())
+            .or_default()
+            .push(NodeEntry {
+                id: name.clone(),
+                private_ip: Some(ip.clone()),
+                role: None,
+                volume_id: nss_volume_id,
+                journal_uuid: Some(journal_uuid),
+                bench_client_num: None,
+            });
+    }
 
     // BSS nodes from Terraform MIG
     for i in 0..params.num_bss_nodes {
@@ -109,6 +113,25 @@ pub fn generate_bootstrap_config(
         if let (Some(name), Some(ip)) = (outputs.get(&name_key), outputs.get(&ip_key)) {
             nodes
                 .entry("bss_server".to_string())
+                .or_default()
+                .push(NodeEntry {
+                    id: name.clone(),
+                    private_ip: Some(ip.clone()),
+                    role: None,
+                    volume_id: None,
+                    journal_uuid: None,
+                    bench_client_num: None,
+                });
+        }
+    }
+
+    // API server nodes from Terraform MIG
+    for i in 0..params.num_api_servers {
+        let name_key = format!("api_{i}_name");
+        let ip_key = format!("api_{i}_ip");
+        if let (Some(name), Some(ip)) = (outputs.get(&name_key), outputs.get(&ip_key)) {
+            nodes
+                .entry("api_server".to_string())
                 .or_default()
                 .push(NodeEntry {
                     id: name.clone(),
@@ -176,7 +199,10 @@ pub fn generate_bootstrap_config(
             data_blob_storage: DataBlobStorage::AllInBssSingleAz,
             rss_ha_enabled: params.rss_ha_enabled,
             rss_backend: params.rss_backend,
-            journal_type: xtask_common::JournalType::Nvme,
+            journal_type: match outputs.get("journal_type").map(|s| s.as_str()) {
+                Some("local_ssd") => xtask_common::JournalType::Nvme,
+                _ => xtask_common::JournalType::Ebs, // pd_ssd uses EBS-style journal
+            },
             num_bss_nodes: Some(params.num_bss_nodes),
             num_api_servers: Some(params.num_api_servers),
             num_bench_clients: None,
@@ -192,7 +218,7 @@ pub fn generate_bootstrap_config(
         },
         resources: Some(ClusterResourcesConfig {
             nss_a_id: nss_a_name,
-            nss_b_id: Some(nss_b_name),
+            nss_b_id: nss_b_name,
             volume_a_id: None,
             volume_b_id: None,
         }),

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::InitConfig;
 use crate::etcd_utils::{ensure_etcd_local, resolve_etcd_bin};
+use crate::firestore_utils;
 use crate::*;
 use colored::*;
 use uuid::Uuid;
@@ -216,6 +217,12 @@ pub fn init_service(
         stop_service(ServiceName::Etcd)?;
         Ok(())
     };
+    let init_firestore = || -> CmdResult {
+        firestore_utils::ensure_firestore_emulator()?;
+        start_service(ServiceName::FirestoreEmulator)?;
+        seed_firestore_emulator()?;
+        Ok(())
+    };
     let init_rss = || -> CmdResult {
         // Start backend service (ddb_local or etcd) based on config
         match init_config.rss_backend {
@@ -227,6 +234,12 @@ pub fn init_service(
             RssBackend::Etcd => {
                 if run_cmd!(systemctl --user is-active --quiet etcd.service).is_err() {
                     init_etcd()?;
+                }
+            }
+            RssBackend::Firestore => {
+                if run_cmd!(systemctl --user is-active --quiet firestore_emulator.service).is_err()
+                {
+                    init_firestore()?;
                 }
             }
         }
@@ -245,6 +258,7 @@ pub fn init_service(
         match init_config.rss_backend {
             RssBackend::Ddb => stop_service(ServiceName::DdbLocal)?,
             RssBackend::Etcd => stop_service(ServiceName::Etcd)?,
+            RssBackend::Firestore => stop_service(ServiceName::FirestoreEmulator)?,
         }
         Ok(())
     };
@@ -344,6 +358,7 @@ pub fn init_service(
         ServiceName::NssRoleAgentA | ServiceName::NssRoleAgentB => {}
         ServiceName::Mirrord => init_mirrord()?,
         ServiceName::Etcd => init_etcd()?,
+        ServiceName::FirestoreEmulator => firestore_utils::ensure_firestore_emulator()?,
         ServiceName::FsServer => {}
         ServiceName::All => {
             if init_config.with_https {
@@ -416,6 +431,101 @@ fn ensure_minio() -> CmdResult {
     }?;
 
     Ok(())
+}
+
+/// Seed the Firestore emulator with initial data (observer state, AZ status, VG configs, journal UUID).
+/// The emulator must already be running on port 8282.
+/// This is called both during init and during start (since the emulator is in-memory only).
+fn seed_firestore_emulator() -> CmdResult {
+    let journal_type = get_journal_type_setting();
+    let bss_count = get_bss_count_from_config();
+
+    let observer_state_json = match journal_type {
+        JournalType::Nvme => {
+            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0,"nss_node_map":{"nss-A":1,"nss-B":2},"next_nss_node_id":3}"#
+        }
+        JournalType::Ebs => {
+            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-B","running_service":"noop","expected_role":"standby","network_address":null},"version":1,"last_updated":0,"nss_node_map":{"nss-A":1,"nss-B":2},"next_nss_node_id":3}"#
+        }
+    };
+    let bss_data_vg_config = generate_bss_data_vg_config(bss_count);
+    let bss_metadata_vg_config = generate_bss_metadata_vg_config(bss_count);
+    let journal_uuid = get_or_create_shared_journal_uuid()?;
+
+    let firestore_put = |collection: &str, doc_id: &str, fields_json: &str| -> CmdResult {
+        let url = format!(
+            "http://localhost:8282/v1/projects/test-project/databases/fractalbits/documents/{collection}/{doc_id}"
+        );
+        run_cmd!(
+            curl -sf -X PATCH $url
+                -H "Content-Type: application/json"
+                -d $fields_json >/dev/null
+        )
+    };
+
+    let escaped_observer = observer_state_json.replace('"', r#"\""#);
+    let observer_fields = format!(
+        r#"{{"fields":{{"state":{{"stringValue":"{escaped_observer}"}},"version":{{"integerValue":"1"}}}}}}"#
+    );
+    info!("Seeding observer_state in Firestore...");
+    firestore_put(
+        "fractalbits-service-discovery",
+        "observer_state",
+        &observer_fields,
+    )?;
+
+    let az_status_json = r#"{"status":{"localdev-az1":"Normal","localdev-az2":"Normal"}}"#;
+    let escaped_az = az_status_json.replace('"', r#"\""#);
+    let az_fields = format!(
+        r#"{{"fields":{{"value":{{"stringValue":"{escaped_az}"}},"version":{{"integerValue":"1"}}}}}}"#
+    );
+    info!("Seeding AZ status in Firestore...");
+    firestore_put("fractalbits-service-discovery", "az_status", &az_fields)?;
+
+    let escaped_data_vg = bss_data_vg_config.replace('"', r#"\""#).replace('\n', "");
+    let data_vg_fields = format!(
+        r#"{{"fields":{{"value":{{"stringValue":"{escaped_data_vg}"}},"version":{{"integerValue":"1"}}}}}}"#
+    );
+    info!("Seeding BSS data VG config in Firestore...");
+    firestore_put(
+        "fractalbits-service-discovery",
+        "bss-data-vg-config",
+        &data_vg_fields,
+    )?;
+
+    let escaped_meta_vg = bss_metadata_vg_config
+        .replace('"', r#"\""#)
+        .replace('\n', "");
+    let meta_vg_fields = format!(
+        r#"{{"fields":{{"value":{{"stringValue":"{escaped_meta_vg}"}},"version":{{"integerValue":"1"}}}}}}"#
+    );
+    info!("Seeding BSS metadata VG config in Firestore...");
+    firestore_put(
+        "fractalbits-service-discovery",
+        "bss-metadata-vg-config",
+        &meta_vg_fields,
+    )?;
+
+    let journal_fields = format!(
+        r#"{{"fields":{{"value":{{"stringValue":"{journal_uuid}"}},"version":{{"integerValue":"1"}}}}}}"#
+    );
+    info!("Seeding journal UUID in Firestore...");
+    firestore_put(
+        "fractalbits-service-discovery",
+        "journal-uuid",
+        &journal_fields,
+    )?;
+
+    Ok(())
+}
+
+/// Re-initialize the test API key in RSS after a fresh Firestore emulator start.
+fn reinit_firestore_api_key() -> CmdResult {
+    let rss_admin_path = resolve_binary_path("rss_admin", BuildMode::Debug);
+    info!("Re-initializing API key for Firestore emulator...");
+    run_cmd! {
+        $rss_admin_path --rss-addr=127.0.0.1:8086 api-key init-test;
+    }
 }
 
 fn get_bss_count_from_config() -> u32 {
@@ -624,6 +734,7 @@ fn all_services(
     let rss_backend_service = match rss_backend {
         RssBackend::Ddb => ServiceName::DdbLocal,
         RssBackend::Etcd => ServiceName::Etcd,
+        RssBackend::Firestore => ServiceName::FirestoreEmulator,
     };
     // Mirrord service is only needed for NVMe journal or S3ExpressMultiAz
     let with_mirrord =
@@ -637,7 +748,6 @@ fn all_services(
                 ServiceName::NssRoleAgentB,
                 ServiceName::Bss,
                 ServiceName::Rss,
-                rss_backend_service,
                 ServiceName::Minio,
             ];
             if with_managed_service {
@@ -655,7 +765,6 @@ fn all_services(
                 ServiceName::NssRoleAgentB,
                 ServiceName::Bss,
                 ServiceName::Rss,
-                rss_backend_service,
                 ServiceName::Minio,
                 ServiceName::MinioAz1,
                 ServiceName::MinioAz2,
@@ -673,7 +782,6 @@ fn all_services(
                 ServiceName::NssRoleAgentB,
                 ServiceName::Bss,
                 ServiceName::Rss,
-                rss_backend_service,
             ];
             if with_managed_service {
                 services.push(ServiceName::Nss);
@@ -684,6 +792,7 @@ fn all_services(
             services
         }
     };
+    services.push(rss_backend_service);
     if sort {
         services.sort_by_key(|s| s.as_ref().to_string());
     }
@@ -693,6 +802,8 @@ fn all_services(
 fn get_rss_backend_setting() -> RssBackend {
     if run_cmd!(grep -q "RSS_BACKEND=etcd" data/etc/rss.service &>/dev/null).is_ok() {
         RssBackend::Etcd
+    } else if run_cmd!(grep -q "RSS_BACKEND=firestore" data/etc/rss.service &>/dev/null).is_ok() {
+        RssBackend::Firestore
     } else {
         RssBackend::Ddb
     }
@@ -926,6 +1037,12 @@ fn start_all_services() -> CmdResult {
             info!("Starting supporting services (etcd)");
             start_service(ServiceName::Etcd)?;
         }
+        RssBackend::Firestore => {
+            info!("Starting supporting services (firestore emulator)");
+            start_service(ServiceName::FirestoreEmulator)?;
+            // Firestore emulator is in-memory only, so re-seed data on every start
+            seed_firestore_emulator()?;
+        }
     }
 
     // Start minio only for S3-based backends
@@ -943,11 +1060,17 @@ fn start_all_services() -> CmdResult {
         DataBlobStorage::AllInBssSingleAz => {}
     }
 
+    // For Firestore backend, re-init API key after RSS starts (emulator is in-memory)
+    let reinit_api_key = matches!(rss_backend, RssBackend::Firestore);
+
     // Start all main services - systemd dependencies will handle ordering
     match data_blob_storage {
         DataBlobStorage::S3HybridSingleAz | DataBlobStorage::AllInBssSingleAz => {
             info!("Starting single_az services");
             start_service(ServiceName::Rss)?;
+            if reinit_api_key {
+                reinit_firestore_api_key()?;
+            }
             // Start all BSS instances
             let bss_count = get_bss_count_from_config();
             for id in 0..bss_count {
@@ -967,6 +1090,9 @@ fn start_all_services() -> CmdResult {
             }
             start_service(ServiceName::NssRoleAgentB)?;
             start_service(ServiceName::Rss)?;
+            if reinit_api_key {
+                reinit_firestore_api_key()?;
+            }
             start_service(ServiceName::NssRoleAgentA)?;
             start_service(ServiceName::ApiServer)?;
         }
@@ -1001,6 +1127,7 @@ fn create_systemd_unit_files_for_init(
         | ServiceName::MinioAz1
         | ServiceName::MinioAz2
         | ServiceName::Etcd
+        | ServiceName::FirestoreEmulator
         | ServiceName::FsServer => {
             create_systemd_unit_file(service, build_mode, init_config)?;
         }
@@ -1132,6 +1259,10 @@ Environment="BSS_WORKING_DIR=./bss%i""##;
                 "\nEnvironment=\"RSS_BACKEND={}\"",
                 init_config.rss_backend.as_ref()
             );
+            if init_config.rss_backend == RssBackend::Firestore {
+                env_settings += "\nEnvironment=\"FIRESTORE_EMULATOR_HOST=localhost:8282\"";
+                env_settings += "\nEnvironment=\"GCP_PROJECT_ID=test-project\"";
+            }
             // Observer leader election configuration
             env_settings +=
                 "\nEnvironment=\"LEADER_TABLE_NAME=fractalbits-leader-election-observer\"";
@@ -1195,6 +1326,13 @@ Environment="MINIO_REGION=localdev""##
                 "{etcd_bin} --data-dir=./etcd --listen-client-urls=http://localhost:2379 --advertise-client-urls=http://localhost:2379"
             )
         }
+        ServiceName::FirestoreEmulator => {
+            let java = run_fun!(bash -c "command -v java")?;
+            let jar = firestore_utils::resolve_firestore_jar();
+            format!(
+                "{java} -Duser.language=en -cp {jar} com.google.cloud.datastore.emulator.firestore.CloudFirestore start --host=localhost --port=8282 --database-mode=firestore-native"
+            )
+        }
         ServiceName::FsServer => {
             let fs = &init_config.fs_server;
             env_settings += &format!("\nEnvironment=\"FS_SERVER_BUCKET_NAME={}\"", fs.bucket_name);
@@ -1228,6 +1366,9 @@ Environment="MINIO_REGION=localdev""##
         ServiceName::Rss => match init_config.rss_backend {
             RssBackend::Ddb => "After=ddb_local.service\nWants=ddb_local.service\n".to_string(),
             RssBackend::Etcd => "After=etcd.service\nWants=etcd.service\n".to_string(),
+            RssBackend::Firestore => {
+                "After=firestore_emulator.service\nWants=firestore_emulator.service\n".to_string()
+            }
         },
         ServiceName::ApiServer | ServiceName::GuiServer => {
             match init_config.data_blob_storage {
@@ -1388,6 +1529,7 @@ pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdRes
             }
         }
         ServiceName::Etcd => ("port 2379", vec![2379]),
+        ServiceName::FirestoreEmulator => ("port 8282", vec![8282]),
         ServiceName::FsServer => ("mountpoint check", vec![]),
         ServiceName::All => unreachable!("Should not check readiness for All"),
     };
@@ -1472,6 +1614,17 @@ fn register_local_api_server() -> CmdResult {
             run_cmd!(
                 $etcdctl put /fractalbits-service-discovery/api-server/local-dev "127.0.0.1" >/dev/null
             )?;
+        }
+        RssBackend::Firestore => {
+            // Register api_server in Firestore service discovery
+            let doc_json = r#"{"fields":{"ip":{"stringValue":"127.0.0.1"}}}"#;
+            run_cmd!(
+                curl -sf -X POST
+                    "http://localhost:8282/v1/projects/test-project/databases/fractalbits/documents/fractalbits-service-discovery?documentId=api-server/local-dev"
+                    -H "Content-Type: application/json"
+                    -d $doc_json
+                    >/dev/null
+            ).ok(); // Ignore error if already exists
         }
     }
 

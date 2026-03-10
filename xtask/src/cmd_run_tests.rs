@@ -37,6 +37,18 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         leader_election::cleanup_test_root_server_instances()?;
         cmd_service::stop_service(ServiceName::Etcd)?;
 
+        // Test with Firestore backend
+        info!("Testing leader election with Firestore backend...");
+        let firestore_config = InitConfig {
+            rss_backend: RssBackend::Firestore,
+            ..Default::default()
+        };
+        cmd_service::init_service(ServiceName::All, BuildMode::Debug, &firestore_config)?;
+        cmd_service::start_service(ServiceName::FirestoreEmulator)?;
+        leader_election::run_leader_election_tests(RssBackend::Firestore)?;
+        leader_election::cleanup_test_root_server_instances()?;
+        cmd_service::stop_service(ServiceName::FirestoreEmulator)?;
+
         Ok(())
     };
 

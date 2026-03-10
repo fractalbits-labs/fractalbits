@@ -1,5 +1,5 @@
 resource "google_service_account" "fractalbits" {
-  account_id   = "fractalbits-${var.cluster_id}"
+  account_id   = "fb-${substr(var.cluster_id, 0, min(26, length(var.cluster_id)))}"
   display_name = "Fractalbits Compute Engine SA (${var.cluster_id})"
 }
 

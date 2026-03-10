@@ -16,12 +16,15 @@ pub(crate) fn format_internal(ebs_dev: &str, journal_uuid: &str) -> CmdResult {
     let mount_point = format!("/data/ebs/{journal_uuid}");
     let journal_dir = mount_point.clone();
 
+    // Unmount if already mounted (e.g., from a previous bootstrap attempt)
+    let _ = cmd_lib::run_cmd!(umount $ebs_dev 2>/dev/null);
+
     run_cmd! {
         info "Disabling udev rules for EBS";
         ln -sf /dev/null /etc/udev/rules.d/99-ebs.rules;
 
         info "Formatting $ebs_dev to ext4 file system with UUID $journal_uuid";
-        mkfs.ext4 -U $journal_uuid -O bigalloc -C 16384 $ebs_dev &>/dev/null;
+        mkfs.ext4 -F -U $journal_uuid -O bigalloc -C 16384 $ebs_dev &>/dev/null;
 
         info "Mounting $ebs_dev to $mount_point";
         mkdir -p $mount_point;
@@ -46,7 +49,11 @@ pub(crate) fn format_internal(ebs_dev: &str, journal_uuid: &str) -> CmdResult {
 }
 
 pub fn get_volume_dev(volume_id: &str) -> String {
-    // Sanitize: convert vol-07451bc901d5e1e09 → vol07451bc901d5e1e09
+    // GCP persistent disk: device name is set in terraform
+    if let Some(device_name) = volume_id.strip_prefix("gcp:") {
+        return format!("/dev/disk/by-id/google-{device_name}");
+    }
+    // AWS EBS: sanitize vol-07451bc901d5e1e09 → vol07451bc901d5e1e09
     let volume_id = &volume_id.replace("-", "");
     format!("/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_{volume_id}")
 }

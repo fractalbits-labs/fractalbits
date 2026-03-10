@@ -5,7 +5,6 @@ resource "google_compute_disk" "nss_journal_a" {
   zone                      = var.zone_a
   type                      = "pd-ssd"
   size                      = var.journal_disk_size_gb
-  provisioned_iops          = var.journal_disk_iops
   physical_block_size_bytes = 4096
 }
 
@@ -16,7 +15,6 @@ resource "google_compute_disk" "nss_journal_b" {
   zone                      = var.zone_b
   type                      = "pd-ssd"
   size                      = var.journal_disk_size_gb
-  provisioned_iops          = var.journal_disk_iops
   physical_block_size_bytes = 4096
 }
 

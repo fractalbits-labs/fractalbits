@@ -1,3 +1,11 @@
+# Static internal IP for RSS-A (avoids self-referential metadata)
+resource "google_compute_address" "rss_a" {
+  name         = "rss-a-ip-${var.cluster_id}"
+  subnetwork   = google_compute_subnetwork.private_a.id
+  address_type = "INTERNAL"
+  region       = var.region
+}
+
 # RSS-A (Root Storage Server - leader)
 resource "google_compute_instance" "rss_a" {
   name         = "rss-a-${var.cluster_id}"
@@ -13,6 +21,7 @@ resource "google_compute_instance" "rss_a" {
 
   network_interface {
     subnetwork = google_compute_subnetwork.private_a.id
+    network_ip = google_compute_address.rss_a.address
   }
 
   metadata = {
@@ -21,7 +30,7 @@ resource "google_compute_instance" "rss_a" {
     cluster-id     = var.cluster_id
     rss-backend    = var.rss_backend
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
-      rss_a_ip       = google_compute_instance.rss_a.network_interface[0].network_ip
+      rss_a_ip       = google_compute_address.rss_a.address
       cluster_id     = var.cluster_id
       deploy_target  = "gcp"
       service_role   = "root_server"

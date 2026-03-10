@@ -48,16 +48,6 @@ output "bss_instance_group" {
   description = "BSS server instance group URL"
 }
 
-output "vpc_network" {
-  value       = google_compute_network.fractalbits.name
-  description = "VPC network name"
-}
-
-output "subnet_a" {
-  value       = google_compute_subnetwork.private_a.name
-  description = "Subnet A name"
-}
-
 output "service_account_email" {
   value       = google_service_account.fractalbits.email
   description = "Service account email"
@@ -98,7 +88,32 @@ output "journal_type" {
   description = "NSS journal type"
 }
 
-output "bench_ip" {
+output "bench_server_name" {
+  value       = var.with_bench ? google_compute_instance.bench[0].name : ""
+  description = "Bench server instance name"
+}
+
+output "bench_server_ip" {
   value       = var.with_bench ? google_compute_instance.bench[0].network_interface[0].network_ip : ""
   description = "Bench server private IP"
+}
+
+output "rss_b_name" {
+  value       = local.is_ha ? google_compute_instance.rss_b[0].name : ""
+  description = "RSS-B instance name (HA only)"
+}
+
+output "network_name" {
+  value       = google_compute_network.fractalbits.name
+  description = "VPC network name"
+}
+
+output "subnetwork_name" {
+  value       = google_compute_subnetwork.private_a.name
+  description = "Subnet name"
+}
+
+output "firestore_database_id" {
+  value       = "fractalbits"
+  description = "Firestore database ID"
 }

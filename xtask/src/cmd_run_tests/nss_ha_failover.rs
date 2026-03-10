@@ -56,10 +56,32 @@ fn get_observer_state_from_ddb() -> Option<ObserverPersistentState> {
     }
 }
 
+fn get_observer_state_from_firestore() -> Option<ObserverPersistentState> {
+    let url = "http://localhost:8282/v1/projects/test-project/databases/fractalbits/documents/fractalbits-service-discovery/observer_state";
+    let result = run_fun!(curl -sf $url);
+    match result {
+        Ok(output) => {
+            let output = output.trim();
+            if output.is_empty() {
+                return None;
+            }
+            let json: serde_json::Value = serde_json::from_str(output).ok()?;
+            let state_str = json
+                .get("fields")?
+                .get("state")?
+                .get("stringValue")?
+                .as_str()?;
+            serde_json::from_str(state_str).ok()
+        }
+        Err(_) => None,
+    }
+}
+
 fn get_observer_state(backend: RssBackend) -> Option<ObserverPersistentState> {
     match backend {
         RssBackend::Etcd => get_observer_state_from_etcd(),
         RssBackend::Ddb => get_observer_state_from_ddb(),
+        RssBackend::Firestore => get_observer_state_from_firestore(),
     }
 }
 

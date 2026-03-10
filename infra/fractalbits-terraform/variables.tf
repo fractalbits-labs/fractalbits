@@ -102,7 +102,7 @@ variable "use_generic_binaries" {
 
 variable "os_image" {
   type    = string
-  default = "ubuntu-os-cloud/ubuntu-2404-lts"
+  default = "ubuntu-os-cloud/ubuntu-2404-lts-amd64"
 }
 
 variable "boot_disk_size_gb" {

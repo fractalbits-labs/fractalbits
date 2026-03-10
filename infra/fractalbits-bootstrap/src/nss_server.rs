@@ -25,11 +25,16 @@ pub fn bootstrap(
     // Complete instances-ready stage
     barrier.complete_stage(stages::INSTANCES_READY, None)?;
 
-    install_packages(&["nvme-cli", "mdadm"])?;
+    if journal_type == JournalType::Nvme {
+        install_packages(&["nvme-cli", "mdadm"])?;
+        format_local_nvme_disks(false)?;
+    } else if journal_type == JournalType::Ebs {
+        // EBS HA uses NVMe persistent reservations for multi-attach failover
+        install_packages(&["nvme-cli"])?;
+    }
     if meta_stack_testing || for_bench {
         let _ = download_binaries(config, &["rewrk_rpc"]);
     }
-    format_local_nvme_disks(false)?;
 
     let mut binaries = vec!["nss_server", "nss_role_agent"];
     if config.is_etcd_backend() {
@@ -60,7 +65,7 @@ pub fn bootstrap(
     // Determine if this node is the EBS HA standby (nss-B with EBS journal)
     // EBS standby skips format/mount since it doesn't have the volume attached
     let resources = config.get_resources();
-    let instance_id = get_instance_id_from_config(config)?;
+    let instance_id = get_instance_id(config.global.deploy_target)?;
     let is_standby = resources.nss_b_id.as_ref() == Some(&instance_id);
     let is_ha_mode = resources.nss_b_id.is_some();
     let is_ebs_standby = journal_type == JournalType::Ebs && is_standby;
@@ -223,14 +228,9 @@ fn setup_configs(
     }
     create_systemd_unit_file("nss_role_agent", false)?;
 
-    // Systemd units - NVMe needs journal_type for local mount dependency, EBS needs journal_uuid
-    create_systemd_unit_file_with_journal_type("mirrord", false, Some(journal_type), journal_uuid)?;
-    create_systemd_unit_file_with_journal_type(
-        service_name,
-        false,
-        Some(journal_type),
-        journal_uuid,
-    )?;
+    // Systemd units - NVMe needs journal_type for local mount dependency
+    create_systemd_unit_file_with_journal_type("mirrord", false, Some(journal_type))?;
+    create_systemd_unit_file_with_journal_type(service_name, false, Some(journal_type))?;
 
     create_logrotate_for_stats()?;
     if config.global.deploy_target == DeployTarget::Aws {
@@ -335,7 +335,7 @@ fn prepare_local_dirs() -> CmdResult {
     let shards: Vec<usize> = (0..NSS_META_CACHE_SHARDS).collect();
     shards.par_iter().try_for_each(|&i| {
         let shard_dir = format!("/data/local/meta_cache/blobs/{}", i);
-        std::fs::create_dir(&shard_dir)
+        std::fs::create_dir_all(&shard_dir)
             .map_err(|e| Error::other(format!("Failed to create {}: {}", shard_dir, e)))
     })?;
 
@@ -369,8 +369,8 @@ pub(crate) fn format_nss(create_journal_dir: bool) -> CmdResult {
 
 fn create_nss_role_agent_config(config: &BootstrapConfig) -> CmdResult {
     let rss_ha_enabled = config.global.rss_ha_enabled;
-    let instance_id = get_instance_id_from_config(config)?;
-    let private_ip = get_private_ip()?;
+    let instance_id = get_instance_id(config.global.deploy_target)?;
+    let private_ip = get_private_ip_from_config(config, &instance_id)?;
     let nss_port = 8088;
 
     // Query service discovery for RSS instance IPs

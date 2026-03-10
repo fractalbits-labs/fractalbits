@@ -33,10 +33,7 @@ for i in $(seq 1 120); do
     sleep 2
 done
 
-# Download and run bootstrap
-echo "$(date): Downloading bootstrap script..." | tee -a "$LOG_FILE"
-curl -sf "$DOCKER_S3_ENDPOINT/$DOCKER_S3_BUCKET/bootstrap.sh" -o /tmp/bootstrap.sh
-chmod +x /tmp/bootstrap.sh
+# Install AWS CLI for bootstrap (xtask triggers bootstrap via SSH)
+snap install aws-cli --classic 2>/dev/null || true
 
-echo "$(date): Running bootstrap script..." | tee -a "$LOG_FILE"
-nohup /tmp/bootstrap.sh >> "$LOG_FILE" 2>&1 &
+echo "$(date): Startup script complete. Waiting for xtask to trigger bootstrap via SSH." | tee -a "$LOG_FILE"

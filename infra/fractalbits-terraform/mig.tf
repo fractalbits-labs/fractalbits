@@ -9,6 +9,7 @@ resource "google_compute_instance_template" "api_server" {
     auto_delete  = true
     boot         = true
     disk_size_gb = var.boot_disk_size_gb
+    disk_type    = "pd-ssd"
   }
 
   network_interface {
@@ -68,11 +69,13 @@ resource "google_compute_instance_template" "bss_server" {
     auto_delete  = true
     boot         = true
     disk_size_gb = var.boot_disk_size_gb
+    disk_type    = "pd-ssd"
   }
 
   # Local SSDs for BSS data storage (io_uring direct I/O)
   disk {
     type         = "SCRATCH"
+    disk_type    = "local-ssd"
     disk_size_gb = 375
     interface    = "NVME"
   }

@@ -395,6 +395,23 @@ fn initialize_bss_volume_groups(
             .enumerate()
             .map(|(i, node)| (format!("bss-{}", i + 1), node.ip.clone()))
             .collect()
+    } else if config.is_firestore_backend() {
+        info!("Getting BSS nodes from bootstrap config...");
+        // Wait for BSS nodes to complete instances-ready stage via workflow
+        info!("Waiting for {total_bss_nodes} BSS node(s) to be ready...");
+        barrier
+            .wait_for_nodes(
+                stages::INSTANCES_READY,
+                total_bss_nodes + 1,
+                timeouts::INSTANCES_READY,
+            )
+            .unwrap_or_default(); // Best effort - RSS already counted
+        let bss_ips = get_service_ips_with_backend(config, "bss-server", total_bss_nodes);
+        bss_ips
+            .into_iter()
+            .enumerate()
+            .map(|(i, ip)| (format!("bss-{}", i + 1), ip))
+            .collect()
     } else {
         let region = get_current_aws_region()?;
         info!("Waiting for all BSS nodes to register in service discovery...");
@@ -737,7 +754,7 @@ fn wait_for_leadership() -> CmdResult {
 
 fn create_rss_config(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: bool) -> CmdResult {
     let region = &config.global.region;
-    let instance_id = get_instance_id_from_config(config)?;
+    let instance_id = get_instance_id(config.global.deploy_target)?;
 
     let backend = if config.is_etcd_backend() {
         "etcd"

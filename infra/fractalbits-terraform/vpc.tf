@@ -48,6 +48,10 @@ resource "google_compute_firewall" "internal" {
   }
 
   source_tags = ["fractalbits-private"]
+  source_ranges = compact([
+    google_compute_subnetwork.private_a.ip_cidr_range,
+    local.is_ha ? google_compute_subnetwork.private_b[0].ip_cidr_range : null,
+  ])
   target_tags = ["fractalbits-private"]
 }
 

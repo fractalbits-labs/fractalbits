@@ -58,8 +58,6 @@ fn generic_bootstrap() -> CmdResult {
 
     info!("Starting config-based bootstrap mode (bucket: {bucket_name})");
 
-    ensure_ec2_metadata()?;
-
     let config = config::download_and_parse(bucket_name)?;
 
     // Clear Docker S3 test credentials from global env so DynamoDB/other AWS

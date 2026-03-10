@@ -1,7 +1,7 @@
 use log::info;
 use std::io::Error;
 
-use crate::common::{get_current_aws_region, get_ec2_tag, get_instance_id_from_config};
+use crate::common::{get_current_aws_region, get_ec2_tag, get_instance_id};
 use crate::config::{BootstrapConfig, DeployTarget, InstanceConfig, JournalType};
 
 pub const SERVICE_TYPE_TAG: &str = "fractalbits:ServiceType";
@@ -25,7 +25,7 @@ pub enum ServiceType {
 }
 
 pub fn discover_service_type(config: &BootstrapConfig) -> Result<ServiceType, Error> {
-    let instance_id = get_instance_id_from_config(config)?;
+    let instance_id = get_instance_id(config.global.deploy_target)?;
     info!("Discovering service type for instance: {instance_id}");
 
     if let Some(instance_config) = config.get_instance(&instance_id) {

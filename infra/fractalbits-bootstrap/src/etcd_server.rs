@@ -12,7 +12,7 @@ pub fn bootstrap_new_cluster(config: &BootstrapConfig, initial_cluster: &str) ->
 
     download_etcd_binaries(config)?;
 
-    let instance_id = get_instance_id_from_config(config)?;
+    let instance_id = get_instance_id(config.global.deploy_target)?;
     let my_ip = get_private_ip_from_config(config, &instance_id)?;
     let member_name = format!("bss-{}", my_ip.replace('.', "-"));
 
