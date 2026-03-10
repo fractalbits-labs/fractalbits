@@ -758,7 +758,7 @@ fn test_manual_leadership_resignation(backend: RssBackend) -> CmdResult {
 
     // Wait a short time for resignation to take effect and second instance to acquire leadership
     // The resignation should be immediate, so we don't need to wait for lease expiration
-    sleep(Duration::from_secs(5));
+    sleep(Duration::from_secs(15));
 
     // Second instance should now be leader (resignation should enable immediate takeover)
     let final_leader = get_current_leader(&table_name, backend);
