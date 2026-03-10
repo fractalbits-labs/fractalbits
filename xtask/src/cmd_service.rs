@@ -653,6 +653,7 @@ fn all_services(
                 ServiceName::ApiServer,
                 ServiceName::NssRoleAgentA,
                 ServiceName::NssRoleAgentB,
+                ServiceName::Bss,
                 ServiceName::Rss,
                 rss_backend_service,
                 ServiceName::Minio,
@@ -709,7 +710,17 @@ fn get_data_blob_storage_setting() -> DataBlobStorage {
 }
 
 fn get_journal_type_setting() -> JournalType {
-    // Check if mirrord@.service exists (indicates NVMe journal with mirrord)
+    // Check the nss_role_agent_b service file for the actual journal type setting.
+    // We can't just check mirrord@.service existence because mirrord is also used
+    // with S3ExpressMultiAz + EBS journal type.
+    let service_file = Path::new("data/etc/nss_role_agent_b.service");
+    if service_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(service_file) {
+            if content.contains("APP_JOURNAL_TYPE=ebs") {
+                return JournalType::Ebs;
+            }
+        }
+    }
     if Path::new("data/etc/mirrord@.service").exists() {
         JournalType::Nvme
     } else {
@@ -949,7 +960,12 @@ fn start_all_services() -> CmdResult {
             start_service(ServiceName::ApiServer)?;
         }
         DataBlobStorage::S3ExpressMultiAz => {
-            info!("Starting multi_az services (skipping BSS)");
+            info!("Starting multi_az services");
+            // Start BSS instances (NSS requires BSS for metadata storage)
+            let bss_count = get_bss_count_from_config();
+            for id in 0..bss_count {
+                start_bss_instance(id)?;
+            }
             start_service(ServiceName::NssRoleAgentB)?;
             start_service(ServiceName::Rss)?;
             start_service(ServiceName::NssRoleAgentA)?;

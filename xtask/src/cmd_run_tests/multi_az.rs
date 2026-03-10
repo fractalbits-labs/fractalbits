@@ -12,7 +12,7 @@ pub async fn run_multi_az_tests(test_type: MultiAzTestType) -> CmdResult {
             BuildMode::Debug,
             &InitConfig {
                 data_blob_storage: crate::DataBlobStorage::S3ExpressMultiAz,
-                bss_count: 0, // No BSS services in multi-AZ mode
+                bss_count: 1, // NSS requires at least 1 BSS for metadata storage
                 ..Default::default()
             },
         )?;
