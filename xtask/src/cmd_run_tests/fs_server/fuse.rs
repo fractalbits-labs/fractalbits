@@ -1182,10 +1182,8 @@ async fn test_fsync_persistence(disk_cache: bool) -> CmdResult {
 // These tests verify that FUSE sees mutations made externally via the
 // S3 API (bypassing FUSE). With TTL-based caching (FUSE entry TTL=1s,
 // DirCache TTL=5s), we must wait for the cache to expire before the
-// kernel re-issues LOOKUP/readdir. These tests establish the baseline
-// behavior; once FUSE cache invalidation (FUSE_NOTIFY_INVAL_ENTRY /
-// FUSE_NOTIFY_INVAL_INODE) is implemented, the sleep can be reduced
-// or removed.
+// kernel re-issues LOOKUP/readdir. This is the expected behavior for
+// TTL-based cache invalidation.
 
 /// Time to wait for FUSE entry TTL + DirCache TTL to expire.
 const CACHE_TTL_WAIT: Duration = Duration::from_secs(7);
@@ -1462,9 +1460,8 @@ async fn test_external_rename_visibility(disk_cache: bool) -> CmdResult {
 // uses MOUNT_POINT_B. Mutations on one instance should become visible
 // on the other after the DirCache TTL expires.
 //
-// Currently these rely on TTL-based expiry (FUSE TTL=1s, DirCache
-// TTL=5s). Once NSS-mediated WatchChanges is implemented, the
-// staleness window should drop to ~100ms.
+// TTL-based expiry (FUSE TTL=1s, DirCache TTL=5s) is the design
+// choice for cache invalidation.
 
 /// Test that a file written via FUSE on instance A becomes visible
 /// on instance B after cache expiry.

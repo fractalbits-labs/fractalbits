@@ -8,7 +8,6 @@ mod inode;
 mod nfs_server;
 mod slice_mut;
 mod vfs;
-mod watch;
 
 use clap::Parser;
 use fractal_fuse::MountOptions;
@@ -16,7 +15,6 @@ use fractal_fuse::Session;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::{Config, ServerMode};
@@ -105,11 +103,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ServerMode::Fuse => {
             tracing::info!(mount_point = %mount_point, "Starting FUSE client");
 
-            // Spawn background watch loop for cross-instance cache invalidation
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let watch_handle =
-                watch::spawn_watch_loop(vfs_core.clone(), backend_config, shutdown.clone());
-
             let fuse_fs = fuse_server::FuseServer::new(vfs_core);
 
             let mount_options = MountOptions::default()
@@ -120,10 +113,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .passthrough(cfg.passthrough_enabled);
 
             Session::new(mount_options).run(fuse_fs, Path::new(&mount_point))?;
-
-            // Signal watch loop to stop and wait for it
-            shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = watch_handle.join();
             tracing::info!("FUSE client exited");
         }
         ServerMode::Nfs => {

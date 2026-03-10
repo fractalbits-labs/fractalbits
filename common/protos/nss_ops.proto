@@ -15,7 +15,6 @@ enum Command {
   CreateRootInode = 20;
   DeleteRootInode = 21;
   Rename = 22;
-  WatchChanges = 23;
 }
 
 // PutInode
@@ -134,27 +133,4 @@ message RenameResponse {
     google.protobuf.Empty err_dst_existed = 3;
     string err_other = 4;
   }
-}
-
-// WatchChanges
-message WatchChangesRequest {
-  string root_blob_name = 1;
-  uint64 last_seq = 2;
-}
-
-message ChangeEvent {
-  enum ChangeType {
-    PUT = 0;
-    DELETE = 1;
-    RENAME = 2;
-  }
-  ChangeType change_type = 1;
-  string key = 2;
-  string old_key = 3;
-}
-
-message WatchChangesResponse {
-  uint64 seq = 1;
-  repeated ChangeEvent events = 2;
-  bool truncated = 3;
 }

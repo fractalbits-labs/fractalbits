@@ -4,7 +4,6 @@ use data_types::TraceId;
 use rkyv::api::high::to_bytes_in;
 use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,8 +15,6 @@ use crate::inode::{EntryType, InodeTable, ROOT_INODE};
 use data_types::object_layout::{
     MpuState, ObjectCoreMetaData, ObjectLayout, ObjectMetaData, ObjectState,
 };
-use fractal_fuse::FuseNotifier;
-
 pub const TTL: Duration = Duration::from_secs(1);
 pub const DEFAULT_BLOCK_SIZE: u32 = 1024 * 1024 - 256;
 
@@ -95,7 +92,6 @@ pub struct VfsCore {
     passthrough_enabled: bool,
     passthrough_max_object_size: u64,
     fuse_dev_fd: AtomicI32,
-    notifier: OnceLock<FuseNotifier>,
     // Tracks blob data for unlinked files that still have open handles.
     // Cleanup is deferred until the last handle is released.
     deferred_blob_cleanup: DashMap<u64, Bytes>,
@@ -148,7 +144,6 @@ impl VfsCore {
             passthrough_enabled,
             passthrough_max_object_size,
             fuse_dev_fd: AtomicI32::new(-1),
-            notifier: OnceLock::new(),
             deferred_blob_cleanup: DashMap::new(),
         }
     }
@@ -286,7 +281,6 @@ impl VfsCore {
 
     pub fn set_fuse_dev_fd(&self, fd: i32) {
         self.fuse_dev_fd.store(fd, Ordering::Relaxed);
-        let _ = self.notifier.set(FuseNotifier::new(fd));
     }
 
     /// Try to set up passthrough for a file handle. Returns (open_flags, backing_id)
@@ -1616,81 +1610,6 @@ impl VfsCore {
         if !evicted.is_empty() {
             tracing::debug!(count = evicted.len(), "evicted stale inodes");
         }
-    }
-
-    // ── FUSE cache invalidation ──
-
-    /// Invalidate a specific directory entry in the kernel dcache.
-    /// Called when we learn about a remote rename/delete/create.
-    pub fn invalidate_entry(&self, parent_s3_key: &str, name: &str) {
-        let Some(notifier) = self.notifier.get() else {
-            return;
-        };
-        // Look up parent inode
-        let parent_ino = self
-            .inodes
-            .find_ino_by_key(parent_s3_key, EntryType::Directory)
-            .unwrap_or(ROOT_INODE);
-
-        if let Err(e) = notifier.inval_entry(parent_ino, name.as_bytes()) {
-            tracing::warn!(
-                parent = parent_s3_key,
-                name,
-                error = %e,
-                "FUSE inval_entry failed"
-            );
-        }
-        // Also invalidate internal DirCache
-        self.dir_cache.invalidate(parent_s3_key);
-    }
-
-    /// Invalidate all cached entries under a directory prefix.
-    /// Only invalidates the parent directory inode (dropping readdir
-    /// page cache), NOT individual child entries, to avoid thundering herd.
-    pub fn invalidate_dir(&self, dir_s3_key: &str) {
-        let Some(notifier) = self.notifier.get() else {
-            return;
-        };
-        // Look up dir inode
-        if let Some(dir_ino) = self
-            .inodes
-            .find_ino_by_key(dir_s3_key, EntryType::Directory)
-        {
-            // Invalidate inode attrs + page cache (readdir results)
-            if let Err(e) = notifier.inval_inode(dir_ino, -1, -1) {
-                tracing::warn!(
-                    dir = dir_s3_key,
-                    ino = dir_ino,
-                    error = %e,
-                    "FUSE inval_inode failed"
-                );
-            }
-        }
-        // Invalidate DirCache
-        self.dir_cache.invalidate(dir_s3_key);
-    }
-
-    /// Invalidate inode attributes + page cache for a file.
-    /// Used when file content changes remotely.
-    pub fn invalidate_inode(&self, s3_key: &str) {
-        let Some(notifier) = self.notifier.get() else {
-            return;
-        };
-        if let Some(ino) = self.inodes.find_ino_by_key(s3_key, EntryType::File)
-            && let Err(e) = notifier.inval_inode(ino, -1, -1)
-        {
-            tracing::warn!(
-                key = s3_key,
-                ino,
-                error = %e,
-                "FUSE inval_inode failed"
-            );
-        }
-        // Evict from DiskCache if present
-        // (DiskCache uses blob_id/volume_id, not s3_key, so we'd need the
-        // layout. For now, invalidating the inode is sufficient -- the kernel
-        // will re-fetch on next access and the disk cache will be bypassed
-        // when the layout's ETag changes.)
     }
 
     pub fn vfs_statfs(&self) -> VfsStatfs {

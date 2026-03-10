@@ -16,8 +16,6 @@ use volume_group_proxy::DataVgProxy;
 use crate::config::Config;
 use crate::error::FsError;
 use data_types::object_layout::ObjectLayout;
-use nss_codec::WatchChangesResponse;
-
 /// Discovered configuration from RSS (shared across threads).
 pub struct BackendConfig {
     pub nss_address: String,
@@ -383,27 +381,6 @@ impl StorageBackend {
                 );
             }
         }
-    }
-
-    /// Poll NSS for mutation events since `last_seq`.
-    pub async fn watch_changes(
-        &self,
-        last_seq: u64,
-        trace_id: &TraceId,
-    ) -> Result<WatchChangesResponse, FsError> {
-        let resp = nss_rpc_retry!(
-            self.nss_client.borrow(),
-            watch_changes(
-                &self.root_blob_name,
-                last_seq,
-                Some(self.config.rpc_request_timeout()),
-                trace_id
-            ),
-            self,
-            trace_id
-        )
-        .await?;
-        Ok(resp)
     }
 
     /// Create a directory marker in NSS.

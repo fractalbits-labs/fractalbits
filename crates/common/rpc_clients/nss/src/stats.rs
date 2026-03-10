@@ -37,8 +37,7 @@ impl OperationType {
             | NssOperation::CreateRootInode
             | NssOperation::DeleteRootInode
             | NssOperation::RenameFolder
-            | NssOperation::RenameObject
-            | NssOperation::WatchChanges => OperationType::Other,
+            | NssOperation::RenameObject => OperationType::Other,
         }
     }
 }
@@ -53,7 +52,6 @@ pub enum NssOperation {
     DeleteRootInode,
     RenameFolder,
     RenameObject,
-    WatchChanges,
 }
 
 pub struct NssStats {
