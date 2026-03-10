@@ -123,7 +123,8 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         }
         TestType::All => {
             test_leader_election()?;
-            multi_az::run_multi_az_tests(MultiAzTestType::All).await
+            multi_az::run_multi_az_tests(MultiAzTestType::All).await?;
+            test_fs_server(true, true, false).await
         }
     }
 }
