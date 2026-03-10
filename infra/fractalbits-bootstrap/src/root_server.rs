@@ -340,6 +340,17 @@ fn initialize_observer_state(
         let etcd_endpoints = get_etcd_endpoints_from_workflow(config)?;
         let key = "/fractalbits-service-discovery/observer_state";
         run_cmd!($etcdctl --endpoints=$etcd_endpoints put $key $observer_state_json >/dev/null)?;
+    } else if config.is_firestore_backend() {
+        let escaped = observer_state_json.replace('"', r#"\""#);
+        let fields_json = format!(
+            r#"{{"fields":{{"state":{{"stringValue":"{escaped}"}},"version":{{"integerValue":"1"}}}}}}"#
+        );
+        firestore_put_document(
+            config,
+            "fractalbits-service-discovery",
+            "observer_state",
+            &fields_json,
+        )?;
     } else {
         let region = get_current_aws_region()?;
         // Escape JSON for DynamoDB attribute value
@@ -445,6 +456,28 @@ fn initialize_bss_volume_groups(
             $etcdctl --endpoints=$etcd_endpoints put $data_key $bss_data_vg_config_json >/dev/null;
             $etcdctl --endpoints=$etcd_endpoints put $metadata_key $bss_metadata_vg_config_json >/dev/null;
         }?;
+    } else if config.is_firestore_backend() {
+        let data_escaped = bss_data_vg_config_json
+            .replace('"', r#"\""#)
+            .replace('\n', "");
+        let data_fields = format!(r#"{{"fields":{{"value":{{"stringValue":"{data_escaped}"}}}}}}"#);
+        firestore_put_document(
+            config,
+            "fractalbits-service-discovery",
+            BSS_DATA_VG_CONFIG_KEY,
+            &data_fields,
+        )?;
+
+        let meta_escaped = bss_metadata_vg_config_json
+            .replace('"', r#"\""#)
+            .replace('\n', "");
+        let meta_fields = format!(r#"{{"fields":{{"value":{{"stringValue":"{meta_escaped}"}}}}}}"#);
+        firestore_put_document(
+            config,
+            "fractalbits-service-discovery",
+            BSS_METADATA_VG_CONFIG_KEY,
+            &meta_fields,
+        )?;
     } else {
         let region = get_current_aws_region()?;
         let bss_data_vg_config_item = format!(
@@ -708,8 +741,24 @@ fn create_rss_config(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: b
 
     let backend = if config.is_etcd_backend() {
         "etcd"
+    } else if config.is_firestore_backend() {
+        "firestore"
     } else {
         "ddb"
+    };
+
+    let firestore_config_lines = if config.is_firestore_backend() {
+        let gcp = config
+            .gcp
+            .as_ref()
+            .expect("GCP config required for Firestore backend");
+        let project_id = &gcp.project_id;
+        let database_id = gcp.firestore_database.as_deref().unwrap_or("fractalbits");
+        format!(
+            "\n# Firestore configuration\nfirestore_project_id = \"{project_id}\"\nfirestore_database_id = \"{database_id}\""
+        )
+    } else {
+        String::new()
     };
 
     let etcd_endpoints_line = if config.is_etcd_backend() {
@@ -754,8 +803,8 @@ api_server_mgmt_port = 18088
 # Nss server rpc server address
 nss_addr = "{nss_endpoint}:8088"
 
-# Backend storage (ddb or etcd)
-backend = "{backend}"{etcd_endpoints_line}
+# Backend storage (ddb, etcd, or firestore)
+backend = "{backend}"{etcd_endpoints_line}{firestore_config_lines}
 
 # Leader Election Configuration (uses the same backend as RSS: ddb or etcd)
 [leader_election]

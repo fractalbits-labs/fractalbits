@@ -4,6 +4,7 @@ mod build;
 mod common;
 mod create_cluster;
 mod docker_host;
+mod gcp_config_gen;
 mod ssm_bootstrap;
 pub(crate) mod ssm_utils;
 mod upload;

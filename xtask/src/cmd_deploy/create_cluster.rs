@@ -293,6 +293,7 @@ impl InputClusterConfig {
         let config = BootstrapClusterConfig {
             global,
             aws: None,
+            gcp: None,
             endpoints,
             resources,
             etcd,

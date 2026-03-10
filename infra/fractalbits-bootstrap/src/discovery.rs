@@ -36,10 +36,12 @@ pub fn discover_service_type(config: &BootstrapConfig) -> Result<ServiceType, Er
         return parse_instance_config(config, &instance_config);
     }
 
-    // For on-prem, instance MUST be in TOML config (no EC2 tag fallback)
-    if config.global.deploy_target == DeployTarget::OnPrem {
+    // For on-prem and GCP, instance MUST be in TOML config (no EC2 tag fallback)
+    if config.global.deploy_target == DeployTarget::OnPrem
+        || config.global.deploy_target == DeployTarget::Gcp
+    {
         return Err(Error::other(format!(
-            "Instance '{instance_id}' not found in config. On-prem requires all instances in TOML."
+            "Instance '{instance_id}' not found in config. Non-AWS targets require all instances in TOML."
         )));
     }
 

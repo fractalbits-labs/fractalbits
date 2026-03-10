@@ -35,6 +35,7 @@ pub fn upload_docker_images(deploy_target: DeployTarget) -> CmdResult {
     let variant = match deploy_target {
         DeployTarget::Aws => "aws",
         DeployTarget::OnPrem => "onprem",
+        DeployTarget::Gcp => "gcp",
     };
     let binaries_path = format!("{}/binaries-{}.tar.gz", DOCKER_OUTPUT_DIR, variant);
     let s3_path = format!("s3://{}/docker/binaries-{}.tar.gz", bucket_name, variant);
@@ -94,8 +95,8 @@ echo "=== Bootstrap completed at $(date) ==="
 
     // Sync binaries based on deploy target
     match deploy_target {
-        DeployTarget::OnPrem => {
-            // On-prem: sync only generic binaries (baseline CPU)
+        DeployTarget::OnPrem | DeployTarget::Gcp => {
+            // On-prem/GCP: sync only generic binaries (baseline CPU)
             for arch in ["x86_64", "aarch64"] {
                 run_cmd! {
                     info "Syncing generic binaries for $arch to S3 bucket $bucket_name";

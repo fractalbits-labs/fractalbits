@@ -120,5 +120,9 @@ pub fn get_bootstrap_bucket_name(deploy_target: DeployTarget) -> FunResult {
             let account_id = run_fun!(aws sts get-caller-identity --query Account --output text)?;
             Ok(format!("fractalbits-bootstrap-{region}-{account_id}"))
         }
+        DeployTarget::Gcp => {
+            // GCP uses Docker S3 on the RSS node, same simple bucket name as on-prem
+            Ok("fractalbits-bootstrap".to_string())
+        }
     }
 }

@@ -452,6 +452,7 @@ pub fn build_docker_images() -> CmdResult {
 pub fn pack_binaries(deploy_target: Option<DeployTarget>) -> CmdResult {
     let pack_onprem = deploy_target.is_none() || deploy_target == Some(DeployTarget::OnPrem);
     let pack_aws = deploy_target.is_none() || deploy_target == Some(DeployTarget::Aws);
+    let pack_gcp = deploy_target.is_none() || deploy_target == Some(DeployTarget::Gcp);
 
     run_cmd!(mkdir -p $DOCKER_OUTPUT_DIR)?;
 
@@ -460,6 +461,9 @@ pub fn pack_binaries(deploy_target: Option<DeployTarget>) -> CmdResult {
     }
     if pack_aws {
         pack_binaries_aws()?;
+    }
+    if pack_gcp {
+        pack_binaries_gcp()?;
     }
 
     Ok(())
@@ -470,6 +474,20 @@ fn pack_binaries_onprem() -> CmdResult {
     info!("Packing on-prem binaries to {}...", output);
 
     // Pack generic binaries for both arches + UI
+    run_cmd!(
+        tar -czf $output
+            -C prebuilt/deploy
+            generic/
+            ui/
+    )?;
+    Ok(())
+}
+
+fn pack_binaries_gcp() -> CmdResult {
+    let output = format!("{}/binaries-gcp.tar.gz", DOCKER_OUTPUT_DIR);
+    info!("Packing GCP binaries to {}...", output);
+
+    // GCP uses generic binaries (same as on-prem) + UI
     run_cmd!(
         tar -czf $output
             -C prebuilt/deploy

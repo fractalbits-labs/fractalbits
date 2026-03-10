@@ -264,6 +264,7 @@ pub fn generate_bootstrap_config(
             use_generic_binaries: vpc_config.use_generic_binaries,
         },
         aws: Some(aws_config),
+        gcp: None,
         endpoints: ClusterEndpointsConfig {
             nss_endpoint,
             api_server_endpoint: api_endpoint,

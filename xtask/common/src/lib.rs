@@ -140,6 +140,7 @@ pub enum DeployTarget {
     OnPrem,
     #[default]
     Aws,
+    Gcp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -165,6 +166,7 @@ pub enum RssBackend {
     Etcd,
     #[default]
     Ddb,
+    Firestore,
 }
 
 /// Node entry within a service type group
@@ -245,6 +247,19 @@ pub struct ClusterAwsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterGcpConfig {
+    pub project_id: String,
+    pub zone: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_zone: Option<String>,
+    pub network: String,
+    pub subnetwork: String,
+    pub service_account: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firestore_database: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterEndpointsConfig {
     pub nss_endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -275,6 +290,8 @@ pub struct BootstrapClusterConfig {
     pub global: ClusterGlobalConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aws: Option<ClusterAwsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gcp: Option<ClusterGcpConfig>,
     pub endpoints: ClusterEndpointsConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ClusterResourcesConfig>,
@@ -297,6 +314,10 @@ impl BootstrapClusterConfig {
 
     pub fn is_etcd_backend(&self) -> bool {
         self.global.rss_backend == RssBackend::Etcd
+    }
+
+    pub fn is_firestore_backend(&self) -> bool {
+        self.global.rss_backend == RssBackend::Firestore
     }
 
     pub fn get_bootstrap_bucket(&self) -> String {

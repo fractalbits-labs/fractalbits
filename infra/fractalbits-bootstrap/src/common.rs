@@ -72,7 +72,7 @@ pub fn common_setup(target: DeployTarget) -> CmdResult {
             install_cloudwatch_agent(os)?;
             install_packages(&[perf_pkg, "lldb"])?;
         }
-        DeployTarget::OnPrem => {
+        DeployTarget::OnPrem | DeployTarget::Gcp => {
             install_packages(&[perf_pkg, "lldb"])?;
         }
     }
@@ -410,7 +410,16 @@ pub fn get_instance_id_from_config(config: &BootstrapConfig) -> FunResult {
     match config.global.deploy_target {
         DeployTarget::OnPrem => run_fun!(hostname),
         DeployTarget::Aws => get_instance_id(),
+        DeployTarget::Gcp => get_gcp_instance_id(),
     }
+}
+
+pub fn get_gcp_instance_id() -> FunResult {
+    // Query GCP instance metadata service for the instance name
+    run_fun!(
+        curl -sf -H "Metadata-Flavor: Google"
+            "http://metadata.google.internal/computeMetadata/v1/instance/name"
+    )
 }
 
 pub fn get_private_ip_from_config(config: &BootstrapConfig, instance_id: &str) -> FunResult {
@@ -422,6 +431,49 @@ pub fn get_private_ip_from_config(config: &BootstrapConfig, instance_id: &str) -
     match config.global.deploy_target {
         DeployTarget::OnPrem => run_fun!(hostname -I | awk r"{print $1}"),
         DeployTarget::Aws => get_private_ip(),
+        DeployTarget::Gcp => get_gcp_private_ip(),
+    }
+}
+
+pub fn get_gcp_private_ip() -> FunResult {
+    run_fun!(
+        curl -sf -H "Metadata-Flavor: Google"
+            "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip"
+    )
+}
+
+/// Get a GCP access token from the instance metadata service.
+pub fn get_gcp_access_token() -> FunResult {
+    run_fun!(
+        curl -sf -H "Metadata-Flavor: Google"
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+            | jq -r ".access_token"
+    )
+}
+
+/// Write a document to Firestore via REST API.
+/// Used during bootstrap to initialize service discovery state before RSS starts.
+pub fn firestore_put_document(
+    config: &BootstrapConfig,
+    collection: &str,
+    doc_id: &str,
+    fields_json: &str,
+) -> CmdResult {
+    let gcp = config.gcp.as_ref().ok_or_else(|| {
+        Error::other("GCP config missing from bootstrap config for Firestore write")
+    })?;
+    let project_id = &gcp.project_id;
+    let database_id = gcp.firestore_database.as_deref().unwrap_or("fractalbits");
+    let token = get_gcp_access_token()?;
+    let url = format!(
+        "https://firestore.googleapis.com/v1/projects/{project_id}/databases/{database_id}/documents/{collection}/{doc_id}"
+    );
+
+    run_cmd! {
+        curl -sf -X PATCH $url
+            -H "Authorization: Bearer $token"
+            -H "Content-Type: application/json"
+            -d $fields_json
     }
 }
 
@@ -972,6 +1024,7 @@ pub fn get_etcd_endpoints(config: &BootstrapConfig) -> FunResult {
     let instance_id = match config.global.deploy_target {
         DeployTarget::OnPrem => run_fun!(hostname)?,
         DeployTarget::Aws => get_instance_id()?,
+        DeployTarget::Gcp => get_gcp_instance_id()?,
     };
 
     let barrier =
@@ -1011,11 +1064,13 @@ fn create_etcd_register_service(
     let get_instance_id_cmd = match config.global.deploy_target {
         DeployTarget::OnPrem => "hostname".to_string(),
         DeployTarget::Aws => "ec2-metadata -i | awk '{print $2}'".to_string(),
+        DeployTarget::Gcp => "curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/name".to_string(),
     };
 
     let get_private_ip_cmd = match config.global.deploy_target {
         DeployTarget::OnPrem => "hostname -I | awk '{print $1}'".to_string(),
         DeployTarget::Aws => "ec2-metadata -o | awk '{print $2}'".to_string(),
+        DeployTarget::Gcp => "curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip".to_string(),
     };
 
     let systemd_unit_content = format!(
@@ -1090,6 +1145,7 @@ fn create_etcd_deregister_service(
     let get_instance_id_cmd = match config.global.deploy_target {
         DeployTarget::OnPrem => "hostname".to_string(),
         DeployTarget::Aws => "ec2-metadata -i | awk '{print $2}'".to_string(),
+        DeployTarget::Gcp => "curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/name".to_string(),
     };
 
     let systemd_unit_content = format!(

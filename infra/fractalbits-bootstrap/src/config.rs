@@ -47,6 +47,7 @@ pub fn download_and_parse(bucket_name: &str) -> Result<BootstrapClusterConfig, E
         let instance_id = match config.global.deploy_target {
             DeployTarget::OnPrem => run_fun!(hostname)?,
             DeployTarget::Aws => get_instance_id()?,
+            DeployTarget::Gcp => crate::common::get_gcp_instance_id()?,
         };
 
         if config.contains_instance(&instance_id) {
