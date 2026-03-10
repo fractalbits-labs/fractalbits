@@ -887,7 +887,12 @@ impl From<ToStrError> for S3Error {
 impl From<SignatureError> for S3Error {
     fn from(value: SignatureError) -> Self {
         tracing::error!("SignatureError: {value}");
-        Self::InvalidSignature
+        match value {
+            SignatureError::Other(ref msg) if msg.contains("signature mismatch") => {
+                Self::SignatureDoesNotMatch
+            }
+            _ => Self::InvalidSignature,
+        }
     }
 }
 

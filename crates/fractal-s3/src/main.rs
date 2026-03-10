@@ -63,6 +63,17 @@ enum Commands {
         #[arg(long, help = "Remove non-empty bucket")]
         force: bool,
     },
+    /// Generate a pre-signed URL for an S3 object
+    Presign {
+        /// S3 URI (s3://bucket/key)
+        s3_uri: String,
+        #[arg(
+            long,
+            default_value = "3600",
+            help = "Expiration in seconds (default: 3600)"
+        )]
+        expires_in: u64,
+    },
     /// Remove objects
     Rm {
         /// S3 URI (s3://bucket/key)
@@ -120,6 +131,9 @@ async fn main() -> anyhow::Result<()> {
             recursive,
         } => {
             commands::mv::execute(&s3_client, &client_config, &src, &dst, recursive).await?;
+        }
+        Commands::Presign { s3_uri, expires_in } => {
+            commands::presign::execute(&s3_client, &s3_uri, expires_in).await?;
         }
         Commands::Rb { s3_uri, force } => {
             commands::rb::execute(&s3_client, &s3_uri, force).await?;

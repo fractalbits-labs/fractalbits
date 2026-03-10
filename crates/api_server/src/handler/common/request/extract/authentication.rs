@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
 use actix_web::{
@@ -7,6 +8,8 @@ use actix_web::{
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use url::form_urlencoded;
 
 use crate::handler::common::{
     s3_error::S3Error,
@@ -21,36 +24,72 @@ pub enum AuthError {
     ToStrError(#[from] ToStrError),
     #[error("invalid format: {0}")]
     Invalid(String),
+    #[error("expired pre-signed URL")]
+    Expired,
+    #[error("invalid query parameters: {0}")]
+    InvalidQueryParam(String),
 }
 
 impl From<AuthError> for S3Error {
     fn from(value: AuthError) -> Self {
         tracing::error!("AuthError: {value}");
-        S3Error::AuthorizationHeaderMalformed
+        match value {
+            AuthError::Expired => S3Error::AccessDenied,
+            AuthError::InvalidQueryParam(_) => S3Error::AuthorizationQueryParametersError,
+            _ => S3Error::AuthorizationHeaderMalformed,
+        }
     }
+}
+
+/// Tracks whether authentication came from header or query parameters
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthSource {
+    Header,
+    QueryParam,
 }
 
 #[derive(Debug)]
 pub struct Authentication<'a> {
-    pub key_id: &'a str,
+    pub key_id: Cow<'a, str>,
     pub scope: Scope<'a>,
-    pub signed_headers: BTreeSet<&'a str>,
-    pub signature: &'a str,
-    pub content_sha256: &'a str,
+    pub signed_headers: BTreeSet<Cow<'a, str>>,
+    pub signature: Cow<'a, str>,
+    pub content_sha256: Cow<'a, str>,
     pub date: DateTime<Utc>,
     pub scope_string: String,
     pub formatted_date: String,
+    pub source: AuthSource,
+    /// For pre-signed URLs: the expiration time
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug)]
 pub struct Scope<'a> {
-    pub date: &'a str,
-    pub region: &'a str,
-    pub service: &'a str,
+    pub date: Cow<'a, str>,
+    pub region: Cow<'a, str>,
+    pub service: Cow<'a, str>,
 }
 
 /// Extract authentication from request with zero-copy optimization
 pub fn extract_authentication(req: &HttpRequest) -> Result<Option<Authentication<'_>>, AuthError> {
+    // Try header-based extraction first (existing path, unchanged hot path)
+    if let Some(auth) = extract_header_authentication(req)? {
+        return Ok(Some(auth));
+    }
+
+    // If no header, try query parameter based authentication (pre-signed URLs)
+    if let Some(auth) = extract_query_authentication(req)? {
+        return Ok(Some(auth));
+    }
+
+    // Neither header nor query params -> anonymous request
+    Ok(None)
+}
+
+/// Extract authentication from Authorization header (zero-copy)
+fn extract_header_authentication(
+    req: &HttpRequest,
+) -> Result<Option<Authentication<'_>>, AuthError> {
     const AWS4_HMAC_SHA256: &str = "AWS4-HMAC-SHA256";
 
     // Note The name of the standard header is unfortunate because it carries authentication
@@ -92,6 +131,7 @@ pub fn extract_authentication(req: &HttpRequest) -> Result<Option<Authentication
             "Could not find SignedHeaders in Authorization field".into(),
         ))?
         .split(';')
+        .map(Cow::Borrowed)
         .collect();
     let signature = auth_params.get("Signature").ok_or(AuthError::Invalid(
         "Could not find Signature in Authorization field".into(),
@@ -118,24 +158,126 @@ pub fn extract_authentication(req: &HttpRequest) -> Result<Option<Authentication
         return Err(AuthError::Invalid("Date is too old".into()));
     }
     let (key_id, scope) = parse_credential(cred)?;
-    if scope.date != format!("{}", date.format(SHORT_DATE)) {
+    if *scope.date != format!("{}", date.format(SHORT_DATE)) {
         return Err(AuthError::Invalid("Date mismatch".into()));
     }
 
     let scope_string =
-        aws_signature::sigv4::format_scope_string(&date, scope.region, scope.service);
+        aws_signature::sigv4::format_scope_string(&date, &scope.region, &scope.service);
     let formatted_date = format!("{}", date.format("%Y%m%dT%H%M%SZ"));
 
     let auth = Authentication {
-        key_id,
+        key_id: Cow::Borrowed(key_id),
         scope,
         signed_headers,
-        signature,
-        content_sha256,
+        signature: Cow::Borrowed(signature),
+        content_sha256: Cow::Borrowed(content_sha256),
         date,
         scope_string,
         formatted_date,
+        source: AuthSource::Header,
+        expires_at: None,
     };
+    Ok(Some(auth))
+}
+
+/// Extract authentication from query parameters (pre-signed URLs)
+fn extract_query_authentication(
+    req: &HttpRequest,
+) -> Result<Option<Authentication<'_>>, AuthError> {
+    let query_str = req.query_string();
+    if query_str.is_empty() {
+        return Ok(None);
+    }
+
+    // Parse query parameters
+    let params: HashMap<String, String> = form_urlencoded::parse(query_str.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    // Check for X-Amz-Algorithm to determine if this is a pre-signed URL
+    let algorithm = match params.get("X-Amz-Algorithm") {
+        Some(alg) => alg,
+        None => return Ok(None),
+    };
+
+    if algorithm != "AWS4-HMAC-SHA256" {
+        return Err(AuthError::InvalidQueryParam(format!(
+            "Unsupported algorithm: {}",
+            algorithm
+        )));
+    }
+
+    // Extract required query parameters
+    let credential = params
+        .get("X-Amz-Credential")
+        .ok_or_else(|| AuthError::InvalidQueryParam("Missing X-Amz-Credential".into()))?;
+
+    let date_str = params
+        .get("X-Amz-Date")
+        .ok_or_else(|| AuthError::InvalidQueryParam("Missing X-Amz-Date".into()))?;
+
+    let expires_str = params
+        .get("X-Amz-Expires")
+        .ok_or_else(|| AuthError::InvalidQueryParam("Missing X-Amz-Expires".into()))?;
+
+    let signed_headers_str = params
+        .get("X-Amz-SignedHeaders")
+        .ok_or_else(|| AuthError::InvalidQueryParam("Missing X-Amz-SignedHeaders".into()))?;
+
+    let signature = params
+        .get("X-Amz-Signature")
+        .ok_or_else(|| AuthError::InvalidQueryParam("Missing X-Amz-Signature".into()))?;
+
+    // Parse date
+    let date = parse_date(date_str)?;
+
+    // Parse expires and check expiration (fail fast before crypto)
+    let expires_seconds: i64 = expires_str.parse().map_err(|_| {
+        AuthError::InvalidQueryParam(format!("Invalid X-Amz-Expires: {}", expires_str))
+    })?;
+
+    // AWS allows 1 second to 7 days (604800 seconds)
+    if !(1..=604800).contains(&expires_seconds) {
+        return Err(AuthError::InvalidQueryParam(format!(
+            "X-Amz-Expires must be between 1 and 604800, got {}",
+            expires_seconds
+        )));
+    }
+
+    let expires_at = date + chrono::Duration::seconds(expires_seconds);
+    if Utc::now() > expires_at {
+        return Err(AuthError::Expired);
+    }
+
+    // Parse credential
+    let (key_id, scope) = parse_credential_owned(credential)?;
+    if *scope.date != format!("{}", date.format(SHORT_DATE)) {
+        return Err(AuthError::Invalid("Date mismatch".into()));
+    }
+
+    let scope_string =
+        aws_signature::sigv4::format_scope_string(&date, &scope.region, &scope.service);
+    let formatted_date = format!("{}", date.format("%Y%m%dT%H%M%SZ"));
+
+    let signed_headers = signed_headers_str
+        .split(';')
+        .map(|s| Cow::Owned(s.to_string()))
+        .collect();
+
+    let auth = Authentication {
+        key_id: Cow::Owned(key_id),
+        scope,
+        signed_headers,
+        signature: Cow::Owned(signature.clone()),
+        content_sha256: Cow::Borrowed("UNSIGNED-PAYLOAD"),
+        date,
+        scope_string,
+        formatted_date,
+        source: AuthSource::QueryParam,
+        expires_at: Some(expires_at),
+    };
+
     Ok(Some(auth))
 }
 
@@ -152,11 +294,28 @@ fn parse_credential(cred: &str) -> Result<(&str, Scope<'_>), AuthError> {
     }
 
     let scope = Scope {
-        date: parts[1],
-        region: parts[2],
-        service: parts[3],
+        date: Cow::Borrowed(parts[1]),
+        region: Cow::Borrowed(parts[2]),
+        service: Cow::Borrowed(parts[3]),
     };
     Ok((parts[0], scope))
+}
+
+/// Parse credential string into owned values (for query param auth)
+fn parse_credential_owned(cred: &str) -> Result<(String, Scope<'static>), AuthError> {
+    let parts: Vec<&str> = cred.split('/').collect();
+    if parts.len() != 5 || parts[4] != SCOPE_ENDING {
+        return Err(AuthError::InvalidQueryParam(
+            "wrong credential scope format".into(),
+        ));
+    }
+
+    let scope = Scope {
+        date: Cow::Owned(parts[1].to_string()),
+        region: Cow::Owned(parts[2].to_string()),
+        service: Cow::Owned(parts[3].to_string()),
+    };
+    Ok((parts[0].to_string(), scope))
 }
 
 /// Zero-copy SigV4 canonical request hasher

@@ -1,11 +1,12 @@
 use aws_signature::sigv4::uri_encode;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{
     AppState,
     handler::common::{
-        request::extract::{Authentication, CanonicalRequestHasher},
+        request::extract::{AuthSource, Authentication, CanonicalRequestHasher},
         signature::SignatureError,
     },
 };
@@ -19,8 +20,10 @@ pub async fn check_signature_impl(
     request: &HttpRequest,
     trace_id: &TraceId,
 ) -> Result<Versioned<ApiKey>, SignatureError> {
-    // Support HTTP Authorization header based signature only for now
-    check_header_based_signature(app, auth, request, trace_id).await
+    match auth.source {
+        AuthSource::Header => check_header_based_signature(app, auth, request, trace_id).await,
+        AuthSource::QueryParam => check_query_based_signature(app, auth, request, trace_id).await,
+    }
 }
 
 async fn check_header_based_signature(
@@ -32,7 +35,7 @@ async fn check_header_based_signature(
     let canonical_hash = hash_canonical_request_streaming(
         request,
         &authentication.signed_headers,
-        authentication.content_sha256,
+        &authentication.content_sha256,
     )?;
 
     let string_to_sign = build_string_to_sign(
@@ -47,10 +50,37 @@ async fn check_header_based_signature(
     Ok(key)
 }
 
-/// Stream canonical request directly to hasher
+async fn check_query_based_signature(
+    app: Arc<AppState>,
+    authentication: &Authentication<'_>,
+    request: &HttpRequest,
+    trace_id: &TraceId,
+) -> Result<Versioned<ApiKey>, SignatureError> {
+    // Build canonical query string excluding X-Amz-Signature
+    let canonical_query = build_canonical_query_string_filtered(request.query_string());
+
+    let canonical_hash = hash_canonical_request_for_presigned(
+        request,
+        &authentication.signed_headers,
+        &canonical_query,
+    )?;
+
+    let string_to_sign = build_string_to_sign(
+        &authentication.formatted_date,
+        &authentication.scope_string,
+        &canonical_hash,
+    );
+
+    tracing::trace!(?authentication, %canonical_hash, %string_to_sign);
+
+    let key = verify_v4(app, authentication, &string_to_sign, trace_id).await?;
+    Ok(key)
+}
+
+/// Stream canonical request directly to hasher (header-based auth)
 fn hash_canonical_request_streaming(
     request: &HttpRequest,
-    signed_headers: &BTreeSet<&str>,
+    signed_headers: &BTreeSet<Cow<'_, str>>,
     payload_hash: &str,
 ) -> Result<String, SignatureError> {
     let mut hasher = CanonicalRequestHasher::new();
@@ -66,17 +96,67 @@ fn hash_canonical_request_streaming(
     hasher.add_query(&query_str);
 
     // Stream canonical headers
+    let header_pairs = collect_signed_headers(request, signed_headers)?;
+
+    // Headers are already sorted because signed_headers is a BTreeSet
+    hasher.add_headers(header_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+
+    // Stream signed headers list
+    hasher.add_signed_headers(signed_headers.iter().map(|s| s.as_ref()));
+
+    // Stream payload hash
+    hasher.add_payload_hash(payload_hash);
+
+    // Return hex hash (no canonical request string ever created!)
+    Ok(hasher.finalize())
+}
+
+/// Hash canonical request for pre-signed URL verification
+fn hash_canonical_request_for_presigned(
+    request: &HttpRequest,
+    signed_headers: &BTreeSet<Cow<'_, str>>,
+    canonical_query: &str,
+) -> Result<String, SignatureError> {
+    let mut hasher = CanonicalRequestHasher::new();
+
+    // Stream HTTP method
+    hasher.add_method(request.method().as_str());
+
+    // Stream URI
+    hasher.add_uri(request.path());
+
+    // Use the pre-filtered canonical query string
+    hasher.add_query(canonical_query);
+
+    // Stream canonical headers
+    let header_pairs = collect_signed_headers(request, signed_headers)?;
+    hasher.add_headers(header_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+
+    // Stream signed headers list
+    hasher.add_signed_headers(signed_headers.iter().map(|s| s.as_ref()));
+
+    // Pre-signed URLs always use UNSIGNED-PAYLOAD
+    hasher.add_payload_hash("UNSIGNED-PAYLOAD");
+
+    Ok(hasher.finalize())
+}
+
+/// Collect signed header values from request
+fn collect_signed_headers(
+    request: &HttpRequest,
+    signed_headers: &BTreeSet<Cow<'_, str>>,
+) -> Result<Vec<(String, String)>, SignatureError> {
     let headers = request.headers();
-    let mut header_pairs: Vec<(&str, String)> = Vec::with_capacity(signed_headers.len());
+    let mut header_pairs: Vec<(String, String)> = Vec::with_capacity(signed_headers.len());
 
     for header_name in signed_headers {
-        let value_str = if *header_name == "host" && !headers.contains_key(HOST) {
+        let value_str = if header_name.as_ref() == "host" && !headers.contains_key(HOST) {
             // For HTTP/2, get host from connection info (:authority pseudo-header)
             let connection_info = request.connection_info();
             let host_value = connection_info.host();
             tracing::debug!("Using host from connection info for HTTP/2: {}", host_value);
             host_value.to_string()
-        } else if let Some(header_value) = headers.get(*header_name) {
+        } else if let Some(header_value) = headers.get(header_name.as_ref()) {
             if let Ok(s) = header_value.to_str() {
                 s.trim().to_string()
             } else {
@@ -91,20 +171,10 @@ fn hash_canonical_request_streaming(
                 header_name
             )));
         };
-        header_pairs.push((header_name, value_str));
+        header_pairs.push((header_name.to_string(), value_str));
     }
 
-    // Headers are already sorted because signed_headers is a BTreeSet
-    hasher.add_headers(header_pairs.iter().map(|(k, v)| (*k, v.as_str())));
-
-    // Stream signed headers list
-    hasher.add_signed_headers(signed_headers.iter().copied());
-
-    // Stream payload hash
-    hasher.add_payload_hash(payload_hash);
-
-    // Return hex hash (no canonical request string ever created!)
-    Ok(hasher.finalize())
+    Ok(header_pairs)
 }
 
 fn build_canonical_query_string(query_str: &str) -> String {
@@ -116,6 +186,30 @@ fn build_canonical_query_string(query_str: &str) -> String {
         .into_inner();
     let mut items = String::with_capacity(query_str.len() * 2);
     for (key, value) in query_params.iter() {
+        if !items.is_empty() {
+            items.push('&');
+        }
+        items.push_str(&uri_encode(key, true));
+        items.push('=');
+        items.push_str(&uri_encode(value, true));
+    }
+    items
+}
+
+/// Build canonical query string for pre-signed URLs, excluding X-Amz-Signature
+fn build_canonical_query_string_filtered(query_str: &str) -> String {
+    if query_str.is_empty() {
+        return String::new();
+    }
+    let query_params = Query::<BTreeMap<String, String>>::from_query(query_str)
+        .unwrap_or_else(|_| Query(Default::default()))
+        .into_inner();
+    let mut items = String::with_capacity(query_str.len() * 2);
+    for (key, value) in query_params.iter() {
+        // Exclude X-Amz-Signature from canonical query string
+        if key == "X-Amz-Signature" {
+            continue;
+        }
         if !items.is_empty() {
             items.push('&');
         }
@@ -157,7 +251,7 @@ async fn verify_v4(
         get_signing_key_cached(auth.date, &key.data.secret_key, &app.config.region)
             .map_err(|e| SignatureError::Other(format!("Unable to build signing key: {}", e)))?;
 
-    if !verify_signature(&signing_key, string_to_sign, auth.signature)? {
+    if !verify_signature(&signing_key, string_to_sign, &auth.signature)? {
         return Err(SignatureError::Other("signature mismatch".into()));
     }
 

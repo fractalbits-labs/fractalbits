@@ -7,7 +7,7 @@ mod checksum_value;
 pub use api_command::{ApiCommand, ApiCommandFromQuery};
 pub use api_signature::{ApiSignature, ApiSignatureExtractor};
 pub use authentication::{
-    AuthError, Authentication, CanonicalRequestHasher, Scope, extract_authentication,
+    AuthError, AuthSource, Authentication, CanonicalRequestHasher, Scope, extract_authentication,
 };
 pub use bucket_name_and_key::BucketAndKeyName;
 pub use checksum_value::ChecksumValueFromHeaders;

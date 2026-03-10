@@ -227,11 +227,16 @@ impl AppState {
                 let data_blob_tracker = if matches!(
                     self.config.blob_storage.backend,
                     BlobStorageBackend::S3ExpressMultiAz
-                )
-                {
-                    let rss_endpoint = self.config.rss_addrs.first().cloned()
+                ) {
+                    let rss_endpoint = self
+                        .config
+                        .rss_addrs
+                        .first()
+                        .cloned()
                         .unwrap_or_else(|| "localhost:8086".to_string());
-                    let nss_address = self.get_nss_address().await
+                    let nss_address = self
+                        .get_nss_address()
+                        .await
                         .unwrap_or_else(|| "localhost:8087".to_string());
                     let tracker = Arc::new(DataBlobTracker::with_endpoints_and_timeout(
                         rss_endpoint,

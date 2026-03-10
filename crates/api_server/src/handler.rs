@@ -151,7 +151,8 @@ pub async fn any_handler(req: HttpRequest, payload: Payload) -> Result<HttpRespo
         Ok(auth) => auth,
         Err(e) => {
             tracing::warn!(%trace_id, "failed to extract authentication {e:?} {:?}", req.uri());
-            return Ok(S3Error::InternalError.error_response_with_resource(&resource, trace_id));
+            let s3_err = S3Error::from(e);
+            return Ok(s3_err.error_response_with_resource(&resource, trace_id));
         }
     };
 
