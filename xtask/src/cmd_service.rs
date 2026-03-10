@@ -714,12 +714,11 @@ fn get_journal_type_setting() -> JournalType {
     // We can't just check mirrord@.service existence because mirrord is also used
     // with S3ExpressMultiAz + EBS journal type.
     let service_file = Path::new("data/etc/nss_role_agent_b.service");
-    if service_file.exists() {
-        if let Ok(content) = std::fs::read_to_string(service_file) {
-            if content.contains("APP_JOURNAL_TYPE=ebs") {
-                return JournalType::Ebs;
-            }
-        }
+    if service_file.exists()
+        && let Ok(content) = std::fs::read_to_string(service_file)
+        && content.contains("APP_JOURNAL_TYPE=ebs")
+    {
+        return JournalType::Ebs;
     }
     if Path::new("data/etc/mirrord@.service").exists() {
         JournalType::Nvme
