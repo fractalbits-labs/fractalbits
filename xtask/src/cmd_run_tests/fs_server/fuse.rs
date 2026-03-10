@@ -126,14 +126,18 @@ fn spawn_second_fuse(bucket: &str, read_write: bool) -> std::io::Result<Child> {
         "{}/target/debug/fs_server",
         std::env::current_dir()?.display()
     );
-    let child = Command::new(&binary)
-        .env("FS_SERVER_BUCKET_NAME", bucket)
+    let mut cmd = Command::new(&binary);
+    cmd.env("FS_SERVER_BUCKET_NAME", bucket)
         .env("FS_SERVER_MOUNT_POINT", mount_point)
         .env("FS_SERVER_MODE", "fuse")
         .env("FS_SERVER_READ_WRITE", read_write.to_string())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::null());
+    // Propagate LLVM_PROFILE_FILE for coverage instrumentation
+    if let Ok(profile_file) = std::env::var("LLVM_PROFILE_FILE") {
+        cmd.env("LLVM_PROFILE_FILE", profile_file);
+    }
+    let child = cmd.spawn()?;
 
     // Wait for mount to appear
     for i in 0..20 {

@@ -48,10 +48,7 @@ coverage +args:
   source <(cargo llvm-cov show-env --sh --no-cfg-coverage)
   cargo llvm-cov clean --workspace
   cargo xtask {{args}}
-  cargo llvm-cov report --html --ignore-filename-regex 'xtask/.*'
-  cargo llvm-cov report --lcov --ignore-filename-regex 'xtask/.*' --output-path target/llvm-cov/lcov.info
-  echo "HTML report: target/llvm-cov/html/index.html"
-  echo "LCOV report: target/llvm-cov/lcov.info"
+  just coverage-report
 
 # Accumulate coverage from an xtask command (does not reset previous data)
 # Run "just coverage ..." first, then "just coverage-add ..." to combine
@@ -65,13 +62,35 @@ coverage-add +args:
   source <(cargo llvm-cov show-env --sh --no-cfg-coverage)
   cargo xtask {{args}}
 
-# Generate coverage report from accumulated data
+# Generate coverage report from accumulated data.
+# Uses llvm tools directly (instead of cargo llvm-cov report) to include
+# fs_server from the isolated compio build that cargo llvm-cov can't discover.
 coverage-report:
   #!/usr/bin/env bash
   set -euo pipefail
   source <(cargo llvm-cov show-env --sh --no-cfg-coverage)
-  cargo llvm-cov report --html --ignore-filename-regex 'xtask/.*'
-  cargo llvm-cov report --lcov --ignore-filename-regex 'xtask/.*' --output-path target/llvm-cov/lcov.info
+  LLVM="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's|host: ||p')/bin"
+
+  # Merge profraw files
+  find target/ -maxdepth 1 -name '*.profraw' > target/profraw-list
+  [[ -s target/profraw-list ]] || { echo "No profraw files found"; exit 1; }
+  "$LLVM/llvm-profdata" merge -sparse -f target/profraw-list -o target/coverage.profdata
+
+  # Find all instrumented ELF binaries (main build + compio build)
+  OBJECTS=()
+  for f in $(find target/debug/deps target/debug target/compio/debug \
+      -maxdepth 1 -type f -executable 2>/dev/null); do
+    file "$f" | grep -q 'ELF' && OBJECTS+=(-object "$f")
+  done
+
+  COMMON=(-instr-profile=target/coverage.profdata "${OBJECTS[@]}" \
+    -ignore-filename-regex 'xtask/|/rustc/|/\.cargo/|/\.rustup/|/target/|infra/|bench_rpc/|container-all-in-one/|fractal-s3/')
+
+  mkdir -p target/llvm-cov/html
+  "$LLVM/llvm-cov" show  -format=html "${COMMON[@]}" -show-instantiations=false \
+    -show-line-counts-or-regions -output-dir=target/llvm-cov/html
+  "$LLVM/llvm-cov" export -format=lcov "${COMMON[@]}" > target/llvm-cov/lcov.info
+
   echo "HTML report: target/llvm-cov/html/index.html"
   echo "LCOV report: target/llvm-cov/lcov.info"
 

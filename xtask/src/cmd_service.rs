@@ -1263,10 +1263,14 @@ StartLimitBurst=100
     // profraw files to the location that `cargo llvm-cov report` discovers.
     // Replace `%Nm` (continuous mmap mode) with `%m` (merge-on-exit) since
     // mmap-based continuous profiling doesn't work reliably under systemd.
+    // IMPORTANT: Escape `%` as `%%` for systemd unit files, since systemd
+    // interprets `%` specifiers (e.g. `%p` = service prefix, `%m` = machine ID)
+    // before passing them to the process. LLVM needs to see the raw `%p`/`%m`.
     if let Ok(profile_file) = std::env::var("LLVM_PROFILE_FILE") {
         let profile_file = regex::Regex::new(r"%\d+m").map_or(profile_file.clone(), |re| {
             re.replace(&profile_file, "%m").into_owned()
         });
+        let profile_file = profile_file.replace('%', "%%");
         env_settings += &format!("\nEnvironment=\"LLVM_PROFILE_FILE={}\"", profile_file);
     }
 
