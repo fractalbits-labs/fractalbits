@@ -52,10 +52,7 @@ impl OsType {
 
 /// Install amazon-ec2-utils on Ubuntu so that ec2-metadata is available
 /// for get_instance_id(). Only needed on AWS; on AL2023 it's pre-installed.
-pub fn ensure_ec2_metadata(target: DeployTarget) -> CmdResult {
-    if target != DeployTarget::Aws {
-        return Ok(());
-    }
+pub fn ensure_ec2_metadata() -> CmdResult {
     if OsType::detect() == OsType::Ubuntu {
         install_packages(&["amazon-ec2-utils"])?;
     }

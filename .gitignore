@@ -29,6 +29,8 @@ third_party/
 # CDK generated JavaScript files (keep TypeScript sources and Lambda JS)
 vpc/fractalbits-cdk/bin/*.js
 infra/fractalbits-cdk/cdk.context.json
+infra/fractalbits-terraform/.terraform/
+infra/fractalbits-terraform/.terraform.lock.hcl
 vpc/fractalbits-cdk/lib/*.js
 !vpc/fractalbits-cdk/lib/lambda/**/*.js
 vpc/fractalbits-cdk/test/*.js
