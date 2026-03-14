@@ -1,11 +1,14 @@
 mod api_server;
+mod aws;
 mod bench_client;
 mod bench_server;
 mod bss_server;
 mod common;
 mod config;
 mod discovery;
+mod etcd;
 mod etcd_server;
+mod gcp;
 mod gui_server;
 mod nss_server;
 mod root_server;
