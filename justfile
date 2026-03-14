@@ -47,7 +47,10 @@ coverage +args:
   set -euo pipefail
   source <(cargo llvm-cov show-env --sh --no-cfg-coverage)
   cargo llvm-cov clean --workspace
+  find . -name '*.profraw' -not -path './target/*' -delete 2>/dev/null || true
   cargo xtask {{args}}
+  # Collect stray profraw files written by services/tests
+  find . -name '*.profraw' -not -path './target/*' -exec mv {} target/ \; 2>/dev/null || true
   just coverage-report
 
 # Accumulate coverage from an xtask command (does not reset previous data)
@@ -61,6 +64,8 @@ coverage-add +args:
   set -euo pipefail
   source <(cargo llvm-cov show-env --sh --no-cfg-coverage)
   cargo xtask {{args}}
+  # Collect stray profraw files written by services/tests
+  find . -name '*.profraw' -not -path './target/*' -exec mv {} target/ \; 2>/dev/null || true
 
 # Generate coverage report from accumulated data.
 # Uses llvm tools directly (instead of cargo llvm-cov report) to include

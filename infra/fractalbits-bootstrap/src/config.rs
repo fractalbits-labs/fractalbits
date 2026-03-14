@@ -46,7 +46,9 @@ pub fn download_and_parse(bucket_name: &str) -> Result<BootstrapClusterConfig, E
         let config: BootstrapClusterConfig =
             toml::from_str(&content).map_err(|e| Error::other(format!("TOML parse error: {e}")))?;
 
-        ensure_ec2_metadata(config.global.deploy_target)?;
+        if config.global.deploy_target == DeployTarget::Aws {
+            ensure_ec2_metadata()?;
+        }
         let instance_id = get_instance_id(config.global.deploy_target)?;
 
         if config.contains_instance(&instance_id) {
