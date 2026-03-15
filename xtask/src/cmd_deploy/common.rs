@@ -135,7 +135,7 @@ pub(super) const RUST_BINS: &[&str] = &[
     "rewrk_rpc",
 ];
 
-pub(super) const ZIG_BINS: &[&str] = &["nss_server", "bss_server", "mirrord"];
+pub(super) const ZIG_BINS: &[&str] = &["nss_server", "bss_server", "mirrord", "test_bss_storage_engine"];
 
 pub fn get_bootstrap_bucket_name(deploy_target: DeployTarget) -> FunResult {
     match deploy_target {
