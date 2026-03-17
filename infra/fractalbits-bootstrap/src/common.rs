@@ -3,10 +3,11 @@ use cmd_lib::*;
 use std::io::Error;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
+use xtask_common::cloud_storage;
 
 // Re-exports from target-specific modules so callers don't need to change imports
 pub use crate::aws::{
-    create_ena_irq_affinity_service, create_s3_express_bucket, ensure_ec2_metadata, get_account_id,
+    create_ena_irq_affinity_service, create_s3_express_bucket, ensure_ec2_metadata,
     get_current_aws_az_id, get_current_aws_region, get_ec2_tag, get_s3_express_bucket_name,
 };
 pub use crate::etcd::get_etcd_endpoints;
@@ -89,11 +90,11 @@ fn download_binary(config: &BootstrapConfig, file_name: &str) -> CmdResult {
     let bootstrap_bucket = config.get_bootstrap_bucket();
     let cpu_arch = run_fun!(arch)?;
 
-    // Determine S3 path based on deploy target and binary type:
-    // - On-prem or use_generic_binaries: all binaries at s3://bucket/{arch}/{binary}
-    // - AWS shared binaries: s3://bucket/{arch}/{binary}
-    // - AWS CPU-specific binaries: s3://bucket/{arch}/{cpu}/{binary}
-    let s3_path = if config.global.deploy_target == DeployTarget::OnPrem
+    // Determine cloud path based on deploy target and binary type:
+    // - On-prem or use_generic_binaries: {bucket}/{arch}/{binary}
+    // - AWS shared binaries: {bucket}/{arch}/{binary}
+    // - AWS CPU-specific binaries: {bucket}/{arch}/{cpu}/{binary}
+    let cloud_path = if config.global.deploy_target == DeployTarget::OnPrem
         || config.global.use_generic_binaries
         || SHARED_BINARIES.contains(&file_name)
     {
@@ -104,76 +105,26 @@ fn download_binary(config: &BootstrapConfig, file_name: &str) -> CmdResult {
     };
 
     let local_path = format!("{BIN_PATH}{file_name}");
-    download_from_s3(&s3_path, &local_path)?;
+    info!("Downloading from {cloud_path} to {local_path}");
+    cloud_storage::download_file(&cloud_path, &local_path)?;
     run_cmd!(chmod +x $local_path)
 }
 
-/// Returns inline env vars for Docker S3 authentication.
-/// When DOCKER_S3_AUTH is set, S3 calls need test credentials since the Docker S3
-/// (container api_server) only accepts test_api_key/test_api_secret.
-/// Non-S3 AWS calls (DynamoDB) must use IAM role credentials.
-pub fn s3_env_overrides() -> Vec<String> {
-    if std::env::var("DOCKER_S3_AUTH").is_ok() {
-        vec![
-            "AWS_ACCESS_KEY_ID=test_api_key".to_string(),
-            "AWS_SECRET_ACCESS_KEY=test_api_secret".to_string(),
-            "AWS_DEFAULT_REGION=localdev".to_string(),
-        ]
-    } else {
-        vec![]
-    }
-}
-
-/// Clear Docker S3 credentials from the global environment.
-/// Called at bootstrap binary startup so that DynamoDB and other AWS calls
-/// use IAM role credentials instead of the test credentials.
-pub fn clear_docker_s3_global_credentials() {
-    if std::env::var("DOCKER_S3_AUTH").is_ok() {
-        info!("Docker S3 mode: clearing global test credentials (S3 uses inline creds)");
-        // SAFETY: bootstrap is single-threaded at this point (called before spawning threads)
-        unsafe {
-            std::env::remove_var("AWS_ACCESS_KEY_ID");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-            std::env::remove_var("AWS_DEFAULT_REGION");
-        }
-    }
-}
-
-pub fn download_from_s3(s3_path: &str, local_path: &str) -> CmdResult {
-    info!("Downloading from {s3_path} to {local_path}");
-    let s3_env = &s3_env_overrides();
-    run_cmd!($[s3_env] aws s3 cp --no-progress $s3_path $local_path)
-}
-
-/// Upload a string to S3 via a temp file.
-/// Avoids piped commands (`echo | aws s3 cp -`) because cmd_lib's `$[env]`
-/// only applies env vars to the first command in a pipe.
-pub fn upload_string_to_s3(content: &str, s3_path: &str) -> CmdResult {
-    let tmp = "/tmp/.s3_upload_tmp";
-    std::fs::write(tmp, content)?;
-    let s3_env = &s3_env_overrides();
-    let result = run_cmd!($[s3_env] aws s3 cp $tmp $s3_path --quiet);
-    let _ = std::fs::remove_file(tmp);
-    result
-}
-
 pub fn backup_config_to_workflow(config: &BootstrapConfig, cluster_id: &str) -> CmdResult {
-    let bucket = config.get_bootstrap_bucket();
+    let bucket = &config.bootstrap_bucket;
+    let target = config.global.deploy_target;
     let local_path = format!("{ETC_PATH}{BOOTSTRAP_CLUSTER_CONFIG}");
-    let workflow_path = format!("{bucket}/workflow/{cluster_id}/{BOOTSTRAP_CLUSTER_CONFIG}");
+    let key = format!("workflow/{cluster_id}/{BOOTSTRAP_CLUSTER_CONFIG}");
 
     // Check if already backed up (only first instance needs to do this)
-    let s3_env = &s3_env_overrides();
-    let exists = run_fun!($[s3_env] aws s3 ls $workflow_path 2>/dev/null);
-    if exists.is_ok() && !exists.unwrap().trim().is_empty() {
+    if cloud_storage::head_object(bucket, &key, target) {
         return Ok(());
     }
 
-    run_cmd! {
-        info "Backing up bootstrap config to ${workflow_path}";
-        $[s3_env] aws s3 cp $local_path $workflow_path --quiet;
-    }?;
-    Ok(())
+    let content = std::fs::read_to_string(&local_path)?;
+    let uri = cloud_storage::object_uri(bucket, &key, target);
+    info!("Backing up bootstrap config to {uri}");
+    cloud_storage::upload_string(&content, &uri)
 }
 
 pub fn create_systemd_unit_file(service_name: &str, enable_now: bool) -> CmdResult {
@@ -759,4 +710,12 @@ pub fn wait_for_service_ready(service_name: &str, port: u16, timeout_secs: u64) 
 
     info!("{service_name} is ready (port {port} responding)");
     Ok(())
+}
+
+pub fn ensure_aws_cli() -> CmdResult {
+    if run_cmd!(bash -c "command -v aws" >/dev/null 2>&1).is_ok() {
+        return Ok(());
+    }
+
+    run_cmd!(snap install aws-cli --classic)
 }

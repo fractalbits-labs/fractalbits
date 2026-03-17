@@ -15,6 +15,7 @@ import {
   createPrivateLinkNlb,
   addAsgDynamoDbDeregistrationLifecycleHook,
   getAzNameFromIdAtBuildTime,
+  createUserData,
   DeployOS,
 } from "./ec2-utils";
 
@@ -185,18 +186,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
       );
     }
 
-    // Docker S3 ports for bootstrap (Docker host serves binaries to nodes)
-    privateSg.addIngressRule(
-      ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
-      ec2.Port.tcp(8080),
-      "Allow Docker S3 API access from within VPC",
-    );
-    privateSg.addIngressRule(
-      ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
-      ec2.Port.tcp(18080),
-      "Allow Docker mgmt API access from within VPC",
-    );
-
     // Create data blob bucket only for s3_hybrid_single_az mode
     let dataBlobBucket: s3.Bucket | undefined;
     if (dataBlobStorage === "s3_hybrid_single_az") {
@@ -321,29 +310,11 @@ export class FractalbitsVpcStack extends cdk.Stack {
         specificSubnet: subnet1,
         sg: privateSg,
       });
-      // Create bench_clients in a ASG group (no UserData - bootstrap via SSM)
-      benchClientAsg = createEc2Asg(
-        this,
-        "benchClientAsg",
-        this.vpc,
-        subnet1,
-        privateSg,
-        ec2Role,
-        [props.benchClientInstanceType],
-        props.numBenchClients,
-        props.numBenchClients,
-        "bench_client",
-        deployOS,
-      );
-      // Add lifecycle hook for bench_client ASG
-      addAsgDynamoDbDeregistrationLifecycleHook(
-        this,
-        "BenchClient",
-        benchClientAsg,
-        "bench-client",
-        "fractalbits-service-discovery",
-      );
     }
+
+    // Single UserData for all instances: download bootstrap binary from S3 and run it
+    const bootstrapUserData = createUserData(this, deployOS);
+
     const instances: Record<string, ec2.Instance> = {};
     instanceConfigs.forEach(
       ({ id, instanceType, sg, specificSubnet, rootVolumeSize }) => {
@@ -357,6 +328,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
           ec2Role,
           deployOS,
           rootVolumeSize,
+          bootstrapUserData,
         );
       },
     );
@@ -376,6 +348,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         props.numBssNodes,
         "bss_server",
         deployOS,
+        bootstrapUserData,
       );
     }
 
@@ -417,7 +390,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       ? nssPrivateLink.endpointDns
       : `${instances["nss-A"].instancePrivateIp}`;
 
-    // Create api_server(s) in a ASG group (no UserData - bootstrap via SSM)
+    // Create api_server(s) in ASG with worker UserData
     const apiServerAsg = createEc2Asg(
       this,
       "ApiServerAsg",
@@ -430,6 +403,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       props.numApiServers,
       "api_server",
       deployOS,
+      bootstrapUserData,
     );
 
     // Add lifecycle hook for api_server ASG
@@ -440,6 +414,31 @@ export class FractalbitsVpcStack extends cdk.Stack {
       "api-server",
       "fractalbits-service-discovery",
     );
+
+    // Create bench_client ASG (after instances so we can pass worker UserData)
+    if (props.benchType === "external") {
+      benchClientAsg = createEc2Asg(
+        this,
+        "benchClientAsg",
+        this.vpc,
+        subnet1,
+        privateSg,
+        ec2Role,
+        [props.benchClientInstanceType],
+        props.numBenchClients,
+        props.numBenchClients,
+        "bench_client",
+        deployOS,
+        bootstrapUserData,
+      );
+      addAsgDynamoDbDeregistrationLifecycleHook(
+        this,
+        "BenchClient",
+        benchClientAsg,
+        "bench-client",
+        "fractalbits-service-discovery",
+      );
+    }
 
     // NLB for API servers - always create regardless of benchType
     const nlb = new elbv2.NetworkLoadBalancer(this, "ApiNLB", {
@@ -495,8 +494,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
         });
       }
     }
-
-    // No UserData - all instances are bootstrapped via SSM after Docker host is ready
 
     // Outputs
     if (dataBlobBucket) {
@@ -562,15 +559,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
-    // Outputs for Docker host creation (used by xtask deploy)
-    new cdk.CfnOutput(this, "privateSubnetId", {
-      value: subnet1.subnetId,
-      description: "Private subnet ID for Docker host",
-    });
-    new cdk.CfnOutput(this, "privateSgId", {
-      value: privateSg.securityGroupId,
-      description: "Private security group ID for Docker host",
-    });
     new cdk.CfnOutput(this, "region", {
       value: this.region,
       description: "AWS region",

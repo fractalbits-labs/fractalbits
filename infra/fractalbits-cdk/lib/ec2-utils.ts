@@ -152,6 +152,7 @@ export const createInstance = (
   role: iam.Role,
   deployOS: DeployOS = "al2023",
   rootVolumeSize?: number,
+  userData?: ec2.UserData,
 ): ec2.Instance => {
   const arch =
     instanceType.architecture === ec2.InstanceArchitecture.ARM_64
@@ -178,9 +179,15 @@ export const createInstance = (
     securityGroup: sg,
     role: role,
     blockDevices: blockDevices,
+    userData: userData,
   });
 };
 
+/**
+ * Create UserData for all instances (RSS leader, workers, ASG nodes).
+ * Downloads the bootstrap binary directly from S3 and runs it.
+ * No Docker dependency - all nodes use the same simple bootstrap path.
+ */
 export const createUserData = (
   scope: Construct,
   deployOS: DeployOS = "al2023",
@@ -195,7 +202,11 @@ export const createUserData = (
       : ``;
   userData.addCommands(
     ...(installAwsCli ? [installAwsCli] : []),
-    `aws s3 cp --no-progress s3://${bucketName}/bootstrap.sh - | bash`,
+    `set -ex`,
+    `ARCH=$(arch)`,
+    `aws s3 cp --no-progress s3://${bucketName}/$ARCH/fractalbits-bootstrap /opt/fractalbits/bin/fractalbits-bootstrap`,
+    `chmod +x /opt/fractalbits/bin/fractalbits-bootstrap`,
+    `/opt/fractalbits/bin/fractalbits-bootstrap s3://${bucketName} 2>&1 | tee -a /var/log/fractalbits-bootstrap.log`,
   );
   return userData;
 };
@@ -225,6 +236,7 @@ export const createEc2Asg = (
   maxCapacity: number,
   serviceType?: string,
   deployOS: DeployOS = "al2023",
+  userData?: ec2.UserData,
 ): autoscaling.AutoScalingGroup => {
   if (instanceTypeNames.length === 0) {
     throw new Error("instanceTypeNames must not be empty.");
@@ -255,6 +267,7 @@ export const createEc2Asg = (
     machineImage: machineImage,
     securityGroup: sg,
     role: role,
+    userData: userData,
   });
 
   if (serviceType) {

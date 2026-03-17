@@ -245,7 +245,7 @@ pub(crate) fn get_service_ips_firestore(
     let database_id = gcp.firestore_database.as_deref().unwrap_or("fractalbits");
 
     let start_time = Instant::now();
-    let timeout = Duration::from_secs(300);
+    let timeout = Duration::from_secs(600);
     let collection = format!("{DDB_SERVICE_DISCOVERY_TABLE}-{service_id}");
 
     loop {

@@ -1,14 +1,12 @@
 mod aws_config_gen;
+mod aws_utils;
 pub mod bootstrap_progress;
 mod build;
 mod common;
 mod create_cluster;
-mod docker_host;
 mod gcp_config_gen;
-mod gcp_ssh;
+mod gcp_utils;
 mod gcp_vpc;
-mod ssm_bootstrap;
-pub(crate) mod ssm_utils;
 mod upload;
 mod vpc;
 

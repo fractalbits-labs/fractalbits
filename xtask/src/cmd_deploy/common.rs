@@ -1,6 +1,6 @@
 use cmd_lib::*;
 
-pub use xtask_common::DeployTarget;
+pub use xtask_common::*;
 
 pub struct VpcConfig {
     pub template: Option<crate::VpcTemplate>,
@@ -53,7 +53,6 @@ pub(super) struct ArchTarget {
     pub rust_cpu: &'static str,
     pub zig_target: &'static str,
     pub zig_cpu: &'static str,
-    pub docker_platform: &'static str,
     pub cpu_name: &'static str,
 }
 
@@ -67,7 +66,6 @@ pub(super) const ARCH_TARGETS: &[ArchTarget] = &[
         rust_cpu: "neoverse-n1",
         zig_target: "aarch64-linux-gnu",
         zig_cpu: "neoverse_n1",
-        docker_platform: "linux/arm64",
         cpu_name: "neoverse-n1",
     },
     // x86_64: x86-64-v3 (AVX2, FMA, BMI1/2) - Haswell+ (2013), Excavator+ (2015)
@@ -77,7 +75,6 @@ pub(super) const ARCH_TARGETS: &[ArchTarget] = &[
         rust_cpu: "x86-64-v3",
         zig_target: "x86_64-linux-gnu",
         zig_cpu: "x86_64_v3",
-        docker_platform: "linux/amd64",
         cpu_name: "x86-64-v3",
     },
 ];
@@ -91,7 +88,6 @@ pub(super) const AWS_CPU_TARGETS: &[ArchTarget] = &[
         rust_cpu: "neoverse-n1",
         zig_target: "aarch64-linux-gnu",
         zig_cpu: "neoverse_n1",
-        docker_platform: "linux/arm64",
         cpu_name: "neoverse-n1",
     },
     // aarch64: Neoverse N2 (Graviton4)
@@ -101,7 +97,6 @@ pub(super) const AWS_CPU_TARGETS: &[ArchTarget] = &[
         rust_cpu: "neoverse-n2",
         zig_target: "aarch64-linux-gnu",
         zig_cpu: "neoverse_n2",
-        docker_platform: "linux/arm64",
         cpu_name: "neoverse-n2",
     },
     // x86_64: Broadwell (i3)
@@ -111,7 +106,6 @@ pub(super) const AWS_CPU_TARGETS: &[ArchTarget] = &[
         rust_cpu: "broadwell",
         zig_target: "x86_64-linux-gnu",
         zig_cpu: "broadwell",
-        docker_platform: "linux/amd64",
         cpu_name: "broadwell",
     },
     // x86_64: Skylake (i3en)
@@ -121,7 +115,6 @@ pub(super) const AWS_CPU_TARGETS: &[ArchTarget] = &[
         rust_cpu: "skylake",
         zig_target: "x86_64-linux-gnu",
         zig_cpu: "skylake",
-        docker_platform: "linux/amd64",
         cpu_name: "skylake",
     },
 ];
@@ -137,6 +130,10 @@ pub(super) const RUST_BINS: &[&str] = &[
 
 pub(super) const ZIG_BINS: &[&str] = &["nss_server", "bss_server", "mirrord"];
 
+/// Get the cloud storage bootstrap bucket name.
+/// - AWS: `fractalbits-bootstrap-{region}-{account}` (real S3)
+/// - GCP: `{project_id}-deploy-staging` (GCS) -- must pass project_id
+/// - OnPrem: `fractalbits-bootstrap` (Docker S3)
 pub fn get_bootstrap_bucket_name(deploy_target: DeployTarget) -> FunResult {
     match deploy_target {
         DeployTarget::OnPrem => Ok("fractalbits-bootstrap".to_string()),
@@ -146,8 +143,30 @@ pub fn get_bootstrap_bucket_name(deploy_target: DeployTarget) -> FunResult {
             Ok(format!("fractalbits-bootstrap-{region}-{account_id}"))
         }
         DeployTarget::Gcp => {
-            // GCP uses Docker S3 on the RSS node, same simple bucket name as on-prem
-            Ok("fractalbits-bootstrap".to_string())
+            // GCP bootstrap bucket is set by the config gen using project_id.
+            // This fallback should not normally be called for GCP.
+            Err(std::io::Error::other(
+                "GCP bootstrap bucket requires project_id; use config generator instead",
+            ))
         }
     }
+}
+
+/// Upload bootstrap config and stage blueprint to a cloud storage bucket URI.
+pub fn upload_config_and_blueprint(
+    bucket_uri: &str,
+    config_toml: &str,
+    config: &BootstrapClusterConfig,
+) -> CmdResult {
+    let config_uri = format!("{bucket_uri}/{}", BOOTSTRAP_CLUSTER_CONFIG);
+    cloud_storage::upload_string(config_toml, &config_uri)?;
+
+    let blueprint = generate_blueprint(config);
+    let blueprint_json = serde_json::to_string(&blueprint)
+        .map_err(|e| std::io::Error::other(format!("Failed to serialize blueprint: {e}")))?;
+    let blueprint_uri = format!("{bucket_uri}/{}", STAGE_BLUEPRINT_FILE);
+    cloud_storage::upload_string(&blueprint_json, &blueprint_uri)?;
+
+    info!("Config and blueprint uploaded to {bucket_uri}");
+    Ok(())
 }

@@ -1,5 +1,5 @@
-use super::common::{DeployTarget, get_bootstrap_bucket_name};
-use super::ssm_utils;
+use super::aws_utils;
+use super::common::DeployTarget;
 use crate::CmdResult;
 use cmd_lib::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -8,73 +8,93 @@ use std::time::{Duration, Instant};
 use xtask_common::{STAGE_BLUEPRINT_FILE, StageBlueprint, StageBlueprintEntry};
 
 const POLL_INTERVAL_SECS: u64 = 2;
-const TIMEOUT_SECS: u64 = 600; // 10 minutes
+const TIMEOUT_SECS: u64 = 900; // 15 minutes (self-bootstrapping Docker takes ~8 min)
 
-/// S3 access configuration for fetching progress data
-struct S3Access {
-    bucket: String,
-    env_vars: Vec<String>,
+/// Cloud storage access configuration for fetching progress data
+enum CloudAccess {
+    AwsS3 { bucket: String },
+    Gcs { bucket: String },
 }
 
-impl S3Access {
-    fn for_aws(target: DeployTarget) -> Result<Self, Error> {
-        Ok(Self {
-            bucket: get_bootstrap_bucket_name(target)?,
-            env_vars: vec![],
+impl CloudAccess {
+    fn for_aws() -> Result<Self, Error> {
+        let bucket = aws_utils::get_aws_bootstrap_bucket()?;
+        Ok(Self::AwsS3 { bucket })
+    }
+
+    fn for_gcp() -> Result<Self, Error> {
+        let project_id = super::common::resolve_gcp_project(None)?;
+        Ok(Self::Gcs {
+            bucket: format!("{project_id}-deploy-staging"),
         })
     }
 
-    fn for_local_tunnel(local_port: u16) -> Self {
-        Self {
-            bucket: "fractalbits-bootstrap".to_string(),
-            env_vars: vec![
-                "AWS_DEFAULT_REGION=localdev".to_string(),
-                format!("AWS_ENDPOINT_URL_S3=http://localhost:{local_port}"),
-                "AWS_ACCESS_KEY_ID=test_api_key".to_string(),
-                "AWS_SECRET_ACCESS_KEY=test_api_secret".to_string(),
-            ],
+    fn download(&self, key: &str) -> Result<String, Error> {
+        match self {
+            Self::AwsS3 { bucket } => {
+                let s3_path = format!("s3://{bucket}/{key}");
+                run_fun!(aws s3 cp $s3_path - 2>/dev/null)
+            }
+            Self::Gcs { bucket } => {
+                let gs_path = format!("gs://{bucket}/{key}");
+                run_fun!(gcloud storage cat $gs_path 2>/dev/null)
+            }
         }
     }
 
-    fn env_refs(&self) -> Vec<&str> {
-        self.env_vars.iter().map(|s| s.as_str()).collect()
+    fn list_recursive(&self, prefix: &str) -> String {
+        match self {
+            Self::AwsS3 { bucket } => {
+                let s3_prefix = format!("s3://{bucket}/{prefix}");
+                run_fun!(aws s3 ls --recursive $s3_prefix 2>/dev/null).unwrap_or_default()
+            }
+            Self::Gcs { bucket } => {
+                let gs_prefix = format!("gs://{bucket}/{prefix}**");
+                run_fun!(gcloud storage ls $gs_prefix 2>/dev/null).unwrap_or_default()
+            }
+        }
     }
 }
 
-fn get_blueprint(access: &S3Access) -> Result<StageBlueprint, Error> {
-    let bucket = &access.bucket;
-    let s3_path = format!("s3://{bucket}/{STAGE_BLUEPRINT_FILE}");
-    let env_vars = access.env_refs();
-    let content = run_fun!($[env_vars] aws s3 cp $s3_path - 2>/dev/null)
+fn get_blueprint(access: &CloudAccess) -> Result<StageBlueprint, Error> {
+    let content = access
+        .download(STAGE_BLUEPRINT_FILE)
         .map_err(|e| Error::other(format!("Failed to download {STAGE_BLUEPRINT_FILE}: {e}")))?;
 
     serde_json::from_str(&content)
         .map_err(|e| Error::other(format!("Failed to parse {STAGE_BLUEPRINT_FILE}: {e}")))
 }
 
-/// Cached S3 listing for all stages - avoids repeated S3 calls
+/// Cached cloud storage listing for all stages
 struct StageCache {
-    /// Lines from `aws s3 ls --recursive` output
     lines: Vec<String>,
+    is_gcs: bool,
 }
 
 impl StageCache {
-    fn fetch(access: &S3Access, cluster_id: &str) -> Self {
-        let bucket = &access.bucket;
-        let prefix = format!("s3://{bucket}/workflow/{cluster_id}/stages/");
-        let env_vars = access.env_refs();
-        let output =
-            run_fun!($[env_vars] aws s3 ls --recursive $prefix 2>/dev/null).unwrap_or_default();
+    fn fetch(access: &CloudAccess, cluster_id: &str) -> Self {
+        let prefix = format!("workflow/{cluster_id}/stages/");
+        let output = access.list_recursive(&prefix);
+        let is_gcs = matches!(access, CloudAccess::Gcs { .. });
         let lines = output.lines().map(|s| s.to_string()).collect();
-        Self { lines }
+        Self { lines, is_gcs }
     }
 
     fn count_stage_completions(&self, stage: &str) -> usize {
-        let stage_prefix = format!("stages/{stage}/");
-        self.lines
-            .iter()
-            .filter(|l| l.contains(&stage_prefix) && l.ends_with(".json"))
-            .count()
+        if self.is_gcs {
+            // GCS listing returns full paths like: gs://bucket/workflow/.../stages/00-instances-ready/node1.json
+            let stage_suffix = format!("stages/{stage}/");
+            self.lines
+                .iter()
+                .filter(|l| l.contains(&stage_suffix) && l.ends_with(".json"))
+                .count()
+        } else {
+            let stage_prefix = format!("stages/{stage}/");
+            self.lines
+                .iter()
+                .filter(|l| l.contains(&stage_prefix) && l.ends_with(".json"))
+                .count()
+        }
     }
 
     fn check_global_stage(&self, stage: &str) -> bool {
@@ -84,95 +104,37 @@ impl StageCache {
 }
 
 pub fn show_progress(target: DeployTarget) -> CmdResult {
-    let access = S3Access::for_aws(target)?;
+    show_progress_with_bucket(target, None)
+}
+
+pub fn show_progress_with_bucket(target: DeployTarget, gcs_bucket: Option<&str>) -> CmdResult {
+    let access = match target {
+        DeployTarget::Aws => CloudAccess::for_aws()?,
+        DeployTarget::Gcp => {
+            if let Some(bucket) = gcs_bucket {
+                CloudAccess::Gcs {
+                    bucket: bucket.to_string(),
+                }
+            } else {
+                CloudAccess::for_gcp()?
+            }
+        }
+        DeployTarget::OnPrem => {
+            return Err(Error::other(
+                "OnPrem progress monitoring not supported via cloud storage",
+            ));
+        }
+    };
     show_progress_inner(&access)
 }
 
-/// Monitor bootstrap progress via SSM port-forwarding tunnel to Docker S3.
-///
-/// Starts an SSM session that forwards a local port to port 8080 on the
-/// Docker host instance, then polls the Docker S3 for workflow stage data.
-pub fn show_progress_from_docker(docker_host_id: &str) -> CmdResult {
-    let local_port = find_available_port()?;
-    info!(
-        "Starting SSM tunnel to Docker S3 on {} (local port {})...",
-        docker_host_id, local_port
-    );
-
-    let mut tunnel = start_ssm_tunnel(docker_host_id, local_port)?;
-
-    // Wait for tunnel to be ready
-    wait_for_tunnel_ready(local_port, 30)?;
-    info!("SSM tunnel established");
-
-    let access = S3Access::for_local_tunnel(local_port);
-    let result = show_progress_inner(&access);
-
-    // Clean up tunnel
-    let _ = tunnel.kill();
-    let _ = tunnel.wait();
-
-    result
-}
-
-/// Monitor bootstrap progress via IAP tunnel to Docker S3 on a GCP instance.
-pub fn show_progress_from_gcp_docker(instance_name: &str, zone: &str, project: &str) -> CmdResult {
-    let local_port = find_available_port()?;
-    info!(
-        "Starting IAP tunnel to Docker S3 on {} (local port {})...",
-        instance_name, local_port
-    );
-
-    let mut tunnel = std::process::Command::new("gcloud")
-        .args([
-            "compute",
-            "start-iap-tunnel",
-            instance_name,
-            "8080",
-            &format!("--local-host-port=localhost:{local_port}"),
-            "--zone",
-            zone,
-            "--project",
-            project,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| Error::other(format!("Failed to start IAP tunnel: {e}")))?;
-
-    // Wait for tunnel to be ready (IAP tunnels take longer than SSM)
-    wait_for_tunnel_ready(local_port, 90)?;
-    info!("IAP tunnel established");
-
-    let access = S3Access::for_local_tunnel(local_port);
-    let result = show_progress_inner(&access);
-
-    // Clean up tunnel
-    let _ = tunnel.kill();
-    let _ = tunnel.wait();
-
-    result
-}
-
-/// Show bootstrap progress using AWS S3 (persisted data) or SSM tunnel fallback.
-///
-/// Tries AWS S3 first (works after Docker cleanup), then falls back to
-/// SSM tunnel to Docker S3 if the blueprint hasn't been synced yet.
+/// Show bootstrap progress using AWS S3 (persisted data).
 pub fn show_progress_from_cdk_outputs() -> CmdResult {
-    let aws_access = S3Access::for_aws(DeployTarget::Aws)?;
-    if get_blueprint(&aws_access).is_ok() {
-        return show_progress_inner(&aws_access);
-    }
-
-    // Fall back to SSM tunnel (Docker still running)
-    let outputs = ssm_utils::parse_cdk_outputs()?;
-    let rss_a_id = outputs
-        .get("rssAId")
-        .ok_or_else(|| Error::other("CDK output 'rssAId' not found"))?;
-    show_progress_from_docker(rss_a_id)
+    let access = CloudAccess::for_aws()?;
+    show_progress_inner(&access)
 }
 
-fn show_progress_inner(access: &S3Access) -> CmdResult {
+fn show_progress_inner(access: &CloudAccess) -> CmdResult {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::default_spinner()
@@ -239,7 +201,6 @@ fn show_progress_inner(access: &S3Access) -> CmdResult {
     }
 
     loop {
-        // Single S3 call per iteration - fetch all stage data at once
         let cache = StageCache::fetch(access, cluster_id);
         let mut all_complete = true;
 
@@ -304,52 +265,4 @@ fn show_progress_inner(access: &S3Access) -> CmdResult {
     info!("Bootstrap completed");
 
     Ok(())
-}
-
-fn find_available_port() -> Result<u16, Error> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| Error::other(format!("Failed to find available port: {e}")))?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
-}
-
-fn start_ssm_tunnel(instance_id: &str, local_port: u16) -> Result<std::process::Child, Error> {
-    let port_str = local_port.to_string();
-    std::process::Command::new("aws")
-        .args([
-            "ssm",
-            "start-session",
-            "--target",
-            instance_id,
-            "--document-name",
-            "AWS-StartPortForwardingSession",
-            "--parameters",
-            &format!("{{\"portNumber\":[\"8080\"],\"localPortNumber\":[\"{port_str}\"]}}"),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| Error::other(format!("Failed to start SSM tunnel: {e}")))
-}
-
-fn wait_for_tunnel_ready(local_port: u16, timeout_secs: u64) -> Result<(), Error> {
-    let start = Instant::now();
-    let timeout = Duration::from_secs(timeout_secs);
-
-    while start.elapsed() < timeout {
-        if std::net::TcpStream::connect_timeout(
-            &format!("127.0.0.1:{local_port}").parse().unwrap(),
-            Duration::from_millis(500),
-        )
-        .is_ok()
-        {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-
-    Err(Error::other(format!(
-        "SSM tunnel not ready after {timeout:?}"
-    )))
 }

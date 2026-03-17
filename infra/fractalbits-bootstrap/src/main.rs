@@ -55,17 +55,17 @@ fn main() -> CmdResult {
 
 fn generic_bootstrap() -> CmdResult {
     let args: Vec<String> = std::env::args().collect();
-    let bucket_name = args
+    let bucket_uri = args
         .get(1)
-        .ok_or_else(|| io::Error::other("Usage: fractalbits-bootstrap <bucket_name>"))?;
+        .ok_or_else(|| io::Error::other("Usage: fractalbits-bootstrap <bucket_uri>"))?;
 
-    info!("Starting config-based bootstrap mode (bucket: {bucket_name})");
+    generic_bootstrap_with_bucket(bucket_uri)
+}
 
-    let config = config::download_and_parse(bucket_name)?;
+pub fn generic_bootstrap_with_bucket(bucket_uri: &str) -> CmdResult {
+    info!("Starting config-based bootstrap mode (bucket: {bucket_uri})");
 
-    // Clear Docker S3 test credentials from global env so DynamoDB/other AWS
-    // calls use IAM role credentials. S3 calls use inline creds via s3_env_overrides().
-    clear_docker_s3_global_credentials();
+    let config = config::download_and_parse(bucket_uri)?;
 
     // Backup config to workflow directory for progress tracking
     if let Some(cluster_id) = &config.global.workflow_cluster_id {

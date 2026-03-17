@@ -1,8 +1,8 @@
 use crate::api_server;
-use crate::common::s3_env_overrides;
 use crate::config::BootstrapConfig;
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use crate::*;
+use xtask_common::cloud_storage;
 
 pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Api)?;
@@ -10,8 +10,8 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
 
     download_binaries(config, &["api_server"])?;
     let bootstrap_bucket = config.get_bootstrap_bucket();
-    let s3_env = &s3_env_overrides();
-    run_cmd!($[s3_env] aws s3 cp --no-progress $bootstrap_bucket/ui $GUI_WEB_ROOT --recursive)?;
+    let ui_uri = format!("{bootstrap_bucket}/ui");
+    cloud_storage::sync_down(&ui_uri, GUI_WEB_ROOT)?;
 
     api_server::create_config(config)?;
     // setup_cloudwatch_agent()?;

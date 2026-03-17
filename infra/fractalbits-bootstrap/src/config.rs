@@ -3,13 +3,13 @@ use std::io::Error;
 use std::time::{Duration, Instant};
 
 use crate::common::{
-    BOOTSTRAP_CLUSTER_CONFIG, ETC_PATH, download_from_s3, ensure_ec2_metadata, get_instance_id,
+    BOOTSTRAP_CLUSTER_CONFIG, ETC_PATH, ensure_aws_cli, ensure_ec2_metadata, get_instance_id,
 };
 
 // Re-export types from xtask_common
 pub use xtask_common::{
     BootstrapClusterConfig, ClusterEtcdConfig, ClusterNodeConfig, DataBlobStorage, DeployTarget,
-    JournalType,
+    JournalType, cloud_storage,
 };
 
 // Type aliases for backwards compatibility
@@ -19,16 +19,21 @@ pub type InstanceConfig = ClusterNodeConfig;
 
 const CONFIG_RETRY_TIMEOUT_SECS: u64 = 120;
 
-pub fn download_and_parse(bucket_name: &str) -> Result<BootstrapClusterConfig, Error> {
-    let bootstrap_bucket = format!("s3://{bucket_name}");
-    let s3_path = format!("{bootstrap_bucket}/{BOOTSTRAP_CLUSTER_CONFIG}");
+/// Download and parse bootstrap config from cloud storage.
+/// `bucket_uri` is a full URI like `s3://bucket-name` or `gs://bucket-name`.
+pub fn download_and_parse(bucket_uri: &str) -> Result<BootstrapClusterConfig, Error> {
+    let cloud_path = format!("{bucket_uri}/{BOOTSTRAP_CLUSTER_CONFIG}");
     let local_path = format!("{ETC_PATH}{BOOTSTRAP_CLUSTER_CONFIG}");
+
+    if bucket_uri.starts_with("s3://") {
+        ensure_aws_cli()?;
+    }
 
     let start_time = Instant::now();
     let timeout = Duration::from_secs(CONFIG_RETRY_TIMEOUT_SECS);
     loop {
         // Retry download if the file doesn't exist yet (race condition with CDK deployment)
-        match download_from_s3(&s3_path, &local_path) {
+        match cloud_storage::download_file(&cloud_path, &local_path) {
             Ok(_) => {}
             Err(e) => {
                 if start_time.elapsed() > timeout {

@@ -53,6 +53,8 @@ pub fn bootstrap(
         info!("etcd cluster is ready");
     }
 
+    ensure_aws_cli()?;
+
     let client_ips = get_service_ips_with_backend(config, "bench-client", bench_client_num);
 
     let region = config.global.region.as_str();

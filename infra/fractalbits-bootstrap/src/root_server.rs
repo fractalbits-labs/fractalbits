@@ -4,6 +4,7 @@ use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use std::io::Error;
 use xtask_common::STAGE_BLUEPRINT_FILE;
+use xtask_common::cloud_storage;
 
 const POLL_INTERVAL_SECONDS: u64 = 1;
 const MAX_POLL_ATTEMPTS: u64 = 300;
@@ -49,7 +50,6 @@ pub fn bootstrap(config: &BootstrapConfig, is_leader: bool, for_bench: bool) -> 
 /// Post-bootstrap cleanup for the RSS leader.
 ///
 /// Waits for all nodes to reach SERVICES_READY, then:
-/// - AWS: syncs workflow data from Docker S3 to real AWS S3, then cleans up Docker
 /// - On-prem: copies workflow data from Docker S3 to local filesystem
 ///
 /// Errors are best-effort (logged as warnings, never fail bootstrap).
@@ -71,63 +71,13 @@ fn post_bootstrap_cleanup(config: &BootstrapConfig) -> CmdResult {
         warn!("Proceeding with cleanup anyway");
     }
 
-    match config.global.deploy_target {
-        DeployTarget::Aws if std::env::var("DOCKER_S3_AUTH").is_ok() => {
-            if let Err(e) = sync_workflow_to_aws_s3_and_cleanup() {
-                warn!("Post-bootstrap AWS cleanup failed (best-effort): {e}");
-            }
-        }
-        DeployTarget::OnPrem => {
-            if let Err(e) = copy_workflow_to_local() {
-                warn!("Post-bootstrap workflow copy failed (best-effort): {e}");
-            }
-        }
-        _ => {}
+    if config.global.deploy_target == DeployTarget::OnPrem
+        && let Err(e) = copy_workflow_to_local()
+    {
+        warn!("Post-bootstrap workflow copy failed (best-effort): {e}");
     }
 
     info!("Post-bootstrap cleanup complete");
-    Ok(())
-}
-
-/// Sync workflow data from Docker S3 to real AWS S3, then clean up Docker.
-fn sync_workflow_to_aws_s3_and_cleanup() -> CmdResult {
-    let region = get_current_aws_region()?;
-    let account_id = get_account_id()?;
-    let aws_bucket = format!("fractalbits-bootstrap-{region}-{account_id}");
-
-    info!("Syncing workflow data from Docker S3 to s3://{aws_bucket}/...");
-
-    // Download from Docker S3 (uses s3_env_overrides for credentials, AWS_ENDPOINT_URL_S3 from env)
-    let s3_env = &s3_env_overrides();
-    let blueprint_src = "s3://fractalbits-bootstrap/stage_blueprint.json";
-    let workflow_src = "s3://fractalbits-bootstrap/workflow/";
-    run_cmd! {
-        $[s3_env] aws s3 cp $blueprint_src /tmp/stage_blueprint.json;
-        $[s3_env] aws s3 sync $workflow_src /tmp/workflow/;
-    }?;
-
-    // Upload to real AWS S3 (override Docker S3 endpoint with real AWS S3)
-    let real_s3_env = &vec![format!(
-        "AWS_ENDPOINT_URL_S3=https://s3.{region}.amazonaws.com"
-    )];
-    let blueprint_dst = format!("s3://{aws_bucket}/stage_blueprint.json");
-    let workflow_dst = format!("s3://{aws_bucket}/workflow/");
-    run_cmd! {
-        $[real_s3_env] aws s3 cp /tmp/stage_blueprint.json $blueprint_dst --region $region;
-        $[real_s3_env] aws s3 sync /tmp/workflow/ $workflow_dst --region $region;
-        rm -rf /tmp/stage_blueprint.json /tmp/workflow/;
-        info "Workflow data synced to s3://${aws_bucket}/";
-    }?;
-
-    // Clean up Docker
-    run_cmd! {
-        info "Cleaning up Docker bootstrap container...";
-        ignore docker stop fractalbits-bootstrap 2>/dev/null;
-        ignore docker rm fractalbits-bootstrap 2>/dev/null;
-        ignore systemctl stop docker 2>/dev/null;
-        info "Docker cleanup complete";
-    }?;
-
     Ok(())
 }
 
@@ -891,10 +841,16 @@ fn upload_stage_blueprint(config: &BootstrapConfig) -> CmdResult {
     let blueprint_json = serde_json::to_string_pretty(&blueprint)
         .map_err(|e| Error::other(format!("Failed to serialize stage blueprint: {e}")))?;
 
-    let bucket = config.get_bootstrap_bucket();
-    let s3_path = format!("{bucket}/{STAGE_BLUEPRINT_FILE}");
-    info!("Uploading {STAGE_BLUEPRINT_FILE} to {s3_path}");
-    upload_string_to_s3(&blueprint_json, &s3_path)?;
+    // Upload to cloud storage for direct progress monitoring.
+    // xtask also uploads the blueprint before infra deploy, but the bootstrap
+    // binary re-uploads it here in case the config changed (e.g. on-prem mode
+    // where xtask doesn't upload to cloud storage).
+    let target = config.global.deploy_target;
+    let cloud_bucket = &config.bootstrap_bucket;
+    info!("Uploading {STAGE_BLUEPRINT_FILE} to cloud storage ({cloud_bucket})");
+    let uri = cloud_storage::object_uri(cloud_bucket, STAGE_BLUEPRINT_FILE, target);
+    cloud_storage::upload_string(&blueprint_json, &uri)?;
+
     info!("{STAGE_BLUEPRINT_FILE} uploaded successfully");
     Ok(())
 }

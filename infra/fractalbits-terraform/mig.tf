@@ -17,15 +17,11 @@ resource "google_compute_instance_template" "api_server" {
   }
 
   metadata = {
-    service-role   = "api_server"
-    instance-role  = "api"
-    cluster-id     = var.cluster_id
+    service-role  = "api_server"
+    instance-role = "api"
+    cluster-id    = var.cluster_id
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
-      rss_a_ip      = google_compute_instance.rss_a.network_interface[0].network_ip
-      cluster_id    = var.cluster_id
-      deploy_target = "gcp"
-      service_role  = "api_server"
-      instance_role = "api"
+      gcs_bucket = "${var.project_id}-deploy-staging"
     })
   }
 
@@ -39,6 +35,14 @@ resource "google_compute_instance_template" "api_server" {
   lifecycle {
     create_before_destroy = true
   }
+
+  depends_on = [
+    google_project_iam_member.firestore,
+    google_project_iam_member.storage,
+    google_project_iam_member.compute,
+    google_project_iam_member.logging,
+    google_project_iam_member.monitoring,
+  ]
 }
 
 # API Server managed instance group
@@ -85,15 +89,11 @@ resource "google_compute_instance_template" "bss_server" {
   }
 
   metadata = {
-    service-role   = "bss_server"
-    instance-role  = "bss"
-    cluster-id     = var.cluster_id
+    service-role  = "bss_server"
+    instance-role = "bss"
+    cluster-id    = var.cluster_id
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
-      rss_a_ip      = google_compute_instance.rss_a.network_interface[0].network_ip
-      cluster_id    = var.cluster_id
-      deploy_target = "gcp"
-      service_role  = "bss_server"
-      instance_role = "bss"
+      gcs_bucket = "${var.project_id}-deploy-staging"
     })
   }
 
@@ -107,6 +107,14 @@ resource "google_compute_instance_template" "bss_server" {
   lifecycle {
     create_before_destroy = true
   }
+
+  depends_on = [
+    google_project_iam_member.firestore,
+    google_project_iam_member.storage,
+    google_project_iam_member.compute,
+    google_project_iam_member.logging,
+    google_project_iam_member.monitoring,
+  ]
 }
 
 # BSS Server managed instance group

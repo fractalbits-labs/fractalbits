@@ -222,7 +222,7 @@ fn backend_name(config: &BootstrapConfig, use_etcd: bool) -> &'static str {
 }
 
 fn wait_for_volume_configs(config: &BootstrapConfig, use_etcd: bool) -> CmdResult {
-    const TIMEOUT_SECS: u64 = 300;
+    const TIMEOUT_SECS: u64 = 600;
     const POLL_INTERVAL_SECS: u64 = 1;
 
     let name = backend_name(config, use_etcd);

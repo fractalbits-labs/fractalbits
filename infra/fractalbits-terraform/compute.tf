@@ -25,16 +25,12 @@ resource "google_compute_instance" "rss_a" {
   }
 
   metadata = {
-    service-role   = "root_server"
-    instance-role  = "leader"
-    cluster-id     = var.cluster_id
-    rss-backend    = var.rss_backend
+    service-role  = "root_server"
+    instance-role = "leader"
+    cluster-id    = var.cluster_id
+    rss-backend   = var.rss_backend
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
-      rss_a_ip       = google_compute_address.rss_a.address
-      cluster_id     = var.cluster_id
-      deploy_target  = "gcp"
-      service_role   = "root_server"
-      instance_role  = "leader"
+      gcs_bucket = "${var.project_id}-deploy-staging"
     })
   }
 
@@ -46,6 +42,14 @@ resource "google_compute_instance" "rss_a" {
   tags = ["fractalbits-private", "rss"]
 
   allow_stopping_for_update = true
+
+  depends_on = [
+    google_project_iam_member.firestore,
+    google_project_iam_member.storage,
+    google_project_iam_member.compute,
+    google_project_iam_member.logging,
+    google_project_iam_member.monitoring,
+  ]
 }
 
 # RSS-B (Root Storage Server - follower, HA only)
@@ -67,16 +71,12 @@ resource "google_compute_instance" "rss_b" {
   }
 
   metadata = {
-    service-role   = "root_server"
-    instance-role  = "follower"
-    cluster-id     = var.cluster_id
-    rss-backend    = var.rss_backend
+    service-role  = "root_server"
+    instance-role = "follower"
+    cluster-id    = var.cluster_id
+    rss-backend   = var.rss_backend
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
-      rss_a_ip       = google_compute_instance.rss_a.network_interface[0].network_ip
-      cluster_id     = var.cluster_id
-      deploy_target  = "gcp"
-      service_role   = "root_server"
-      instance_role  = "follower"
+      gcs_bucket = "${var.project_id}-deploy-staging"
     })
   }
 
@@ -88,6 +88,14 @@ resource "google_compute_instance" "rss_b" {
   tags = ["fractalbits-private", "rss"]
 
   allow_stopping_for_update = true
+
+  depends_on = [
+    google_project_iam_member.firestore,
+    google_project_iam_member.storage,
+    google_project_iam_member.compute,
+    google_project_iam_member.logging,
+    google_project_iam_member.monitoring,
+  ]
 }
 
 # NSS-A (Namespace Server)
@@ -126,15 +134,11 @@ resource "google_compute_instance" "nss_a" {
   }
 
   metadata = {
-    service-role   = "nss_server"
-    instance-role  = "active"
-    cluster-id     = var.cluster_id
+    service-role  = "nss_server"
+    instance-role = "active"
+    cluster-id    = var.cluster_id
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
-      rss_a_ip       = google_compute_instance.rss_a.network_interface[0].network_ip
-      cluster_id     = var.cluster_id
-      deploy_target  = "gcp"
-      service_role   = "nss_server"
-      instance_role  = "active"
+      gcs_bucket = "${var.project_id}-deploy-staging"
     })
   }
 
@@ -146,6 +150,14 @@ resource "google_compute_instance" "nss_a" {
   tags = ["fractalbits-private", "nss"]
 
   allow_stopping_for_update = true
+
+  depends_on = [
+    google_project_iam_member.firestore,
+    google_project_iam_member.storage,
+    google_project_iam_member.compute,
+    google_project_iam_member.logging,
+    google_project_iam_member.monitoring,
+  ]
 }
 
 # NSS-B (Namespace Server - standby, HA only)
@@ -183,15 +195,11 @@ resource "google_compute_instance" "nss_b" {
   }
 
   metadata = {
-    service-role   = "nss_server"
-    instance-role  = "standby"
-    cluster-id     = var.cluster_id
+    service-role  = "nss_server"
+    instance-role = "standby"
+    cluster-id    = var.cluster_id
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
-      rss_a_ip       = google_compute_instance.rss_a.network_interface[0].network_ip
-      cluster_id     = var.cluster_id
-      deploy_target  = "gcp"
-      service_role   = "nss_server"
-      instance_role  = "standby"
+      gcs_bucket = "${var.project_id}-deploy-staging"
     })
   }
 
@@ -203,6 +211,14 @@ resource "google_compute_instance" "nss_b" {
   tags = ["fractalbits-private", "nss"]
 
   allow_stopping_for_update = true
+
+  depends_on = [
+    google_project_iam_member.firestore,
+    google_project_iam_member.storage,
+    google_project_iam_member.compute,
+    google_project_iam_member.logging,
+    google_project_iam_member.monitoring,
+  ]
 }
 
 # Bench server (optional)
@@ -224,15 +240,11 @@ resource "google_compute_instance" "bench" {
   }
 
   metadata = {
-    service-role   = "bench_server"
-    instance-role  = "bench"
-    cluster-id     = var.cluster_id
+    service-role  = "bench_server"
+    instance-role = "bench"
+    cluster-id    = var.cluster_id
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
-      rss_a_ip       = google_compute_instance.rss_a.network_interface[0].network_ip
-      cluster_id     = var.cluster_id
-      deploy_target  = "gcp"
-      service_role   = "bench_server"
-      instance_role  = "bench"
+      gcs_bucket = "${var.project_id}-deploy-staging"
     })
   }
 
@@ -244,4 +256,12 @@ resource "google_compute_instance" "bench" {
   tags = ["fractalbits-private", "fractalbits-bench"]
 
   allow_stopping_for_update = true
+
+  depends_on = [
+    google_project_iam_member.firestore,
+    google_project_iam_member.storage,
+    google_project_iam_member.compute,
+    google_project_iam_member.logging,
+    google_project_iam_member.monitoring,
+  ]
 }

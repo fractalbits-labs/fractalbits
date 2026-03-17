@@ -66,6 +66,8 @@ export class FractalbitsMetaStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
+    const bootstrapUserData = createUserData(this);
+
     let targetIdOutput: cdk.CfnOutput;
 
     const buildMetaStackConfig = (nodeEntries: string[]): string => {
@@ -117,6 +119,9 @@ export class FractalbitsMetaStack extends cdk.Stack {
         nssInstanceType,
         sg,
         ec2Role,
+        "al2023",
+        undefined,
+        bootstrapUserData,
       );
       const ebsVolume = createEbsVolume(
         this,
@@ -142,8 +147,6 @@ export class FractalbitsMetaStack extends cdk.Stack {
         destinationBucket: buildsBucket,
         prune: false,
       });
-
-      instance.addUserData(createUserData(this).render());
 
       targetIdOutput = new cdk.CfnOutput(this, "instanceId", {
         value: instance.instanceId,
@@ -178,6 +181,8 @@ export class FractalbitsMetaStack extends cdk.Stack {
         1,
         1,
         "bss_server",
+        "al2023",
+        bootstrapUserData,
       );
 
       targetIdOutput = new cdk.CfnOutput(this, "bssAsgName", {

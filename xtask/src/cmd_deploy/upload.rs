@@ -1,89 +1,110 @@
 use crate::*;
+use xtask_common::cloud_storage;
 
-use super::build::DOCKER_OUTPUT_DIR;
-use super::common::{DeployTarget, get_bootstrap_bucket_name};
+use super::common::{DeployTarget, get_bootstrap_bucket_name, resolve_gcp_project};
 
 pub fn upload(deploy_target: DeployTarget) -> CmdResult {
-    upload_with_endpoint(deploy_target, None)
+    match deploy_target {
+        DeployTarget::Gcp => {
+            let project_id = resolve_gcp_project(None)?;
+            upload_gcp(&project_id)
+        }
+        DeployTarget::Aws | DeployTarget::OnPrem => upload_to_aws(deploy_target),
+    }
 }
 
-/// Build slim Docker images and binaries bundle, then upload to AWS S3.
-pub fn upload_docker_images(deploy_target: DeployTarget) -> CmdResult {
-    super::build::build_docker_images()?;
-    super::build::pack_binaries(Some(deploy_target))?;
-
-    let variant = match deploy_target {
-        DeployTarget::Aws => "aws",
-        DeployTarget::OnPrem => "onprem",
-        DeployTarget::Gcp => "gcp",
-    };
-
-    upload_docker_images_to_aws(variant)
-}
-
-/// Build slim Docker images and binaries bundle, then upload to GCS.
-pub fn upload_docker_images_gcp(project_id: &str) -> CmdResult {
-    super::build::build_docker_images()?;
-    super::build::pack_binaries(Some(DeployTarget::Gcp))?;
-    upload_docker_images_to_gcs("gcp", project_id)
-}
-
-fn upload_docker_images_to_aws(variant: &str) -> CmdResult {
+/// Upload binaries directly to AWS S3 (no Docker images needed).
+pub fn upload_to_aws(deploy_target: DeployTarget) -> CmdResult {
     let bucket_name = get_bootstrap_bucket_name(DeployTarget::Aws)?;
+    let target = xtask_common::DeployTarget::Aws;
 
-    // Create bucket if it doesn't exist
-    let bucket_exists = run_cmd!(aws s3api head-bucket --bucket $bucket_name &>/dev/null).is_ok();
-    if !bucket_exists {
-        run_cmd! {
-            info "Creating bucket $bucket_name";
-            aws s3 mb "s3://$bucket_name";
-        }?;
+    cloud_storage::ensure_bucket(&bucket_name, target)?;
+
+    // Sync binaries based on deploy target
+    match deploy_target {
+        DeployTarget::OnPrem | DeployTarget::Gcp => {
+            // On-prem/GCP: sync only generic binaries (baseline CPU)
+            for arch in ["x86_64", "aarch64"] {
+                let src = format!("prebuilt/deploy/generic/{arch}");
+                let dst = format!("s3://{bucket_name}/{arch}");
+                info!("Syncing generic binaries for {arch} to {dst}");
+                cloud_storage::sync_up(&src, &dst)?;
+            }
+        }
+        DeployTarget::Aws => {
+            // AWS: sync shared binaries to s3://{bucket}/{arch}/
+            // and CPU-specific binaries to s3://{bucket}/{arch}/{cpu}/
+            let cpu_targets = [
+                ("x86_64", vec!["broadwell", "skylake"]),
+                ("aarch64", vec!["neoverse-n1", "neoverse-n2"]),
+            ];
+
+            for (arch, cpus) in cpu_targets {
+                // Sync shared binaries (bootstrap, etcd, warp) from generic
+                let src = format!("prebuilt/deploy/generic/{arch}");
+                let dst = format!("s3://{bucket_name}/{arch}");
+                info!("Syncing shared binaries for {arch} to {dst}");
+                cloud_storage::sync_up_filtered(
+                    &src,
+                    &dst,
+                    &["fractalbits-bootstrap", "etcd", "etcdctl", "warp"],
+                    &["*"],
+                )?;
+
+                // Sync CPU-specific binaries
+                for cpu in &cpus {
+                    let aws_cpu_path = format!("prebuilt/deploy/aws/{arch}/{cpu}");
+                    if std::path::Path::new(&aws_cpu_path).exists() {
+                        let cpu_dst = format!("s3://{bucket_name}/{arch}/{cpu}");
+                        info!("Syncing AWS {cpu} binaries for {arch} to {cpu_dst}");
+                        cloud_storage::sync_up(&aws_cpu_path, &cpu_dst)?;
+                    }
+                }
+            }
+        }
     }
 
-    // Upload slim Docker images (one per arch)
-    for arch in ["aarch64", "x86_64"] {
-        let image_path = format!("{}/fractalbits-{}.tar.gz", DOCKER_OUTPUT_DIR, arch);
-        let s3_path = format!("s3://{}/docker/fractalbits-{}.tar.gz", bucket_name, arch);
-        info!("Uploading {} Docker image to S3...", arch);
-        run_cmd!(aws s3 cp $image_path $s3_path)?;
+    // Sync UI if it exists
+    if std::path::Path::new("prebuilt/deploy/ui").exists() {
+        let ui_dst = format!("s3://{bucket_name}/ui");
+        info!("Syncing UI to {ui_dst}");
+        cloud_storage::sync_up("prebuilt/deploy/ui", &ui_dst)?;
     }
 
-    let binaries_path = format!("{}/binaries-{}.tar.gz", DOCKER_OUTPUT_DIR, variant);
-    let s3_path = format!("s3://{}/docker/binaries-{}.tar.gz", bucket_name, variant);
-    info!("Uploading {} binaries bundle to S3...", variant);
-    run_cmd!(aws s3 cp $binaries_path $s3_path)?;
-
+    info!("Syncing all binaries is done");
     Ok(())
 }
 
-fn upload_docker_images_to_gcs(variant: &str, project_id: &str) -> CmdResult {
+/// Upload binaries directly to GCS.
+pub fn upload_gcp(project_id: &str) -> CmdResult {
     let bucket_name = format!("{project_id}-deploy-staging");
-    let gcs_bucket = format!("gs://{bucket_name}");
+    let target = xtask_common::DeployTarget::Gcp;
 
-    // Create bucket if it doesn't exist
-    let bucket_exists = run_cmd!(gcloud storage ls $gcs_bucket &>/dev/null).is_ok();
-    if !bucket_exists {
-        run_cmd! {
-            info "Creating GCS bucket $gcs_bucket";
-            gcloud storage buckets create --location=us-central1 $gcs_bucket;
-        }?;
+    cloud_storage::ensure_bucket(&bucket_name, target)?;
+
+    // GCP: sync generic binaries per arch
+    for arch in ["x86_64", "aarch64"] {
+        let src = format!("prebuilt/deploy/generic/{arch}");
+        if std::path::Path::new(&src).exists() {
+            let dst = format!("gs://{bucket_name}/{arch}");
+            info!("Syncing generic binaries for {arch} to {dst}");
+            cloud_storage::sync_up(&src, &dst)?;
+        }
     }
 
-    for arch in ["aarch64", "x86_64"] {
-        let image_path = format!("{}/fractalbits-{}.tar.gz", DOCKER_OUTPUT_DIR, arch);
-        let gcs_path = format!("{}/docker/fractalbits-{}.tar.gz", gcs_bucket, arch);
-        info!("Uploading {} Docker image to GCS...", arch);
-        run_cmd!(gcloud storage cp $image_path $gcs_path)?;
+    // Sync UI if it exists
+    if std::path::Path::new("prebuilt/deploy/ui").exists() {
+        let ui_dst = format!("gs://{bucket_name}/ui");
+        info!("Syncing UI to {ui_dst}");
+        cloud_storage::sync_up("prebuilt/deploy/ui", &ui_dst)?;
     }
 
-    let binaries_path = format!("{}/binaries-{}.tar.gz", DOCKER_OUTPUT_DIR, variant);
-    let gcs_path = format!("{}/docker/binaries-{}.tar.gz", gcs_bucket, variant);
-    info!("Uploading {} binaries bundle to GCS...", variant);
-    run_cmd!(gcloud storage cp $binaries_path $gcs_path)?;
-
+    info!("Syncing all binaries to GCS is done");
     Ok(())
 }
 
+/// Upload binaries to on-prem Docker S3 endpoint.
+#[allow(dead_code)] // Used by on-prem Docker S3 path
 pub fn upload_with_endpoint(deploy_target: DeployTarget, s3_endpoint: Option<&str>) -> CmdResult {
     // Docker S3 always uses the simple bucket name (no region/account suffix).
     // AWS S3 uses the qualified name to avoid cross-account collisions.
@@ -115,6 +136,7 @@ pub fn upload_with_endpoint(deploy_target: DeployTarget, s3_endpoint: Option<&st
         }?;
     }
 
+    let bucket_uri = format!("s3://{bucket_name}");
     let boostrap_script_content = format!(
         r#"#!/bin/bash
 set -ex
@@ -122,7 +144,7 @@ exec > >(tee -a /var/log/fractalbits-bootstrap.log) 2>&1
 echo "=== Bootstrap started at $(date) ==="
 aws s3 cp --no-progress s3://{bucket_name}/$(arch)/fractalbits-bootstrap /opt/fractalbits/bin/fractalbits-bootstrap
 chmod +x /opt/fractalbits/bin/fractalbits-bootstrap
-/opt/fractalbits/bin/fractalbits-bootstrap {bucket_name}
+/opt/fractalbits/bin/fractalbits-bootstrap {bucket_uri}
 echo "=== Bootstrap completed at $(date) ==="
 "#
     );

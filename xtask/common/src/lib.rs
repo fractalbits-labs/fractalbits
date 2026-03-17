@@ -11,6 +11,8 @@ use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
+pub mod cloud_storage;
+
 pub const BOOTSTRAP_CLUSTER_CONFIG: &str = "bootstrap_cluster.toml";
 pub const STAGE_BLUEPRINT_FILE: &str = "stage_blueprint.json";
 
@@ -320,8 +322,12 @@ impl BootstrapClusterConfig {
         self.global.rss_backend == RssBackend::Firestore
     }
 
+    /// Returns the S3/GCS URI for downloading binaries and config.
+    ///
+    /// - AWS/OnPrem: `s3://{bootstrap_bucket}`
+    /// - GCP: `gs://{bootstrap_bucket}`
     pub fn get_bootstrap_bucket(&self) -> String {
-        format!("s3://{}", self.bootstrap_bucket)
+        cloud_storage::bucket_uri(&self.bootstrap_bucket, self.global.deploy_target)
     }
 
     /// Get all nodes as a flat list with service_type

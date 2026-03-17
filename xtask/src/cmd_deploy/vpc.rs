@@ -5,20 +5,20 @@ use std::path::Path;
 
 use super::aws_config_gen;
 use super::bootstrap_progress;
-use super::common::{DeployTarget, VpcConfig, get_bootstrap_bucket_name};
-use super::docker_host;
-use super::ssm_bootstrap;
-use super::ssm_utils;
+use super::common::{
+    DeployTarget, VpcConfig, get_bootstrap_bucket_name, upload_config_and_blueprint,
+};
 use super::upload;
 
 pub fn create_vpc(config: VpcConfig) -> CmdResult {
-    // 1. Upload Docker images to AWS S3
+    // 1. Upload binaries directly to AWS S3
+    let aws_bucket = get_bootstrap_bucket_name(DeployTarget::Aws)?;
     if !config.skip_upload {
-        info!("Uploading Docker images to AWS S3...");
-        upload::upload_docker_images(DeployTarget::Aws)?;
+        info!("Uploading binaries to AWS S3...");
+        upload::upload(DeployTarget::Aws)?;
     }
 
-    // 2. CDK deploy (no UserData, all bootstrap via SSM)
+    // 3. CDK deploy (instances self-bootstrap via UserData)
     let cdk_dir = "infra/fractalbits-cdk";
 
     // Check if node_modules exists, if not run npm install
@@ -63,32 +63,23 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     info!("VPC deployment completed successfully");
 
     // 3. Parse CDK outputs
-    let outputs = ssm_utils::parse_cdk_outputs()?;
+    let outputs = super::aws_utils::parse_cdk_outputs()?;
 
-    // 4. Setup Docker on rss-A (downloads slim image + binaries, starts container, uploads to S3)
-    let rss_a_id = outputs
-        .get("rssAId")
-        .ok_or_else(|| std::io::Error::other("CDK output 'rssAId' not found"))?;
-
-    ssm_utils::wait_for_ssm_agent_ready(std::slice::from_ref(rss_a_id))?;
-    let aws_bucket = get_bootstrap_bucket_name(DeployTarget::Aws)?;
-    let docker_host = docker_host::setup_docker_on_host(rss_a_id, &aws_bucket, "aws")?;
-
-    // 5. Generate and upload bootstrap config to Docker S3
+    // 5. Generate bootstrap config and upload to AWS S3
     let bootstrap_config = aws_config_gen::generate_bootstrap_config(&outputs, &config)?;
     let config_toml = bootstrap_config
         .to_toml()
         .map_err(|e| std::io::Error::other(format!("Failed to serialize config: {}", e)))?;
-    docker_host::upload_config_to_docker_s3(&docker_host.instance_id, &config_toml)?;
 
-    // 6. Bootstrap all nodes via SSM (pointing at Docker S3 on rss-A)
-    let instance_ids = ssm_utils::collect_all_instance_ids(&outputs)?;
-    ssm_utils::wait_for_ssm_agent_ready(&instance_ids)?;
-    ssm_bootstrap::ssm_bootstrap_from_docker(&instance_ids, &docker_host.private_ip)?;
+    // Upload config and blueprint to AWS S3 (RSS leader polls for this)
+    let s3_bucket = format!("s3://{aws_bucket}");
+    upload_config_and_blueprint(&s3_bucket, &config_toml, &bootstrap_config)?;
+
+    // 6. Instances self-bootstrap via UserData (all nodes download binary from S3)
 
     // 7. Optionally watch bootstrap progress inline
     if config.watch_bootstrap {
-        bootstrap_progress::show_progress_from_docker(&docker_host.instance_id)?;
+        bootstrap_progress::show_progress(DeployTarget::Aws)?;
     } else {
         info!("To monitor bootstrap progress, run:");
         info!("  cargo xtask deploy bootstrap-progress");

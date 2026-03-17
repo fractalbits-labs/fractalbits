@@ -1,14 +1,8 @@
-use crate::docker_utils::{
-    BinarySources, DockerBuildConfig, build_docker_image, stage_binaries_for_docker,
-};
 use crate::etcd_utils::download_etcd_for_deploy;
-use crate::etcd_utils::resolve_etcd_dir_for_arch;
 use crate::*;
 use std::path::Path;
 
-use super::common::{ARCH_TARGETS, AWS_CPU_TARGETS, ArchTarget, DeployTarget, RUST_BINS, ZIG_BINS};
-
-pub const DOCKER_OUTPUT_DIR: &str = "target/docker";
+use super::common::{ARCH_TARGETS, AWS_CPU_TARGETS, ArchTarget, RUST_BINS, ZIG_BINS};
 
 pub fn build(
     target: DeployBuildTarget,
@@ -389,125 +383,5 @@ fn download_warp_binaries() -> CmdResult {
         }?;
     }
 
-    Ok(())
-}
-
-/// Build slim Docker images (without pre-populated data) and pack binaries as tgz.
-///
-/// The Docker images contain only container-all-in-one + etcd (the orchestrator).
-/// Binaries are packed separately as tgz files and uploaded to the container's S3
-/// at deploy time on the Docker host.
-pub fn build_docker_images() -> CmdResult {
-    info!("Building slim Docker images...");
-
-    let staging_dir = "target/docker-staging";
-    run_cmd!(rm -rf $staging_dir)?;
-
-    run_cmd!(mkdir -p $DOCKER_OUTPUT_DIR)?;
-
-    for target in ARCH_TARGETS {
-        let arch = target.arch;
-        let generic_dir = get_generic_deploy_dir(target);
-        let bin_subdir = format!("bin-{}", arch);
-
-        let sources = BinarySources {
-            rust_bin_dir: &generic_dir,
-            zig_bin_dir: None,
-            prebuilt_dir: &generic_dir,
-            etcd_dir: &resolve_etcd_dir_for_arch(arch),
-            prefer_built: true,
-        };
-        stage_binaries_for_docker(&sources, staging_dir, &bin_subdir)?;
-
-        let image_name = "fractalbits";
-        let config = DockerBuildConfig {
-            image_name,
-            tag: arch,
-            arch: Some(arch),
-            platform: Some(target.docker_platform),
-            staging_dir,
-            bin_subdir: &bin_subdir,
-            include_volume: false,
-            data_source: None,
-        };
-        build_docker_image(&config)?;
-
-        let image_tag = format!("{}:{}", image_name, arch);
-        let output_file = format!("{}/fractalbits-{}.tar.gz", DOCKER_OUTPUT_DIR, arch);
-        info!("Exporting {} image to {}...", arch, output_file);
-        run_cmd!(docker save $image_tag | gzip > $output_file)?;
-
-        run_cmd! { ignore docker rmi $image_tag 2>/dev/null; }?;
-    }
-
-    info!("Docker images exported to {}/", DOCKER_OUTPUT_DIR);
-    Ok(())
-}
-
-/// Pack deployment binaries into tgz bundles for upload to Docker S3 at deploy time.
-///
-/// Creates:
-/// - target/docker/binaries-onprem.tar.gz: generic binaries for both arches
-/// - target/docker/binaries-aws.tar.gz: generic shared + AWS CPU-specific binaries
-pub fn pack_binaries(deploy_target: Option<DeployTarget>) -> CmdResult {
-    let pack_onprem = deploy_target.is_none() || deploy_target == Some(DeployTarget::OnPrem);
-    let pack_aws = deploy_target.is_none() || deploy_target == Some(DeployTarget::Aws);
-    let pack_gcp = deploy_target.is_none() || deploy_target == Some(DeployTarget::Gcp);
-
-    run_cmd!(mkdir -p $DOCKER_OUTPUT_DIR)?;
-
-    if pack_onprem {
-        pack_binaries_onprem()?;
-    }
-    if pack_aws {
-        pack_binaries_aws()?;
-    }
-    if pack_gcp {
-        pack_binaries_gcp()?;
-    }
-
-    Ok(())
-}
-
-fn pack_binaries_onprem() -> CmdResult {
-    let output = format!("{}/binaries-onprem.tar.gz", DOCKER_OUTPUT_DIR);
-    info!("Packing on-prem binaries to {}...", output);
-
-    // Pack generic binaries for both arches + UI
-    run_cmd!(
-        tar -czf $output
-            -C prebuilt/deploy
-            generic/
-            ui/
-    )?;
-    Ok(())
-}
-
-fn pack_binaries_gcp() -> CmdResult {
-    let output = format!("{}/binaries-gcp.tar.gz", DOCKER_OUTPUT_DIR);
-    info!("Packing GCP binaries to {}...", output);
-
-    // GCP uses generic binaries (same as on-prem) + UI
-    run_cmd!(
-        tar -czf $output
-            -C prebuilt/deploy
-            generic/
-            ui/
-    )?;
-    Ok(())
-}
-
-fn pack_binaries_aws() -> CmdResult {
-    let output = format!("{}/binaries-aws.tar.gz", DOCKER_OUTPUT_DIR);
-    info!("Packing AWS binaries to {}...", output);
-
-    // Pack generic + aws CPU-specific binaries + UI
-    run_cmd!(
-        tar -czf $output
-            -C prebuilt/deploy
-            generic/
-            aws/
-            ui/
-    )?;
     Ok(())
 }

@@ -1,15 +1,16 @@
-//! S3-based workflow barrier system for bootstrap coordination.
+//! Cloud-storage-based workflow barrier system for bootstrap coordination.
 //!
 //! Services progress through well-defined stages, writing stage completion
-//! objects to S3. This provides clear dependency ordering and visibility
-//! into bootstrap progress.
+//! objects to cloud storage (AWS S3 or GCS). This provides clear dependency
+//! ordering and visibility into bootstrap progress.
 
-use crate::common::{get_instance_id, get_private_ip, s3_env_overrides, upload_string_to_s3};
+use crate::common::{get_instance_id, get_private_ip};
 use crate::config::{BootstrapConfig, DeployTarget};
 use cmd_lib::*;
 use serde::{Deserialize, Serialize};
 use std::io::Error;
 use std::time::{Duration, Instant};
+use xtask_common::cloud_storage;
 
 /// Poll interval when waiting for barriers
 const POLL_INTERVAL_SECS: u64 = 2;
@@ -36,7 +37,7 @@ impl WorkflowServiceType {
     }
 }
 
-/// Stage completion object written to S3
+/// Stage completion object written to cloud storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageCompletion {
     pub instance_id: String,
@@ -48,7 +49,7 @@ pub struct StageCompletion {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// Workflow barrier for coordinating bootstrap stages via S3
+/// Workflow barrier for coordinating bootstrap stages via cloud storage
 pub struct WorkflowBarrier {
     bucket: String,
     cluster_id: String,
@@ -97,22 +98,22 @@ impl WorkflowBarrier {
         ))
     }
 
-    /// Get the S3 prefix for workflow data
+    /// Key prefix for workflow data (no URI scheme)
     fn workflow_prefix(&self) -> String {
-        format!("s3://{}/workflow/{}", self.bucket, self.cluster_id)
+        format!("workflow/{}", self.cluster_id)
     }
 
-    /// Get the S3 path for a stage directory or file
-    fn stage_path(&self, stage: &str) -> String {
+    /// Key for a stage directory
+    fn stage_key(&self, stage: &str) -> String {
         format!("{}/stages/{}", self.workflow_prefix(), stage)
     }
 
-    /// Get the S3 path for this instance's stage completion
-    fn instance_stage_path(&self, stage: &str) -> String {
-        format!("{}/{}.json", self.stage_path(stage), self.instance_id)
+    /// Key for this instance's stage completion
+    fn instance_stage_key(&self, stage: &str) -> String {
+        format!("{}/{}.json", self.stage_key(stage), self.instance_id)
     }
 
-    /// Write stage completion marker to S3 (per-node stage)
+    /// Write stage completion marker (per-node stage)
     pub fn complete_stage(&self, stage: &str, metadata: Option<serde_json::Value>) -> CmdResult {
         let completion = StageCompletion {
             instance_id: self.instance_id.clone(),
@@ -125,11 +126,12 @@ impl WorkflowBarrier {
         let json = serde_json::to_string(&completion)
             .map_err(|e| Error::other(format!("Failed to serialize stage completion: {e}")))?;
 
-        let s3_path = self.instance_stage_path(stage);
-        info!("Completing stage '{stage}' at {s3_path}");
-        upload_string_to_s3(&json, &s3_path)?;
-
-        Ok(())
+        let key = self.instance_stage_key(stage);
+        info!("Completing stage '{stage}' at {}/{key}", self.bucket);
+        cloud_storage::upload_string(
+            &json,
+            &cloud_storage::object_uri(&self.bucket, &key, self.deploy_target),
+        )
     }
 
     /// Write a global stage completion marker (single file, not per-node)
@@ -149,18 +151,18 @@ impl WorkflowBarrier {
         let json = serde_json::to_string(&completion)
             .map_err(|e| Error::other(format!("Failed to serialize stage completion: {e}")))?;
 
-        let s3_path = format!("{}.json", self.stage_path(stage));
-        info!("Completing global stage '{stage}' at {s3_path}");
-        upload_string_to_s3(&json, &s3_path)?;
-
-        Ok(())
+        let key = format!("{}.json", self.stage_key(stage));
+        info!("Completing global stage '{stage}' at {}/{key}", self.bucket);
+        cloud_storage::upload_string(
+            &json,
+            &cloud_storage::object_uri(&self.bucket, &key, self.deploy_target),
+        )
     }
 
     /// Wait for a global stage (single file, no node suffix)
     pub fn wait_for_global(&self, stage: &str, timeout_secs: u64) -> CmdResult {
-        let bucket = &self.bucket;
-        let key = format!("workflow/{}/stages/{}.json", self.cluster_id, stage);
-        info!("Waiting for global stage '{stage}' (head-object {bucket}/{key})");
+        let key = format!("{}/stages/{}.json", self.workflow_prefix(), stage);
+        info!("Waiting for global stage '{stage}' ({}/{key})", self.bucket);
 
         let start = Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
@@ -172,11 +174,7 @@ impl WorkflowBarrier {
                 )));
             }
 
-            // Check if the file exists
-            let s3_env = &s3_env_overrides();
-            let result =
-                run_fun!($[s3_env] aws s3api head-object --bucket $bucket --key $key 2>/dev/null);
-            if result.is_ok() {
+            if cloud_storage::head_object(&self.bucket, &key, self.deploy_target) {
                 info!("Global stage '{stage}' is complete");
                 return Ok(());
             }
@@ -221,31 +219,24 @@ impl WorkflowBarrier {
 
     /// List all completions for a per-node stage
     pub fn get_stage_completions(&self, stage: &str) -> Result<Vec<StageCompletion>, Error> {
-        let stage_prefix = format!("{}/", self.stage_path(stage));
-
-        let s3_env = &s3_env_overrides();
-        let output = run_fun!($[s3_env] aws s3 ls $stage_prefix 2>/dev/null).unwrap_or_default();
+        let prefix = format!("{}/", self.stage_key(stage));
+        let output = cloud_storage::list_objects(&self.bucket, &prefix, self.deploy_target)
+            .unwrap_or_default();
         if output.trim().is_empty() {
             return Ok(Vec::new());
         }
 
         let mut completions = Vec::new();
-        for line in output.lines() {
-            let parts: Vec<_> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                let filename = parts[3];
-                if filename.ends_with(".json") {
-                    let s3_path = format!("{}{}", stage_prefix, filename);
-                    match run_fun!($[s3_env] aws s3 cp $s3_path - 2>/dev/null) {
-                        Ok(content) => {
-                            if let Ok(completion) =
-                                serde_json::from_str::<StageCompletion>(&content)
-                            {
-                                completions.push(completion);
-                            }
-                        }
-                        Err(_) => continue,
-                    }
+        for filename in parse_listing_filenames(&output, self.deploy_target) {
+            if filename.ends_with(".json") {
+                let key = format!("{prefix}{filename}");
+                if let Ok(content) = cloud_storage::cat(&cloud_storage::object_uri(
+                    &self.bucket,
+                    &key,
+                    self.deploy_target,
+                )) && let Ok(completion) = serde_json::from_str::<StageCompletion>(&content)
+                {
+                    completions.push(completion);
                 }
             }
         }
@@ -253,12 +244,12 @@ impl WorkflowBarrier {
         Ok(completions)
     }
 
-    /// Get the etcd nodes prefix for this cluster (unified path)
-    pub fn etcd_nodes_prefix(&self) -> String {
+    /// Key prefix for etcd nodes
+    fn etcd_nodes_key_prefix(&self) -> String {
         format!("{}/etcd/nodes/", self.workflow_prefix())
     }
 
-    /// Register an etcd node in the workflow S3 structure
+    /// Register an etcd node in the workflow storage
     pub fn register_etcd_node(&self) -> CmdResult {
         let my_ip = get_private_ip(self.deploy_target)?;
         let timestamp = std::time::SystemTime::now()
@@ -275,38 +266,34 @@ impl WorkflowBarrier {
         let json = serde_json::to_string(&node_info)
             .map_err(|e| Error::other(format!("Failed to serialize node info: {e}")))?;
 
-        let s3_path = format!("{}{}.json", self.etcd_nodes_prefix(), my_ip);
-        info!("Registering etcd node at {s3_path}");
-        upload_string_to_s3(&json, &s3_path)?;
-
-        Ok(())
+        let key = format!("{}{}.json", self.etcd_nodes_key_prefix(), my_ip);
+        info!("Registering etcd node at {}/{key}", self.bucket);
+        cloud_storage::upload_string(
+            &json,
+            &cloud_storage::object_uri(&self.bucket, &key, self.deploy_target),
+        )
     }
 
-    /// Get registered etcd nodes from the workflow S3 structure
+    /// Get registered etcd nodes from the workflow storage
     pub fn get_etcd_nodes(&self) -> Result<Vec<EtcdNodeInfo>, Error> {
-        let prefix = self.etcd_nodes_prefix();
-
-        let s3_env = &s3_env_overrides();
-        let output = run_fun!($[s3_env] aws s3 ls $prefix 2>/dev/null).unwrap_or_default();
+        let prefix = self.etcd_nodes_key_prefix();
+        let output = cloud_storage::list_objects(&self.bucket, &prefix, self.deploy_target)
+            .unwrap_or_default();
         if output.trim().is_empty() {
             return Ok(Vec::new());
         }
 
         let mut nodes = Vec::new();
-        for line in output.lines() {
-            let parts: Vec<_> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                let filename = parts[3];
-                if filename.ends_with(".json") {
-                    let s3_path = format!("{}{}", prefix, filename);
-                    match run_fun!($[s3_env] aws s3 cp $s3_path - 2>/dev/null) {
-                        Ok(content) => {
-                            if let Ok(node_info) = serde_json::from_str::<EtcdNodeInfo>(&content) {
-                                nodes.push(node_info);
-                            }
-                        }
-                        Err(_) => continue,
-                    }
+        for filename in parse_listing_filenames(&output, self.deploy_target) {
+            if filename.ends_with(".json") {
+                let key = format!("{prefix}{filename}");
+                if let Ok(content) = cloud_storage::cat(&cloud_storage::object_uri(
+                    &self.bucket,
+                    &key,
+                    self.deploy_target,
+                )) && let Ok(node_info) = serde_json::from_str::<EtcdNodeInfo>(&content)
+                {
+                    nodes.push(node_info);
                 }
             }
         }
@@ -341,6 +328,40 @@ impl WorkflowBarrier {
             }
 
             std::thread::sleep(Duration::from_secs(POLL_INTERVAL_SECS));
+        }
+    }
+}
+
+/// Parse filenames from cloud storage listing output.
+/// AWS `aws s3 ls` returns lines like: `2024-01-01 00:00:00    123 filename.json`
+/// GCS `gcloud storage ls` returns full paths like: `gs://bucket/prefix/filename.json`
+fn parse_listing_filenames(output: &str, deploy_target: DeployTarget) -> Vec<String> {
+    match deploy_target {
+        DeployTarget::Gcp => output
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() {
+                    return None;
+                }
+                // GCS returns full gs:// paths; extract just the filename
+                line.rsplit('/').next().map(|s| s.to_string())
+            })
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => {
+            // AWS S3 listing: "2024-01-01 00:00:00    123 filename.json"
+            output
+                .lines()
+                .filter_map(|line| {
+                    let parts: Vec<_> = line.split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        Some(parts[3].to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
         }
     }
 }
@@ -409,5 +430,20 @@ mod tests {
             result,
             "bss-10-0-1-5=http://10.0.1.5:2380,bss-10-0-1-6=http://10.0.1.6:2380"
         );
+    }
+
+    #[test]
+    fn test_parse_listing_filenames_aws() {
+        let output =
+            "2024-01-01 00:00:00    123 node1.json\n2024-01-01 00:00:01    456 node2.json\n";
+        let filenames = parse_listing_filenames(output, DeployTarget::Aws);
+        assert_eq!(filenames, vec!["node1.json", "node2.json"]);
+    }
+
+    #[test]
+    fn test_parse_listing_filenames_gcp() {
+        let output = "gs://bucket/workflow/123/stages/00-instances-ready/node1.json\ngs://bucket/workflow/123/stages/00-instances-ready/node2.json\n";
+        let filenames = parse_listing_filenames(output, DeployTarget::Gcp);
+        assert_eq!(filenames, vec!["node1.json", "node2.json"]);
     }
 }

@@ -224,7 +224,7 @@ pub fn generate_bootstrap_config(
         }),
         etcd: None,
         nodes,
-        bootstrap_bucket: "fractalbits-bootstrap".to_string(),
+        bootstrap_bucket: format!("{}-deploy-staging", params.project_id),
     };
 
     Ok(config)
