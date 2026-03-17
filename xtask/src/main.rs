@@ -729,10 +729,22 @@ enum ToolKind {
     },
     DescribeStack {
         #[clap(
-            long_help = "CloudFormation stack name",
+            long_help = "CloudFormation stack name (AWS) or ignored for GCP",
             default_value = "FractalbitsVpcStack"
         )]
         stack_name: String,
+
+        #[clap(long, long_help = "Describe GCP stack instead of AWS")]
+        gcp: bool,
+
+        #[clap(long, long_help = "GCP project ID (or GCP_PROJECT_ID env var)")]
+        gcp_project: Option<String>,
+
+        #[clap(
+            long,
+            long_help = "GCP zone (or GCP_ZONE env var, default: us-central1-a)"
+        )]
+        gcp_zone: Option<String>,
     },
     DumpVgConfig {
         #[clap(

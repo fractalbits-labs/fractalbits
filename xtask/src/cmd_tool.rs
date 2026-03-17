@@ -8,8 +8,17 @@ pub fn run_cmd_tool(tool_kind: ToolKind) -> CmdResult {
         ToolKind::GenUuids { num, file } => {
             xtask_common::gen_uuids(num, &file)?;
         }
-        ToolKind::DescribeStack { stack_name } => {
-            describe_stack(&stack_name)?;
+        ToolKind::DescribeStack {
+            stack_name,
+            gcp,
+            gcp_project,
+            gcp_zone,
+        } => {
+            if gcp {
+                describe_gcp_stack(gcp_project.as_deref(), gcp_zone.as_deref())?;
+            } else {
+                describe_stack(&stack_name)?;
+            }
         }
         ToolKind::DumpVgConfig { localdev } => {
             xtask_common::dump_vg_config(localdev)?;
@@ -245,6 +254,134 @@ fn describe_stack(stack_name: &str) -> CmdResult {
 
     if !nlb_endpoint.is_empty() {
         println!("\n API Server NLB Endpoint: {nlb_endpoint}");
+    }
+
+    Ok(())
+}
+
+fn resolve_gcp_project(cli_arg: Option<&str>) -> Result<String, std::io::Error> {
+    if let Some(p) = cli_arg.filter(|s| !s.is_empty()) {
+        return Ok(p.to_string());
+    }
+    if let Ok(p) = std::env::var("GCP_PROJECT_ID")
+        && !p.is_empty()
+    {
+        return Ok(p);
+    }
+    // Fall back to gcloud config default project
+    if let Ok(p) = run_fun!(gcloud config get-value project 2>/dev/null)
+        && !p.trim().is_empty()
+    {
+        return Ok(p.trim().to_string());
+    }
+    Err(std::io::Error::other(
+        "GCP project ID required. Set via --gcp-project, GCP_PROJECT_ID env var, or gcloud config",
+    ))
+}
+
+fn resolve_gcp_zone(cli_arg: Option<&str>) -> String {
+    if let Some(z) = cli_arg.filter(|s| !s.is_empty()) {
+        return z.to_string();
+    }
+    std::env::var("GCP_ZONE").unwrap_or_else(|_| "us-central1-a".to_string())
+}
+
+fn describe_gcp_stack(gcp_project: Option<&str>, gcp_zone: Option<&str>) -> CmdResult {
+    let project_id = resolve_gcp_project(gcp_project)?;
+    let zone = resolve_gcp_zone(gcp_zone);
+    let region = zone
+        .rsplit_once('-')
+        .map(|(r, _)| r)
+        .unwrap_or("us-central1");
+
+    // List all instances in the project with fractalbits network tags
+    let instance_list = match run_fun! {
+        gcloud compute instances list
+            --project $project_id
+            --format "csv[no-heading](name,zone.basename(),status,machineType.basename(),networkInterfaces[0].networkIP,metadata.items.filter(key:service-role).extract(value).flatten())"
+            --filter "networkInterfaces.network:fractalbits-vpc"
+    } {
+        Ok(output) => output,
+        Err(_) => {
+            warn!("No GCP instances found in project '{project_id}' with fractalbits VPC");
+            warn!(
+                "Please deploy first using 'just deploy create-vpc --deploy-target gcp' or check GCP credentials"
+            );
+            return Ok(());
+        }
+    };
+
+    if instance_list.trim().is_empty() {
+        warn!("No GCP instances found in project '{project_id}' with fractalbits VPC");
+        return Ok(());
+    }
+
+    // Parse and collect instance data
+    let mut instances: Vec<(String, String, String, String, String, String)> = Vec::new();
+    for line in instance_list.lines() {
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() >= 5 {
+            let name = parts[0];
+            let inst_zone = parts[1];
+            let status = parts[2];
+            let machine_type = parts[3];
+            let private_ip = if parts[4].is_empty() { "-" } else { parts[4] };
+            let role = if parts.len() >= 6 && !parts[5].is_empty() {
+                parts[5]
+            } else {
+                "-"
+            };
+            instances.push((
+                name.to_string(),
+                inst_zone.to_string(),
+                status.to_string(),
+                machine_type.to_string(),
+                private_ip.to_string(),
+                role.to_string(),
+            ));
+        }
+    }
+
+    // Sort by name
+    instances.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Create and populate the table
+    let mut table = Table::new();
+    table.load_preset(presets::NOTHING);
+    table.set_header(vec![
+        "Name",
+        "Zone",
+        "Status",
+        "MachineType",
+        "PrivateIP",
+        "Role",
+    ]);
+
+    for (name, inst_zone, status, machine_type, private_ip, role) in &instances {
+        table.add_row(vec![
+            name,
+            inst_zone,
+            status,
+            machine_type,
+            private_ip,
+            role,
+        ]);
+    }
+
+    println!("{table}");
+
+    // Get internal LB endpoint
+    let lb_ip = run_fun! {
+        gcloud compute forwarding-rules list
+            --project $project_id
+            --regions $region
+            --format "csv[no-heading](IPAddress)"
+            --filter "name:api-lb"
+    };
+    if let Ok(ip) = lb_ip
+        && !ip.trim().is_empty()
+    {
+        println!("\n API Server LB Endpoint: {}", ip.trim());
     }
 
     Ok(())
