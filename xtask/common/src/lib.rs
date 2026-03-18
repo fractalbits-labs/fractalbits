@@ -513,7 +513,9 @@ pub fn create_bss_dirs(data_dir: &Path, bss_id: u32, bss_count: u32) -> CmdResul
 
     let bss_dir = data_dir.join(format!("bss{}", bss_id));
     fs::create_dir_all(bss_dir.join("local/stats"))?;
-    fs::create_dir_all(bss_dir.join("local/blobs"))?;
+    fs::create_dir_all(bss_dir.join("local/journal"))?;
+    fs::create_dir_all(bss_dir.join("local/storage"))?;
+    fs::create_dir_all(bss_dir.join("local/storage/meta_blobs"))?;
 
     // Data volume: EC-only for 6-node, replicated otherwise
     if bss_count == 6 {

@@ -50,8 +50,9 @@ impl Orchestrator {
         info!("Initializing etcd service-discovery keys");
         self.init_etcd_keys()?;
 
-        // Phase 2: Start BSS and RSS in parallel (both depend on etcd)
+        // Phase 2: Format BSS, then start BSS and RSS in parallel (both depend on etcd)
         let phase_start = Instant::now();
+        self.format_bss()?;
         info!("Starting bss_server and root_server in parallel");
         self.start_bss()?;
         self.start_rss()?;
@@ -146,11 +147,32 @@ impl Orchestrator {
         Ok(())
     }
 
+    fn format_bss(&self) -> Result<()> {
+        let bss_bin = self.bin_dir.join("bss_server");
+        let working_dir = self.data_dir.join("bss0");
+
+        // Skip formatting if storage engine file already exists
+        let storage_file = working_dir.join("local/storage/blobs.storage");
+        if storage_file.exists() {
+            info!("BSS data already formatted, skipping format_bss");
+            return Ok(());
+        }
+
+        // Use 1 GB flag_storage_size for container (production bootstrap sets this dynamically)
+        let flag_storage_size = "1073741824";
+        info!("Formatting BSS storage at {:?}", working_dir);
+        run_cmd! {
+            WORKING_DIR=$working_dir FLAG_STORAGE_SIZE=$flag_storage_size $bss_bin format;
+        }?;
+
+        Ok(())
+    }
+
     fn start_bss(&mut self) -> Result<()> {
         let mut child = Command::new(self.bin_dir.join("bss_server"))
-            .env("BSS_WORKING_DIR", self.data_dir.join("bss0"))
-            .env("BSS_ID", "bss0")
-            .env("BSS_PORT", "8088")
+            .arg("serve")
+            .env("WORKING_DIR", self.data_dir.join("bss0"))
+            .env("SERVER_PORT", "8088")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;

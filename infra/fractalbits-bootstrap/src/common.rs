@@ -209,7 +209,7 @@ IOSchedulingPriority=0";
         }
         "bss" => {
             requires = "data-local.mount".to_string();
-            format!("{BIN_PATH}bss_server -c {ETC_PATH}{BSS_SERVER_CONFIG}")
+            format!("{BIN_PATH}bss_server serve -c {ETC_PATH}{BSS_SERVER_CONFIG}")
         }
         "bench_client" => {
             format!("{BIN_PATH}warp client")

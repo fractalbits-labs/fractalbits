@@ -2,46 +2,11 @@ use super::common::*;
 use crate::config::{BootstrapConfig, DeployTarget};
 use crate::workflow::{EtcdNodeInfo, WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
-use rayon::prelude::*;
-use std::fs;
 use std::io::Error;
 
-const BSS_DATA_VOLUME_SHARDS: usize = 65536;
-const BSS_METADATA_VOLUME_SHARDS: usize = 256;
-
-#[derive(Debug, Clone, Copy)]
-enum VolumeType {
-    Data,
-    Metadata,
-}
-
-impl VolumeType {
-    fn as_str(&self) -> &'static str {
-        match self {
-            VolumeType::Data => "data",
-            VolumeType::Metadata => "metadata",
-        }
-    }
-
-    fn shard_count(&self) -> usize {
-        match self {
-            VolumeType::Data => BSS_DATA_VOLUME_SHARDS,
-            VolumeType::Metadata => BSS_METADATA_VOLUME_SHARDS,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct VolumeAssignments {
-    data_volume: Option<usize>,
-    metadata_volume: Option<usize>,
-}
-
-impl VolumeAssignments {
-    fn has_assignments(&self) -> bool {
-        self.data_volume.is_some() || self.metadata_volume.is_some()
-    }
-}
+const BLOB_DRAM_MEM_PERCENT: f64 = 0.8;
+const FA_JOURNAL_SEGMENT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+const FLAG_STORAGE_SIZE_PERCENT: f64 = 0.9;
 
 pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     let for_bench = for_bench || config.global.for_bench;
@@ -56,7 +21,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     install_packages(&["nvme-cli", "mdadm"])?;
     format_local_nvme_disks(false)?; // no twp support since experiment is done
 
-    let mut binaries = vec!["bss_server"];
+    let mut binaries = vec!["bss_server", "test_bss_storage_engine"];
     if use_etcd {
         binaries.push("etcdctl");
     }
@@ -65,7 +30,12 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     create_coredump_config()?;
 
     info!("Creating directories for bss_server");
-    run_cmd!(mkdir -p "/data/local/stats")?;
+    run_cmd! {
+        mkdir -p "/data/local/stats";
+        mkdir -p "/data/local/journal";
+        mkdir -p "/data/local/storage";
+        mkdir -p "/data/local/storage/meta_blobs";
+    }?;
 
     if meta_stack_testing || for_bench {
         let _ = download_binaries(config, &["rewrk_rpc"]); // i3, i3en may not compile rewrk_rpc tool
@@ -90,18 +60,14 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     // This ensures etcd endpoints are available for registration
     register_service(config, "bss-server")?;
 
-    if meta_stack_testing {
-        info!("Meta-stack testing mode: skipping RSS wait, creating default volume dirs");
-        create_default_volume_directories()?;
-    } else {
+    if !meta_stack_testing {
         // Wait for RSS to initialize and publish volume configs
         info!("Waiting for RSS to initialize...");
         barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
-
-        // Now get volume configs and setup directories
-        setup_volume_directories(config, use_etcd)?;
     }
+
     create_bss_config()?;
+    format_bss()?;
     create_systemd_unit_file("bss", true)?;
 
     run_cmd! {
@@ -150,259 +116,60 @@ fn bootstrap_etcd(
     Ok(())
 }
 
-fn setup_volume_directories(config: &BootstrapConfig, use_etcd: bool) -> CmdResult {
-    let instance_id = get_instance_id(config.global.deploy_target)?;
-    info!("BSS instance ID: {instance_id}");
-
-    let assignments = match wait_for_volume_configs(config, use_etcd) {
-        Ok(()) => match get_volume_assignments(config, &instance_id, use_etcd) {
-            Ok(assignments) => {
-                info!("Volume assignments for {instance_id}: {assignments:?}");
-
-                if assignments.has_assignments() {
-                    assignments
-                } else {
-                    cmd_die!("No volume assignments found for $instance_id");
-                }
-            }
-            Err(e) => {
-                cmd_die!("Failed to get volume assignments: $e");
-            }
-        },
-        Err(e) => {
-            cmd_die!("Get volume assignments failed: $e");
-        }
-    };
-
-    create_volume_directories(&assignments)?;
-    Ok(())
-}
-
-fn create_bss_config() -> CmdResult {
-    let num_threads = run_fun!(nproc)?;
-    let config_content = format!(
-        r##"working_dir = "/data"
-server_port = 8088
-num_threads = {num_threads}
-log_level = "warn"
-use_direct_io = true
-io_concurrency = 256
-data_volume_shards = {BSS_DATA_VOLUME_SHARDS}
-metadata_volume_shards = {BSS_METADATA_VOLUME_SHARDS}
-set_thread_affinity = true
-"##
-    );
+fn format_bss() -> CmdResult {
     run_cmd! {
-        mkdir -p $ETC_PATH;
-        echo $config_content > $ETC_PATH/$BSS_SERVER_CONFIG;
+        info "Running format for bss_server";
+        ${BIN_PATH}bss_server format -c ${ETC_PATH}${BSS_SERVER_CONFIG};
     }?;
 
     Ok(())
 }
 
-/// Get a config value from the appropriate backend (etcd, Firestore, or DDB).
-fn get_backend_config(config: &BootstrapConfig, use_etcd: bool, key: &str) -> FunResult {
-    if use_etcd {
-        get_etcd_config(config, key)
-    } else if config.is_firestore_backend() {
-        firestore_get_document_value(config, DDB_SERVICE_DISCOVERY_TABLE, key)
-    } else {
-        get_ddb_config(key)
-    }
-}
+fn create_bss_config() -> CmdResult {
+    // Get total memory in kilobytes from /proc/meminfo
+    let total_mem_kb_str = run_fun!(cat /proc/meminfo | grep MemTotal | awk r"{print $2}")?;
+    let total_mem_kb = total_mem_kb_str
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| Error::other(format!("invalid total_mem_kb: {total_mem_kb_str}")))?;
 
-fn backend_name(config: &BootstrapConfig, use_etcd: bool) -> &'static str {
-    if use_etcd {
-        "etcd"
-    } else if config.is_firestore_backend() {
-        "Firestore"
-    } else {
-        "DDB"
-    }
-}
+    let blob_dram_kilo_bytes = (total_mem_kb as f64 * BLOB_DRAM_MEM_PERCENT) as u64;
 
-fn wait_for_volume_configs(config: &BootstrapConfig, use_etcd: bool) -> CmdResult {
-    const TIMEOUT_SECS: u64 = 600;
-    const POLL_INTERVAL_SECS: u64 = 1;
+    let num_cores = num_cpus()?;
+    let net_worker_thread_count = num_cores / 2;
+    let fa_thread_dataop_count = num_cores / 2;
+    let fa_thread_count = fa_thread_dataop_count + 4;
 
-    let name = backend_name(config, use_etcd);
-    info!("Waiting for BSS volume configurations in {name}...");
-    let start = std::time::Instant::now();
+    let fa_journal_segment_size = FA_JOURNAL_SEGMENT_SIZE;
 
-    while start.elapsed().as_secs() < TIMEOUT_SECS {
-        let data_result = get_backend_config(config, use_etcd, BSS_DATA_VG_CONFIG_KEY);
-        let metadata_result = get_backend_config(config, use_etcd, BSS_METADATA_VG_CONFIG_KEY);
+    // Get /data volume size in 1K blocks and compute flag_storage_size as 90% of it
+    let data_size_kb_str = run_fun!(df -k /data | awk r"NR==2 {print $2}")?;
+    let data_size_kb = data_size_kb_str
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| Error::other(format!("invalid /data volume size: {data_size_kb_str}")))?;
+    let flag_storage_size = (data_size_kb as f64 * 1024.0 * FLAG_STORAGE_SIZE_PERCENT) as u64;
+    info!("/data volume size: {} KB, flag_storage_size: {} bytes ({} GB)",
+        data_size_kb, flag_storage_size, flag_storage_size / (1024 * 1024 * 1024));
 
-        if let (Ok(data_config), Ok(metadata_config)) = (data_result, metadata_result) {
-            // Verify the configs contain valid JSON
-            if serde_json::from_str::<serde_json::Value>(&data_config).is_ok()
-                && serde_json::from_str::<serde_json::Value>(&metadata_config).is_ok()
-            {
-                info!("Volume configurations found in {name}");
-                return Ok(());
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS));
-    }
-
-    Err(Error::other(format!(
-        "Timeout waiting for volume configs in {name}"
-    )))
-}
-
-fn get_ddb_config(service_key: &str) -> FunResult {
-    let key = format!(r#"{{"service_id":{{"S":"{}"}}}}"#, service_key);
-    let result = run_fun!(
-        aws dynamodb get-item
-            --table-name $DDB_SERVICE_DISCOVERY_TABLE
-            --key $key
-            --query "Item.value.S"
-            --output text
-            2>/dev/null
-    )?;
-
-    if result.is_empty() || result == "None" || result == "null" {
-        return Err(Error::other(format!(
-            "Config {} not found in DDB",
-            service_key
-        )));
-    }
-
-    Ok(result)
-}
-
-fn get_etcd_config(config: &BootstrapConfig, service_key: &str) -> FunResult {
-    // Get etcd endpoints from workflow barrier (nodes are already registered)
-    let cluster_id = config
-        .global
-        .workflow_cluster_id
-        .as_ref()
-        .ok_or_else(|| Error::other("workflow_cluster_id not configured"))?;
-
-    let bucket = &config.bootstrap_bucket;
-    let instance_id = get_instance_id(config.global.deploy_target)?;
-    let barrier = WorkflowBarrier::new(
-        bucket,
-        cluster_id,
-        &instance_id,
-        "bss_server",
-        config.global.deploy_target,
+    let config_content = format!(
+        r##"working_dir = "/data"
+shared_dir = "local/journal"
+server_port = 8088
+health_port = 19998
+net_worker_thread_count = {net_worker_thread_count}
+fa_thread_count = {fa_thread_count}
+fa_thread_dataop_count = {fa_thread_dataop_count}
+blob_dram_kilo_bytes = {blob_dram_kilo_bytes}
+io_concurrency = 256
+flag_storage_size = {flag_storage_size}
+fa_journal_segment_size = {fa_journal_segment_size}
+log_level = "info"
+"##
     );
-
-    let nodes = barrier.get_etcd_nodes()?;
-    let etcd_endpoints = nodes
-        .iter()
-        .map(|node| format!("http://{}:2379", node.ip))
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let etcdctl = format!("{BIN_PATH}etcdctl");
-    let key = format!("/fractalbits-service-discovery/{}", service_key);
-
-    let result =
-        run_fun!($etcdctl --endpoints=$etcd_endpoints get $key --print-value-only 2>/dev/null)?;
-
-    if result.is_empty() {
-        return Err(Error::other(format!(
-            "Config {} not found in etcd",
-            service_key
-        )));
-    }
-
-    Ok(result.trim().to_string())
-}
-
-fn get_volume_assignments(
-    config: &BootstrapConfig,
-    instance_id: &str,
-    use_etcd: bool,
-) -> Result<VolumeAssignments, Error> {
-    // For etcd/firestore backend, configs use IP addresses as identifiers
-    // For DDB backend, configs use instance IDs
-    let my_ip = if use_etcd || config.is_firestore_backend() {
-        Some(get_private_ip_from_config(config, instance_id)?)
-    } else {
-        None
-    };
-
-    let find_volume = |config_json: &str| -> Result<Option<usize>, Error> {
-        let config: serde_json::Value = serde_json::from_str(config_json)
-            .map_err(|e| Error::other(format!("Failed to parse config: {}", e)))?;
-
-        if let Some(volumes) = config["volumes"].as_array() {
-            for volume in volumes {
-                if let Some(nodes) = volume["bss_nodes"].as_array() {
-                    for node in nodes {
-                        // For DDB backend, match by node_id (instance ID)
-                        // For etcd backend, match by IP address
-                        let matches = if let Some(ref ip) = my_ip {
-                            node["ip"].as_str() == Some(ip.as_str())
-                        } else {
-                            node["node_id"].as_str() == Some(instance_id)
-                        };
-                        if matches {
-                            return Ok(volume["volume_id"].as_u64().map(|v| v as usize));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(None)
-    };
-
-    let mut assignments = VolumeAssignments::default();
-
-    let data_config = get_backend_config(config, use_etcd, BSS_DATA_VG_CONFIG_KEY)?;
-    assignments.data_volume = find_volume(&data_config)?;
-
-    let metadata_config = get_backend_config(config, use_etcd, BSS_METADATA_VG_CONFIG_KEY)?;
-    assignments.metadata_volume = find_volume(&metadata_config)?;
-
-    Ok(assignments)
-}
-
-fn create_default_volume_directories() -> CmdResult {
-    let assignments = VolumeAssignments {
-        data_volume: Some(1),
-        metadata_volume: Some(1),
-    };
-    create_volume_directories(&assignments)
-}
-
-fn create_volume_directories(assignments: &VolumeAssignments) -> CmdResult {
-    let create_dirs = |volume_type: VolumeType, volume_id: usize| -> CmdResult {
-        let type_str = volume_type.as_str();
-        let volume_dir = format!("/data/local/blobs/{}_volume{}", type_str, volume_id);
-
-        info!("Creating {type_str} volume{volume_id} directories");
-        fs::create_dir_all(&volume_dir)
-            .map_err(|e| Error::other(format!("Failed to create {volume_dir}: {e}")))?;
-
-        let shard_count = volume_type.shard_count();
-        let shards: Vec<usize> = (0..shard_count).collect();
-
-        shards.par_iter().try_for_each(|&i| {
-            let shard_dir = format!("{}/{}", volume_dir, i);
-            fs::create_dir_all(&shard_dir)
-                .map_err(|e| Error::other(format!("Failed to create {shard_dir}: {e}")))
-        })?;
-
-        info!("Created {shard_count} {type_str} volume{volume_id} shard directories");
-        Ok(())
-    };
-
-    if let Some(vol_id) = assignments.data_volume {
-        create_dirs(VolumeType::Data, vol_id)?;
-    }
-
-    if let Some(vol_id) = assignments.metadata_volume {
-        create_dirs(VolumeType::Metadata, vol_id)?;
-    }
-
     run_cmd! {
-        info "Syncing filesystem";
-        sync;
+        mkdir -p $ETC_PATH;
+        echo $config_content > $ETC_PATH/$BSS_SERVER_CONFIG;
     }?;
 
     Ok(())
