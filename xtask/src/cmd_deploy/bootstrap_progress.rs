@@ -1,4 +1,4 @@
-use super::aws_utils;
+use super::aws::utils as aws_utils;
 use super::common::DeployTarget;
 use crate::CmdResult;
 use cmd_lib::*;

@@ -3,13 +3,13 @@ use colored::*;
 use dialoguer::Input;
 use std::path::Path;
 
-use super::aws_config_gen;
-use super::bootstrap_progress;
-use super::common::cloud_storage;
-use super::common::{
+use super::super::bootstrap_progress;
+use super::super::common::cloud_storage;
+use super::super::common::{
     DeployTarget, VpcConfig, get_bootstrap_bucket_name, upload_config_and_blueprint,
 };
-use super::upload;
+use super::super::upload;
+use super::config_gen;
 
 pub fn create_vpc(config: VpcConfig) -> CmdResult {
     // 1. Upload binaries directly to AWS S3
@@ -70,10 +70,10 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     info!("VPC deployment completed successfully");
 
     // 3. Parse CDK outputs
-    let outputs = super::aws_utils::parse_cdk_outputs()?;
+    let outputs = super::utils::parse_cdk_outputs()?;
 
     // 5. Generate bootstrap config and upload to AWS S3
-    let bootstrap_config = aws_config_gen::generate_bootstrap_config(&outputs, &config)?;
+    let bootstrap_config = config_gen::generate_bootstrap_config(&outputs, &config)?;
     let config_toml = bootstrap_config
         .to_toml()
         .map_err(|e| std::io::Error::other(format!("Failed to serialize config: {}", e)))?;
