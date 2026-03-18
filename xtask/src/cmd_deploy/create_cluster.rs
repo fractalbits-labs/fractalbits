@@ -477,7 +477,7 @@ pub fn create_cluster(
     info!("Bootstrap commands sent to {} nodes", total_nodes);
 
     if watch_bootstrap {
-        super::bootstrap_progress::show_progress(xtask_common::DeployTarget::OnPrem)?;
+        super::bootstrap_progress::show_progress(DeployTarget::OnPrem, None)?;
     } else {
         info!("To monitor bootstrap progress, run:");
         info!("  cargo xtask deploy bootstrap-progress --deploy-target on-prem");

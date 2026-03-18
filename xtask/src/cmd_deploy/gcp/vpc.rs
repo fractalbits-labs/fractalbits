@@ -74,7 +74,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
 
     // 7. Watch bootstrap progress via GCS
     if config.watch_bootstrap {
-        bootstrap_progress::show_progress_with_bucket(DeployTarget::Gcp, Some(&gcs_bucket))?;
+        bootstrap_progress::show_progress_with_bucket(DeployTarget::Gcp, None, Some(&gcs_bucket))?;
     } else {
         info!("To monitor bootstrap progress, run:");
         info!("  cargo xtask deploy bootstrap-progress --deploy-target gcp");

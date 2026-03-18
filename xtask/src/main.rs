@@ -400,6 +400,8 @@ pub enum DeployCommand {
     BootstrapProgress {
         #[clap(long, value_enum, default_value = "aws")]
         deploy_target: DeployTarget,
+        #[clap(long, long_help = "GCP project ID (overrides GCP_PROJECT_ID env var)")]
+        gcp_project: Option<String>,
     },
 
     #[clap(about = "Create cluster from a cluster.toml config file")]
@@ -955,11 +957,17 @@ async fn main() -> CmdResult {
                     cmd_deploy::gcp::destroy_vpc(gcp_project, gcp_zone, delete_project)?
                 }
             },
-            DeployCommand::BootstrapProgress { deploy_target } => match deploy_target {
+            DeployCommand::BootstrapProgress {
+                deploy_target,
+                gcp_project,
+            } => match deploy_target {
                 DeployTarget::Aws => {
                     cmd_deploy::bootstrap_progress::show_progress_from_cdk_outputs()?
                 }
-                _ => cmd_deploy::bootstrap_progress::show_progress(deploy_target)?,
+                _ => cmd_deploy::bootstrap_progress::show_progress(
+                    deploy_target,
+                    gcp_project.as_deref(),
+                )?,
             },
             DeployCommand::CreateCluster {
                 config,

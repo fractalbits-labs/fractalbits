@@ -22,8 +22,8 @@ impl CloudAccess {
         Ok(Self::AwsS3 { bucket })
     }
 
-    fn for_gcp() -> Result<Self, Error> {
-        let project_id = super::common::resolve_gcp_project(None)?;
+    fn for_gcp(gcp_project: Option<&str>) -> Result<Self, Error> {
+        let project_id = super::common::resolve_gcp_project(gcp_project)?;
         Ok(Self::Gcs {
             bucket: format!("{project_id}-deploy-staging"),
         })
@@ -103,11 +103,15 @@ impl StageCache {
     }
 }
 
-pub fn show_progress(target: DeployTarget) -> CmdResult {
-    show_progress_with_bucket(target, None)
+pub fn show_progress(target: DeployTarget, gcp_project: Option<&str>) -> CmdResult {
+    show_progress_with_bucket(target, gcp_project, None)
 }
 
-pub fn show_progress_with_bucket(target: DeployTarget, gcs_bucket: Option<&str>) -> CmdResult {
+pub fn show_progress_with_bucket(
+    target: DeployTarget,
+    gcp_project: Option<&str>,
+    gcs_bucket: Option<&str>,
+) -> CmdResult {
     let access = match target {
         DeployTarget::Aws => CloudAccess::for_aws()?,
         DeployTarget::Gcp => {
@@ -116,7 +120,7 @@ pub fn show_progress_with_bucket(target: DeployTarget, gcs_bucket: Option<&str>)
                     bucket: bucket.to_string(),
                 }
             } else {
-                CloudAccess::for_gcp()?
+                CloudAccess::for_gcp(gcp_project)?
             }
         }
         DeployTarget::OnPrem => {

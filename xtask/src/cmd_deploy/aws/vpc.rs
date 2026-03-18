@@ -86,7 +86,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
 
     // 7. Optionally watch bootstrap progress inline
     if config.watch_bootstrap {
-        bootstrap_progress::show_progress(DeployTarget::Aws)?;
+        bootstrap_progress::show_progress(DeployTarget::Aws, None)?;
     } else {
         info!("To monitor bootstrap progress: just deploy bootstrap-progress");
     }
