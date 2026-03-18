@@ -1,14 +1,15 @@
 use crate::*;
 
-use super::common::cloud_storage;
-use super::common::{DeployTarget, VpcConfig, upload_config_and_blueprint};
-use super::{bootstrap_progress, gcp_config_gen, gcp_utils, upload};
+use super::super::common::cloud_storage;
+use super::super::common::{DeployTarget, VpcConfig, upload_config_and_blueprint};
+use super::super::{bootstrap_progress, upload};
+use super::{config_gen, utils};
 
 const TERRAFORM_DIR: &str = "infra/fractalbits-terraform";
 
-pub fn create_gcp_vpc(config: VpcConfig) -> CmdResult {
-    let project_id = super::common::resolve_gcp_project(config.gcp_project.as_deref())?;
-    let zone = super::common::resolve_gcp_zone(config.gcp_zone.as_deref());
+pub fn create_vpc(config: VpcConfig) -> CmdResult {
+    let project_id = super::super::common::resolve_gcp_project(config.gcp_project.as_deref())?;
+    let zone = super::super::common::resolve_gcp_zone(config.gcp_zone.as_deref());
     let region = zone
         .rsplit_once('-')
         .map(|(r, _)| r)
@@ -47,10 +48,10 @@ pub fn create_gcp_vpc(config: VpcConfig) -> CmdResult {
     info!("Terraform apply completed");
 
     // 4. Parse Terraform outputs
-    let outputs = gcp_utils::parse_terraform_outputs(TERRAFORM_DIR)?;
+    let outputs = utils::parse_terraform_outputs(TERRAFORM_DIR)?;
 
     // 6. Generate bootstrap config and upload to GCS
-    let params = gcp_config_gen::GcpDeployParams {
+    let params = config_gen::GcpDeployParams {
         outputs: &outputs,
         project_id: &project_id,
         zone: &zone,
@@ -60,7 +61,7 @@ pub fn create_gcp_vpc(config: VpcConfig) -> CmdResult {
         num_api_servers: config.num_api_servers as usize,
         with_bench: config.with_bench,
     };
-    let bootstrap_config = gcp_config_gen::generate_bootstrap_config(&params)?;
+    let bootstrap_config = config_gen::generate_bootstrap_config(&params)?;
     let config_toml = bootstrap_config
         .to_toml()
         .map_err(|e| std::io::Error::other(format!("Failed to serialize config: {e}")))?;
@@ -82,7 +83,7 @@ pub fn create_gcp_vpc(config: VpcConfig) -> CmdResult {
     Ok(())
 }
 
-pub fn destroy_gcp_vpc(
+pub fn destroy_vpc(
     gcp_project: Option<String>,
     gcp_zone: Option<String>,
     delete_project: bool,
@@ -90,8 +91,8 @@ pub fn destroy_gcp_vpc(
     use colored::*;
     use dialoguer::Input;
 
-    let project_id = super::common::resolve_gcp_project(gcp_project.as_deref())?;
-    let _zone = super::common::resolve_gcp_zone(gcp_zone.as_deref());
+    let project_id = super::super::common::resolve_gcp_project(gcp_project.as_deref())?;
+    let _zone = super::super::common::resolve_gcp_zone(gcp_zone.as_deref());
 
     if delete_project {
         warn!("This will DELETE the entire GCP project '{project_id}' and ALL its resources!");

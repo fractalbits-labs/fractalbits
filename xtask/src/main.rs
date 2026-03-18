@@ -940,8 +940,8 @@ async fn main() -> CmdResult {
                     gcp_zone,
                 };
                 match provider {
-                    CloudProvider::Aws => cmd_deploy::create_vpc(vpc_config)?,
-                    CloudProvider::Gcp => cmd_deploy::create_gcp_vpc(vpc_config)?,
+                    CloudProvider::Aws => cmd_deploy::aws::create_vpc(vpc_config)?,
+                    CloudProvider::Gcp => cmd_deploy::gcp::create_vpc(vpc_config)?,
                 }
             }
             DeployCommand::DestroyVpc {
@@ -950,9 +950,9 @@ async fn main() -> CmdResult {
                 gcp_zone,
                 delete_project,
             } => match provider {
-                CloudProvider::Aws => cmd_deploy::destroy_vpc()?,
+                CloudProvider::Aws => cmd_deploy::aws::destroy_vpc()?,
                 CloudProvider::Gcp => {
-                    cmd_deploy::destroy_gcp_vpc(gcp_project, gcp_zone, delete_project)?
+                    cmd_deploy::gcp::destroy_vpc(gcp_project, gcp_zone, delete_project)?
                 }
             },
             DeployCommand::BootstrapProgress { deploy_target } => match deploy_target {

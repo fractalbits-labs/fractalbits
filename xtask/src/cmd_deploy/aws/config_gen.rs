@@ -8,8 +8,8 @@ use xtask_common::{
     ClusterGlobalConfig, ClusterResourcesConfig, DataBlobStorage, NodeEntry,
 };
 
-use super::aws_utils;
-use super::common::VpcConfig;
+use super::super::common::VpcConfig;
+use super::utils;
 
 fn to_common_rss_backend(backend: crate::RssBackend) -> xtask_common::RssBackend {
     match backend {
@@ -48,9 +48,9 @@ pub fn generate_bootstrap_config(
     let nss_b_id = get_output(outputs, "nssBId")?;
     let rss_b_id = outputs.get("rssBId").cloned();
 
-    let rss_a_ip = aws_utils::get_instance_private_ip(&rss_a_id)?;
-    let nss_a_ip = aws_utils::get_instance_private_ip(&nss_a_id)?;
-    let nss_b_ip = aws_utils::get_instance_private_ip(&nss_b_id)?;
+    let rss_a_ip = utils::get_instance_private_ip(&rss_a_id)?;
+    let nss_a_ip = utils::get_instance_private_ip(&nss_a_id)?;
+    let nss_b_ip = utils::get_instance_private_ip(&nss_b_id)?;
 
     let is_ebs = vpc_config.journal_type == crate::JournalType::Ebs;
 
@@ -88,7 +88,7 @@ pub fn generate_bootstrap_config(
             bench_client_num: None,
         });
     if let Some(rss_b) = &rss_b_id {
-        let rss_b_ip = aws_utils::get_instance_private_ip(rss_b)?;
+        let rss_b_ip = utils::get_instance_private_ip(rss_b)?;
         nodes
             .entry("root_server".to_string())
             .or_default()
@@ -142,9 +142,9 @@ pub fn generate_bootstrap_config(
     if let Some(bss_asg) = outputs.get("bssAsgName")
         && !bss_asg.is_empty()
     {
-        let bss_ids = aws_utils::get_asg_instance_ids(bss_asg)?;
+        let bss_ids = utils::get_asg_instance_ids(bss_asg)?;
         for id in &bss_ids {
-            let ip = aws_utils::get_instance_private_ip(id)?;
+            let ip = utils::get_instance_private_ip(id)?;
             nodes
                 .entry("bss_server".to_string())
                 .or_default()
@@ -164,12 +164,12 @@ pub fn generate_bootstrap_config(
 
     // Bench server
     if let Some(bench_id) = outputs.get("benchserverId") {
-        let bench_ip = aws_utils::get_instance_private_ip(bench_id)?;
+        let bench_ip = utils::get_instance_private_ip(bench_id)?;
         let bench_client_asg = outputs.get("benchClientAsgName");
         let num_bench_clients = if let Some(asg) = bench_client_asg
             && !asg.is_empty()
         {
-            aws_utils::get_asg_instance_ids(asg)?.len()
+            utils::get_asg_instance_ids(asg)?.len()
         } else {
             0
         };
@@ -190,9 +190,9 @@ pub fn generate_bootstrap_config(
     if let Some(bench_asg) = outputs.get("benchClientAsgName")
         && !bench_asg.is_empty()
     {
-        let bench_ids = aws_utils::get_asg_instance_ids(bench_asg)?;
+        let bench_ids = utils::get_asg_instance_ids(bench_asg)?;
         for (i, id) in bench_ids.iter().enumerate() {
-            let ip = aws_utils::get_instance_private_ip(id)?;
+            let ip = utils::get_instance_private_ip(id)?;
             nodes
                 .entry("bench_client".to_string())
                 .or_default()
@@ -209,7 +209,7 @@ pub fn generate_bootstrap_config(
 
     // GUI server
     if let Some(gui_id) = outputs.get("guiserverId") {
-        let gui_ip = aws_utils::get_instance_private_ip(gui_id)?;
+        let gui_ip = utils::get_instance_private_ip(gui_id)?;
         nodes
             .entry("gui_server".to_string())
             .or_default()
@@ -286,7 +286,7 @@ pub fn generate_bootstrap_config(
             None
         },
         nodes,
-        bootstrap_bucket: super::common::get_bootstrap_bucket_name(
+        bootstrap_bucket: super::super::common::get_bootstrap_bucket_name(
             xtask_common::DeployTarget::Aws,
         )?,
     };
