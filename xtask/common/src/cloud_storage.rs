@@ -114,6 +114,35 @@ pub fn list_objects(bucket: &str, prefix: &str, target: DeployTarget) -> FunResu
     }
 }
 
+/// Delete an object from cloud storage
+pub fn delete_object(bucket: &str, key: &str, target: DeployTarget) -> CmdResult {
+    match target {
+        DeployTarget::Gcp => {
+            let gs_path = format!("gs://{bucket}/{key}");
+            run_cmd!(gcloud storage rm $gs_path 2>/dev/null)
+        }
+        _ => {
+            let s3_path = format!("s3://{bucket}/{key}");
+            run_cmd!(aws s3 rm $s3_path)
+        }
+    }
+}
+
+/// Delete stale bootstrap_cluster.toml from cloud storage before a fresh deploy.
+/// Prevents leftover configs (e.g. from a MetaStack with no instance entries) from being
+/// served to VpcStack instances during the race window before the correct config is uploaded.
+pub fn delete_stale_bootstrap_config(bucket: &str, target: DeployTarget) -> CmdResult {
+    let key = super::BOOTSTRAP_CLUSTER_CONFIG;
+    if head_object(bucket, key, target) {
+        let path = format!("{}/{}", bucket_uri(bucket, target), key);
+        run_cmd! {
+            info "Deleting stale $key from $path before deploy";
+        }?;
+        delete_object(bucket, key, target)?;
+    }
+    Ok(())
+}
+
 /// Ensure bucket exists, create if not
 pub fn ensure_bucket(bucket: &str, target: DeployTarget) -> CmdResult {
     match target {

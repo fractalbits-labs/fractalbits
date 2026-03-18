@@ -1,5 +1,6 @@
 use crate::*;
 
+use super::common::cloud_storage;
 use super::common::{DeployTarget, VpcConfig, upload_config_and_blueprint};
 use super::{bootstrap_progress, gcp_config_gen, gcp_utils, upload};
 
@@ -22,6 +23,10 @@ pub fn create_gcp_vpc(config: VpcConfig) -> CmdResult {
         info!("Uploading binaries to GCS...");
         upload::upload_gcp(&project_id)?;
     }
+
+    // Delete any stale bootstrap_cluster.toml from GCS before Terraform deploy.
+    // Prevents leftover configs from being served to instances during the race window.
+    cloud_storage::delete_stale_bootstrap_config(&gcs_bucket, DeployTarget::Gcp)?;
 
     // 4. Terraform init + apply
     let tf_vars = build_terraform_vars(&config, &project_id, &zone, region);

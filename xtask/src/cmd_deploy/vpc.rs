@@ -5,6 +5,7 @@ use std::path::Path;
 
 use super::aws_config_gen;
 use super::bootstrap_progress;
+use super::common::cloud_storage;
 use super::common::{
     DeployTarget, VpcConfig, get_bootstrap_bucket_name, upload_config_and_blueprint,
 };
@@ -17,6 +18,12 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         info!("Uploading binaries to AWS S3...");
         upload::upload(DeployTarget::Aws)?;
     }
+
+    // Delete any stale bootstrap_cluster.toml from S3 before CDK deploy.
+    // This prevents a leftover MetaStack config (which has no instance entries) from being
+    // served to VpcStack instances while they wait for the correct config to be uploaded
+    // after CDK finishes.
+    cloud_storage::delete_stale_bootstrap_config(&aws_bucket, DeployTarget::Aws)?;
 
     // 3. CDK deploy (instances self-bootstrap via UserData)
     let cdk_dir = "infra/fractalbits-cdk";
@@ -81,8 +88,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     if config.watch_bootstrap {
         bootstrap_progress::show_progress(DeployTarget::Aws)?;
     } else {
-        info!("To monitor bootstrap progress, run:");
-        info!("  cargo xtask deploy bootstrap-progress");
+        info!("To monitor bootstrap progress: just deploy bootstrap-progress");
     }
 
     info!("View your deployed stack with: just describe-stack");

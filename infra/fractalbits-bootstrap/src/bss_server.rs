@@ -149,8 +149,12 @@ fn create_bss_config() -> CmdResult {
         .parse::<u64>()
         .map_err(|_| Error::other(format!("invalid /data volume size: {data_size_kb_str}")))?;
     let flag_storage_size = (data_size_kb as f64 * 1024.0 * FLAG_STORAGE_SIZE_PERCENT) as u64;
-    info!("/data volume size: {} KB, flag_storage_size: {} bytes ({} GB)",
-        data_size_kb, flag_storage_size, flag_storage_size / (1024 * 1024 * 1024));
+    info!(
+        "/data volume size: {} KB, flag_storage_size: {} bytes ({} GB)",
+        data_size_kb,
+        flag_storage_size,
+        flag_storage_size / (1024 * 1024 * 1024)
+    );
 
     let config_content = format!(
         r##"working_dir = "/data"

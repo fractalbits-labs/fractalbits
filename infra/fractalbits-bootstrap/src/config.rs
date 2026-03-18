@@ -17,7 +17,9 @@ pub type BootstrapConfig = BootstrapClusterConfig;
 pub type EtcdConfig = ClusterEtcdConfig;
 pub type InstanceConfig = ClusterNodeConfig;
 
-const CONFIG_RETRY_TIMEOUT_SECS: u64 = 120;
+// CDK VPC deploy can take 10-15 minutes, and instances start booting during CDK deploy.
+// Give enough time for CDK to finish and xtask to upload the config with instance IDs.
+const CONFIG_RETRY_TIMEOUT_SECS: u64 = 900;
 
 /// Download and parse bootstrap config from cloud storage.
 /// `bucket_uri` is a full URI like `s3://bucket-name` or `gs://bucket-name`.
