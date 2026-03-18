@@ -64,7 +64,7 @@ const deployOS = (app.node.tryGetContext("deployOS") ?? "al2023") as DeployOS;
 // Configure based on template type
 let nssInstanceType = "m7gd.4xlarge";
 if (vpcTemplate === "mini") {
-  nssInstanceType = "m7gd.2xlarge";
+  nssInstanceType = "m7gd.xlarge";
   ebsVolumeSize = 5;
   ebsVolumeIops = 1000;
   rootServerHa = false;
