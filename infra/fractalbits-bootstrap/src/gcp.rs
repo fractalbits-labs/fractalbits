@@ -54,36 +54,6 @@ pub fn firestore_put_document(
     }
 }
 
-/// Read a document's "value" field from Firestore via REST API.
-pub fn firestore_get_document_value(
-    config: &BootstrapConfig,
-    collection: &str,
-    doc_id: &str,
-) -> FunResult {
-    let gcp = config.gcp.as_ref().ok_or_else(|| {
-        Error::other("GCP config missing from bootstrap config for Firestore read")
-    })?;
-    let project_id = &gcp.project_id;
-    let database_id = gcp.firestore_database.as_deref().unwrap_or("fractalbits");
-    let token = get_gcp_access_token()?;
-    let url = format!(
-        "https://firestore.googleapis.com/v1/projects/{project_id}/databases/{database_id}/documents/{collection}/{doc_id}"
-    );
-
-    let result = run_fun!(
-        curl -sf $url
-            -H "Authorization: Bearer $token"
-            | jq -r ".fields.value.stringValue"
-    )?;
-
-    if result.is_empty() || result == "null" {
-        return Err(Error::other(format!(
-            "Firestore document {collection}/{doc_id} not found or has no value field"
-        )));
-    }
-    Ok(result)
-}
-
 pub(crate) fn create_firestore_register_and_deregister_service(
     config: &BootstrapConfig,
     service_id: &str,
