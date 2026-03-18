@@ -11,7 +11,7 @@ pub use crate::aws::{
     get_current_aws_az_id, get_current_aws_region, get_ec2_tag, get_s3_express_bucket_name,
 };
 pub use crate::etcd::get_etcd_endpoints;
-pub use crate::gcp::{firestore_get_document_value, firestore_put_document};
+pub use crate::gcp::firestore_put_document;
 
 pub const BIN_PATH: &str = "/opt/fractalbits/bin/";
 pub const ETC_PATH: &str = "/opt/fractalbits/etc/";
