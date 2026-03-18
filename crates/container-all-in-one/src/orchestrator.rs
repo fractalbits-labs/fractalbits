@@ -105,7 +105,7 @@ impl Orchestrator {
             mkdir -p $data_dir/logs;
         }?;
 
-        create_bss_dirs(&self.data_dir, 0, 1)?;
+        create_bss_dirs(&self.data_dir, 0)?;
         // Container uses NVMe journal type without journal_uuid for simplicity
         create_nss_dirs(&self.data_dir, "nss-A", false, None)?;
 

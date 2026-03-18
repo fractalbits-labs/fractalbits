@@ -508,7 +508,7 @@ pub fn check_port_ready(port: u16) -> bool {
 }
 
 /// Create directories for BSS server
-pub fn create_bss_dirs(data_dir: &Path, bss_id: u32, bss_count: u32) -> CmdResult {
+pub fn create_bss_dirs(data_dir: &Path, bss_id: u32) -> CmdResult {
     info!("Creating directories for bss{} server", bss_id);
 
     let bss_dir = data_dir.join(format!("bss{}", bss_id));
@@ -516,38 +516,6 @@ pub fn create_bss_dirs(data_dir: &Path, bss_id: u32, bss_count: u32) -> CmdResul
     fs::create_dir_all(bss_dir.join("local/journal"))?;
     fs::create_dir_all(bss_dir.join("local/storage"))?;
     fs::create_dir_all(bss_dir.join("local/storage/meta_blobs"))?;
-
-    // Data volume: EC-only for 6-node, replicated otherwise
-    if bss_count == 6 {
-        // EC volume: all 6 nodes get data_volume32768 (0x8000)
-        let ec_volume_id: u16 = 0x8000;
-        let data_vol_dir = bss_dir.join(format!("local/blobs/data_volume{}", ec_volume_id));
-        fs::create_dir_all(&data_vol_dir)?;
-        for i in 0..256 {
-            fs::create_dir_all(data_vol_dir.join(format!("{}", i)))?;
-        }
-    } else {
-        let data_volume_id = match bss_count {
-            1 => 1,
-            _ => (bss_id / 3) + 1, // DATA_VG_QUORUM_N = 3
-        };
-        let data_vol_dir = bss_dir.join(format!("local/blobs/data_volume{}", data_volume_id));
-        fs::create_dir_all(&data_vol_dir)?;
-        for i in 0..256 {
-            fs::create_dir_all(data_vol_dir.join(format!("{}", i)))?;
-        }
-    }
-
-    // Metadata volume
-    let metadata_volume_id = match bss_count {
-        1 => 1,
-        _ => (bss_id / 6) + 1, // METADATA_VG_QUORUM_N = 6
-    };
-    let meta_vol_dir = bss_dir.join(format!("local/blobs/metadata_volume{}", metadata_volume_id));
-    fs::create_dir_all(&meta_vol_dir)?;
-    for i in 0..256 {
-        fs::create_dir_all(meta_vol_dir.join(format!("{}", i)))?;
-    }
 
     Ok(())
 }

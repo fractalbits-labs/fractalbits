@@ -265,7 +265,7 @@ pub fn init_service(
     let init_all_bss = |count: u32| -> CmdResult {
         create_bss_service_symlinks(count)?;
         for id in 0..count {
-            create_bss_dirs(Path::new("data"), id, count)?;
+            create_bss_dirs(Path::new("data"), id)?;
         }
 
         // Format each BSS instance (like NSS, BSS now requires format before use)
