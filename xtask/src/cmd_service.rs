@@ -271,8 +271,8 @@ pub fn init_service(
         // Format each BSS instance (like NSS, BSS now requires format before use)
         let bss_binary = resolve_binary_path("bss_server", build_mode);
         let format_log = "data/logs/bss_format.log";
-        // 1 GB flag_storage_size for local dev (production uses 90% of disk)
-        let flag_storage_size = "1073741824";
+        // 4 GB flag_storage_size for local dev (production uses 90% of disk)
+        let flag_storage_size = "4294967296";
         for id in 0..count {
             let working_dir = format!("data/bss{}", id);
             let port = 8088 + id;
@@ -1203,10 +1203,10 @@ Environment="RUST_LOG=warn""##
         ServiceName::Bss => {
             // Create template for BSS services using %i placeholder
             // Use bash arithmetic to calculate port dynamically: 8088 + instance_id
-            // FLAG_STORAGE_SIZE must match the value used during format (1 GB for local dev)
+            // FLAG_STORAGE_SIZE must match the value used during format (4 GB for local dev)
             env_settings += r##"
 Environment="WORKING_DIR=./bss%i"
-Environment="FLAG_STORAGE_SIZE=1073741824""##;
+Environment="FLAG_STORAGE_SIZE=4294967296""##;
             let bss_binary = resolve_binary_path("bss_server", build_mode);
             format!("/bin/bash -c 'SERVER_PORT=$((8088 + %i)) {bss_binary} serve'")
         }
