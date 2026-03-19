@@ -73,6 +73,7 @@ pub enum Command {
     PutMetadataBlob = 19,
     GetMetadataBlob = 20,
     DeleteMetadataBlob = 21,
+    ListBlobs = 22,
 }
 
 #[allow(clippy::derivable_impls)]

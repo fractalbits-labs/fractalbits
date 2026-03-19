@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package bss_ops;
+
+// ListBlobs
+message ListBlobsRequest {
+  uint32 max_keys = 1;
+  string prefix = 2;
+  string start_after = 3;
+}
+
+message ListBlobsResponse {
+  oneof result {
+    Blobs ok = 1;
+    string err = 2;
+  }
+
+  message BlobEntry {
+    string key = 1;
+    uint32 total_bytes = 2;
+    uint64 checksum_body = 3;
+    uint64 version = 4;
+  }
+
+  message Blobs {
+    repeated BlobEntry blobs = 1;
+    bool has_more = 2;
+  }
+}
