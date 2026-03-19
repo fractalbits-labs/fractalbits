@@ -92,8 +92,28 @@ fn populate_mig_instances(
         }
         outputs.insert(format!("{prefix}_{i}_name"), instance_name.to_string());
 
-        if let Ok(ip) = get_instance_private_ip(instance_name, zone, project_id) {
-            outputs.insert(format!("{prefix}_{i}_ip"), ip);
+        // The MIG may report an instance before the VM is fully created in Compute Engine.
+        // Retry until the instance is describe-able and has a private IP.
+        let mut ip_found = false;
+        for attempt in 0..12 {
+            match get_instance_private_ip(instance_name, zone, project_id) {
+                Ok(ip) => {
+                    outputs.insert(format!("{prefix}_{i}_ip"), ip);
+                    ip_found = true;
+                    break;
+                }
+                Err(_) => {
+                    if attempt == 0 {
+                        info!("Waiting for {instance_name} to be fully created...");
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+            }
+        }
+        if !ip_found {
+            return Err(Error::other(format!(
+                "Timed out waiting for instance {instance_name} to be created"
+            )));
         }
     }
     Ok(())
