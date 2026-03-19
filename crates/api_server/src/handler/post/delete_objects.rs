@@ -108,14 +108,15 @@ pub async fn delete_objects_handler(
                     };
                     delete_result.deleted.push(deleted);
                 } else {
-                    // For other errors, record them in the error field
+                    // Record the error but continue processing remaining objects.
+                    // Stopping at the first error would leave the rest of the batch
+                    // unprocessed and is not correct S3 batch delete behavior.
                     delete_result.error = Some(Error {
                         code: e.as_ref().to_owned(),
                         key: obj.key,
                         message: e.to_string(),
                         version_id: "".to_string(),
                     });
-                    break;
                 }
             }
         }
