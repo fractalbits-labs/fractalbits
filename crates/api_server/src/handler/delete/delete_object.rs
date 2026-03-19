@@ -36,12 +36,57 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
     let object_bytes = match parse_delete_inode(resp)? {
         Some(bytes) => bytes,
         None => {
-            // Object doesn't exist or already deleted - S3 returns success for idempotent operations
+            // Object doesn't exist or already deleted - S3 returns success for idempotent operations.
+            // However, a previous delete may have removed the main inode but failed before cleaning
+            // up MPU part inodes (e.g., due to a transient RPC error). Attempt best-effort cleanup
+            // of any orphaned MPU parts so the bucket can eventually be deleted.
             tracing::debug!(
                 "delete non-existing or already-deleted object {}/{}",
                 bucket.bucket_name,
                 ctx.key
             );
+            let mpu_prefix = mpu_get_part_prefix(ctx.key.clone(), 0);
+            if let Ok(mpus) = list_raw_objects(
+                &ctx.app,
+                &bucket.root_blob_name,
+                10000,
+                &mpu_prefix,
+                "",
+                "",
+                false,
+                &ctx.trace_id,
+            )
+            .await
+            {
+                for (mpu_key, mpu_obj) in mpus.iter() {
+                    let _ = nss_rpc_retry!(
+                        nss_client,
+                        delete_inode(
+                            &bucket.root_blob_name,
+                            mpu_key,
+                            Some(rpc_timeout),
+                            &ctx.trace_id
+                        ),
+                        ctx.app,
+                        &ctx.trace_id
+                    )
+                    .await;
+                    let _ = delete_blob(
+                        bucket.tracking_root_blob_name.clone(),
+                        mpu_obj,
+                        blob_deletion.clone(),
+                    )
+                    .await;
+                }
+                if !mpus.is_empty() {
+                    tracing::info!(
+                        "Cleaned up {} orphaned MPU parts for {}/{}",
+                        mpus.len(),
+                        bucket.bucket_name,
+                        ctx.key
+                    );
+                }
+            }
             return Ok(HttpResponse::NoContent().finish());
         }
     };

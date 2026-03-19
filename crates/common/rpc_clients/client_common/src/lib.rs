@@ -342,7 +342,7 @@ macro_rules! nss_rpc_retry {
                     refresh_attempt = 0;
                 }
 
-                // Wait before next refresh attempt
+                // Wait before next retry attempt
                 // Exponential backoff: 200ms, 400ms, 800ms, 1000ms (capped)
                 let backoff_ms = std::cmp::min(200 * (1u64 << refresh_attempt.min(3)), 1000);
                 ::tracing::debug!(
@@ -353,6 +353,19 @@ macro_rules! nss_rpc_retry {
                 );
                 $crate::rpc_sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 refresh_attempt = refresh_attempt.saturating_add(1);
+
+                // Retry with same address — NSS may have recovered without an address change
+                // (e.g., nss_role_agent briefly restarted on the same port).
+                let same_addr_result = $crate::rpc_retry!("nss", $client, $method($($args),*)).await;
+                if same_addr_result.is_ok() || !same_addr_result.as_ref().err().map(|e| e.retryable()).unwrap_or(false) {
+                    if same_addr_result.is_ok() {
+                        ::tracing::info!(
+                            "NSS recovered at same address after {}ms",
+                            failover_start.elapsed().as_millis()
+                        );
+                    }
+                    return same_addr_result;
+                }
             }
         }
     };
