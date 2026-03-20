@@ -152,23 +152,16 @@ impl Orchestrator {
         let working_dir = self.data_dir.join("bss0");
 
         // Skip formatting if both storage engine and state files exist.
-        // If only some files exist (e.g., after code upgrade), clean up and reformat.
         let storage_file = working_dir.join("local/storage/blobs.storage");
         let state_file = working_dir.join("local/journal/bss.state");
         if storage_file.exists() && state_file.exists() {
             info!("BSS data already formatted, skipping format_bss");
             return Ok(());
         }
-        // Clean up any partial/stale data before formatting
-        let _ = std::fs::remove_file(&storage_file);
-        let _ = std::fs::remove_file(&state_file);
-        let _ = std::fs::remove_file(working_dir.join("local/journal/journal.data"));
 
-        // Use 1 GB flag_storage_size for container (production bootstrap sets this dynamically)
-        let flag_storage_size = "1073741824";
         info!("Formatting BSS storage at {:?}", working_dir);
         run_cmd! {
-            WORKING_DIR=$working_dir FLAG_STORAGE_SIZE=$flag_storage_size $bss_bin format;
+            WORKING_DIR=$working_dir $bss_bin format;
         }?;
 
         Ok(())
@@ -179,7 +172,6 @@ impl Orchestrator {
             .arg("serve")
             .env("WORKING_DIR", self.data_dir.join("bss0"))
             .env("SERVER_PORT", "8088")
-            .env("FLAG_STORAGE_SIZE", "1073741824")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
