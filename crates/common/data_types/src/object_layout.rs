@@ -35,7 +35,7 @@ impl ObjectLayout {
     }
 
     /// Returns true if the object is in a final state and can be listed/returned.
-    /// Objects in Mpu(Uploading) or Mpu(Aborted) states are not listable.
+    /// Objects in Mpu(Uploading) state are not listable.
     #[inline]
     pub fn is_listable(&self) -> bool {
         matches!(
@@ -119,7 +119,6 @@ pub enum ObjectState {
 #[derive(Debug, Archive, Deserialize, Serialize, PartialEq, Clone)]
 pub enum MpuState {
     Uploading,
-    Aborted,
     Completed(ObjectCoreMetaData),
 }
 

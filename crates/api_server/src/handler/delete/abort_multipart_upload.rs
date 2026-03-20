@@ -1,8 +1,10 @@
-use crate::handler::{ObjectRequestContext, common::s3_error::S3Error};
+use crate::handler::{
+    ObjectRequestContext,
+    common::{list_raw_objects, mpu_get_part_prefix, s3_error::S3Error},
+    delete::delete_object::delete_blob,
+};
 use actix_web::HttpResponse;
-use bytes::Bytes;
-use file_ops::{parse_get_inode, parse_put_inode};
-use rkyv::{self, api::high::to_bytes_in, rancor::Error};
+use file_ops::{parse_delete_inode, parse_get_inode};
 use rpc_client_common::nss_rpc_retry;
 
 pub async fn abort_multipart_upload_handler(
@@ -22,8 +24,11 @@ pub async fn abort_multipart_upload_handler(
     }
 
     let bucket = ctx.resolve_bucket().await?;
+    let blob_deletion = ctx.app.get_blob_deletion();
     let rpc_timeout = ctx.app.config.rpc_request_timeout();
     let nss_client = ctx.app.get_nss_rpc_client().await?;
+
+    // Verify the upload exists and the upload_id matches
     let resp = nss_rpc_retry!(
         nss_client,
         get_inode(
@@ -37,7 +42,7 @@ pub async fn abort_multipart_upload_handler(
     )
     .await?;
 
-    let mut object = match parse_get_inode(resp) {
+    let object = match parse_get_inode(resp) {
         Ok(layout) => layout,
         Err(file_ops::NssError::NotFound) => return Err(S3Error::NoSuchUpload),
         Err(e) => return Err(e.into()),
@@ -46,25 +51,54 @@ pub async fn abort_multipart_upload_handler(
         return Err(S3Error::NoSuchUpload);
     }
 
-    object.state =
-        data_types::object_layout::ObjectState::Mpu(data_types::object_layout::MpuState::Aborted);
-    let new_object_bytes: Bytes = to_bytes_in::<_, Error>(&object, Vec::new())?.into();
+    // Delete all uploaded parts and their blobs
+    let mpu_prefix = mpu_get_part_prefix(ctx.key.clone(), 0);
+    let parts = list_raw_objects(
+        &ctx.app,
+        &bucket.root_blob_name,
+        10000,
+        &mpu_prefix,
+        "",
+        "",
+        false,
+        &ctx.trace_id,
+    )
+    .await?;
+    for (part_key, part_obj) in parts.iter() {
+        nss_rpc_retry!(
+            nss_client,
+            delete_inode(
+                &bucket.root_blob_name,
+                part_key,
+                Some(rpc_timeout),
+                &ctx.trace_id
+            ),
+            ctx.app,
+            &ctx.trace_id
+        )
+        .await?;
+        delete_blob(
+            bucket.tracking_root_blob_name.clone(),
+            part_obj,
+            blob_deletion.clone(),
+        )
+        .await?;
+    }
 
+    // Delete the main MPU inode
     let resp = nss_rpc_retry!(
         nss_client,
-        put_inode(
+        delete_inode(
             &bucket.root_blob_name,
             &ctx.key,
-            new_object_bytes.clone(),
-            Some(ctx.app.config.rpc_request_timeout()),
+            Some(rpc_timeout),
             &ctx.trace_id
         ),
         ctx.app,
         &ctx.trace_id
     )
     .await?;
-
-    parse_put_inode(resp)?;
+    parse_delete_inode(resp)?;
 
     Ok(HttpResponse::NoContent().finish())
 }

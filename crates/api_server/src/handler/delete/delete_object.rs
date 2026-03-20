@@ -119,10 +119,6 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
                     tracing::warn!("invalid mpu state: Uploading");
                     return Err(S3Error::InvalidObjectState);
                 }
-                MpuState::Aborted => {
-                    tracing::warn!("invalid mpu state: Aborted");
-                    return Err(S3Error::InvalidObjectState);
-                }
                 MpuState::Completed { .. } => {
                     // Clean up completed multipart upload parts
                     let mpu_prefix = mpu_get_part_prefix(ctx.key.clone(), 0);
@@ -166,7 +162,7 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
     Ok(HttpResponse::NoContent().finish())
 }
 
-async fn delete_blob(
+pub async fn delete_blob(
     tracking_root_blob_name: Option<String>,
     object: &ObjectLayout,
     blob_deletion: Sender<BlobDeletionRequest>,

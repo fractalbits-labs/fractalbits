@@ -233,10 +233,6 @@ pub async fn get_object_content(
                 tracing::warn!("invalid mpu state: Uploading");
                 Err(S3Error::InvalidObjectState)
             }
-            MpuState::Aborted => {
-                tracing::warn!("invalid mpu state: Aborted");
-                Err(S3Error::InvalidObjectState)
-            }
             MpuState::Completed(core_meta_data) => {
                 let mpu_prefix = mpu_get_part_prefix(key, 0);
                 let mut mpus = list_raw_objects(
@@ -327,10 +323,6 @@ async fn get_object_range_content(
         ObjectState::Mpu(ref mpu_state) => match mpu_state {
             MpuState::Uploading => {
                 tracing::warn!("invalid mpu state: Uploading");
-                Err(S3Error::InvalidObjectState)
-            }
-            MpuState::Aborted => {
-                tracing::warn!("invalid mpu state: Aborted");
                 Err(S3Error::InvalidObjectState)
             }
             MpuState::Completed { .. } => {
