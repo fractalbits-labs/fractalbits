@@ -299,7 +299,7 @@ pub fn build_prebuilt_dev() -> CmdResult {
                 -Doptimize=ReleaseSafe
                 -Dtarget=$zig_target
                 -Dcpu=$zig_cpu
-                -Dfor_prebuilt=true 2>&1;
+                -Dfor_prebuilt_dev=true 2>&1;
             info "Zig build complete for $arch";
         }?;
 
