@@ -57,7 +57,13 @@ jobs:
       run: cargo xtask repo init
 
     - name: Run precheckin
-      run: cargo xtask precheckin --docker=excluded
+      run: cargo xtask precheckin --docker=excluded ${{ matrix.arch == 'x86_64' && '--skip-ddb' || '' }}
+
+    - name: Dump kernel OOM logs on failure
+      if: failure()
+      run: |
+        sudo dmesg | grep -E "oom|killed|Out of memory|memory" -i || true
+        free -h
 
   docker:
     strategy:

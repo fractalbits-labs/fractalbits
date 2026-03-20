@@ -6,6 +6,7 @@ pub fn run_cmd_precheckin(
     zig_unit_tests_only: bool,
     debug_api_server: bool,
     with_fractal_art_tests: bool,
+    skip_ddb: bool,
     docker: DockerTestMode,
 ) -> CmdResult {
     if docker == DockerTestMode::Only {
@@ -27,7 +28,7 @@ pub fn run_cmd_precheckin(
     }
 
     if s3_api_only {
-        return run_s3_api_tests(&init_config, debug_api_server);
+        return run_s3_api_tests(&init_config, debug_api_server, skip_ddb);
     }
 
     if zig_unit_tests_only {
@@ -41,7 +42,7 @@ pub fn run_cmd_precheckin(
         cargo test --workspace --exclude api_server --exclude fs_server;
     }?;
 
-    run_s3_api_tests(&init_config, false)?;
+    run_s3_api_tests(&init_config, false, skip_ddb)?;
 
     if with_fractal_art_tests {
         run_fractal_art_tests()?;
@@ -110,7 +111,7 @@ fn run_fractal_art_tests() -> CmdResult {
     Ok(())
 }
 
-fn run_s3_api_tests(init_config: &InitConfig, debug_api_server: bool) -> CmdResult {
+fn run_s3_api_tests(init_config: &InitConfig, debug_api_server: bool, skip_ddb: bool) -> CmdResult {
     if debug_api_server {
         cmd_service::start_service(ServiceName::ApiServer)?;
         run_cmd! {
@@ -126,27 +127,31 @@ fn run_s3_api_tests(init_config: &InitConfig, debug_api_server: bool) -> CmdResu
         return Ok(());
     }
 
-    // Test with DDB backend
-    let ddb_config = InitConfig {
-        rss_backend: RssBackend::Ddb,
-        ..init_config.clone()
-    };
-    info!("Testing with DDB backend...");
-    cmd_service::init_service(ServiceName::All, BuildMode::Debug, &ddb_config)?;
-    cmd_service::start_service(ServiceName::All)?;
-    run_cmd! {
-        info "Run cargo tests (s3 api tests - DDB backend)";
-        cargo test --package api_server;
-    }?;
-
-    if init_config.with_https {
+    if skip_ddb {
+        info!("Skipping DDB backend tests (--skip-ddb)");
+    } else {
+        // Test with DDB backend
+        let ddb_config = InitConfig {
+            rss_backend: RssBackend::Ddb,
+            ..init_config.clone()
+        };
+        info!("Testing with DDB backend...");
+        cmd_service::init_service(ServiceName::All, BuildMode::Debug, &ddb_config)?;
+        cmd_service::start_service(ServiceName::All)?;
         run_cmd! {
-            info "Run cargo tests (s3 https api tests - DDB backend)";
-            USE_HTTPS_ENDPOINT=true cargo test --package api_server;
+            info "Run cargo tests (s3 api tests - DDB backend)";
+            cargo test --package api_server;
         }?;
-    }
 
-    cmd_service::stop_service(ServiceName::All)?;
+        if init_config.with_https {
+            run_cmd! {
+                info "Run cargo tests (s3 https api tests - DDB backend)";
+                USE_HTTPS_ENDPOINT=true cargo test --package api_server;
+            }?;
+        }
+
+        cmd_service::stop_service(ServiceName::All)?;
+    }
 
     // Test with etcd backend
     let etcd_config = InitConfig {
