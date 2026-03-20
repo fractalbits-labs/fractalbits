@@ -1,4 +1,4 @@
-use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region, retry::RetryConfig};
 use aws_sdk_s3::operation::list_buckets::ListBucketsOutput;
 use aws_sdk_s3::{Client, Config};
 use cmd_lib::*;
@@ -89,6 +89,9 @@ pub fn build_client() -> Client {
         .endpoint_url(format!("{}://127.0.0.1:{}", scheme, port))
         .region(Region::from_static("localdev"))
         .credentials_provider(credentials)
+        // Retry transient connection errors (e.g. stale keep-alive connections
+        // under concurrent test load) before failing the test.
+        .retry_config(RetryConfig::standard().with_max_attempts(5))
         .behavior_version(BehaviorVersion::latest());
 
     let config = config_builder.build();
