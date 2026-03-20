@@ -777,6 +777,54 @@ async fn test_uploadpartcopy() {
     assert_eq!(real_obj, exp_obj);
 }
 
+#[tokio::test]
+async fn test_delete_bucket_with_pending_multipart() {
+    let ctx = context();
+    let bucket = ctx.create_bucket("test-mpu-delete-bucket").await;
+
+    let u1 = vec![0x11; SZ_5MB];
+
+    let up = ctx
+        .client
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key("pending")
+        .send()
+        .await
+        .unwrap();
+    let uid = up.upload_id.as_ref().unwrap();
+
+    ctx.client
+        .upload_part()
+        .bucket(&bucket)
+        .key("pending")
+        .upload_id(uid)
+        .part_number(1)
+        .body(ByteStream::from(u1))
+        .send()
+        .await
+        .unwrap();
+
+    // Deleting a bucket with an in-progress multipart upload must fail
+    let err = ctx.client.delete_bucket().bucket(&bucket).send().await;
+    assert!(
+        err.is_err(),
+        "delete_bucket should fail with pending multipart upload"
+    );
+
+    // Abort the upload, then delete should succeed
+    ctx.client
+        .abort_multipart_upload()
+        .bucket(&bucket)
+        .key("pending")
+        .upload_id(uid)
+        .send()
+        .await
+        .unwrap();
+
+    ctx.delete_bucket(&bucket).await;
+}
+
 fn calculate_sha1(bytes: &[u8]) -> String {
     use sha1::{Digest, Sha1};
 
