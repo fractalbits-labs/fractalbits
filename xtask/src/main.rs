@@ -87,9 +87,6 @@ enum Cmd {
         #[arg(default_value_t)]
         data_blob_storage: DataBlobStorage,
 
-        #[clap(long, long_help = "Skip DDB backend tests")]
-        skip_ddb: bool,
-
         #[clap(
             long,
             value_enum,
@@ -813,7 +810,6 @@ async fn main() -> CmdResult {
             with_fractal_art_tests,
             with_https,
             data_blob_storage,
-            skip_ddb,
             docker,
         } => {
             let init_config = InitConfig {
@@ -828,7 +824,6 @@ async fn main() -> CmdResult {
                 zig_unit_tests_only,
                 debug_api_server,
                 with_fractal_art_tests,
-                skip_ddb,
                 docker,
             )?;
         }

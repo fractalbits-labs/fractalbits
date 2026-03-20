@@ -57,7 +57,7 @@ jobs:
       run: cargo xtask repo init
 
     - name: Run precheckin
-      run: cargo xtask precheckin --docker=excluded ${{ matrix.arch == 'x86_64' && '--skip-ddb' || '' }}
+      run: cargo xtask precheckin --docker=excluded
 
     - name: Dump kernel OOM logs on failure
       if: failure()
