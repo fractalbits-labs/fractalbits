@@ -554,11 +554,6 @@ pub fn create_nss_dirs(
     }
 
     fs::create_dir_all(nss_dir.join("local/stats"))?;
-    fs::create_dir_all(nss_dir.join("local/meta_cache/blobs"))?;
-
-    for i in 0..256 {
-        fs::create_dir_all(nss_dir.join(format!("local/meta_cache/blobs/{}", i)))?;
-    }
 
     Ok(())
 }
