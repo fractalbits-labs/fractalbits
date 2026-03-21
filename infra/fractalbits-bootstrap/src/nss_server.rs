@@ -74,7 +74,7 @@ pub fn bootstrap(
         // EBS HA standby: skip format/mount entirely, start role_agent idle
         info!("Starting as EBS HA standby NSS (idle)");
 
-        // Create local directories (stats, meta_cache) needed when standby becomes active
+        // Create local directories needed when standby becomes active
         prepare_local_dirs()?;
 
         // Signal formatting complete (standby has nothing to format)
