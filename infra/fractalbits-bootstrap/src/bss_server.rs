@@ -142,15 +142,15 @@ fn create_bss_config() -> CmdResult {
 
     let fa_journal_segment_size = FA_JOURNAL_SEGMENT_SIZE;
 
-    // Get /data volume size in 1K blocks and compute flag_storage_size as 90% of it
-    let data_size_kb_str = run_fun!(df -k /data | awk r"NR==2 {print $2}")?;
+    // Get /data/local volume size in 1K blocks and compute flag_storage_size as 90% of it
+    let data_size_kb_str = run_fun!(df -k /data/local | awk r"NR==2 {print $2}")?;
     let data_size_kb = data_size_kb_str
         .trim()
         .parse::<u64>()
-        .map_err(|_| Error::other(format!("invalid /data volume size: {data_size_kb_str}")))?;
+        .map_err(|_| Error::other(format!("invalid /data/local volume size: {data_size_kb_str}")))?;
     let flag_storage_size = (data_size_kb as f64 * 1024.0 * FLAG_STORAGE_SIZE_PERCENT) as u64;
     info!(
-        "/data volume size: {} KB, flag_storage_size: {} bytes ({} GB)",
+        "/data/local volume size: {} KB, flag_storage_size: {} bytes ({} GB)",
         data_size_kb,
         flag_storage_size,
         flag_storage_size / (1024 * 1024 * 1024)
