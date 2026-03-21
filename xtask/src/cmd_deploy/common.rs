@@ -132,6 +132,7 @@ pub(super) const ZIG_BINS: &[&str] = &[
     "nss_server",
     "bss_server",
     "mirrord",
+    "fbs",
     "test_bss_storage_engine",
 ];
 

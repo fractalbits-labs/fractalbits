@@ -5,11 +5,9 @@ use super::common::*;
 use crate::config::{BootstrapConfig, DeployTarget, JournalType};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
-use rayon::prelude::*;
 use std::io::Error;
 
 const BLOB_DRAM_MEM_PERCENT: f64 = 0.8;
-const NSS_META_CACHE_SHARDS: usize = 256;
 
 pub fn bootstrap(
     config: &BootstrapConfig,
@@ -284,7 +282,6 @@ blob_dram_kilo_bytes = {blob_dram_kilo_bytes}
 fa_journal_segment_size = {fa_journal_segment_size}
 log_level = "info"
 mirrord_port = 9999
-meta_cache_shards = {NSS_META_CACHE_SHARDS}
 {journal_uuid_line}"##
     );
     run_cmd! {
@@ -318,26 +315,13 @@ fa_journal_segment_size = {fa_journal_segment_size}
     Ok(())
 }
 
-/// Prepare local directories for nss_server (stats, meta_cache).
-/// Note: /data/local is already mounted by format_local_nvme_disks() earlier in bootstrap.
+/// Prepare local directories for nss_server (stats).
 /// This is called for both active and standby nodes.
 fn prepare_local_dirs() -> CmdResult {
     run_cmd! {
         info "Creating local directories for nss_server";
         mkdir -p /data/local/stats;
-        mkdir -p /data/local/meta_cache/blobs;
     }?;
-
-    info!(
-        "Creating {} meta cache shard directories in parallel",
-        NSS_META_CACHE_SHARDS
-    );
-    let shards: Vec<usize> = (0..NSS_META_CACHE_SHARDS).collect();
-    shards.par_iter().try_for_each(|&i| {
-        let shard_dir = format!("/data/local/meta_cache/blobs/{}", i);
-        std::fs::create_dir_all(&shard_dir)
-            .map_err(|e| Error::other(format!("Failed to create {}: {}", shard_dir, e)))
-    })?;
 
     run_cmd! {
         info "Syncing file system changes";

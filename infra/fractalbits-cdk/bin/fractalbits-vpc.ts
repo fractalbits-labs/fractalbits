@@ -41,7 +41,7 @@ const vpcTemplate = app.node.tryGetContext("vpcTemplate") ?? null;
 
 // Get context values (may be overridden by template)
 const benchType = app.node.tryGetContext("benchType") ?? null;
-const bssInstanceTypes =
+let bssInstanceTypes =
   app.node.tryGetContext("bssInstanceTypes") ?? "i8g.2xlarge";
 const apiServerInstanceType =
   app.node.tryGetContext("apiServerInstanceType") ?? "c8g.xlarge";
@@ -62,9 +62,10 @@ let rootServerHa = app.node.tryGetContext("rootServerHa") || false;
 const deployOS = (app.node.tryGetContext("deployOS") ?? "al2023") as DeployOS;
 
 // Configure based on template type
-let nssInstanceType = "m7gd.4xlarge";
+let nssInstanceType = "r7g.4xlarge";
 if (vpcTemplate === "mini") {
-  nssInstanceType = "m7gd.xlarge";
+  nssInstanceType = "r7g.xlarge";
+  bssInstanceTypes = "i8g.xlarge";
   ebsVolumeSize = 5;
   ebsVolumeIops = 1000;
   rootServerHa = false;
@@ -72,7 +73,7 @@ if (vpcTemplate === "mini") {
   numBssNodes = 1;
   numBenchClients = 1;
 } else if (vpcTemplate === "perf_demo") {
-  nssInstanceType = "m7gd.4xlarge";
+  nssInstanceType = "r7g.4xlarge";
   ebsVolumeSize = 20;
   ebsVolumeIops = 10000;
   rootServerHa = true;
