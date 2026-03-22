@@ -1,12 +1,12 @@
 use crate::*;
 use xtask_common::cloud_storage;
 
-use super::common::{DeployTarget, get_bootstrap_bucket_name, resolve_gcp_project};
+use super::common::{DeployTarget, get_bootstrap_bucket_name};
 
 pub fn upload(deploy_target: DeployTarget) -> CmdResult {
     match deploy_target {
         DeployTarget::Gcp => {
-            let project_id = resolve_gcp_project(None)?;
+            let project_id = super::gcp::resolve_gcp_project(None)?;
             upload_gcp(&project_id)
         }
         DeployTarget::Aws | DeployTarget::OnPrem => upload_to_aws(deploy_target),

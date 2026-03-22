@@ -1,15 +1,14 @@
 use crate::*;
 
-use super::super::common::cloud_storage;
-use super::super::common::{DeployTarget, VpcConfig, upload_config_and_blueprint};
+use super::super::common::{DeployTarget, VpcConfig, cloud_storage, upload_config_and_blueprint};
 use super::super::{bootstrap_progress, upload};
 use super::{config_gen, utils};
 
 const TERRAFORM_DIR: &str = "infra/fractalbits-terraform";
 
 pub fn create_vpc(config: VpcConfig) -> CmdResult {
-    let project_id = super::super::common::resolve_gcp_project(config.gcp_project.as_deref())?;
-    let zone = super::super::common::resolve_gcp_zone(config.gcp_zone.as_deref());
+    let project_id = super::resolve_gcp_project(config.gcp_project.as_deref())?;
+    let zone = super::resolve_gcp_zone(config.gcp_zone.as_deref());
     let region = zone
         .rsplit_once('-')
         .map(|(r, _)| r)
@@ -91,8 +90,8 @@ pub fn destroy_vpc(
     use colored::*;
     use dialoguer::Input;
 
-    let project_id = super::super::common::resolve_gcp_project(gcp_project.as_deref())?;
-    let _zone = super::super::common::resolve_gcp_zone(gcp_zone.as_deref());
+    let project_id = super::resolve_gcp_project(gcp_project.as_deref())?;
+    let _zone = super::resolve_gcp_zone(gcp_zone.as_deref());
 
     if delete_project {
         warn!("This will DELETE the entire GCP project '{project_id}' and ALL its resources!");

@@ -23,7 +23,7 @@ impl CloudAccess {
     }
 
     fn for_gcp(gcp_project: Option<&str>) -> Result<Self, Error> {
-        let project_id = super::common::resolve_gcp_project(gcp_project)?;
+        let project_id = super::gcp::resolve_gcp_project(gcp_project)?;
         Ok(Self::Gcs {
             bucket: format!("{project_id}-deploy-staging"),
         })
