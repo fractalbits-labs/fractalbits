@@ -28,7 +28,7 @@ pub struct ObjectLayout {
 }
 
 impl ObjectLayout {
-    pub const DEFAULT_BLOCK_SIZE: u32 = 1024 * 1024 - 256;
+    pub const DEFAULT_BLOCK_SIZE: u32 = 128 * 1024;
 
     pub fn gen_version_id() -> Uuid {
         Uuid::new_v4()
