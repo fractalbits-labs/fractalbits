@@ -1,5 +1,5 @@
+use cmd_lib::run_fun;
 use std::io::Error;
-use std::process::Command;
 
 use chrono::Utc;
 use uuid::Uuid;
@@ -30,7 +30,7 @@ fn to_common_journal_type(jt: crate::JournalType) -> xtask_common::JournalType {
 /// Only static parameters are included — no instance IDs, no NSS endpoint,
 /// no per-node data. Each instance gets its role via `--role` CLI arg in UserData.
 pub fn generate_bootstrap_config(vpc_config: &VpcConfig) -> Result<BootstrapClusterConfig, Error> {
-    let region = run_fun_trimmed("aws", &["configure", "get", "region"])?;
+    let region = run_fun!(aws configure get region)?;
 
     let workflow_cluster_id = Utc::now().format("%Y%m%d-%H%M%S").to_string();
 
@@ -38,19 +38,10 @@ pub fn generate_bootstrap_config(vpc_config: &VpcConfig) -> Result<BootstrapClus
     let journal_uuid = Uuid::now_v7().to_string();
 
     // Query the first AZ in the region (used for S3 Express / EBS placement)
-    let local_az = run_fun_trimmed(
-        "aws",
-        &[
-            "ec2",
-            "describe-availability-zones",
-            "--region",
-            &region,
-            "--query",
-            "AvailabilityZones[0].ZoneName",
-            "--output",
-            "text",
-        ],
-    )?;
+    let local_az = run_fun! {
+        aws ec2 describe-availability-zones
+            --region $region --query "AvailabilityZones[0].ZoneName" --output text
+    }?;
 
     let aws_config = ClusterAwsConfig {
         // data_blob_bucket: for AllInBss it's unused; for S3Hybrid it comes from CDK output
@@ -101,20 +92,4 @@ pub fn generate_bootstrap_config(vpc_config: &VpcConfig) -> Result<BootstrapClus
     };
 
     Ok(config)
-}
-
-fn run_fun_trimmed(cmd: &str, args: &[&str]) -> Result<String, Error> {
-    let output = Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|e| Error::other(format!("Failed to run {} {:?}: {}", cmd, args, e)))?;
-    if !output.status.success() {
-        return Err(Error::other(format!(
-            "{} {:?} failed: {}",
-            cmd,
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }

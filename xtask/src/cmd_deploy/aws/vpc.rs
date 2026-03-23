@@ -25,7 +25,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     // after CDK finishes.
     cloud_storage::delete_stale_bootstrap_config(&aws_bucket, DeployTarget::Aws)?;
 
-    // 3. CDK deploy (instances self-bootstrap via UserData)
+    // 2. CDK deploy (instances self-bootstrap via UserData)
     let cdk_dir = "infra/fractalbits-cdk";
 
     // Check if node_modules exists, if not run npm install
@@ -78,9 +78,9 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     )?;
     info!("VPC deployment completed successfully");
 
-    // 6. Instances self-bootstrap via UserData (all nodes download binary from S3)
+    // 3. Instances self-bootstrap via UserData (all nodes download binary from S3)
 
-    // 7. Optionally watch bootstrap progress inline
+    // 4. Optionally watch bootstrap progress inline
     if config.watch_bootstrap {
         bootstrap_progress::show_progress(DeployTarget::Aws, None)?;
     } else {

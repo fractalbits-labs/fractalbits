@@ -225,6 +225,52 @@ resource "google_compute_instance" "nss_b" {
   ]
 }
 
+# Bench clients (optional, one per index)
+resource "google_compute_instance" "bench_client" {
+  count        = var.with_bench ? var.num_bench_clients : 0
+  name         = "bench-client-${count.index}-${var.cluster_id}"
+  machine_type = var.api_machine_type
+  zone         = var.zone_a
+
+  boot_disk {
+    initialize_params {
+      image = var.os_image
+      size  = var.boot_disk_size_gb
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.private_a.id
+  }
+
+  metadata = {
+    service-role  = "bench_client"
+    instance-role = "bench_client"
+    cluster-id    = var.cluster_id
+    startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
+      gcs_bucket = "${var.project_id}-deploy-staging"
+      role_args  = "--role bench_client"
+    })
+  }
+
+  service_account {
+    email  = google_service_account.fractalbits.email
+    scopes = ["cloud-platform"]
+  }
+
+  tags = ["fractalbits-private", "fractalbits-bench"]
+
+  allow_stopping_for_update = true
+
+  depends_on = [
+    google_project_iam_member.firestore,
+    google_project_iam_member.storage,
+    google_project_iam_member.compute,
+    google_project_iam_member.logging,
+    google_project_iam_member.monitoring,
+  ]
+}
+
 # Bench server (optional)
 resource "google_compute_instance" "bench" {
   count        = var.with_bench ? 1 : 0

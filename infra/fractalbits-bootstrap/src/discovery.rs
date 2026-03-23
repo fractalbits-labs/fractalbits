@@ -48,10 +48,6 @@ pub struct CliArgs {
     #[clap(long)]
     pub volume_id: Option<String>,
 
-    /// Number of bench clients to connect (for bench_server)
-    #[clap(long)]
-    pub bench_client_count: Option<usize>,
-
     /// NSS-A instance ID (for root_server leader — used to initialize observer state)
     #[clap(long)]
     pub nss_a_id: Option<String>,
@@ -92,12 +88,9 @@ pub fn discover_from_args(args: &CliArgs) -> Result<ServiceType, Error> {
         "api_server" => Ok(ServiceType::ApiServer),
         "bss_server" => Ok(ServiceType::BssServer),
         "gui_server" => Ok(ServiceType::GuiServer),
-        "bench_server" => {
-            // bench_client_count defaults to 0 when not provided via CLI;
-            // main.rs falls back to config.global.num_bench_clients in that case
-            let bench_client_num = args.bench_client_count.unwrap_or(0);
-            Ok(ServiceType::BenchServer { bench_client_num })
-        }
+        "bench_server" => Ok(ServiceType::BenchServer {
+            bench_client_num: 0,
+        }),
         "bench_client" => Ok(ServiceType::BenchClient),
         _ => Err(Error::other(format!(
             "Unknown --role value: {role:?}. Expected one of: root_server, nss_server, api_server, bss_server, gui_server, bench_server, bench_client"

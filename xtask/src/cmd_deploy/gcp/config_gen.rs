@@ -15,6 +15,7 @@ pub struct GcpDeployParams<'a> {
     pub rss_ha_enabled: bool,
     pub num_bss_nodes: usize,
     pub num_api_servers: usize,
+    pub num_bench_clients: usize,
     pub with_bench: bool,
     pub use_generic_binaries: bool,
 }
@@ -59,8 +60,11 @@ pub fn generate_bootstrap_config(
             journal_type: xtask_common::JournalType::Ebs,
             num_bss_nodes: Some(params.num_bss_nodes),
             num_api_servers: Some(params.num_api_servers),
-            // GCP has no separate bench_client instances; bench_server runs standalone (0 clients)
-            num_bench_clients: if params.with_bench { Some(0) } else { None },
+            num_bench_clients: if params.with_bench {
+                Some(params.num_bench_clients)
+            } else {
+                None
+            },
             workflow_cluster_id: Some(workflow_cluster_id),
             meta_stack_testing: false,
             use_generic_binaries: params.use_generic_binaries,

@@ -584,7 +584,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         const benchServerUserData = createUserData(
           this,
           deployOS,
-          `--role bench_server --bench-client-count ${props.numBenchClients} --api-server-endpoint ${nlb.loadBalancerDnsName}`,
+          `--role bench_server --api-server-endpoint ${nlb.loadBalancerDnsName}`,
         );
         instances["bench_server"] = createInstance(
           this,

@@ -131,7 +131,8 @@ fn generic_bootstrap_with_args(cli_args: CliArgs) -> CmdResult {
                         .and_then(|e| e.api_server_endpoint.as_deref())
                 })
                 .ok_or_else(|| io::Error::other("api_server_endpoint not set"))?;
-            // Fall back to config.global.num_bench_clients when CLI arg not provided (0)
+            // bench_client_num is 0 for cloud (CLI) path; read from global config.
+            // For on-prem (TOML) path, it comes from per-instance config.
             let actual_bench_client_num = if bench_client_num > 0 {
                 bench_client_num
             } else {

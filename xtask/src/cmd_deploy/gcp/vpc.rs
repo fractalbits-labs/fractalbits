@@ -39,6 +39,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         rss_ha_enabled: config.root_server_ha,
         num_bss_nodes: config.num_bss_nodes as usize,
         num_api_servers: config.num_api_servers as usize,
+        num_bench_clients: config.num_bench_clients as usize,
         with_bench: config.with_bench,
         use_generic_binaries: config.use_generic_binaries,
     };
@@ -199,6 +200,7 @@ fn build_terraform_vars(
     );
     if config.with_bench {
         add("with_bench", "true");
+        add("num_bench_clients", &config.num_bench_clients.to_string());
     }
     if let Some(ref template_val) = config.template {
         add("vpc_template", template_val.as_ref());

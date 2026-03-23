@@ -95,6 +95,11 @@ variable "with_bench" {
   default = false
 }
 
+variable "num_bench_clients" {
+  type    = number
+  default = 0
+}
+
 variable "use_generic_binaries" {
   type    = bool
   default = true
