@@ -1,4 +1,3 @@
-use super::aws::utils as aws_utils;
 use super::common::DeployTarget;
 use crate::CmdResult;
 use cmd_lib::*;
@@ -18,7 +17,7 @@ enum CloudAccess {
 
 impl CloudAccess {
     fn for_aws() -> Result<Self, Error> {
-        let bucket = aws_utils::get_aws_bootstrap_bucket()?;
+        let bucket = super::aws::get_aws_bootstrap_bucket()?;
         Ok(Self::AwsS3 { bucket })
     }
 

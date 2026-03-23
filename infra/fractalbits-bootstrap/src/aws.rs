@@ -3,7 +3,6 @@ use crate::common::{
     install_packages,
 };
 use cmd_lib::*;
-use std::io::Error;
 use std::time::{Duration, Instant};
 
 /// Install amazon-ec2-utils on Ubuntu so that ec2-metadata is available
@@ -86,22 +85,6 @@ pub fn get_account_id() -> FunResult {
         ));
     }
     Ok(account)
-}
-
-pub fn get_ec2_tag(instance_id: &str, region: &str, tag_name: &str) -> FunResult {
-    let tag_value = run_fun!(
-        aws ec2 describe-tags
-            --region $region
-            --filters "Name=resource-id,Values=$instance_id" "Name=key,Values=$tag_name"
-            --query "Tags[0].Value" --output text
-    )?;
-
-    if tag_value.is_empty() || tag_value == "None" {
-        return Err(Error::other(format!(
-            "EC2 tag '{tag_name}' not found for instance {instance_id}"
-        )));
-    }
-    Ok(tag_value)
 }
 
 pub fn get_aws_instance_id() -> FunResult {

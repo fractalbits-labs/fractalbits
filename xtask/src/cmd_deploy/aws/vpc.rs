@@ -60,7 +60,16 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     // Build CDK context parameters
     let context_params = build_cdk_context(&config);
 
-    info!("Deploying FractalbitsVpcStack...");
+    // Generate and upload bootstrap config BEFORE CDK deploy so instances find it immediately on boot
+    info!("Generating bootstrap config (pre-deploy)...");
+    let bootstrap_config = config_gen::generate_bootstrap_config(&config)?;
+    let config_toml = bootstrap_config
+        .to_toml()
+        .map_err(|e| std::io::Error::other(format!("Failed to serialize config: {}", e)))?;
+    let s3_bucket = format!("s3://{aws_bucket}");
+    upload_config_and_blueprint(&s3_bucket, &config_toml, &bootstrap_config)?;
+    info!("Bootstrap config uploaded. Starting CDK deploy...");
+
     let outputs_file = "/tmp/cdk-outputs.json";
     run_cmd!(
         cd $cdk_dir;
@@ -68,19 +77,6 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
             --outputs-file $outputs_file --require-approval never 2>&1
     )?;
     info!("VPC deployment completed successfully");
-
-    // 3. Parse CDK outputs
-    let outputs = super::utils::parse_cdk_outputs()?;
-
-    // 5. Generate bootstrap config and upload to AWS S3
-    let bootstrap_config = config_gen::generate_bootstrap_config(&outputs, &config)?;
-    let config_toml = bootstrap_config
-        .to_toml()
-        .map_err(|e| std::io::Error::other(format!("Failed to serialize config: {}", e)))?;
-
-    // Upload config and blueprint to AWS S3 (RSS leader polls for this)
-    let s3_bucket = format!("s3://{aws_bucket}");
-    upload_config_and_blueprint(&s3_bucket, &config_toml, &bootstrap_config)?;
 
     // 6. Instances self-bootstrap via UserData (all nodes download binary from S3)
 

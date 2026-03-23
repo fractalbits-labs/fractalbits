@@ -31,6 +31,7 @@ resource "google_compute_instance" "rss_a" {
     rss-backend   = var.rss_backend
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
+      role_args  = "--role root_server --rss-role leader --nss-a-ip ${google_compute_instance.nss_a.network_interface[0].network_ip} --nss-a-id nss-a-${var.cluster_id}${local.is_ha ? " --nss-b-id nss-b-${var.cluster_id}" : ""}"
     })
   }
 
@@ -77,6 +78,7 @@ resource "google_compute_instance" "rss_b" {
     rss-backend   = var.rss_backend
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
+      role_args  = "--role root_server --rss-role follower --nss-a-ip ${google_compute_instance.nss_a.network_interface[0].network_ip}"
     })
   }
 
@@ -139,6 +141,7 @@ resource "google_compute_instance" "nss_a" {
     cluster-id    = var.cluster_id
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
+      role_args  = "--role nss_server --nss-role primary"
     })
   }
 
@@ -200,6 +203,7 @@ resource "google_compute_instance" "nss_b" {
     cluster-id    = var.cluster_id
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
+      role_args  = "--role nss_server --nss-role standby"
     })
   }
 
@@ -245,6 +249,7 @@ resource "google_compute_instance" "bench" {
     cluster-id    = var.cluster_id
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
+      role_args  = "--role bench_server --api-server-endpoint ${google_compute_forwarding_rule.api_lb.ip_address}"
     })
   }
 
@@ -263,5 +268,6 @@ resource "google_compute_instance" "bench" {
     google_project_iam_member.compute,
     google_project_iam_member.logging,
     google_project_iam_member.monitoring,
+    google_compute_forwarding_rule.api_lb,
   ]
 }

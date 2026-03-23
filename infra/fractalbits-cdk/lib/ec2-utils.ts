@@ -184,13 +184,14 @@ export const createInstance = (
 };
 
 /**
- * Create UserData for all instances (RSS leader, workers, ASG nodes).
- * Downloads the bootstrap binary directly from S3 and runs it.
+ * Create UserData for an instance, downloading the bootstrap binary from S3 and running it.
+ * `extraArgs` is appended to the bootstrap invocation (e.g. `--role bss_server`).
  * No Docker dependency - all nodes use the same simple bootstrap path.
  */
 export const createUserData = (
   scope: Construct,
   deployOS: DeployOS = "al2023",
+  extraArgs: string = "",
 ): ec2.UserData => {
   const region = cdk.Stack.of(scope).region;
   const account = cdk.Stack.of(scope).account;
@@ -200,13 +201,14 @@ export const createUserData = (
     deployOS === "ubuntu"
       ? `command -v aws >/dev/null 2>&1 || snap install aws-cli --classic`
       : ``;
+  const extraArgsStr = extraArgs ? ` ${extraArgs}` : "";
   userData.addCommands(
     ...(installAwsCli ? [installAwsCli] : []),
     `set -ex`,
     `ARCH=$(arch)`,
     `aws s3 cp --no-progress s3://${bucketName}/$ARCH/fractalbits-bootstrap /opt/fractalbits/bin/fractalbits-bootstrap`,
     `chmod +x /opt/fractalbits/bin/fractalbits-bootstrap`,
-    `/opt/fractalbits/bin/fractalbits-bootstrap s3://${bucketName} 2>&1 | tee -a /var/log/fractalbits-bootstrap.log`,
+    `/opt/fractalbits/bin/fractalbits-bootstrap s3://${bucketName}${extraArgsStr} 2>&1 | tee -a /var/log/fractalbits-bootstrap.log`,
   );
   return userData;
 };
@@ -298,11 +300,10 @@ export const createEbsVolume = (
   scope: Construct,
   id: string,
   az: string,
-  instanceId: string,
   volumeSize: number,
   volumeIops: number,
 ): ec2.Volume => {
-  const ebsVolume = new ec2.Volume(scope, id, {
+  return new ec2.Volume(scope, id, {
     removalPolicy: cdk.RemovalPolicy.DESTROY,
     availabilityZone: az,
     size: cdk.Size.gibibytes(volumeSize),
@@ -310,14 +311,20 @@ export const createEbsVolume = (
     iops: volumeIops,
     enableMultiAttach: true,
   });
+};
 
+export const attachEbsVolume = (
+  scope: Construct,
+  id: string,
+  volume: ec2.Volume,
+  instanceId: string,
+  device: string = "/dev/xvdf",
+): void => {
   new ec2.CfnVolumeAttachment(scope, `${id}Attachment`, {
     instanceId: instanceId,
-    device: "/dev/xvdf",
-    volumeId: ebsVolume.volumeId,
+    device: device,
+    volumeId: volume.volumeId,
   });
-
-  return ebsVolume;
 };
 
 export function addAsgDeregistrationLifecycleHook(

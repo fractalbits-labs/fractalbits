@@ -2,7 +2,8 @@ use crate::*;
 
 use super::super::common::{DeployTarget, VpcConfig, cloud_storage, upload_config_and_blueprint};
 use super::super::{bootstrap_progress, upload};
-use super::{config_gen, utils};
+use super::config_gen;
+use xtask_common;
 
 const TERRAFORM_DIR: &str = "infra/fractalbits-terraform";
 
@@ -28,11 +29,31 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     // Prevents leftover configs from being served to instances during the race window.
     cloud_storage::delete_stale_bootstrap_config(&gcs_bucket, DeployTarget::Gcp)?;
 
+    // Generate and upload bootstrap config BEFORE Terraform so instances find it immediately on boot
+    info!("Generating bootstrap config (pre-deploy)...");
+    let params = config_gen::GcpDeployParams {
+        project_id: &project_id,
+        zone: &zone,
+        region,
+        rss_backend: to_common_rss_backend(config.rss_backend),
+        rss_ha_enabled: config.root_server_ha,
+        num_bss_nodes: config.num_bss_nodes as usize,
+        num_api_servers: config.num_api_servers as usize,
+        with_bench: config.with_bench,
+        use_generic_binaries: config.use_generic_binaries,
+    };
+    let bootstrap_config = config_gen::generate_bootstrap_config(&params)?;
+    let config_toml = bootstrap_config
+        .to_toml()
+        .map_err(|e| std::io::Error::other(format!("Failed to serialize config: {e}")))?;
+    let gs_bucket = format!("gs://{gcs_bucket}");
+    upload_config_and_blueprint(&gs_bucket, &config_toml, &bootstrap_config)?;
+    info!("Bootstrap config uploaded. Starting Terraform apply...");
+
     // 4. Terraform init + apply
     let tf_vars = build_terraform_vars(&config, &project_id, &zone, region);
     let tf_state_bucket =
         std::env::var("GCP_TF_STATE_BUCKET").unwrap_or_else(|_| format!("{project_id}-tf-state"));
-    info!("Running Terraform apply...");
     run_cmd!(
         cd $TERRAFORM_DIR;
         terraform init
@@ -46,32 +67,9 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     )?;
     info!("Terraform apply completed");
 
-    // 4. Parse Terraform outputs
-    let outputs = utils::parse_terraform_outputs(TERRAFORM_DIR)?;
+    // 5. Instances self-bootstrap via startup scripts (download binary from GCS)
 
-    // 6. Generate bootstrap config and upload to GCS
-    let params = config_gen::GcpDeployParams {
-        outputs: &outputs,
-        project_id: &project_id,
-        zone: &zone,
-        rss_backend: to_common_rss_backend(config.rss_backend),
-        rss_ha_enabled: config.root_server_ha,
-        num_bss_nodes: config.num_bss_nodes as usize,
-        num_api_servers: config.num_api_servers as usize,
-        with_bench: config.with_bench,
-    };
-    let bootstrap_config = config_gen::generate_bootstrap_config(&params)?;
-    let config_toml = bootstrap_config
-        .to_toml()
-        .map_err(|e| std::io::Error::other(format!("Failed to serialize config: {e}")))?;
-
-    // Upload config and blueprint to GCS (RSS leader polls for this via startup script)
-    let gs_bucket = format!("gs://{gcs_bucket}");
-    upload_config_and_blueprint(&gs_bucket, &config_toml, &bootstrap_config)?;
-
-    // 6. Instances self-bootstrap via startup scripts (download binary from GCS)
-
-    // 7. Watch bootstrap progress via GCS
+    // 6. Watch bootstrap progress via GCS
     if config.watch_bootstrap {
         bootstrap_progress::show_progress_with_bucket(DeployTarget::Gcp, None, Some(&gcs_bucket))?;
     } else {

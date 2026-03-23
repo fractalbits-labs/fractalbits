@@ -237,6 +237,10 @@ pub struct ClusterGlobalConfig {
     pub meta_stack_testing: bool,
     #[serde(default)]
     pub use_generic_binaries: bool,
+    /// Cluster-scoped journal UUID for NSS (pre-generated before deploy).
+    /// Replaces per-node journal_uuid in NodeEntry for cloud deployments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,9 +265,10 @@ pub struct ClusterGcpConfig {
     pub firestore_database: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClusterEndpointsConfig {
-    pub nss_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nss_endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_server_endpoint: Option<String>,
 }
@@ -294,7 +299,8 @@ pub struct BootstrapClusterConfig {
     pub aws: Option<ClusterAwsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gcp: Option<ClusterGcpConfig>,
-    pub endpoints: ClusterEndpointsConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoints: Option<ClusterEndpointsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ClusterResourcesConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

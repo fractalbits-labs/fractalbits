@@ -401,7 +401,7 @@ pub mod timeouts {
     pub const METADATA_VG_READY: u64 = 300;
     pub const NSS_FORMATTED: u64 = 300;
     pub const MIRRORD_READY: u64 = 120;
-    pub const NSS_JOURNAL_READY: u64 = 120;
+    pub const NSS_JOURNAL_READY: u64 = 360;
     pub const BSS_CONFIGURED: u64 = 300;
     pub const SERVICES_READY: u64 = 60;
 }

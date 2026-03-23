@@ -13,15 +13,33 @@ pub fn bootstrap(
     config: &BootstrapConfig,
     volume_id: Option<&str>,
     journal_uuid: Option<&str>,
+    is_standby: bool,
     for_bench: bool,
 ) -> CmdResult {
     let meta_stack_testing = config.global.meta_stack_testing;
     let journal_type = config.global.journal_type;
 
+    // Resolve journal_uuid: prefer CLI/NodeEntry value, fall back to global config
+    let global_journal_uuid;
+    let journal_uuid: Option<&str> = if journal_uuid.is_some() {
+        journal_uuid
+    } else {
+        global_journal_uuid = config.global.journal_uuid.clone();
+        global_journal_uuid.as_deref()
+    };
+
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Nss)?;
 
+    // Get private IP for stage completion metadata (used by RSS to discover NSS IP)
+    let private_ip = crate::common::get_private_ip(config.global.deploy_target).unwrap_or_default();
+    let nss_role = if is_standby { "standby" } else { "primary" };
+    let instances_ready_meta = serde_json::json!({
+        "private_ip": private_ip,
+        "role": nss_role,
+    });
+
     // Complete instances-ready stage
-    barrier.complete_stage(stages::INSTANCES_READY, None)?;
+    barrier.complete_stage(stages::INSTANCES_READY, Some(instances_ready_meta))?;
 
     if journal_type == JournalType::Nvme {
         install_packages(&["nvme-cli", "mdadm"])?;
@@ -60,12 +78,13 @@ pub fn bootstrap(
         info!("Meta-stack testing mode: skipping RSS wait");
     }
 
-    // Determine if this node is the EBS HA standby (nss-B with EBS journal)
-    // EBS standby skips format/mount since it doesn't have the volume attached
-    let resources = config.get_resources();
-    let instance_id = get_instance_id(config.global.deploy_target)?;
-    let is_standby = resources.nss_b_id.as_ref() == Some(&instance_id);
-    let is_ha_mode = resources.nss_b_id.is_some();
+    // Determine HA mode: if this node is the standby, we're definitely in HA mode.
+    // For the primary node, check resources (TOML path) to see if a standby exists.
+    let is_ha_mode = if is_standby {
+        true
+    } else {
+        config.get_resources().nss_b_id.is_some()
+    };
     let is_ebs_standby = journal_type == JournalType::Ebs && is_standby;
 
     setup_configs(config, journal_type, volume_id, journal_uuid, "nss")?;
@@ -95,8 +114,19 @@ pub fn bootstrap(
             nvme_journal::format()?;
         }
         JournalType::Ebs => {
-            let volume_id =
-                volume_id.ok_or_else(|| Error::other("volume_id required for ebs journal type"))?;
+            // On GCP, the pd_ssd journal disk is pre-attached as device "nss-journal".
+            // No volume_id is passed via CLI; use the fixed GCP device name instead.
+            let gcp_default;
+            let volume_id = match volume_id {
+                Some(v) => v,
+                None if config.global.deploy_target == DeployTarget::Gcp => {
+                    gcp_default = "gcp:nss-journal".to_string();
+                    &gcp_default
+                }
+                None => {
+                    return Err(Error::other("volume_id required for ebs journal type"));
+                }
+            };
             let journal_uuid = journal_uuid
                 .ok_or_else(|| Error::other("journal_uuid required for ebs journal type"))?;
             ebs_journal::format_with_volume_id(volume_id, journal_uuid)?;
@@ -139,7 +169,11 @@ pub fn bootstrap(
             wait_for_service_ready("nss_server", 8088, 360)?;
 
             // Signal that journal is ready and nss_server is accepting connections
-            barrier.complete_stage(stages::NSS_JOURNAL_READY, None)?;
+            let journal_ready_meta = serde_json::json!({
+                "private_ip": private_ip,
+                "role": nss_role,
+            });
+            barrier.complete_stage(stages::NSS_JOURNAL_READY, Some(journal_ready_meta))?;
 
             // Complete services-ready stage
             barrier.complete_stage(stages::SERVICES_READY, None)?;
@@ -161,7 +195,11 @@ pub fn bootstrap(
             wait_for_service_ready("nss_server", 8088, 360)?;
 
             // Signal that journal is ready and nss_server is accepting connections
-            barrier.complete_stage(stages::NSS_JOURNAL_READY, None)?;
+            let journal_ready_meta = serde_json::json!({
+                "private_ip": private_ip,
+                "role": nss_role,
+            });
+            barrier.complete_stage(stages::NSS_JOURNAL_READY, Some(journal_ready_meta))?;
 
             // Complete services-ready stage
             barrier.complete_stage(stages::SERVICES_READY, None)?;
@@ -184,7 +222,11 @@ pub fn bootstrap(
         wait_for_service_ready("nss_server", 8088, 360)?;
 
         // Signal that journal is ready and nss_server is accepting connections
-        barrier.complete_stage(stages::NSS_JOURNAL_READY, None)?;
+        let journal_ready_meta = serde_json::json!({
+            "private_ip": private_ip,
+            "role": nss_role,
+        });
+        barrier.complete_stage(stages::NSS_JOURNAL_READY, Some(journal_ready_meta))?;
 
         // Complete services-ready stage
         barrier.complete_stage(stages::SERVICES_READY, None)?;
@@ -205,7 +247,16 @@ fn setup_configs(
     // For NVMe: journal at /data/local/journal/
     let (volume_dev, shared_dir) = match journal_type {
         JournalType::Ebs => {
-            let vid = volume_id.ok_or_else(|| Error::other("volume_id required for EBS"))?;
+            // On GCP, pd_ssd is pre-attached as "nss-journal"; no volume_id from CLI.
+            let gcp_default;
+            let vid = match volume_id {
+                Some(v) => v,
+                None if config.global.deploy_target == DeployTarget::Gcp => {
+                    gcp_default = "gcp:nss-journal".to_string();
+                    &gcp_default
+                }
+                None => return Err(Error::other("volume_id required for EBS")),
+            };
             let uuid = journal_uuid.ok_or_else(|| Error::other("journal_uuid required for EBS"))?;
             // shared_dir is relative to /data, so "ebs/{uuid}" means /data/ebs/{uuid}/
             (

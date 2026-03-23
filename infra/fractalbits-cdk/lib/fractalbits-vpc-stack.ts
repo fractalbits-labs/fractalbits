@@ -9,6 +9,7 @@ import {
   createInstance,
   createEc2Asg,
   createEbsVolume,
+  attachEbsVolume,
   createDynamoDbTable,
   createEc2Role,
   createVpcEndpoints,
@@ -312,12 +313,71 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
-    // Single UserData for all instances: download bootstrap binary from S3 and run it
-    const bootstrapUserData = createUserData(this, deployOS);
+    // For EBS journal: create volumes BEFORE instances so their IDs are available in UserData.
+    // CloudFormation resolves the volumeId token at deploy time.
+    let ebsVolumeA: ec2.Volume | undefined;
+    let ebsVolumeB: ec2.Volume | undefined;
+    if (props.journalType === "ebs") {
+      ebsVolumeA = createEbsVolume(
+        this,
+        "MultiAttachVolumeA",
+        subnet1.availabilityZone,
+        props.ebsVolumeSize,
+        props.ebsVolumeIops,
+      );
+      if (multiAz) {
+        ebsVolumeB = createEbsVolume(
+          this,
+          "MultiAttachVolumeB",
+          subnet2.availabilityZone,
+          props.ebsVolumeSize,
+          props.ebsVolumeIops,
+        );
+      }
+    }
+
+    // Per-service UserData: each instance gets --role (and optional sub-args) appended
+    const nssVolumeIdArg =
+      props.journalType === "ebs" && ebsVolumeA
+        ? ` --volume-id ${ebsVolumeA.volumeId}`
+        : "";
+    const nssVolumeBIdArg =
+      props.journalType === "ebs"
+        ? multiAz && ebsVolumeB
+          ? ` --volume-id ${ebsVolumeB.volumeId}`
+          : ` --volume-id ${ebsVolumeA!.volumeId}` // single-AZ: same volume for standby
+        : "";
+
+    const perServiceUserData: Record<string, ec2.UserData> = {
+      // rss-A is set below after NSS instances are created (needs their instanceIds)
+      "rss-B": createUserData(
+        this,
+        deployOS,
+        "--role root_server --rss-role follower",
+      ),
+      "nss-A": createUserData(
+        this,
+        deployOS,
+        `--role nss_server --nss-role primary${nssVolumeIdArg}`,
+      ),
+      "nss-B": createUserData(
+        this,
+        deployOS,
+        `--role nss_server --nss-role standby${nssVolumeBIdArg}`,
+      ),
+      gui_server: createUserData(this, deployOS, "--role gui_server"),
+      // bench_server UserData is set after NLB creation so we can embed the NLB DNS name
+    };
 
     const instances: Record<string, ec2.Instance> = {};
-    instanceConfigs.forEach(
-      ({ id, instanceType, sg, specificSubnet, rootVolumeSize }) => {
+
+    // First pass: create NSS instances so their instanceIds (CDK tokens) are
+    // available for the RSS leader UserData below.
+    instanceConfigs
+      .filter(({ id }) => id.startsWith("nss-"))
+      .forEach(({ id, instanceType, sg, specificSubnet, rootVolumeSize }) => {
+        const userData =
+          perServiceUserData[id] ?? createUserData(this, deployOS);
         instances[id] = createInstance(
           this,
           this.vpc,
@@ -328,10 +388,70 @@ export class FractalbitsVpcStack extends cdk.Stack {
           ec2Role,
           deployOS,
           rootVolumeSize,
-          bootstrapUserData,
+          userData,
         );
-      },
+      });
+
+    // Build RSS leader UserData with the NSS instance IDs embedded so the
+    // RSS bootstrap can call initialize_observer_state with the real IDs.
+    const nssAInstanceId = instances["nss-A"].instanceId;
+    const nssAPrivateIp = instances["nss-A"].instancePrivateIp;
+    const nssBInstance = instances["nss-B"];
+    const nssIdArgs = nssBInstance
+      ? ` --nss-a-id ${nssAInstanceId} --nss-b-id ${nssBInstance.instanceId}`
+      : ` --nss-a-id ${nssAInstanceId}`;
+    perServiceUserData["rss-A"] = createUserData(
+      this,
+      deployOS,
+      `--role root_server --rss-role leader${nssIdArgs} --nss-a-ip ${nssAPrivateIp}`,
     );
+
+    // Second pass: create all remaining (non-NSS, non-bench_server) instances.
+    // bench_server is deferred to after NLB creation so its UserData can include the NLB DNS.
+    instanceConfigs
+      .filter(({ id }) => !id.startsWith("nss-") && id !== "bench_server")
+      .forEach(({ id, instanceType, sg, specificSubnet, rootVolumeSize }) => {
+        const userData =
+          perServiceUserData[id] ?? createUserData(this, deployOS);
+        instances[id] = createInstance(
+          this,
+          this.vpc,
+          id,
+          specificSubnet,
+          instanceType,
+          sg,
+          ec2Role,
+          deployOS,
+          rootVolumeSize,
+          userData,
+        );
+      });
+
+    // Attach EBS volumes to NSS instances (volumes were created before instances above)
+    if (props.journalType === "ebs" && ebsVolumeA) {
+      attachEbsVolume(
+        this,
+        "MultiAttachVolumeAToNssA",
+        ebsVolumeA,
+        instances["nss-A"].instanceId,
+      );
+      if (multiAz && ebsVolumeB) {
+        attachEbsVolume(
+          this,
+          "MultiAttachVolumeBToNssB",
+          ebsVolumeB,
+          instances["nss-B"].instanceId,
+        );
+      } else {
+        // Single-AZ EBS HA: attach same volume to nss-B for NVMe reservation failover
+        attachEbsVolume(
+          this,
+          "MultiAttachVolumeAToNssB",
+          ebsVolumeA,
+          instances["nss-B"].instanceId,
+        );
+      }
+    }
 
     // Create BSS nodes in ASG (dynamic cluster discovery via S3)
     let bssAsg: autoscaling.AutoScalingGroup | undefined;
@@ -348,7 +468,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         props.numBssNodes,
         "bss_server",
         deployOS,
-        bootstrapUserData,
+        createUserData(this, deployOS, "--role bss_server"),
       );
     }
 
@@ -385,12 +505,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       );
     }
 
-    // Determine NSS endpoint based on mode
-    const nssEndpoint = multiAz
-      ? nssPrivateLink.endpointDns
-      : `${instances["nss-A"].instancePrivateIp}`;
-
-    // Create api_server(s) in ASG with worker UserData
+    // Create api_server(s) in ASG
     const apiServerAsg = createEc2Asg(
       this,
       "ApiServerAsg",
@@ -403,7 +518,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       props.numApiServers,
       "api_server",
       deployOS,
-      bootstrapUserData,
+      createUserData(this, deployOS, "--role api_server"),
     );
 
     // Add lifecycle hook for api_server ASG
@@ -429,7 +544,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         props.numBenchClients,
         "bench_client",
         deployOS,
-        bootstrapUserData,
+        createUserData(this, deployOS, "--role bench_client"),
       );
       addAsgDynamoDbDeregistrationLifecycleHook(
         this,
@@ -460,38 +575,29 @@ export class FractalbitsVpcStack extends cdk.Stack {
       },
     });
 
-    // Create EBS Volumes for nss_servers only when journalType is "ebs"
-    let ebsVolumeAId: string = "";
-    let ebsVolumeBId: string = "";
-    if (props.journalType === "ebs") {
-      const ebsVolumeA = createEbsVolume(
-        this,
-        "MultiAttachVolumeA",
-        subnet1.availabilityZone,
-        instances["nss-A"].instanceId,
-        props.ebsVolumeSize,
-        props.ebsVolumeIops,
+    // Third pass: create bench_server after NLB so UserData can embed the NLB DNS name.
+    if (props.benchType === "external") {
+      const benchServerConfig = instanceConfigs.find(
+        ({ id }) => id === "bench_server",
       );
-      ebsVolumeAId = ebsVolumeA.volumeId;
-
-      if (multiAz) {
-        // Multi-AZ: separate volumes per AZ
-        const ebsVolumeB = createEbsVolume(
+      if (benchServerConfig) {
+        const benchServerUserData = createUserData(
           this,
-          "MultiAttachVolumeB",
-          subnet2.availabilityZone,
-          instances["nss-B"].instanceId,
-          props.ebsVolumeSize,
-          props.ebsVolumeIops,
+          deployOS,
+          `--role bench_server --bench-client-count ${props.numBenchClients} --api-server-endpoint ${nlb.loadBalancerDnsName}`,
         );
-        ebsVolumeBId = ebsVolumeB.volumeId;
-      } else {
-        // Single-AZ EBS HA: attach same volume to nss-B for NVMe reservation failover
-        new ec2.CfnVolumeAttachment(this, "MultiAttachVolumeAToNssB", {
-          instanceId: instances["nss-B"].instanceId,
-          device: "/dev/xvdf",
-          volumeId: ebsVolumeA.volumeId,
-        });
+        instances["bench_server"] = createInstance(
+          this,
+          this.vpc,
+          "bench_server",
+          benchServerConfig.specificSubnet,
+          benchServerConfig.instanceType,
+          benchServerConfig.sg,
+          ec2Role,
+          deployOS,
+          benchServerConfig.rootVolumeSize,
+          benchServerUserData,
+        );
       }
     }
 
@@ -518,17 +624,17 @@ export class FractalbitsVpcStack extends cdk.Stack {
     this.nlbLoadBalancerDnsName = nlb.loadBalancerDnsName;
 
     // Only output EBS volume IDs when journalType is "ebs"
-    if (ebsVolumeAId) {
+    if (ebsVolumeA) {
       new cdk.CfnOutput(this, "VolumeAId", {
-        value: ebsVolumeAId,
+        value: ebsVolumeA.volumeId,
         description: "EBS volume A ID",
       });
     }
 
     // Only output volume B for multiAz mode with EBS
-    if (multiAz && ebsVolumeBId) {
+    if (multiAz && ebsVolumeB) {
       new cdk.CfnOutput(this, "VolumeBId", {
-        value: ebsVolumeBId,
+        value: ebsVolumeB.volumeId,
         description: "EBS volume B ID",
       });
     }

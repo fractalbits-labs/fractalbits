@@ -20,11 +20,37 @@ const META_DATA_VG_QUORUM_W: usize = 4;
 
 const BOOTSTRAP_GRACE_PERIOD_SECS: u64 = 300;
 
-pub fn bootstrap(config: &BootstrapConfig, is_leader: bool, for_bench: bool) -> CmdResult {
-    let nss_endpoint = &config.endpoints.nss_endpoint;
+pub fn bootstrap(
+    config: &BootstrapConfig,
+    is_leader: bool,
+    for_bench: bool,
+    cli_nss_a_id: Option<&str>,
+    cli_nss_b_id: Option<&str>,
+    cli_nss_a_ip: Option<&str>,
+) -> CmdResult {
+    // CLI-provided IP takes precedence (injected via UserData on cloud deployments
+    // where the instance IP is known at CDK/Terraform synthesis time but not in
+    // the bootstrap config, which is generated before instances are created).
+    let nss_endpoint = cli_nss_a_ip
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            config
+                .endpoints
+                .as_ref()
+                .and_then(|e| e.nss_endpoint.as_deref())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("");
     let resources = config.get_resources();
-    let nss_a_id = &resources.nss_a_id;
-    let nss_b_id = resources.nss_b_id.as_deref();
+    // CLI-provided IDs take precedence (AWS cloud path); fall back to TOML resources (on-prem path)
+    let nss_a_id_owned;
+    let nss_a_id = if let Some(id) = cli_nss_a_id {
+        id
+    } else {
+        nss_a_id_owned = resources.nss_a_id.clone();
+        &nss_a_id_owned
+    };
+    let nss_b_id = cli_nss_b_id.or(resources.nss_b_id.as_deref());
     let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     let num_bss_nodes = config.global.num_bss_nodes;
     let ha_enabled = config.global.rss_ha_enabled;
@@ -253,12 +279,15 @@ fn initialize_observer_state(
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
 
-    // Get shared journal_uuid from the primary NSS (nss-A) in config
+    // Get shared journal_uuid: prefer per-node entry (on-prem TOML path), fall back to global config
     // Both NSS and mirrord use the same journal_uuid
     let nss_nodes = config.get_node_entries("nss_server");
-    let shared_journal_uuid = nss_nodes
+    let node_journal_uuid = nss_nodes
         .and_then(|nodes| nodes.iter().find(|n| n.id == nss_a_id))
-        .and_then(|n| n.journal_uuid.as_deref());
+        .and_then(|n| n.journal_uuid.clone());
+    let shared_journal_uuid = node_journal_uuid
+        .as_deref()
+        .or(config.global.journal_uuid.as_deref());
 
     let journal_uuid_json = shared_journal_uuid
         .map(|u| format!("\"{u}\""))

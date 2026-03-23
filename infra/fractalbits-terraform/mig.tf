@@ -22,6 +22,7 @@ resource "google_compute_instance_template" "api_server" {
     cluster-id    = var.cluster_id
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
+      role_args  = "--role api_server"
     })
   }
 
@@ -94,6 +95,7 @@ resource "google_compute_instance_template" "bss_server" {
     cluster-id    = var.cluster_id
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
+      role_args  = "--role bss_server"
     })
   }
 

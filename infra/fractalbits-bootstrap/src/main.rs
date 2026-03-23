@@ -14,15 +14,17 @@ mod nss_server;
 mod root_server;
 mod workflow;
 
+use clap::Parser;
 use cmd_lib::*;
 use common::*;
-use discovery::{ServiceType, discover_service_type};
-use std::io::{self, Write};
+use discovery::{CliArgs, ServiceType, discover_from_args, discover_service_type};
+use std::io;
 
 #[cmd_lib::main]
 fn main() -> CmdResult {
     env_logger::Builder::new()
         .format(|buf, record| {
+            use std::io::Write;
             let timestamp = chrono::Local::now().format("%b %d %H:%M:%S").to_string();
             let process_name = std::env::current_exe()
                 .ok()
@@ -50,20 +52,18 @@ fn main() -> CmdResult {
     let build_info = format!("{}, build time: {}", main_build_info, build_timestamp);
     eprintln!("build info: {}", build_info);
 
-    generic_bootstrap()
-}
-
-fn generic_bootstrap() -> CmdResult {
-    let args: Vec<String> = std::env::args().collect();
-    let bucket_uri = args
-        .get(1)
-        .ok_or_else(|| io::Error::other("Usage: fractalbits-bootstrap <bucket_uri>"))?;
-
-    generic_bootstrap_with_bucket(bucket_uri)
+    let cli_args = CliArgs::parse();
+    generic_bootstrap_with_args(cli_args)
 }
 
 pub fn generic_bootstrap_with_bucket(bucket_uri: &str) -> CmdResult {
-    info!("Starting config-based bootstrap mode (bucket: {bucket_uri})");
+    let cli_args = CliArgs::parse_from(["fractalbits-bootstrap", bucket_uri]);
+    generic_bootstrap_with_args(cli_args)
+}
+
+fn generic_bootstrap_with_args(cli_args: CliArgs) -> CmdResult {
+    let bucket_uri = &cli_args.bucket_uri;
+    info!("Starting bootstrap (bucket: {bucket_uri})");
 
     let config = config::download_and_parse(bucket_uri)?;
 
@@ -73,23 +73,37 @@ pub fn generic_bootstrap_with_bucket(bucket_uri: &str) -> CmdResult {
     }
 
     let for_bench = config.global.for_bench;
-    let service_type = discover_service_type(&config)?;
+
+    // If --role is provided, use it directly (cloud deployments).
+    // Otherwise fall back to TOML-based discovery (on-prem / backward compat).
+    let service_type = if cli_args.role.is_some() {
+        info!("Using CLI-provided role: {:?}", cli_args.role);
+        discover_from_args(&cli_args)?
+    } else {
+        info!("No --role arg, falling back to TOML-based discovery");
+        discover_service_type(&config)?
+    };
 
     common_setup(config.global.deploy_target)?;
 
-    let service_name = match &service_type {
+    let service_name = match service_type {
         ServiceType::RootServer { is_leader } => {
-            root_server::bootstrap(&config, *is_leader, for_bench)?;
+            let nss_a_id = cli_args.nss_a_id.as_deref();
+            let nss_b_id = cli_args.nss_b_id.as_deref();
+            let nss_a_ip = cli_args.nss_a_ip.as_deref();
+            root_server::bootstrap(&config, is_leader, for_bench, nss_a_id, nss_b_id, nss_a_ip)?;
             "root_server"
         }
         ServiceType::NssServer {
             volume_id,
             journal_uuid,
+            is_standby,
         } => {
             nss_server::bootstrap(
                 &config,
                 volume_id.as_deref(),
                 journal_uuid.as_deref(),
+                is_standby,
                 for_bench,
             )?;
             "nss_server"
@@ -107,12 +121,23 @@ pub fn generic_bootstrap_with_bucket(bucket_uri: &str) -> CmdResult {
             "gui_server"
         }
         ServiceType::BenchServer { bench_client_num } => {
-            let api_endpoint = config
-                .endpoints
+            let api_endpoint = cli_args
                 .api_server_endpoint
-                .as_ref()
-                .ok_or_else(|| io::Error::other("api_server_endpoint not set in config"))?;
-            bench_server::bootstrap(&config, api_endpoint.clone(), *bench_client_num)?;
+                .as_deref()
+                .or_else(|| {
+                    config
+                        .endpoints
+                        .as_ref()
+                        .and_then(|e| e.api_server_endpoint.as_deref())
+                })
+                .ok_or_else(|| io::Error::other("api_server_endpoint not set"))?;
+            // Fall back to config.global.num_bench_clients when CLI arg not provided (0)
+            let actual_bench_client_num = if bench_client_num > 0 {
+                bench_client_num
+            } else {
+                config.global.num_bench_clients.unwrap_or(1)
+            };
+            bench_server::bootstrap(&config, api_endpoint.to_string(), actual_bench_client_num)?;
             "bench_server"
         }
         ServiceType::BenchClient => {

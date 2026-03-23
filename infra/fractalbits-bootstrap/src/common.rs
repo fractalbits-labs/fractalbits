@@ -8,7 +8,7 @@ use xtask_common::cloud_storage;
 // Re-exports from target-specific modules so callers don't need to change imports
 pub use crate::aws::{
     create_ena_irq_affinity_service, create_s3_express_bucket, ensure_ec2_metadata,
-    get_current_aws_az_id, get_current_aws_region, get_ec2_tag, get_s3_express_bucket_name,
+    get_current_aws_az_id, get_current_aws_region, get_s3_express_bucket_name,
 };
 pub use crate::etcd::get_etcd_endpoints;
 pub use crate::gcp::firestore_put_document;
@@ -91,10 +91,11 @@ fn download_binary(config: &BootstrapConfig, file_name: &str) -> CmdResult {
     let cpu_arch = run_fun!(arch)?;
 
     // Determine cloud path based on deploy target and binary type:
-    // - On-prem or use_generic_binaries: {bucket}/{arch}/{binary}
+    // - On-prem, GCP, or use_generic_binaries: {bucket}/{arch}/{binary}
     // - AWS shared binaries: {bucket}/{arch}/{binary}
     // - AWS CPU-specific binaries: {bucket}/{arch}/{cpu}/{binary}
     let cloud_path = if config.global.deploy_target == DeployTarget::OnPrem
+        || config.global.deploy_target == DeployTarget::Gcp
         || config.global.use_generic_binaries
         || SHARED_BINARIES.contains(&file_name)
     {

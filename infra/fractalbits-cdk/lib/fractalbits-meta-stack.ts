@@ -6,6 +6,7 @@ import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import * as TOML from "@iarna/toml";
 import {
   createEbsVolume,
+  attachEbsVolume,
   createEc2Asg,
   createInstance,
   createUserData,
@@ -66,8 +67,6 @@ export class FractalbitsMetaStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    const bootstrapUserData = createUserData(this);
-
     let targetIdOutput: cdk.CfnOutput;
 
     const buildMetaStackConfig = (nodeEntries: string[]): string => {
@@ -111,6 +110,7 @@ export class FractalbitsMetaStack extends cdk.Stack {
       const nssInstanceType = new ec2.InstanceType(
         props.nssInstanceType ?? "m7gd.2xlarge",
       );
+      const nssUserData = createUserData(this);
       const instance = createInstance(
         this,
         this.vpc,
@@ -121,15 +121,20 @@ export class FractalbitsMetaStack extends cdk.Stack {
         ec2Role,
         "al2023",
         undefined,
-        bootstrapUserData,
+        nssUserData,
       );
       const ebsVolume = createEbsVolume(
         this,
         "MultiAttachVolume",
         az,
-        instance.instanceId,
         20,
         10000,
+      );
+      attachEbsVolume(
+        this,
+        "MultiAttachVolume",
+        ebsVolume,
+        instance.instanceId,
       );
 
       const nodeEntries = [
@@ -170,6 +175,7 @@ export class FractalbitsMetaStack extends cdk.Stack {
         prune: false,
       });
 
+      const bssUserData = createUserData(this, "al2023", "--role bss_server");
       const bssAsg = createEc2Asg(
         this,
         "BssAsg",
@@ -182,7 +188,7 @@ export class FractalbitsMetaStack extends cdk.Stack {
         1,
         "bss_server",
         "al2023",
-        bootstrapUserData,
+        bssUserData,
       );
 
       targetIdOutput = new cdk.CfnOutput(this, "bssAsgName", {

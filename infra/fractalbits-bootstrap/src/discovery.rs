@@ -1,10 +1,9 @@
+use clap::Parser;
 use log::info;
 use std::io::Error;
 
-use crate::common::{get_current_aws_region, get_ec2_tag, get_instance_id};
-use crate::config::{BootstrapConfig, DeployTarget, InstanceConfig, JournalType};
-
-pub const SERVICE_TYPE_TAG: &str = "fractalbits:ServiceType";
+use crate::common::get_instance_id;
+use crate::config::{BootstrapConfig, InstanceConfig, JournalType};
 
 #[derive(Debug, Clone)]
 pub enum ServiceType {
@@ -14,6 +13,7 @@ pub enum ServiceType {
     NssServer {
         volume_id: Option<String>,
         journal_uuid: Option<String>,
+        is_standby: bool,
     },
     ApiServer,
     BssServer,
@@ -22,6 +22,87 @@ pub enum ServiceType {
         bench_client_num: usize,
     },
     BenchClient,
+}
+
+/// CLI arguments passed to fractalbits-bootstrap for cloud deployments.
+/// Each instance gets its role via `--role` (and optional sub-args) in UserData/startup-script.
+#[derive(Debug, Parser)]
+pub struct CliArgs {
+    /// Bucket URI (s3:// or gs://) — positional, always first
+    pub bucket_uri: String,
+
+    /// Service role: root_server, nss_server, api_server, bss_server, gui_server,
+    /// bench_server, bench_client
+    #[clap(long)]
+    pub role: Option<String>,
+
+    /// RSS sub-role: leader or follower (for root_server)
+    #[clap(long)]
+    pub rss_role: Option<String>,
+
+    /// NSS sub-role: primary or standby (for nss_server)
+    #[clap(long)]
+    pub nss_role: Option<String>,
+
+    /// EBS volume ID (for nss_server with EBS journal)
+    #[clap(long)]
+    pub volume_id: Option<String>,
+
+    /// Number of bench clients to connect (for bench_server)
+    #[clap(long)]
+    pub bench_client_count: Option<usize>,
+
+    /// NSS-A instance ID (for root_server leader — used to initialize observer state)
+    #[clap(long)]
+    pub nss_a_id: Option<String>,
+
+    /// NSS-B instance ID (for root_server leader — used to initialize observer state)
+    #[clap(long)]
+    pub nss_b_id: Option<String>,
+
+    /// NSS-A private IP (for root_server leader — injected via UserData so RSS config
+    /// has the correct nss_addr from the start, without needing a post-start update)
+    #[clap(long)]
+    pub nss_a_ip: Option<String>,
+
+    /// API server NLB endpoint (for bench_server — injected via UserData)
+    #[clap(long)]
+    pub api_server_endpoint: Option<String>,
+}
+
+/// Discover service type from CLI args (cloud deployments with `--role` arg).
+pub fn discover_from_args(args: &CliArgs) -> Result<ServiceType, Error> {
+    let role = args.role.as_deref().unwrap_or("");
+    info!("Discovering service type from CLI args: role={role:?}");
+
+    match role {
+        "root_server" => {
+            let is_leader = args.rss_role.as_deref().unwrap_or("leader") == "leader";
+            Ok(ServiceType::RootServer { is_leader })
+        }
+        "nss_server" => {
+            let is_standby = args.nss_role.as_deref().unwrap_or("primary") == "standby";
+            // journal_uuid is no longer per-node; it comes from config.global.journal_uuid
+            Ok(ServiceType::NssServer {
+                volume_id: args.volume_id.clone(),
+                journal_uuid: None, // read from config.global.journal_uuid at bootstrap time
+                is_standby,
+            })
+        }
+        "api_server" => Ok(ServiceType::ApiServer),
+        "bss_server" => Ok(ServiceType::BssServer),
+        "gui_server" => Ok(ServiceType::GuiServer),
+        "bench_server" => {
+            // bench_client_count defaults to 0 when not provided via CLI;
+            // main.rs falls back to config.global.num_bench_clients in that case
+            let bench_client_num = args.bench_client_count.unwrap_or(0);
+            Ok(ServiceType::BenchServer { bench_client_num })
+        }
+        "bench_client" => Ok(ServiceType::BenchClient),
+        _ => Err(Error::other(format!(
+            "Unknown --role value: {role:?}. Expected one of: root_server, nss_server, api_server, bss_server, gui_server, bench_server, bench_client"
+        ))),
+    }
 }
 
 pub fn discover_service_type(config: &BootstrapConfig) -> Result<ServiceType, Error> {
@@ -36,29 +117,10 @@ pub fn discover_service_type(config: &BootstrapConfig) -> Result<ServiceType, Er
         return parse_instance_config(config, &instance_config);
     }
 
-    // For on-prem and GCP, instance MUST be in TOML config (no EC2 tag fallback)
-    if config.global.deploy_target == DeployTarget::OnPrem
-        || config.global.deploy_target == DeployTarget::Gcp
-    {
-        return Err(Error::other(format!(
-            "Instance '{instance_id}' not found in config. Non-AWS targets require all instances in TOML."
-        )));
-    }
-
-    // AWS fallback: query EC2 tag
-    info!("Instance not in TOML config, querying EC2 tag: {SERVICE_TYPE_TAG}");
-    let region = get_current_aws_region()?;
-    let service_type_tag = get_ec2_tag(&instance_id, &region, SERVICE_TYPE_TAG)?;
-    info!("Found service type from EC2 tag: {service_type_tag}");
-
-    match service_type_tag.as_str() {
-        "api_server" => Ok(ServiceType::ApiServer),
-        "bss_server" => Ok(ServiceType::BssServer),
-        "bench_client" => Ok(ServiceType::BenchClient),
-        _ => Err(Error::other(format!(
-            "Unknown service type tag: {service_type_tag}"
-        ))),
-    }
+    // Instance must be in TOML config for all deploy targets
+    Err(Error::other(format!(
+        "Instance '{instance_id}' not found in bootstrap config. All instances must be listed in TOML."
+    )))
 }
 
 fn parse_instance_config(
@@ -87,9 +149,17 @@ fn parse_instance_config(
                     ));
                 }
             }
+            // Determine if this is the standby NSS node via resources (TOML path)
+            let resources = config.get_resources();
+            let is_standby = resources
+                .nss_b_id
+                .as_deref()
+                .map(|b| b == instance_config.id)
+                .unwrap_or(false);
             Ok(ServiceType::NssServer {
                 volume_id,
                 journal_uuid,
+                is_standby,
             })
         }
         "api_server" => Ok(ServiceType::ApiServer),

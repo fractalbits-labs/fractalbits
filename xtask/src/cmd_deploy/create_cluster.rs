@@ -200,6 +200,7 @@ impl InputClusterConfig {
             workflow_cluster_id: Some(cluster_id),
             meta_stack_testing: false,
             use_generic_binaries: true,
+            journal_uuid: None,
         };
 
         let nss_endpoint = self
@@ -226,7 +227,11 @@ impl InputClusterConfig {
             });
 
         let endpoints = ClusterEndpointsConfig {
-            nss_endpoint,
+            nss_endpoint: if nss_endpoint.is_empty() {
+                None
+            } else {
+                Some(nss_endpoint)
+            },
             api_server_endpoint,
         };
 
@@ -294,7 +299,7 @@ impl InputClusterConfig {
             global,
             aws: None,
             gcp: None,
-            endpoints,
+            endpoints: Some(endpoints),
             resources,
             etcd,
             nodes,

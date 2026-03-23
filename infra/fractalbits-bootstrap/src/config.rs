@@ -2,9 +2,7 @@ use cmd_lib::*;
 use std::io::Error;
 use std::time::{Duration, Instant};
 
-use crate::common::{
-    BOOTSTRAP_CLUSTER_CONFIG, ETC_PATH, ensure_aws_cli, ensure_ec2_metadata, get_instance_id,
-};
+use crate::common::{BOOTSTRAP_CLUSTER_CONFIG, ETC_PATH, ensure_aws_cli, ensure_ec2_metadata};
 
 // Re-export types from xtask_common
 pub use xtask_common::{
@@ -18,8 +16,9 @@ pub type EtcdConfig = ClusterEtcdConfig;
 pub type InstanceConfig = ClusterNodeConfig;
 
 // CDK VPC deploy can take 10-15 minutes, and instances start booting during CDK deploy.
-// Give enough time for CDK to finish and xtask to upload the config with instance IDs.
-const CONFIG_RETRY_TIMEOUT_SECS: u64 = 900;
+// With pre-deploy TOML upload, this should be much shorter — but keep a generous timeout
+// as a safety net for slow S3 propagation or network issues.
+const CONFIG_RETRY_TIMEOUT_SECS: u64 = 600;
 
 /// Download and parse bootstrap config from cloud storage.
 /// `bucket_uri` is a full URI like `s3://bucket-name` or `gs://bucket-name`.
@@ -34,7 +33,7 @@ pub fn download_and_parse(bucket_uri: &str) -> Result<BootstrapClusterConfig, Er
     let start_time = Instant::now();
     let timeout = Duration::from_secs(CONFIG_RETRY_TIMEOUT_SECS);
     loop {
-        // Retry download if the file doesn't exist yet (race condition with CDK deployment)
+        // Retry download if the file doesn't exist yet (race condition with deploy)
         match cloud_storage::download_file(&cloud_path, &local_path) {
             Ok(_) => {}
             Err(e) => {
@@ -56,21 +55,8 @@ pub fn download_and_parse(bucket_uri: &str) -> Result<BootstrapClusterConfig, Er
         if config.global.deploy_target == DeployTarget::Aws {
             ensure_ec2_metadata()?;
         }
-        let instance_id = get_instance_id(config.global.deploy_target)?;
 
-        if config.contains_instance(&instance_id) {
-            info!("Found instance {instance_id} in bootstrap config");
-            return Ok(config);
-        }
-
-        if start_time.elapsed() > timeout {
-            info!(
-                "Instance {instance_id} not in config after {CONFIG_RETRY_TIMEOUT_SECS}s, proceeding anyway"
-            );
-            return Ok(config);
-        }
-
-        info!("Instance {instance_id} not yet in config, waiting 5s and retrying...");
-        std::thread::sleep(Duration::from_secs(5));
+        info!("Bootstrap config downloaded successfully");
+        return Ok(config);
     }
 }
