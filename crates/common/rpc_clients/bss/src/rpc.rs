@@ -1,10 +1,12 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client::RpcClient;
-use bss_codec::{Command, MessageHeader};
+use bss_codec::{Command, ListBlobsRequest, ListBlobsResponse, MessageHeader, list_blobs_response};
 use bytes::Bytes;
 use data_types::{DataBlobGuid, TraceId};
-use rpc_client_common::{InflightRpcGuard, RpcError};
+use prost::Message as PbMessage;
+use rpc_client_common::{InflightRpcGuard, RpcError, encode_protobuf};
 use rpc_codec_common::MessageFrame;
 use tracing::error;
 
@@ -36,7 +38,121 @@ fn check_response_errno(header: &MessageHeader) -> Result<(), RpcError> {
     }
 }
 
+fn parse_list_blobs_response(
+    resp: ListBlobsResponse,
+) -> Result<list_blobs_response::Blobs, RpcError> {
+    match resp.result {
+        Some(list_blobs_response::Result::Ok(blobs)) => Ok(blobs),
+        Some(list_blobs_response::Result::Err(err)) => Err(RpcError::InternalResponseError(err)),
+        None => Err(RpcError::InternalResponseError(
+            "BSS ListBlobs response missing result".to_string(),
+        )),
+    }
+}
+
+pub struct BlobListStream {
+    client: Arc<RpcClient>,
+    volume_id: u16,
+    prefix: String,
+    marker: String,
+    max_keys: u32,
+    done: bool,
+}
+
+impl BlobListStream {
+    pub fn new(
+        client: Arc<RpcClient>,
+        volume_id: u16,
+        prefix: impl Into<String>,
+        start_after: impl Into<String>,
+        max_keys: u32,
+    ) -> Self {
+        Self {
+            client,
+            volume_id,
+            prefix: prefix.into(),
+            marker: start_after.into(),
+            max_keys,
+            done: false,
+        }
+    }
+
+    pub async fn next_batch(
+        &mut self,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<Option<list_blobs_response::Blobs>, RpcError> {
+        if self.done {
+            return Ok(None);
+        }
+
+        let page = self
+            .client
+            .list_data_blobs(
+                self.volume_id,
+                &self.prefix,
+                &self.marker,
+                self.max_keys,
+                timeout,
+                trace_id,
+                retry_count,
+            )
+            .await?;
+
+        if let Some(last) = page.blobs.last() {
+            self.marker = last.key.clone();
+        }
+        self.done = !page.has_more;
+        Ok(Some(page))
+    }
+}
+
 impl RpcClient {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_data_blobs(
+        &self,
+        volume_id: u16,
+        prefix: &str,
+        start_after: &str,
+        max_keys: u32,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<list_blobs_response::Blobs, RpcError> {
+        let _guard = InflightRpcGuard::new("bss", "list_data_blobs");
+        let body = ListBlobsRequest {
+            max_keys,
+            prefix: prefix.to_string(),
+            start_after: start_after.to_string(),
+        };
+
+        let mut header = MessageHeader::default();
+        let request_id = self.gen_request_id();
+        header.id = request_id;
+        header.command = Command::ListBlobs;
+        header.volume_id = volume_id;
+        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
+        header.retry_count = retry_count as u8;
+        header.trace_id = trace_id.0;
+
+        let body_bytes = encode_protobuf(body, trace_id)?;
+        header.set_body_checksum(&body_bytes);
+
+        let msg_frame = MessageFrame::new(header, body_bytes);
+        let resp_frame = self.send_request(msg_frame, timeout, None).await.map_err(|e| {
+            if !e.retryable() {
+                error!(rpc=%"list_data_blobs", %request_id, %volume_id, %prefix, error=?e, "bss rpc failed");
+            }
+            e
+        })?;
+        check_response_errno(&resp_frame.header)?;
+
+        let resp: ListBlobsResponse =
+            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        parse_list_blobs_response(resp)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn put_data_blob(
         &self,
@@ -188,5 +304,27 @@ impl RpcClient {
             })?;
         check_response_errno(&resp_frame.header)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlobListStream;
+    use crate::client::RpcClient;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn blob_list_stream_tracks_done_for_empty_terminal_page() {
+        let client = Arc::new(RpcClient::new_from_address(
+            "127.0.0.1:1".to_string(),
+            Duration::from_secs(1),
+        ));
+        let stream = BlobListStream::new(client, 1, "/d1/", "", 1000);
+
+        assert_eq!(stream.marker, "");
+        assert!(!stream.done);
+        assert_eq!(stream.prefix, "/d1/");
+        assert_eq!(stream.max_keys, 1000);
     }
 }

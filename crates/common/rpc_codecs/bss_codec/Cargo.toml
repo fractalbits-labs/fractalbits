@@ -10,3 +10,7 @@ bytes.workspace = true
 bytemuck.workspace = true
 data_types.workspace = true
 xxhash-rust.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true

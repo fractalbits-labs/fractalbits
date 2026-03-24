@@ -17,6 +17,7 @@ rpc_client_common.workspace = true
 bss_codec.workspace = true
 rpc_codec_common.workspace = true
 data_types.workspace = true
+prost.workspace = true
 
 [dev-dependencies]
 tracing-test.workspace = true
