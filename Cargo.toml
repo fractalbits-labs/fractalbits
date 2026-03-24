@@ -36,6 +36,7 @@ exclude = [
     "crates/fractal-s3/src",
     "crates/ha/multi_az/src",
     "crates/ha/multi_az/data_blob_resync_server/src",
+    "crates/ha/bss_repair/src",
     "crates/ha/nss_role_agent/src",
     "crates/ha/src",
     "crates/ha/.git",
@@ -156,4 +157,3 @@ indicatif = "0.18"
 
 # Build dependencies
 prost-build = "0.14"
-
