@@ -11,7 +11,8 @@ use super::super::common::{
 use super::super::upload;
 use super::config_gen;
 
-pub fn create_vpc(config: VpcConfig) -> CmdResult {
+pub fn create_vpc(mut config: VpcConfig) -> CmdResult {
+    apply_template_defaults(&mut config);
     // 1. Upload binaries directly to AWS S3
     let aws_bucket = get_bootstrap_bucket_name(DeployTarget::Aws)?;
     if !config.skip_upload {
@@ -142,6 +143,7 @@ fn build_cdk_context(config: &VpcConfig) -> Vec<String> {
     add("numBenchClients", config.num_bench_clients.to_string());
     add("numBssNodes", config.num_bss_nodes.to_string());
     add("bssInstanceTypes", config.bss_instance_type.clone());
+    add("nssInstanceType", config.nss_instance_type.clone());
     add(
         "apiServerInstanceType",
         config.api_server_instance_type.clone(),
@@ -150,11 +152,10 @@ fn build_cdk_context(config: &VpcConfig) -> Vec<String> {
         "benchClientInstanceType",
         config.bench_client_instance_type.clone(),
     );
+    add("ebsVolumeSize", config.ebs_volume_size.to_string());
+    add("ebsVolumeIops", config.ebs_volume_iops.to_string());
     if config.with_bench {
         add("benchType", "external".to_string());
-    }
-    if let Some(ref template_val) = config.template {
-        add("vpcTemplate", template_val.as_ref().to_string());
     }
     if let Some(ref az_val) = config.az {
         add("az", az_val.clone());
@@ -170,6 +171,36 @@ fn build_cdk_context(config: &VpcConfig) -> Vec<String> {
     add("deployOS", config.deploy_os.as_ref().to_string());
 
     params
+}
+
+/// Apply template defaults to VpcConfig fields before CDK deploy.
+/// Templates are shortcuts that set a group of related fields to preset values.
+/// Applying them in Rust ensures the resolved values are used for TOML generation
+/// and passed explicitly to CDK, rather than having CDK derive them independently.
+fn apply_template_defaults(config: &mut VpcConfig) {
+    use crate::VpcTemplate;
+    match config.template {
+        Some(VpcTemplate::Mini) => {
+            config.nss_instance_type = "r7g.xlarge".to_string();
+            config.bss_instance_type = "i8g.xlarge".to_string();
+            config.ebs_volume_size = 5;
+            config.ebs_volume_iops = 1000;
+            config.root_server_ha = false;
+            config.num_api_servers = 1;
+            config.num_bss_nodes = 1;
+            config.num_bench_clients = 1;
+        }
+        Some(VpcTemplate::PerfDemo) => {
+            config.nss_instance_type = "r7g.4xlarge".to_string();
+            config.ebs_volume_size = 20;
+            config.ebs_volume_iops = 10000;
+            config.root_server_ha = true;
+            config.num_api_servers = 14;
+            config.num_bss_nodes = 6;
+            config.num_bench_clients = 42;
+        }
+        None => {}
+    }
 }
 
 fn cleanup_bootstrap_bucket() -> CmdResult {
