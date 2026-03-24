@@ -19,6 +19,16 @@ fn check_response_errno(header: &MessageHeader) -> Result<(), RpcError> {
         2 => Err(RpcError::NotFound),
         3 => Err(RpcError::ChecksumMismatch), // Corrupted
         4 => Err(RpcError::Retry),            // SlowDown
+        5 => Err(RpcError::InternalResponseError(
+            "BSS returned ShutDown".to_string(),
+        )),
+        6 => Err(RpcError::InternalResponseError(
+            "BSS returned TokenExpired".to_string(),
+        )),
+        7 => Err(RpcError::InternalResponseError(
+            "BSS returned DeviceMismatch".to_string(),
+        )),
+        8 => Ok(()), // VersionSkipped: write skipped due to version check (not an error)
         code => Err(RpcError::InternalResponseError(format!(
             "Unknown BSS error code: {}",
             code

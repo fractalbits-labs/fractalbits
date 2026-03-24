@@ -54,11 +54,14 @@ pub struct MessageHeader {
     pub is_new: u8,
     /// Flag to indicate whether this blob is deleted
     pub is_deleted: u8,
+    /// Padding for fence_token alignment
+    pub reserve0: [u8; 2],
+    /// Fence token for fencing stale NSS instances
+    pub fence_token: u64,
     /// Reserved parts for padding
-    /// TODO: will add device id, fence_token, nss-active-id, for meta-blob use
-    pub reserved2: [u8; 2],
-    pub reserved1: [u8; 32],
-    pub reserved0: [u8; 32],
+    /// TODO: will add device_id, nss-active-id, for meta-blob use
+    pub reserve1: [u8; 24],
+    pub reserve2: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -109,15 +112,17 @@ impl Default for MessageHeader {
             retry_count: 0,
             is_new: 0,
             is_deleted: 0,
-            reserved2: [0u8; 2],
-            reserved1: [0u8; 32],
-            reserved0: [0u8; 32],
+            reserve0: [0u8; 2],
+            fence_token: 0,
+            reserve1: [0u8; 24],
+            reserve2: [0u8; 32],
         }
     }
 }
 
 impl MessageHeader {
     const _SIZE_OK: () = assert!(size_of::<Self>() == 160);
+    const _FENCE_TOKEN_OFFSET_OK: () = assert!(std::mem::offset_of!(Self, fence_token) == 96);
     pub const PROTO_VERSION: u8 = 1;
 
     /// Calculate and set the body checksum field.
