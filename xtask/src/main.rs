@@ -263,7 +263,7 @@ pub enum DeployCommand {
     #[clap(about = "Upload prebuilt binaries to s3 builds bucket")]
     Upload {
         #[clap(long, value_enum, default_value = "aws")]
-        deploy_target: DeployTarget,
+        target: DeployTarget,
     },
 
     #[clap(about = "Create VPC infrastructure (AWS via CDK, GCP via Terraform)")]
@@ -274,7 +274,7 @@ pub enum DeployCommand {
             long_help = "Cloud provider (aws or gcp)",
             default_value = "aws"
         )]
-        provider: CloudProvider,
+        target: CloudProvider,
 
         #[clap(
             long,
@@ -387,7 +387,7 @@ pub enum DeployCommand {
             long_help = "Cloud provider (aws or gcp)",
             default_value = "aws"
         )]
-        provider: CloudProvider,
+        target: CloudProvider,
 
         #[clap(long, long_help = "GCP project ID (overrides GCP_PROJECT_ID env var)")]
         gcp_project: Option<String>,
@@ -408,7 +408,7 @@ pub enum DeployCommand {
     #[clap(about = "Show bootstrap progress for a cluster deployment")]
     BootstrapProgress {
         #[clap(long, value_enum, default_value = "aws")]
-        deploy_target: DeployTarget,
+        target: DeployTarget,
         #[clap(long, long_help = "GCP project ID (overrides GCP_PROJECT_ID env var)")]
         gcp_project: Option<String>,
     },
@@ -908,9 +908,9 @@ async fn main() -> CmdResult {
                 zig_extra_build,
                 api_server_build_env,
             } => cmd_deploy::build(target, release, &zig_extra_build, &api_server_build_env)?,
-            DeployCommand::Upload { deploy_target } => cmd_deploy::upload(deploy_target)?,
+            DeployCommand::Upload { target } => cmd_deploy::upload(target)?,
             DeployCommand::CreateVpc {
-                provider,
+                target,
                 template,
                 num_api_servers,
                 num_bench_clients,
@@ -956,33 +956,30 @@ async fn main() -> CmdResult {
                     gcp_project,
                     gcp_zone,
                 };
-                match provider {
+                match target {
                     CloudProvider::Aws => cmd_deploy::aws::create_vpc(vpc_config)?,
                     CloudProvider::Gcp => cmd_deploy::gcp::create_vpc(vpc_config)?,
                 }
             }
             DeployCommand::DestroyVpc {
-                provider,
+                target,
                 gcp_project,
                 gcp_zone,
                 delete_project,
-            } => match provider {
+            } => match target {
                 CloudProvider::Aws => cmd_deploy::aws::destroy_vpc()?,
                 CloudProvider::Gcp => {
                     cmd_deploy::gcp::destroy_vpc(gcp_project, gcp_zone, delete_project)?
                 }
             },
             DeployCommand::BootstrapProgress {
-                deploy_target,
+                target,
                 gcp_project,
-            } => match deploy_target {
+            } => match target {
                 DeployTarget::Aws => {
                     cmd_deploy::bootstrap_progress::show_progress_from_cdk_outputs()?
                 }
-                _ => cmd_deploy::bootstrap_progress::show_progress(
-                    deploy_target,
-                    gcp_project.as_deref(),
-                )?,
+                _ => cmd_deploy::bootstrap_progress::show_progress(target, gcp_project.as_deref())?,
             },
             DeployCommand::CreateCluster {
                 config,
