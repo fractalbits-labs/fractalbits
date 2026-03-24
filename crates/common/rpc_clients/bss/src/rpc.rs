@@ -268,7 +268,13 @@ impl RpcClient {
             })?;
         check_response_errno(&resp_frame.header)?;
         *body = resp_frame.body;
-        assert_eq!(content_len, body.len());
+        if content_len != body.len() {
+            return Err(RpcError::InternalResponseError(format!(
+                "BSS returned body length {} but client expected {}",
+                body.len(),
+                content_len
+            )));
+        }
         Ok(())
     }
 
