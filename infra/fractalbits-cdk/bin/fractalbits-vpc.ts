@@ -36,13 +36,13 @@ if (metaStackContext) {
   new cdk.Stack(app, "FractalbitsMetaStack", { env });
 }
 
-// Get template type to determine default configurations
-const vpcTemplate = app.node.tryGetContext("vpcTemplate") ?? null;
-
-// Get context values (may be overridden by template)
+// All template defaults are resolved in Rust (xtask vpc.rs) before CDK is invoked.
+// Context values here are the final resolved values passed explicitly from Rust.
 const benchType = app.node.tryGetContext("benchType") ?? null;
-let bssInstanceTypes =
+const bssInstanceTypes =
   app.node.tryGetContext("bssInstanceTypes") ?? "i8g.2xlarge";
+const nssInstanceType =
+  app.node.tryGetContext("nssInstanceType") ?? "r7g.4xlarge";
 const apiServerInstanceType =
   app.node.tryGetContext("apiServerInstanceType") ?? "c8g.xlarge";
 const benchClientInstanceType =
@@ -53,34 +53,13 @@ const rssBackend = app.node.tryGetContext("rssBackend") ?? "ddb";
 const journalType = app.node.tryGetContext("journalType") ?? "ebs";
 const browserIp = app.node.tryGetContext("browserIp") ?? null;
 // Note: Context values from CLI are always strings, so convert to numbers
-let numApiServers = Number(app.node.tryGetContext("numApiServers")) || 1;
-let numBenchClients = Number(app.node.tryGetContext("numBenchClients")) || 1;
-let numBssNodes = Number(app.node.tryGetContext("numBssNodes")) || 1;
-let ebsVolumeIops = Number(app.node.tryGetContext("ebsVolumeIops")) || 10000;
-let ebsVolumeSize = Number(app.node.tryGetContext("ebsVolumeSize")) || 20;
-let rootServerHa = app.node.tryGetContext("rootServerHa") || false;
+const numApiServers = Number(app.node.tryGetContext("numApiServers")) || 1;
+const numBenchClients = Number(app.node.tryGetContext("numBenchClients")) || 1;
+const numBssNodes = Number(app.node.tryGetContext("numBssNodes")) || 1;
+const ebsVolumeIops = Number(app.node.tryGetContext("ebsVolumeIops")) || 10000;
+const ebsVolumeSize = Number(app.node.tryGetContext("ebsVolumeSize")) || 20;
+const rootServerHa = app.node.tryGetContext("rootServerHa") || false;
 const deployOS = (app.node.tryGetContext("deployOS") ?? "al2023") as DeployOS;
-
-// Configure based on template type
-let nssInstanceType = "r7g.4xlarge";
-if (vpcTemplate === "mini") {
-  nssInstanceType = "r7g.xlarge";
-  bssInstanceTypes = "i8g.xlarge";
-  ebsVolumeSize = 5;
-  ebsVolumeIops = 1000;
-  rootServerHa = false;
-  numApiServers = 1;
-  numBssNodes = 1;
-  numBenchClients = 1;
-} else if (vpcTemplate === "perf_demo") {
-  nssInstanceType = "r7g.4xlarge";
-  ebsVolumeSize = 20;
-  ebsVolumeIops = 10000;
-  rootServerHa = true;
-  numApiServers = 14;
-  numBssNodes = 6;
-  numBenchClients = 42;
-}
 
 // Determine default AZ based on deployment mode and region
 // For single-AZ modes: single AZ ID (e.g., "usw2-az3")

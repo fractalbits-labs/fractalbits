@@ -298,6 +298,9 @@ pub enum DeployCommand {
         #[clap(long, long_help = "BSS instance type", default_value = "i8g.2xlarge")]
         bss_instance_type: String,
 
+        #[clap(long, long_help = "NSS instance type", default_value = "r7g.4xlarge")]
+        nss_instance_type: String,
+
         #[clap(
             long,
             long_help = "API server instance type",
@@ -336,6 +339,12 @@ pub enum DeployCommand {
             default_value = "ebs"
         )]
         journal_type: JournalType,
+
+        #[clap(long, long_help = "EBS volume size in GiB", default_value = "20")]
+        ebs_volume_size: u32,
+
+        #[clap(long, long_help = "EBS volume IOPS", default_value = "10000")]
+        ebs_volume_iops: u32,
 
         #[clap(long, long_help = "Watch bootstrap progress inline after VPC creation")]
         watch_bootstrap: bool,
@@ -908,12 +917,15 @@ async fn main() -> CmdResult {
                 num_bss_nodes,
                 with_bench,
                 bss_instance_type,
+                nss_instance_type,
                 api_server_instance_type,
                 bench_client_instance_type,
                 az,
                 root_server_ha,
                 rss_backend,
                 journal_type,
+                ebs_volume_size,
+                ebs_volume_iops,
                 watch_bootstrap,
                 skip_upload,
                 use_generic_binaries,
@@ -928,12 +940,15 @@ async fn main() -> CmdResult {
                     num_bss_nodes,
                     with_bench,
                     bss_instance_type,
+                    nss_instance_type,
                     api_server_instance_type,
                     bench_client_instance_type,
                     az,
                     root_server_ha,
                     rss_backend,
                     journal_type,
+                    ebs_volume_size,
+                    ebs_volume_iops,
                     watch_bootstrap,
                     skip_upload,
                     use_generic_binaries,
