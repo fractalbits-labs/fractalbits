@@ -1,4 +1,5 @@
 pub mod bss_node_failure;
+pub mod bss_repair;
 pub mod fs_server;
 pub mod leader_election;
 pub mod multi_az;
@@ -113,6 +114,22 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         result
     };
 
+    let test_bss_repair = || async {
+        cmd_service::init_service(
+            ServiceName::All,
+            BuildMode::Debug,
+            &InitConfig {
+                data_blob_storage: DataBlobStorage::AllInBssSingleAz,
+                bss_count: 6,
+                ..Default::default()
+            },
+        )?;
+        cmd_service::start_service(ServiceName::All)?;
+        let result = bss_repair::run_bss_repair_tests().await;
+        cmd_service::stop_service(ServiceName::All)?;
+        result
+    };
+
     // prepare
     cmd_service::stop_service(ServiceName::All)?;
     cmd_build::build_rust_servers(BuildMode::Debug)?;
@@ -120,6 +137,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         TestType::MultiAz { subcommand } => multi_az::run_multi_az_tests(subcommand).await,
         TestType::LeaderElection => test_leader_election(),
         TestType::BssNodeFailure => test_bss_node_failure().await,
+        TestType::BssRepair => test_bss_repair().await,
         TestType::NssHaWithMirrord => test_nss_ha_with_mirrord().await,
         TestType::NssHaWithEBS => test_nss_ha_with_ebs().await,
         TestType::FsServer {
@@ -135,6 +153,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         }
         TestType::All => {
             test_leader_election()?;
+            test_bss_repair().await?;
             multi_az::run_multi_az_tests(MultiAzTestType::All).await?;
             test_fs_server(true, true, false).await
         }

@@ -683,6 +683,7 @@ pub enum TestType {
     },
     LeaderElection,
     BssNodeFailure,
+    BssRepair,
     NssHaWithMirrord,
     NssHaWithEBS,
     FsServer {
