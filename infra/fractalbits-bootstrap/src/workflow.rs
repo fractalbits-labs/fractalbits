@@ -396,13 +396,13 @@ pub use xtask_common::stages;
 #[allow(dead_code)]
 pub mod timeouts {
     pub const INSTANCES_READY: u64 = 120;
-    pub const ETCD_READY: u64 = 300;
-    pub const RSS_INITIALIZED: u64 = 300;
-    pub const METADATA_VG_READY: u64 = 300;
-    pub const NSS_FORMATTED: u64 = 300;
+    pub const ETCD_READY: u64 = 600;
+    pub const RSS_INITIALIZED: u64 = 600;
+    pub const METADATA_VG_READY: u64 = 600;
+    pub const NSS_FORMATTED: u64 = 600;
     pub const MIRRORD_READY: u64 = 120;
-    pub const NSS_JOURNAL_READY: u64 = 360;
-    pub const BSS_CONFIGURED: u64 = 300;
+    pub const NSS_JOURNAL_READY: u64 = 600;
+    pub const BSS_CONFIGURED: u64 = 600;
     pub const SERVICES_READY: u64 = 60;
 }
 
