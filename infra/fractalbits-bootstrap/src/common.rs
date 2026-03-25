@@ -444,10 +444,10 @@ pub fn format_local_nvme_disks(support_storage_twp: bool) -> CmdResult {
 pub fn create_mount_unit(what: &str, mount_point: &str, fs_type: &str) -> CmdResult {
     let mount_options = match fs_type {
         "xfs" => {
-            "defaults,nofail,noatime,nodiratime,logbufs=8,logbsize=256k,allocsize=1m,largeio,inode64"
+            "defaults,nofail,noatime,nodiratime,lazytime,logbufs=8,logbsize=256k,allocsize=1m,largeio,inode64"
         }
         "ext4" => {
-            "defaults,nofail,noatime,nodiratime,nobarrier,data=ordered,journal_checksum,delalloc,dioread_nolock"
+            "defaults,nofail,noatime,nodiratime,lazytime,nobarrier,data=ordered,journal_checksum,delalloc,dioread_nolock"
         }
         _ => "defaults,nofail",
     };
@@ -569,6 +569,12 @@ vm.dirty_background_ratio = 5
 vm.dirty_ratio = 10
 # Reduce swapping to keep more file cache in memory (default: 60)
 vm.swappiness = 10
+# Disable periodic dirty-inode (lazytime timestamp) writeback.
+# With lazytime mount option, timestamps are only written to the journal when
+# the inode is flushed for another reason (e.g. fsync, data write), eliminating
+# journal commits that exist solely to record atime/mtime/ctime.
+# Requires kernel >= 6.19 (https://lkml.org/lkml/2026/1/2/673).
+#vm.dirtytime_expire_seconds = 0
 "##;
 
     run_cmd! {

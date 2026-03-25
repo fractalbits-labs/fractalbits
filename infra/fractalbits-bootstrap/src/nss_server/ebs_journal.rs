@@ -28,7 +28,7 @@ pub(crate) fn format_internal(ebs_dev: &str, journal_uuid: &str) -> CmdResult {
 
         info "Mounting $ebs_dev to $mount_point";
         mkdir -p $mount_point;
-        mount $ebs_dev $mount_point;
+        mount -o noatime,nodiratime,lazytime $ebs_dev $mount_point;
 
         info "Creating journal directory at $journal_dir";
         mkdir -p $journal_dir;
