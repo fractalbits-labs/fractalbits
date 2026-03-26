@@ -113,7 +113,7 @@ enum Cmd {
     #[command(subcommand)]
     Tools(ToolKind),
 
-    #[clap(about = "Deploy binaries to s3 builds bucket")]
+    #[clap(about = "Deploy and manage cloud infrastructure")]
     #[clap(subcommand)]
     Deploy(DeployCommand),
 

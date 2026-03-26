@@ -96,7 +96,7 @@ pub fn head_object(bucket: &str, key: &str, target: DeployTarget) -> bool {
             let gs_path = format!("gs://{bucket}/{key}");
             run_cmd!(gcloud storage ls $gs_path 2>/dev/null).is_ok()
         }
-        _ => run_cmd!(aws s3api head-object --bucket $bucket --key $key 2>/dev/null).is_ok(),
+        _ => run_cmd!(aws s3api head-object --bucket $bucket --key $key &>/dev/null).is_ok(),
     }
 }
 
@@ -123,7 +123,7 @@ pub fn delete_object(bucket: &str, key: &str, target: DeployTarget) -> CmdResult
         }
         _ => {
             let s3_path = format!("s3://{bucket}/{key}");
-            run_cmd!(aws s3 rm $s3_path)
+            run_cmd!(aws s3 rm $s3_path &>/dev/null)
         }
     }
 }
