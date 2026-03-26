@@ -194,6 +194,7 @@ impl InputClusterConfig {
             rss_ha_enabled: self.global.rss_ha_enabled,
             rss_backend: RssBackend::Etcd,
             journal_type: JournalType::Nvme,
+            num_nss_nodes: None, // derived from populated nodes map at blueprint time
             num_bss_nodes: Some(self.global.num_bss_nodes),
             num_api_servers: self.global.num_api_servers,
             num_bench_clients: self.global.num_bench_clients,

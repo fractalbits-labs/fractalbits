@@ -60,6 +60,7 @@ pub fn generate_bootstrap_config(vpc_config: &VpcConfig) -> Result<BootstrapClus
             rss_ha_enabled: vpc_config.root_server_ha,
             rss_backend: to_common_rss_backend(vpc_config.rss_backend),
             journal_type: to_common_journal_type(vpc_config.journal_type),
+            num_nss_nodes: Some(2), // CDK always creates nss-A and nss-B unconditionally
             num_bss_nodes: Some(vpc_config.num_bss_nodes as usize),
             num_api_servers: Some(vpc_config.num_api_servers as usize),
             num_bench_clients: if vpc_config.with_bench {

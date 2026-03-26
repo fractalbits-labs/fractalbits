@@ -48,7 +48,10 @@ pub struct StageBlueprint {
 /// Generate a stage blueprint from a bootstrap cluster config
 pub fn generate_blueprint(config: &BootstrapClusterConfig) -> StageBlueprint {
     let num_bss = config.global.num_bss_nodes.unwrap_or(1);
-    let num_nss = config.nodes.get("nss_server").map(|v| v.len()).unwrap_or(1);
+    let num_nss = config
+        .global
+        .num_nss_nodes
+        .unwrap_or_else(|| config.nodes.get("nss_server").map(|v| v.len()).unwrap_or(1));
     let num_rss = if config.global.rss_ha_enabled { 2 } else { 1 };
     let num_api = config
         .global
@@ -225,6 +228,8 @@ pub struct ClusterGlobalConfig {
     pub rss_backend: RssBackend,
     #[serde(default)]
     pub journal_type: JournalType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_nss_nodes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_bss_nodes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
