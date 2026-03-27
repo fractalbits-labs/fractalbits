@@ -12,7 +12,7 @@ resource "google_compute_subnetwork" "private_a" {
 }
 
 resource "google_compute_subnetwork" "private_b" {
-  count                    = local.is_ha ? 1 : 0
+  count                    = local.rss_ha_enabled ? 1 : 0
   name                     = "fractalbits-private-b-${var.cluster_id}"
   ip_cidr_range            = "10.0.2.0/24"
   region                   = var.region
@@ -50,7 +50,7 @@ resource "google_compute_firewall" "internal" {
   source_tags = ["fractalbits-private"]
   source_ranges = compact([
     google_compute_subnetwork.private_a.ip_cidr_range,
-    local.is_ha ? google_compute_subnetwork.private_b[0].ip_cidr_range : null,
+    local.rss_ha_enabled ? google_compute_subnetwork.private_b[0].ip_cidr_range : null,
   ])
   target_tags = ["fractalbits-private"]
 }

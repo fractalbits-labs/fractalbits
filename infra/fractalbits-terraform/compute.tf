@@ -31,7 +31,7 @@ resource "google_compute_instance" "rss_a" {
     rss-backend   = var.rss_backend
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
-      role_args  = "--role root_server --rss-role leader --nss-a-ip ${google_compute_instance.nss_a.network_interface[0].network_ip} --nss-a-id nss-a-${var.cluster_id}${local.is_ha ? " --nss-b-id nss-b-${var.cluster_id}" : ""}"
+      role_args  = "--role root_server --rss-role leader --nss-a-ip ${google_compute_instance.nss_a.network_interface[0].network_ip} --nss-a-id nss-a-${var.cluster_id} --nss-b-id nss-b-${var.cluster_id}"
     })
   }
 
@@ -55,7 +55,7 @@ resource "google_compute_instance" "rss_a" {
 
 # RSS-B (Root Storage Server - follower, HA only)
 resource "google_compute_instance" "rss_b" {
-  count        = local.is_ha ? 1 : 0
+  count        = local.rss_ha_enabled ? 1 : 0
   name         = "rss-b-${var.cluster_id}"
   machine_type = var.rss_machine_type
   zone         = var.zone_b
@@ -68,7 +68,7 @@ resource "google_compute_instance" "rss_b" {
   }
 
   network_interface {
-    subnetwork = local.is_ha ? google_compute_subnetwork.private_b[0].id : google_compute_subnetwork.private_a.id
+    subnetwork = local.rss_ha_enabled ? google_compute_subnetwork.private_b[0].id : google_compute_subnetwork.private_a.id
   }
 
   metadata = {
@@ -121,12 +121,14 @@ resource "google_compute_instance" "nss_a" {
     }
   }
 
-  # Attach PD journal disk (if using pd_ssd journal type)
+  # Attach shared PD journal disk (if using pd_ssd journal type)
   dynamic "attached_disk" {
     for_each = var.journal_type == "pd_ssd" ? [1] : []
     content {
-      source      = google_compute_disk.nss_journal_a[0].id
+      source      = google_compute_disk.nss_journal[0].id
       device_name = "nss-journal"
+      # Multi-writer is set on the disk itself (access_mode=READ_WRITE_MANY).
+      # The attached_disk mode must be READ_WRITE (not READ_WRITE_MANY).
       mode        = "READ_WRITE"
     }
   }
@@ -163,12 +165,12 @@ resource "google_compute_instance" "nss_a" {
   ]
 }
 
-# NSS-B (Namespace Server - standby, HA only)
+# NSS-B (Namespace Server - standby, same zone as NSS-A, shares journal disk)
 resource "google_compute_instance" "nss_b" {
-  count        = local.is_ha ? 1 : 0
+  count        = 1
   name         = "nss-b-${var.cluster_id}"
   machine_type = var.nss_machine_type
-  zone         = var.zone_b
+  zone         = var.zone_a
 
   boot_disk {
     initialize_params {
@@ -187,14 +189,16 @@ resource "google_compute_instance" "nss_b" {
   dynamic "attached_disk" {
     for_each = var.journal_type == "pd_ssd" ? [1] : []
     content {
-      source      = google_compute_disk.nss_journal_b[0].id
+      source      = google_compute_disk.nss_journal[0].id
       device_name = "nss-journal"
+      # Multi-writer is set on the disk itself (access_mode=READ_WRITE_MANY).
+      # The attached_disk mode must be READ_WRITE (not READ_WRITE_MANY).
       mode        = "READ_WRITE"
     }
   }
 
   network_interface {
-    subnetwork = local.is_ha ? google_compute_subnetwork.private_b[0].id : google_compute_subnetwork.private_a.id
+    subnetwork = google_compute_subnetwork.private_a.id
   }
 
   metadata = {

@@ -97,7 +97,7 @@ pub fn generate_blueprint(config: &BootstrapClusterConfig) -> StageBlueprint {
             stages::NSS_JOURNAL_READY,
             "NSS journal ready",
             false,
-            1,
+            num_nss,
             true,
         ),
         (

@@ -9,7 +9,7 @@ output "rss_a_name" {
 }
 
 output "rss_b_ip" {
-  value       = local.is_ha ? google_compute_instance.rss_b[0].network_interface[0].network_ip : ""
+  value       = local.rss_ha_enabled ? google_compute_instance.rss_b[0].network_interface[0].network_ip : ""
   description = "RSS-B private IP (HA only)"
 }
 
@@ -24,13 +24,13 @@ output "nss_a_name" {
 }
 
 output "nss_b_ip" {
-  value       = local.is_ha ? google_compute_instance.nss_b[0].network_interface[0].network_ip : ""
-  description = "NSS-B private IP (HA only)"
+  value       = google_compute_instance.nss_b[0].network_interface[0].network_ip
+  description = "NSS-B private IP"
 }
 
 output "nss_b_name" {
-  value       = local.is_ha ? google_compute_instance.nss_b[0].name : ""
-  description = "NSS-B instance name (HA only)"
+  value       = google_compute_instance.nss_b[0].name
+  description = "NSS-B instance name"
 }
 
 output "api_lb_ip" {
@@ -99,7 +99,7 @@ output "bench_server_ip" {
 }
 
 output "rss_b_name" {
-  value       = local.is_ha ? google_compute_instance.rss_b[0].name : ""
+  value       = local.rss_ha_enabled ? google_compute_instance.rss_b[0].name : ""
   description = "RSS-B instance name (HA only)"
 }
 

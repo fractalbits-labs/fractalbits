@@ -56,6 +56,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         terraform init
             -backend-config="bucket=$tf_state_bucket"
             -backend-config="prefix=vpc"
+            -reconfigure
             -input=false 2>&1
     )?;
     run_cmd!(

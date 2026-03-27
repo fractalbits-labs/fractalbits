@@ -1,36 +1,13 @@
-# NSS journal disk (PD mode) - zone A
-resource "google_compute_disk" "nss_journal_a" {
+# NSS journal disk (hyperdisk-balanced) - shared between NSS-A and NSS-B via multi-writer
+# Note: pd-ssd does not support READ_WRITE_MANY; hyperdisk-balanced does.
+resource "google_compute_disk" "nss_journal" {
   count                     = var.journal_type == "pd_ssd" ? 1 : 0
-  name                      = "nss-journal-a-${var.cluster_id}"
+  name                      = "nss-journal-${var.cluster_id}"
   zone                      = var.zone_a
-  type                      = "pd-ssd"
+  type                      = "hyperdisk-balanced"
   size                      = var.journal_disk_size_gb
   physical_block_size_bytes = 4096
-}
-
-# NSS journal disk (PD mode) - zone B (HA only)
-resource "google_compute_disk" "nss_journal_b" {
-  count                     = var.journal_type == "pd_ssd" && local.is_ha ? 1 : 0
-  name                      = "nss-journal-b-${var.cluster_id}"
-  zone                      = var.zone_b
-  type                      = "pd-ssd"
-  size                      = var.journal_disk_size_gb
-  physical_block_size_bytes = 4096
-}
-
-# Regional PD for multi-attach HA (shared journal between NSS-A and NSS-B)
-resource "google_compute_region_disk" "nss_shared_journal" {
-  count                     = var.journal_type == "pd_ssd" && local.is_ha ? 1 : 0
-  name                      = "nss-shared-journal-${var.cluster_id}"
-  type                      = "pd-ssd"
-  region                    = var.region
-  size                      = var.journal_disk_size_gb
-  physical_block_size_bytes = 4096
-
-  replica_zones = [
-    "projects/${var.project_id}/zones/${var.zone_a}",
-    "projects/${var.project_id}/zones/${var.zone_b}",
-  ]
+  access_mode               = "READ_WRITE_MANY"
 }
 
 # GCS bucket for hybrid blob storage (optional)

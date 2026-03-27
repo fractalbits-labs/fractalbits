@@ -1,9 +1,10 @@
 mod config_gen;
 mod vpc;
 
+use cmd_lib::*;
 pub use vpc::{create_vpc, destroy_vpc};
 
-/// Resolve GCP project ID from: CLI arg > GCP_PROJECT_ID env var
+/// Resolve GCP project ID from: CLI arg > GCP_PROJECT_ID env var > gcloud config
 pub fn resolve_gcp_project(cli_arg: Option<&str>) -> Result<String, std::io::Error> {
     if let Some(p) = cli_arg.filter(|s| !s.is_empty()) {
         return Ok(p.to_string());
@@ -13,15 +14,21 @@ pub fn resolve_gcp_project(cli_arg: Option<&str>) -> Result<String, std::io::Err
     {
         return Ok(p);
     }
+    if let Ok(p) = run_fun!(gcloud config get-value project 2>/dev/null)
+        && !p.is_empty()
+        && p != "(unset)"
+    {
+        return Ok(p);
+    }
     Err(std::io::Error::other(
-        "GCP project ID required. Set via --gcp-project or GCP_PROJECT_ID env var",
+        "GCP project ID required. Set via --gcp-project, GCP_PROJECT_ID env var, or gcloud config set project",
     ))
 }
 
-/// Resolve GCP zone from: CLI arg > GCP_ZONE env > default us-central1-a
+/// Resolve GCP zone from: CLI arg > GCP_ZONE env > default us-central1-c
 pub fn resolve_gcp_zone(cli_arg: Option<&str>) -> String {
     if let Some(z) = cli_arg.filter(|s| !s.is_empty()) {
         return z.to_string();
     }
-    std::env::var("GCP_ZONE").unwrap_or_else(|_| "us-central1-a".to_string())
+    std::env::var("GCP_ZONE").unwrap_or_else(|_| "us-central1-c".to_string())
 }

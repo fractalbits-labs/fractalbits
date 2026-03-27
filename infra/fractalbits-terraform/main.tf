@@ -24,7 +24,7 @@ locals {
   nss_a_name = "nss-a"
   nss_b_name = "nss-b"
 
-  # Mini template: single NSS, single BSS, single API server
+  # Mini template: two NSS, single BSS, single API server
   # Standard template: two NSS (HA), multiple BSS/API
-  is_ha = var.vpc_template == "standard" || var.root_server_ha
+  rss_ha_enabled = var.vpc_template == "standard" || var.root_server_ha
 }
