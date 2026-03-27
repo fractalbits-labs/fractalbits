@@ -3,8 +3,6 @@ use crate::config::{BootstrapConfig, DeployTarget, JournalType};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use std::io::Error;
-use xtask_common::STAGE_BLUEPRINT_FILE;
-use xtask_common::cloud_storage;
 
 const POLL_INTERVAL_SECONDS: u64 = 1;
 const MAX_POLL_ATTEMPTS: u64 = 300;
@@ -171,9 +169,6 @@ fn bootstrap_leader(
 
     // Complete instances-ready stage
     barrier.complete_stage(stages::INSTANCES_READY, None)?;
-
-    // Generate and upload stage blueprint so progress display knows what to expect
-    upload_stage_blueprint(config)?;
 
     // Wait for etcd cluster if using etcd backend
     if config.is_etcd_backend() {
@@ -862,24 +857,5 @@ fn create_rss_bootstrap_env() -> CmdResult {
 fn clear_rss_bootstrap_env() -> CmdResult {
     run_cmd!(echo -n "" > ${ETC_PATH}rss.env)?;
     info!("Cleared RSS bootstrap env file");
-    Ok(())
-}
-
-fn upload_stage_blueprint(config: &BootstrapConfig) -> CmdResult {
-    let blueprint = xtask_common::generate_blueprint(config);
-    let blueprint_json = serde_json::to_string_pretty(&blueprint)
-        .map_err(|e| Error::other(format!("Failed to serialize stage blueprint: {e}")))?;
-
-    // Upload to cloud storage for direct progress monitoring.
-    // xtask also uploads the blueprint before infra deploy, but the bootstrap
-    // binary re-uploads it here in case the config changed (e.g. on-prem mode
-    // where xtask doesn't upload to cloud storage).
-    let target = config.global.deploy_target;
-    let cloud_bucket = &config.bootstrap_bucket;
-    info!("Uploading {STAGE_BLUEPRINT_FILE} to cloud storage ({cloud_bucket})");
-    let uri = cloud_storage::object_uri(cloud_bucket, STAGE_BLUEPRINT_FILE, target);
-    cloud_storage::upload_string(&blueprint_json, &uri)?;
-
-    info!("{STAGE_BLUEPRINT_FILE} uploaded successfully");
     Ok(())
 }

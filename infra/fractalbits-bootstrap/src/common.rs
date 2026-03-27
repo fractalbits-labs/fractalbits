@@ -122,10 +122,9 @@ pub fn backup_config_to_workflow(config: &BootstrapConfig, cluster_id: &str) -> 
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&local_path)?;
     let uri = cloud_storage::object_uri(bucket, &key, target);
     info!("Backing up bootstrap config to {uri}");
-    cloud_storage::upload_string(&content, &uri)
+    cloud_storage::upload_file(&local_path, &uri)
 }
 
 pub fn create_systemd_unit_file(service_name: &str, enable_now: bool) -> CmdResult {

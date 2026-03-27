@@ -128,21 +128,6 @@ pub fn delete_object(bucket: &str, key: &str, target: DeployTarget) -> CmdResult
     }
 }
 
-/// Delete stale bootstrap_cluster.toml from cloud storage before a fresh deploy.
-/// Prevents leftover configs (e.g. from a MetaStack with no instance entries) from being
-/// served to VpcStack instances during the race window before the correct config is uploaded.
-pub fn delete_stale_bootstrap_config(bucket: &str, target: DeployTarget) -> CmdResult {
-    let key = super::BOOTSTRAP_CLUSTER_CONFIG;
-    if head_object(bucket, key, target) {
-        let path = format!("{}/{}", bucket_uri(bucket, target), key);
-        run_cmd! {
-            info "Deleting stale $key from $path before deploy";
-        }?;
-        delete_object(bucket, key, target)?;
-    }
-    Ok(())
-}
-
 /// Ensure bucket exists, create if not
 pub fn ensure_bucket(bucket: &str, target: DeployTarget) -> CmdResult {
     match target {
