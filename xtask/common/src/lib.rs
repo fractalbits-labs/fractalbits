@@ -408,7 +408,6 @@ impl BootstrapClusterConfig {
     }
 }
 
-// Support GenUuids only for now
 pub fn gen_uuids(num: usize, file: &str) -> CmdResult {
     info!("Generating {num} uuids into file {file}");
     let num_threads = num_cpus::get();

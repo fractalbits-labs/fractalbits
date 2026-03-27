@@ -4,7 +4,6 @@ use dialoguer::Input;
 use std::path::Path;
 
 use super::super::bootstrap_progress;
-use super::super::common::cloud_storage;
 use super::super::common::{
     DeployTarget, VpcConfig, get_bootstrap_bucket_name, upload_config_and_blueprint,
 };
@@ -13,18 +12,13 @@ use super::config_gen;
 
 pub fn create_vpc(mut config: VpcConfig) -> CmdResult {
     apply_template_defaults(&mut config);
+
     // 1. Upload binaries directly to AWS S3
     let aws_bucket = get_bootstrap_bucket_name(DeployTarget::Aws)?;
     if !config.skip_upload {
         info!("Uploading binaries to AWS S3...");
         upload::upload(DeployTarget::Aws)?;
     }
-
-    // Delete any stale bootstrap_cluster.toml from S3 before CDK deploy.
-    // This prevents a leftover MetaStack config (which has no instance entries) from being
-    // served to VpcStack instances while they wait for the correct config to be uploaded
-    // after CDK finishes.
-    cloud_storage::delete_stale_bootstrap_config(&aws_bucket, DeployTarget::Aws)?;
 
     // 2. CDK deploy (instances self-bootstrap via UserData)
     let cdk_dir = "infra/fractalbits-cdk";
@@ -61,7 +55,7 @@ pub fn create_vpc(mut config: VpcConfig) -> CmdResult {
     // Build CDK context parameters
     let context_params = build_cdk_context(&config);
 
-    // Generate and upload bootstrap config BEFORE CDK deploy so instances find it immediately on boot
+    // 3. Generate and upload bootstrap config BEFORE CDK deploy so instances find it immediately on boot
     info!("Generating bootstrap config (pre-deploy)...");
     let bootstrap_config = config_gen::generate_bootstrap_config(&config)?;
     let config_toml = bootstrap_config
@@ -79,13 +73,13 @@ pub fn create_vpc(mut config: VpcConfig) -> CmdResult {
     )?;
     info!("VPC deployment completed successfully");
 
-    // 3. Instances self-bootstrap via UserData (all nodes download binary from S3)
+    // 4. Instances self-bootstrap via UserData (all nodes download binary from S3)
 
-    // 4. Optionally watch bootstrap progress inline
+    // 5. Optionally watch bootstrap progress inline
     if config.watch_bootstrap {
         bootstrap_progress::show_progress(DeployTarget::Aws, None)?;
     } else {
-        info!("To monitor bootstrap progress: just deploy bootstrap-progress");
+        info!("To monitor bootstrap progress, run: just deploy bootstrap-progress");
     }
 
     info!("View your deployed stack with: just describe-stack");

@@ -1,6 +1,6 @@
 use crate::*;
 
-use super::super::common::{DeployTarget, VpcConfig, cloud_storage, upload_config_and_blueprint};
+use super::super::common::{DeployTarget, VpcConfig, upload_config_and_blueprint};
 use super::super::{bootstrap_progress, upload};
 use super::config_gen;
 use xtask_common;
@@ -25,11 +25,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         upload::upload_gcp(&project_id)?;
     }
 
-    // Delete any stale bootstrap_cluster.toml from GCS before Terraform deploy.
-    // Prevents leftover configs from being served to instances during the race window.
-    cloud_storage::delete_stale_bootstrap_config(&gcs_bucket, DeployTarget::Gcp)?;
-
-    // Generate and upload bootstrap config BEFORE Terraform so instances find it immediately on boot
+    // 3. Generate and upload bootstrap config BEFORE Terraform so instances find it immediately on boot
     info!("Generating bootstrap config (pre-deploy)...");
     let params = config_gen::GcpDeployParams {
         project_id: &project_id,
@@ -74,8 +70,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
     if config.watch_bootstrap {
         bootstrap_progress::show_progress_with_bucket(DeployTarget::Gcp, None, Some(&gcs_bucket))?;
     } else {
-        info!("To monitor bootstrap progress, run:");
-        info!("  cargo xtask deploy bootstrap-progress --deploy-target gcp");
+        info!("To monitor bootstrap progress, run: just deploy bootstrap-progress --target gcp");
     }
 
     Ok(())

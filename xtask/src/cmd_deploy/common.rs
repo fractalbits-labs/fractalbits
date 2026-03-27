@@ -144,14 +144,24 @@ pub fn upload_config_and_blueprint(
     config_toml: &str,
     config: &BootstrapClusterConfig,
 ) -> CmdResult {
-    let config_uri = format!("{bucket_uri}/{}", BOOTSTRAP_CLUSTER_CONFIG);
-    cloud_storage::upload_string(config_toml, &config_uri)?;
+    let tmp_dir = std::env::temp_dir();
+    let config_tmp = tmp_dir.join(BOOTSTRAP_CLUSTER_CONFIG);
+    let blueprint_tmp = tmp_dir.join(STAGE_BLUEPRINT_FILE);
+
+    std::fs::write(&config_tmp, config_toml)
+        .map_err(|e| std::io::Error::other(format!("Failed to write config tmp: {e}")))?;
 
     let blueprint = generate_blueprint(config);
     let blueprint_json = serde_json::to_string(&blueprint)
         .map_err(|e| std::io::Error::other(format!("Failed to serialize blueprint: {e}")))?;
+    std::fs::write(&blueprint_tmp, &blueprint_json)
+        .map_err(|e| std::io::Error::other(format!("Failed to write blueprint tmp: {e}")))?;
+
+    let config_uri = format!("{bucket_uri}/{}", BOOTSTRAP_CLUSTER_CONFIG);
+    cloud_storage::upload_file(config_tmp.to_str().unwrap(), &config_uri)?;
+
     let blueprint_uri = format!("{bucket_uri}/{}", STAGE_BLUEPRINT_FILE);
-    cloud_storage::upload_string(&blueprint_json, &blueprint_uri)?;
+    cloud_storage::upload_file(blueprint_tmp.to_str().unwrap(), &blueprint_uri)?;
 
     info!("Config and blueprint uploaded to {bucket_uri}");
     Ok(())
