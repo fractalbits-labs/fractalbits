@@ -7,6 +7,7 @@ message ListBlobsRequest {
   uint32 max_keys = 1;
   string prefix = 2;
   string start_after = 3;
+  bool include_deleted = 4;
 }
 
 message ListBlobsResponse {
@@ -20,6 +21,7 @@ message ListBlobsResponse {
     uint32 total_bytes = 2;
     uint64 checksum_body = 3;
     uint64 version = 4;
+    bool is_deleted = 5;
   }
 
   message Blobs {

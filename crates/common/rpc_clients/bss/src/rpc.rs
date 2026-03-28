@@ -56,6 +56,7 @@ pub struct BlobListStream {
     prefix: String,
     marker: String,
     max_keys: u32,
+    include_deleted: bool,
     done: bool,
 }
 
@@ -66,6 +67,7 @@ impl BlobListStream {
         prefix: impl Into<String>,
         start_after: impl Into<String>,
         max_keys: u32,
+        include_deleted: bool,
     ) -> Self {
         Self {
             client,
@@ -73,6 +75,7 @@ impl BlobListStream {
             prefix: prefix.into(),
             marker: start_after.into(),
             max_keys,
+            include_deleted,
             done: false,
         }
     }
@@ -97,6 +100,7 @@ impl BlobListStream {
                 timeout,
                 trace_id,
                 retry_count,
+                self.include_deleted,
             )
             .await?;
 
@@ -119,12 +123,14 @@ impl RpcClient {
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
+        include_deleted: bool,
     ) -> Result<list_blobs_response::Blobs, RpcError> {
         let _guard = InflightRpcGuard::new("bss", "list_data_blobs");
         let body = ListBlobsRequest {
             max_keys,
             prefix: prefix.to_string(),
             start_after: start_after.to_string(),
+            include_deleted,
         };
 
         let mut header = MessageHeader::default();
@@ -326,7 +332,7 @@ mod tests {
             "127.0.0.1:1".to_string(),
             Duration::from_secs(1),
         ));
-        let stream = BlobListStream::new(client, 1, "/d1/", "", 1000);
+        let stream = BlobListStream::new(client, 1, "/d1/", "", 1000, false);
 
         assert_eq!(stream.marker, "");
         assert!(!stream.done);
