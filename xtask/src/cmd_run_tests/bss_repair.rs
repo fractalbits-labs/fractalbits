@@ -24,6 +24,7 @@ struct TestVolumes {
     split_brain: u16,
     majority: u16,
     degraded_scan: u16,
+    delete_repair: u16,
 }
 
 struct BssRestartGuard {
@@ -126,6 +127,14 @@ async fn run_bss_repair_tests_inner() -> TestResult {
             .green()
     );
     test_degraded_scan_continues_with_quorum().await?;
+
+    println!(
+        "\n{}",
+        "=== Test: Repair Skips Partially-Deleted Blobs ==="
+            .bold()
+            .green()
+    );
+    test_repair_skips_partially_deleted_blobs().await?;
 
     println!("\n{}", "=== All BSS Repair Tests PASSED ===".green().bold());
     Ok(())
@@ -317,15 +326,83 @@ async fn test_degraded_scan_continues_with_quorum() -> TestResult {
     Ok(())
 }
 
+async fn test_repair_skips_partially_deleted_blobs() -> TestResult {
+    let volumes = *TEST_VOLUMES.get().expect("test volumes initialized");
+    let blob_guid = DataBlobGuid {
+        blob_id: Uuid::now_v7(),
+        volume_id: volumes.delete_repair,
+    };
+    let body = Bytes::from_static(b"bss-repair-delete-test");
+
+    // Write blob to all 3 nodes
+    put_blob("127.0.0.1:8088", blob_guid, 0, body.clone()).await?;
+    put_blob("127.0.0.1:8089", blob_guid, 0, body.clone()).await?;
+    put_blob("127.0.0.1:8090", blob_guid, 0, body).await?;
+
+    // Delete from node 2 only (simulate partial delete failure)
+    delete_blob_from_node("127.0.0.1:8090", blob_guid, 0).await?;
+
+    // Scan should NOT report the deleted blob as a repair candidate
+    let volume_id = volumes.delete_repair.to_string();
+    let report = run_bss_repair_json(&["scan-data", "--volume-id", &volume_id, "--json"])?;
+    assert_eq!(report.scanned_volumes, 1, "expected one scanned volume");
+    assert_eq!(report.failed_volumes, 0, "scan should not fail");
+    assert_eq!(
+        report.repair_candidates, 0,
+        "partially-deleted blob must not be a repair candidate"
+    );
+
+    // Repair should also NOT resurrect the blob
+    let report = run_bss_repair_json(&["repair-data", "--volume-id", &volume_id, "--json"])?;
+    assert_eq!(report.failed_volumes, 0, "repair should not fail");
+    assert_eq!(report.repaired_blobs, 0, "no blobs should be repaired");
+
+    // Verify node 2 still does NOT have the blob (not resurrected)
+    let node2_entries = list_keys_on_node("127.0.0.1:8090", volumes.delete_repair).await?;
+    assert!(
+        node2_entries.is_empty(),
+        "deleted blob must not be resurrected on node 2"
+    );
+
+    println!("  OK: repair correctly skipped the partially-deleted blob");
+    Ok(())
+}
+
+async fn delete_blob_from_node(
+    addr: &str,
+    blob_guid: DataBlobGuid,
+    block_number: u32,
+) -> TestResult {
+    let client = Arc::new(RpcClientBss::new_from_address(
+        addr.to_string(),
+        Duration::from_secs(5),
+    ));
+    client
+        .delete_data_blob(
+            blob_guid,
+            block_number,
+            Some(Duration::from_secs(5)),
+            &TraceId::new(),
+            0,
+        )
+        .await?;
+    Ok(())
+}
+
 fn install_test_data_vg_config(volumes: TestVolumes) -> CmdResult {
     let data_vg_config = format!(
         r#"{{"volumes":[
 {{"volume_id":{},"bss_nodes":[{{"node_id":"bss0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}},
 {{"volume_id":{},"bss_nodes":[{{"node_id":"bss0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}},
 {{"volume_id":{},"bss_nodes":[{{"node_id":"bss0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}},
+{{"volume_id":{},"bss_nodes":[{{"node_id":"bss0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}},
 {{"volume_id":{},"bss_nodes":[{{"node_id":"bss0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}}
 ]}}"#,
-        volumes.scan, volumes.split_brain, volumes.majority, volumes.degraded_scan
+        volumes.scan,
+        volumes.split_brain,
+        volumes.majority,
+        volumes.degraded_scan,
+        volumes.delete_repair
     );
     let etcdctl = resolve_etcd_bin("etcdctl");
 
@@ -339,12 +416,13 @@ fn install_test_data_vg_config(volumes: TestVolumes) -> CmdResult {
 
 fn new_test_volumes() -> TestVolumes {
     let seed = (Uuid::now_v7().as_u128() % 10_000) as u16;
-    let base = 10_000 + seed * 5;
+    let base = 10_000 + seed * 6;
     TestVolumes {
         scan: base,
         split_brain: base + 1,
         majority: base + 2,
         degraded_scan: base + 3,
+        delete_repair: base + 4,
     }
 }
 
@@ -381,6 +459,7 @@ async fn start_bss_instance(instance: u8) -> TestResult {
                 Some(Duration::from_secs(2)),
                 &TraceId::new(),
                 0,
+                false,
             )
             .await
             .is_ok()
@@ -500,6 +579,7 @@ async fn list_keys_on_node(addr: &str, volume_id: u16) -> TestResult<Vec<String>
             Some(Duration::from_secs(5)),
             &TraceId::new(),
             0,
+            false,
         )
         .await?;
     Ok(page.blobs.into_iter().map(|entry| entry.key).collect())
