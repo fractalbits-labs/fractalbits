@@ -19,7 +19,6 @@ use self::usage::Usage;
 use crate::results::WorkerResult;
 
 mod usage;
-mod user_input;
 
 pub type Handle = JoinHandle<anyhow::Result<WorkerResult>>;
 
