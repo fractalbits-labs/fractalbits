@@ -402,7 +402,7 @@ pub mod timeouts {
     pub const NSS_FORMATTED: u64 = 600;
     pub const MIRRORD_READY: u64 = 120;
     pub const NSS_JOURNAL_READY: u64 = 600;
-    pub const BSS_CONFIGURED: u64 = 600;
+    pub const BSS_CONFIGURED: u64 = 1200; // 20 min: format_zero=true is slower
     pub const SERVICES_READY: u64 = 60;
 }
 
