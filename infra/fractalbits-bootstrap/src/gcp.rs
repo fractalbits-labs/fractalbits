@@ -220,7 +220,7 @@ pub(crate) fn get_service_ips_firestore(
 
     loop {
         if start_time.elapsed() > timeout {
-            cmd_die!("Timeout waiting for {service_id} service(s) via Firestore");
+            cmd_die!("Timeout waiting for ${service_id} service(s) via Firestore");
         }
 
         let token_result = get_gcp_access_token();

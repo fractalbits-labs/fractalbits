@@ -238,7 +238,7 @@ pub fn wait_for_container_ready(container_name: &str) -> crate::CmdResult {
         }
         if i == TIMEOUT_SECS {
             run_cmd!(docker logs $container_name)?;
-            cmd_die!("Container failed to start within {TIMEOUT_SECS} seconds");
+            cmd_die!("Container failed to start within ${TIMEOUT_SECS} seconds");
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
