@@ -3,16 +3,18 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use bss_repair::DataRepairReport;
 use bytes::Bytes;
 use cmd_lib::*;
 use colored::*;
+use data_types::DataRepairReport;
 use data_types::{DataBlobGuid, TraceId};
 use rpc_client_bss::RpcClientBss;
 use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::CmdResult;
+use crate::cmd_build::BuildMode;
+use crate::cmd_service::resolve_binary_path;
 use crate::etcd_utils::resolve_etcd_bin;
 
 type TestResult<T = ()> = Result<T, BssRepairTestError>;
@@ -474,7 +476,8 @@ async fn start_bss_instance(instance: u8) -> TestResult {
 }
 
 fn run_bss_repair_json(args: &[&str]) -> TestResult<DataRepairReport> {
-    let output = Command::new("./target/debug/bss_repair")
+    let bss_repair_bin = resolve_binary_path("bss_repair", BuildMode::Debug);
+    let output = Command::new(&bss_repair_bin)
         .args(["--rss-addrs", "127.0.0.1:8086"])
         .args(args)
         .output()?;
@@ -491,7 +494,8 @@ fn run_bss_repair_json(args: &[&str]) -> TestResult<DataRepairReport> {
 }
 
 fn run_bss_repair_json_expect_failure(args: &[&str]) -> TestResult<DataRepairReport> {
-    let output = Command::new("./target/debug/bss_repair")
+    let bss_repair_bin = resolve_binary_path("bss_repair", BuildMode::Debug);
+    let output = Command::new(&bss_repair_bin)
         .args(["--rss-addrs", "127.0.0.1:8086"])
         .args(args)
         .output()?;

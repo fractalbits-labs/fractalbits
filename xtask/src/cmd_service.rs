@@ -1644,7 +1644,7 @@ fn register_local_api_server() -> CmdResult {
     Ok(())
 }
 
-fn resolve_binary_path(binary_name: &str, build_mode: BuildMode) -> String {
+pub(crate) fn resolve_binary_path(binary_name: &str, build_mode: BuildMode) -> String {
     let pwd = run_fun!(pwd).unwrap_or_else(|_| ".".to_string());
     let build = build_mode.as_ref();
     let arch = run_fun!(arch).unwrap_or_else(|_| "x86_64".to_string());

@@ -14,7 +14,6 @@ xtask_common.workspace = true
 colored.workspace = true
 test_common.workspace = true
 data_types.workspace = true
-bss_repair.workspace = true
 rpc_client_bss = { workspace = true, features = ["tokio-runtime"] }
 aws-sdk-s3.workspace = true
 aws-config.workspace = true
