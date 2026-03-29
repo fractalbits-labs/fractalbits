@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Error;
 use std::time::{Duration, Instant};
 use xtask_common::cloud_storage;
+use xtask_common::stages::StageDef;
 
 /// Poll interval when waiting for barriers
 const POLL_INTERVAL_SECS: u64 = 2;
@@ -114,7 +115,13 @@ impl WorkflowBarrier {
     }
 
     /// Write stage completion marker (per-node stage)
-    pub fn complete_stage(&self, stage: &str, metadata: Option<serde_json::Value>) -> CmdResult {
+    pub fn complete_stage(
+        &self,
+        stage: StageDef,
+        metadata: Option<serde_json::Value>,
+    ) -> CmdResult {
+        let key_name = stage.key_name();
+        let stage = stage.name;
         let completion = StageCompletion {
             instance_id: self.instance_id.clone(),
             service_type: self.service_type.clone(),
@@ -126,7 +133,7 @@ impl WorkflowBarrier {
         let json = serde_json::to_string(&completion)
             .map_err(|e| Error::other(format!("Failed to serialize stage completion: {e}")))?;
 
-        let key = self.instance_stage_key(stage);
+        let key = self.instance_stage_key(&key_name);
         info!("Completing stage '{stage}' at {}/{key}", self.bucket);
         cloud_storage::upload_string(
             &json,
@@ -137,9 +144,11 @@ impl WorkflowBarrier {
     /// Write a global stage completion marker (single file, not per-node)
     pub fn complete_global_stage(
         &self,
-        stage: &str,
+        stage: StageDef,
         metadata: Option<serde_json::Value>,
     ) -> CmdResult {
+        let key_name = stage.key_name();
+        let stage = stage.name;
         let completion = StageCompletion {
             instance_id: self.instance_id.clone(),
             service_type: self.service_type.clone(),
@@ -151,7 +160,7 @@ impl WorkflowBarrier {
         let json = serde_json::to_string(&completion)
             .map_err(|e| Error::other(format!("Failed to serialize stage completion: {e}")))?;
 
-        let key = format!("{}.json", self.stage_key(stage));
+        let key = format!("{}.json", self.stage_key(&key_name));
         info!("Completing global stage '{stage}' at {}/{key}", self.bucket);
         cloud_storage::upload_string(
             &json,
@@ -160,8 +169,10 @@ impl WorkflowBarrier {
     }
 
     /// Wait for a global stage (single file, no node suffix)
-    pub fn wait_for_global(&self, stage: &str, timeout_secs: u64) -> CmdResult {
-        let key = format!("{}/stages/{}.json", self.workflow_prefix(), stage);
+    pub fn wait_for_global(&self, stage: StageDef, timeout_secs: u64) -> CmdResult {
+        let key_name = stage.key_name();
+        let stage = stage.name;
+        let key = format!("{}/stages/{}.json", self.workflow_prefix(), key_name);
         info!("Waiting for global stage '{stage}' ({}/{key})", self.bucket);
 
         let start = Instant::now();
@@ -186,10 +197,12 @@ impl WorkflowBarrier {
     /// Wait for N nodes to complete a per-node stage
     pub fn wait_for_nodes(
         &self,
-        stage: &str,
+        stage: StageDef,
         expected: usize,
         timeout_secs: u64,
     ) -> Result<Vec<StageCompletion>, Error> {
+        let key_name = stage.key_name();
+        let stage = stage.name;
         info!("Waiting for {expected} nodes to complete stage '{stage}'");
 
         let start = Instant::now();
@@ -202,7 +215,7 @@ impl WorkflowBarrier {
                 )));
             }
 
-            let completions = self.get_stage_completions(stage)?;
+            let completions = self.get_stage_completions(&key_name)?;
             info!(
                 "Stage '{stage}': {} of {expected} nodes complete",
                 completions.len()

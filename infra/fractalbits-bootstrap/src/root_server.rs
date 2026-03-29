@@ -83,7 +83,7 @@ fn post_bootstrap_cleanup(config: &BootstrapConfig) -> CmdResult {
         blueprint
             .stages
             .iter()
-            .find(|s| s.name == stages::SERVICES_READY)
+            .find(|s| s.name == stages::SERVICES_READY.name)
             .map(|s| s.expected)
             .unwrap_or(1)
     };

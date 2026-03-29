@@ -216,7 +216,7 @@ fn show_progress_inner(access: &CloudAccess) -> CmdResult {
             let expected = stage.expected;
 
             if stage.is_global {
-                let complete = cache.check_global_stage(&stage.name);
+                let complete = cache.check_global_stage(&stage.key_name);
                 if complete {
                     pb.set_style(style_global_done.clone());
                     pb.set_prefix("[OK]");
@@ -228,7 +228,7 @@ fn show_progress_inner(access: &CloudAccess) -> CmdResult {
                     pb.set_prefix("[..]");
                 }
             } else {
-                let count = cache.count_stage_completions(&stage.name);
+                let count = cache.count_stage_completions(&stage.key_name);
                 pb.set_position(count as u64);
 
                 if count >= expected {

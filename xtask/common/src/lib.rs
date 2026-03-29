@@ -16,26 +16,23 @@ pub mod cloud_storage;
 pub const BOOTSTRAP_CLUSTER_CONFIG: &str = "bootstrap_cluster.toml";
 pub const STAGE_BLUEPRINT_FILE: &str = "stage_blueprint.json";
 
-/// Stage name constants (used as S3 key prefixes for workflow barriers)
-pub mod stages {
-    pub const INSTANCES_READY: &str = "00-instances-ready";
-    pub const ETCD_READY: &str = "10-etcd-ready";
-    pub const RSS_INITIALIZED: &str = "20-rss-initialized";
-    pub const METADATA_VG_READY: &str = "25-metadata-vg-ready";
-    pub const NSS_FORMATTED: &str = "30-nss-formatted";
-    pub const MIRRORD_READY: &str = "35-mirrord-ready";
-    pub const NSS_JOURNAL_READY: &str = "40-nss-journal-ready";
-    pub const BSS_CONFIGURED: &str = "50-bss-configured";
-    pub const SERVICES_READY: &str = "60-services-ready";
-}
+pub mod stages;
 
 /// A resolved stage entry in the blueprint
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StageBlueprintEntry {
+    /// Bare stage name (e.g. "instances-ready")
     pub name: String,
     pub desc: String,
     pub is_global: bool,
     pub expected: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// Cloud storage key name with sequence prefix (e.g. "00-instances-ready").
+    /// The prefix is derived from topological order so listings appear in
+    /// natural execution order.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_name: String,
 }
 
 /// Self-contained blueprint for bootstrap progress display
@@ -66,6 +63,10 @@ pub fn generate_blueprint(config: &BootstrapClusterConfig) -> StageBlueprint {
 
     let use_etcd = config.global.rss_backend == RssBackend::Etcd;
     let use_nvme = config.global.journal_type == JournalType::Nvme;
+    // In HA mode (2 NSS nodes), only the active node signals journal-ready;
+    // the standby runs mirrord (NVMe) or is idle (EBS).
+    let has_nss_standby = num_nss > 1;
+    let num_journal_ready = if has_nss_standby { 1 } else { num_nss };
 
     let cluster_id = config
         .global
@@ -73,51 +74,41 @@ pub fn generate_blueprint(config: &BootstrapClusterConfig) -> StageBlueprint {
         .clone()
         .unwrap_or_default();
 
-    // Stage definitions: (name, desc, is_global, expected, include)
-    let stage_defs: &[(&str, &str, bool, usize, bool)] = &[
-        (stages::INSTANCES_READY, "Instances ready", false, all, true),
-        (stages::ETCD_READY, "etcd cluster formed", true, 1, use_etcd),
-        (
-            stages::RSS_INITIALIZED,
-            "RSS config published",
-            true,
-            1,
-            true,
-        ),
-        (
-            stages::METADATA_VG_READY,
-            "Metadata VG ready",
-            true,
-            1,
-            true,
-        ),
-        (stages::NSS_FORMATTED, "NSS formatted", false, num_nss, true),
-        (stages::MIRRORD_READY, "Mirrord ready", false, 1, use_nvme),
-        (
-            stages::NSS_JOURNAL_READY,
-            "NSS journal ready",
-            false,
-            num_nss,
-            true,
-        ),
-        (
-            stages::BSS_CONFIGURED,
-            "BSS configured",
-            false,
-            num_bss,
-            true,
-        ),
-        (stages::SERVICES_READY, "Services ready", false, all, true),
+    // (stage_def, expected_count, include)
+    let stage_defs: &[(&stages::StageDef, usize, bool)] = &[
+        (&stages::INSTANCES_READY, all, true),
+        (&stages::ETCD_READY, 1, use_etcd),
+        (&stages::RSS_INITIALIZED, 1, true),
+        (&stages::METADATA_VG_READY, 1, true),
+        (&stages::NSS_FORMATTED, num_nss, true),
+        (&stages::MIRRORD_READY, 1, use_nvme),
+        (&stages::NSS_JOURNAL_READY, num_journal_ready, true),
+        (&stages::BSS_CONFIGURED, num_bss, true),
+        (&stages::SERVICES_READY, all, true),
     ];
+
+    // Collect included stage names for filtering depends_on references
+    let included: std::collections::HashSet<&str> = stage_defs
+        .iter()
+        .filter(|(_, _, include)| *include)
+        .map(|(def, _, _)| def.name)
+        .collect();
 
     let stages = stage_defs
         .iter()
-        .filter(|(_, _, _, _, include)| *include)
-        .map(|(name, desc, is_global, expected, _)| StageBlueprintEntry {
-            name: name.to_string(),
-            desc: desc.to_string(),
-            is_global: *is_global,
+        .filter(|(_, _, include)| *include)
+        .map(|(def, expected, _)| StageBlueprintEntry {
+            name: def.name.to_string(),
+            desc: def.desc.to_string(),
+            is_global: def.is_global,
             expected: *expected,
+            depends_on: def
+                .depends_on
+                .iter()
+                .filter(|d| included.contains(**d))
+                .map(|d| d.to_string())
+                .collect(),
+            key_name: def.key_name(),
         })
         .collect();
 
