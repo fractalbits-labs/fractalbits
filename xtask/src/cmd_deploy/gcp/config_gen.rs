@@ -4,7 +4,8 @@ use std::io::Error;
 use chrono::Utc;
 use uuid::Uuid;
 use xtask_common::{
-    BootstrapClusterConfig, ClusterGcpConfig, ClusterGlobalConfig, DataBlobStorage,
+    BootstrapClusterConfig, ClusterEtcdConfig, ClusterGcpConfig, ClusterGlobalConfig,
+    DataBlobStorage,
 };
 
 pub struct GcpDeployParams<'a> {
@@ -75,7 +76,15 @@ pub fn generate_bootstrap_config(
         gcp: Some(gcp_config),
         endpoints: None,
         resources: None,
-        etcd: None,
+        etcd: if params.rss_backend == xtask_common::RssBackend::Etcd {
+            Some(ClusterEtcdConfig {
+                enabled: true,
+                cluster_size: params.num_bss_nodes,
+                endpoints: None,
+            })
+        } else {
+            None
+        },
         nodes: HashMap::new(),
         bootstrap_bucket: format!("{}-deploy-staging", params.project_id),
     };
