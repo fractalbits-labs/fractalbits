@@ -1,5 +1,6 @@
 mod api_key;
 mod blob_guid;
+mod bss_repair_report;
 mod bucket;
 pub mod hash;
 pub mod object_layout;
@@ -15,6 +16,8 @@ pub use bucket::Bucket;
 pub use permission::BucketKeyPerm;
 pub use trace_id::TraceId;
 pub use volume::{BssNode, DataVgInfo, Volume, VolumeMode};
+
+pub use bss_repair_report::{DataRepairReport, DataVolumeReport};
 
 pub use observer_types::{
     HealthCheckResponse, MachineState, ObserverPersistentState, ObserverState, ServiceStatus,

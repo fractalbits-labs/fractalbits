@@ -57,7 +57,6 @@ rpc_client_common = { path = "crates/common/rpc_clients/client_common", default-
 rpc_client_bss = { path = "crates/common/rpc_clients/bss", default-features = false }
 rpc_client_nss = { path = "crates/common/rpc_clients/nss", default-features = false }
 rpc_client_rss = { path = "crates/common/rpc_clients/rss", default-features = false }
-bss_repair = { path = "crates/ha/bss_repair" }
 rpc_codec_common = { path = "crates/common/rpc_codecs/codec_common" }
 bss_codec = { path = "crates/common/rpc_codecs/bss_codec" }
 nss_codec = { path = "crates/common/rpc_codecs/nss_codec" }

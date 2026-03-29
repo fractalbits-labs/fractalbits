@@ -324,6 +324,7 @@ pub fn build_prebuilt_dev() -> CmdResult {
         let prebuilt_dir = format!("prebuilt/dev/{arch}");
         run_cmd!(mkdir -p $prebuilt_dir)?;
         for bin in [
+            "bss_repair",
             "nss_role_agent",
             "root_server",
             "rss_admin",
