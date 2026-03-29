@@ -4,7 +4,7 @@
 //! objects to cloud storage (AWS S3 or GCS). This provides clear dependency
 //! ordering and visibility into bootstrap progress.
 
-use crate::common::{get_instance_id, get_private_ip};
+use crate::common::get_instance_id;
 use crate::config::{BootstrapConfig, DeployTarget};
 use cmd_lib::*;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,19 @@ pub struct StageCompletion {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+}
+
+impl StageCompletion {
+    /// Extract a string field from metadata across multiple completions, sorted.
+    /// Useful for collecting per-node data (e.g. IPs) written via stage metadata.
+    pub fn extract_metadata_field(completions: &[Self], field: &str) -> Vec<String> {
+        let mut values: Vec<String> = completions
+            .iter()
+            .filter_map(|c| c.metadata.as_ref()?.get(field)?.as_str().map(String::from))
+            .collect();
+        values.sort();
+        values
+    }
 }
 
 /// Workflow barrier for coordinating bootstrap stages via cloud storage
@@ -256,93 +269,6 @@ impl WorkflowBarrier {
 
         Ok(completions)
     }
-
-    /// Key prefix for etcd nodes
-    fn etcd_nodes_key_prefix(&self) -> String {
-        format!("{}/etcd/nodes/", self.workflow_prefix())
-    }
-
-    /// Register an etcd node in the workflow storage
-    pub fn register_etcd_node(&self) -> CmdResult {
-        let my_ip = get_private_ip(self.deploy_target)?;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let node_info = serde_json::json!({
-            "ip": my_ip,
-            "timestamp": timestamp,
-            "instance_id": self.instance_id,
-        });
-
-        let json = serde_json::to_string(&node_info)
-            .map_err(|e| Error::other(format!("Failed to serialize node info: {e}")))?;
-
-        let key = format!("{}{}.json", self.etcd_nodes_key_prefix(), my_ip);
-        info!("Registering etcd node at {}/{key}", self.bucket);
-        cloud_storage::upload_string(
-            &json,
-            &cloud_storage::object_uri(&self.bucket, &key, self.deploy_target),
-        )
-    }
-
-    /// Get registered etcd nodes from the workflow storage
-    pub fn get_etcd_nodes(&self) -> Result<Vec<EtcdNodeInfo>, Error> {
-        let prefix = self.etcd_nodes_key_prefix();
-        let output = cloud_storage::list_objects(&self.bucket, &prefix, self.deploy_target)
-            .unwrap_or_default();
-        if output.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut nodes = Vec::new();
-        for filename in parse_listing_filenames(&output, self.deploy_target) {
-            if filename.ends_with(".json") {
-                let key = format!("{prefix}{filename}");
-                if let Ok(content) = cloud_storage::cat(&cloud_storage::object_uri(
-                    &self.bucket,
-                    &key,
-                    self.deploy_target,
-                )) && let Ok(node_info) = serde_json::from_str::<EtcdNodeInfo>(&content)
-                {
-                    nodes.push(node_info);
-                }
-            }
-        }
-
-        nodes.sort_by(|a, b| a.ip.cmp(&b.ip));
-        Ok(nodes)
-    }
-
-    /// Wait for etcd cluster nodes to register
-    pub fn wait_for_etcd_nodes(
-        &self,
-        expected: usize,
-        timeout_secs: u64,
-    ) -> Result<Vec<EtcdNodeInfo>, Error> {
-        info!("Waiting for {expected} etcd nodes to register");
-
-        let start = Instant::now();
-        let timeout = Duration::from_secs(timeout_secs);
-
-        loop {
-            if start.elapsed() > timeout {
-                return Err(Error::other(format!(
-                    "Timeout waiting for {expected} etcd nodes after {timeout_secs}s"
-                )));
-            }
-
-            let nodes = self.get_etcd_nodes()?;
-            info!("Found {} of {expected} etcd nodes", nodes.len());
-
-            if nodes.len() >= expected {
-                return Ok(nodes);
-            }
-
-            std::thread::sleep(Duration::from_secs(POLL_INTERVAL_SECS));
-        }
-    }
 }
 
 /// Parse filenames from cloud storage listing output.
@@ -379,30 +305,6 @@ fn parse_listing_filenames(output: &str, deploy_target: DeployTarget) -> Vec<Str
     }
 }
 
-/// etcd node registration info
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EtcdNodeInfo {
-    pub ip: String,
-    pub timestamp: u64,
-    #[serde(default)]
-    pub instance_id: Option<String>,
-}
-
-impl EtcdNodeInfo {
-    /// Generate etcd initial-cluster string from nodes
-    pub fn generate_initial_cluster(nodes: &[EtcdNodeInfo]) -> String {
-        const ETCD_PEER_PORT: u16 = 2380;
-        nodes
-            .iter()
-            .map(|node| {
-                let member_name = format!("bss-{}", node.ip.replace('.', "-"));
-                format!("{}=http://{}:{}", member_name, node.ip, ETCD_PEER_PORT)
-            })
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-}
-
 pub use xtask_common::stages;
 
 /// Timeout constants for each stage (in seconds)
@@ -415,7 +317,7 @@ pub mod timeouts {
     pub const NSS_FORMATTED: u64 = 600;
     pub const MIRRORD_READY: u64 = 120;
     pub const NSS_JOURNAL_READY: u64 = 600;
-    pub const BSS_CONFIGURED: u64 = 1200; // 20 min: format_zero=true is slower
+    pub const BSS_CONFIGURED: u64 = 1200; // 20 min: storage_alloc_mode=.write_zero is slower
     pub const SERVICES_READY: u64 = 60;
 }
 
@@ -424,25 +326,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_generate_initial_cluster() {
-        let nodes = vec![
-            EtcdNodeInfo {
-                ip: "10.0.1.5".to_string(),
-                timestamp: 1234567890,
-                instance_id: None,
+    fn test_extract_metadata_field() {
+        let completions = vec![
+            StageCompletion {
+                instance_id: "i-1".to_string(),
+                service_type: "bss_server".to_string(),
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+                version: "1.0".to_string(),
+                metadata: Some(serde_json::json!({"ip": "10.0.1.6"})),
             },
-            EtcdNodeInfo {
-                ip: "10.0.1.6".to_string(),
-                timestamp: 1234567891,
-                instance_id: None,
+            StageCompletion {
+                instance_id: "i-2".to_string(),
+                service_type: "bss_server".to_string(),
+                timestamp: "2024-01-01T00:00:01Z".to_string(),
+                version: "1.0".to_string(),
+                metadata: Some(serde_json::json!({"ip": "10.0.1.5"})),
+            },
+            StageCompletion {
+                instance_id: "i-3".to_string(),
+                service_type: "bss_server".to_string(),
+                timestamp: "2024-01-01T00:00:02Z".to_string(),
+                version: "1.0".to_string(),
+                metadata: None,
             },
         ];
 
-        let result = EtcdNodeInfo::generate_initial_cluster(&nodes);
-        assert_eq!(
-            result,
-            "bss-10-0-1-5=http://10.0.1.5:2380,bss-10-0-1-6=http://10.0.1.6:2380"
-        );
+        let ips = StageCompletion::extract_metadata_field(&completions, "ip");
+        assert_eq!(ips, vec!["10.0.1.5", "10.0.1.6"]); // sorted
     }
 
     #[test]

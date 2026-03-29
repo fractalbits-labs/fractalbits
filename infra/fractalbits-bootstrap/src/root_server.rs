@@ -1,6 +1,6 @@
 use super::common::*;
 use crate::config::{BootstrapConfig, DeployTarget, JournalType};
-use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
+use crate::workflow::{StageCompletion, WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use std::io::Error;
 
@@ -353,21 +353,23 @@ fn initialize_bss_volume_groups(
     info!("Initializing BSS volume group configurations...");
 
     let bss_addresses: Vec<(String, String)> = if config.is_etcd_backend() {
-        info!("Getting BSS nodes from workflow barrier...");
-        let bss_nodes = barrier.get_etcd_nodes()?;
+        info!("Getting BSS nodes from workflow stage completions...");
+        let completions =
+            barrier.get_stage_completions(&stages::ETCD_NODES_REGISTERED.key_name())?;
+        let bss_ips = StageCompletion::extract_metadata_field(&completions, "ip");
 
-        if bss_nodes.len() < total_bss_nodes {
+        if bss_ips.len() < total_bss_nodes {
             return Err(Error::other(format!(
                 "Not enough BSS nodes registered: {} < {}",
-                bss_nodes.len(),
+                bss_ips.len(),
                 total_bss_nodes
             )));
         }
 
-        bss_nodes
+        bss_ips
             .iter()
             .enumerate()
-            .map(|(i, node)| (format!("bss-{}", i + 1), node.ip.clone()))
+            .map(|(i, ip)| (format!("bss-{}", i + 1), ip.clone()))
             .collect()
     } else if config.is_firestore_backend() {
         info!("Getting BSS nodes from bootstrap config...");
@@ -672,15 +674,16 @@ fn get_etcd_endpoints_from_workflow(config: &BootstrapConfig) -> Result<String, 
 
     // Fall back to workflow barrier discovery (for dynamic BSS etcd cluster)
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Rss)?;
-    let bss_nodes = barrier.get_etcd_nodes()?;
+    let completions = barrier.get_stage_completions(&stages::ETCD_NODES_REGISTERED.key_name())?;
+    let bss_ips = StageCompletion::extract_metadata_field(&completions, "ip");
 
-    if bss_nodes.is_empty() {
+    if bss_ips.is_empty() {
         return Err(Error::other("No BSS nodes registered in workflow"));
     }
 
-    Ok(bss_nodes
+    Ok(bss_ips
         .iter()
-        .map(|node| format!("http://{}:2379", node.ip))
+        .map(|ip| format!("http://{ip}:2379"))
         .collect::<Vec<_>>()
         .join(","))
 }
@@ -753,17 +756,19 @@ fn create_rss_config(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: b
     };
 
     let etcd_endpoints_line = if config.is_etcd_backend() {
-        // Use workflow barrier to get etcd nodes
+        // Use workflow stage completions to get etcd node IPs
         let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Rss)?;
-        let bss_nodes = barrier.get_etcd_nodes()?;
-        if bss_nodes.is_empty() {
+        let completions =
+            barrier.get_stage_completions(&stages::ETCD_NODES_REGISTERED.key_name())?;
+        let bss_ips = StageCompletion::extract_metadata_field(&completions, "ip");
+        if bss_ips.is_empty() {
             return Err(Error::other(
                 "No BSS nodes registered in workflow for etcd endpoints",
             ));
         }
-        let endpoints: Vec<String> = bss_nodes
+        let endpoints: Vec<String> = bss_ips
             .iter()
-            .map(|node| format!("http://{}:2379", node.ip))
+            .map(|ip| format!("http://{ip}:2379"))
             .collect();
         format!(
             "\n# etcd endpoints for cluster connection\netcd_endpoints = {:?}",

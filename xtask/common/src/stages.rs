@@ -35,10 +35,17 @@ pub const INSTANCES_READY: StageDef = StageDef {
     is_global: false,
 };
 
+pub const ETCD_NODES_REGISTERED: StageDef = StageDef {
+    name: "etcd-nodes-registered",
+    desc: "etcd nodes registered IPs",
+    depends_on: &["instances-ready"],
+    is_global: false,
+};
+
 pub const ETCD_READY: StageDef = StageDef {
     name: "etcd-ready",
     desc: "etcd cluster formed",
-    depends_on: &["instances-ready"],
+    depends_on: &["etcd-nodes-registered"],
     is_global: true,
 };
 
@@ -94,6 +101,7 @@ pub const SERVICES_READY: StageDef = StageDef {
 /// All stage definitions. The blueprint uses this to build the DAG.
 pub const ALL_STAGES: &[&StageDef] = &[
     &INSTANCES_READY,
+    &ETCD_NODES_REGISTERED,
     &ETCD_READY,
     &RSS_INITIALIZED,
     &METADATA_VG_READY,
@@ -188,6 +196,12 @@ mod tests {
     fn dependencies_precede_dependents() {
         let order = validate_dag().expect("DAG validation failed");
         let pos = |name: &str| order.iter().position(|&n| n == name).unwrap();
+
+        // ETCD_NODES_REGISTERED depends on INSTANCES_READY
+        assert!(pos(INSTANCES_READY.name) < pos(ETCD_NODES_REGISTERED.name));
+
+        // ETCD_READY depends on ETCD_NODES_REGISTERED
+        assert!(pos(ETCD_NODES_REGISTERED.name) < pos(ETCD_READY.name));
 
         // RSS_INITIALIZED depends on ETCD_READY
         assert!(pos(ETCD_READY.name) < pos(RSS_INITIALIZED.name));

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use xtask_common::{STAGE_BLUEPRINT_FILE, StageBlueprint, StageBlueprintEntry};
 
 const POLL_INTERVAL_SECS: u64 = 2;
-const TIMEOUT_SECS: u64 = 1500; // 25 minutes (format_zero=true is slower)
+const TIMEOUT_SECS: u64 = 1500; // 25 minutes (storage_alloc_mode=.write_zero is slower)
 
 /// Cloud storage access configuration for fetching progress data
 enum CloudAccess {

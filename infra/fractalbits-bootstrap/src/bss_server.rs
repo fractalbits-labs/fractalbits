@@ -1,6 +1,6 @@
 use super::common::*;
 use crate::config::{BootstrapConfig, DeployTarget};
-use crate::workflow::{EtcdNodeInfo, WorkflowBarrier, WorkflowServiceType, stages, timeouts};
+use crate::workflow::{StageCompletion, WorkflowBarrier, WorkflowServiceType, stages, timeouts};
 use cmd_lib::*;
 use std::io::Error;
 
@@ -89,21 +89,26 @@ fn bootstrap_etcd(
 ) -> CmdResult {
     let cluster_size = etcd_config.cluster_size;
 
-    // REGISTER: Write node info to S3 via workflow barrier
-    info!("Registering etcd node via workflow barrier");
-    barrier.register_etcd_node()?;
+    // REGISTER: Write node IP to cloud storage via generic stage mechanism
+    let my_ip = get_private_ip(config.global.deploy_target)?;
+    info!("Registering etcd node (IP: {my_ip}) via workflow stage");
+    barrier.complete_stage(
+        stages::ETCD_NODES_REGISTERED,
+        Some(serde_json::json!({"ip": my_ip})),
+    )?;
 
     // DISCOVER: Wait for all nodes to register
     info!("Waiting for {cluster_size} etcd nodes to register");
-    let nodes = barrier.wait_for_etcd_nodes(cluster_size, timeouts::ETCD_READY)?;
-    info!(
-        "Found {} nodes: {:?}",
-        nodes.len(),
-        nodes.iter().map(|n| &n.ip).collect::<Vec<_>>()
-    );
+    let completions = barrier.wait_for_nodes(
+        stages::ETCD_NODES_REGISTERED,
+        cluster_size,
+        timeouts::ETCD_READY,
+    )?;
+    let ips = StageCompletion::extract_metadata_field(&completions, "ip");
+    info!("Found {} nodes: {ips:?}", ips.len());
 
     // ELECTION: All nodes have same view, generate initial-cluster
-    let initial_cluster = EtcdNodeInfo::generate_initial_cluster(&nodes);
+    let initial_cluster = generate_initial_cluster(&ips);
     info!("Generated initial-cluster: {initial_cluster}");
 
     // START: All nodes start etcd together with initial-cluster-state: new
@@ -114,6 +119,18 @@ fn bootstrap_etcd(
     barrier.complete_global_stage(stages::ETCD_READY, None)?;
 
     Ok(())
+}
+
+/// Generate etcd initial-cluster string from node IPs
+fn generate_initial_cluster(ips: &[String]) -> String {
+    const ETCD_PEER_PORT: u16 = 2380;
+    ips.iter()
+        .map(|ip| {
+            let member_name = format!("bss-{}", ip.replace('.', "-"));
+            format!("{member_name}=http://{ip}:{ETCD_PEER_PORT}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn format_bss() -> CmdResult {

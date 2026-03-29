@@ -1,4 +1,4 @@
-use crate::common::{BIN_PATH, ETC_PATH, get_instance_id};
+use crate::common::{BIN_PATH, ETC_PATH};
 use crate::config::{BootstrapConfig, DeployTarget};
 use cmd_lib::*;
 use std::io::Error;
@@ -13,32 +13,23 @@ pub fn get_etcd_endpoints(config: &BootstrapConfig) -> FunResult {
     }
 
     // Fall back to workflow barrier discovery (for dynamic BSS etcd cluster)
-    let cluster_id = config
-        .global
-        .workflow_cluster_id
-        .as_ref()
-        .ok_or_else(|| Error::other("workflow_cluster_id not configured"))?;
-    let bucket = &config.bootstrap_bucket;
-    let instance_id = get_instance_id(config.global.deploy_target)?;
+    let barrier = crate::workflow::WorkflowBarrier::from_config(
+        config,
+        crate::workflow::WorkflowServiceType::Bss,
+    )?;
+    let completions = barrier
+        .get_stage_completions(&crate::workflow::stages::ETCD_NODES_REGISTERED.key_name())?;
+    let bss_ips = crate::workflow::StageCompletion::extract_metadata_field(&completions, "ip");
 
-    let barrier = crate::workflow::WorkflowBarrier::new(
-        bucket,
-        cluster_id,
-        &instance_id,
-        "bss_server",
-        config.global.deploy_target,
-    );
-    let bss_nodes = barrier.get_etcd_nodes()?;
-
-    if bss_nodes.is_empty() {
+    if bss_ips.is_empty() {
         return Err(Error::other(
             "No BSS nodes registered in workflow for etcd endpoints",
         ));
     }
 
-    Ok(bss_nodes
+    Ok(bss_ips
         .iter()
-        .map(|node| format!("http://{}:2379", node.ip))
+        .map(|ip| format!("http://{ip}:2379"))
         .collect::<Vec<_>>()
         .join(","))
 }
