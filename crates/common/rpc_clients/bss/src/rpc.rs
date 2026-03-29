@@ -30,7 +30,7 @@ fn check_response_errno(header: &MessageHeader) -> Result<(), RpcError> {
         7 => Err(RpcError::InternalResponseError(
             "BSS returned DeviceMismatch".to_string(),
         )),
-        8 => Ok(()), // VersionSkipped: write skipped due to version check (not an error)
+        8 => Err(RpcError::VersionSkipped), // Write skipped due to version check
         code => Err(RpcError::InternalResponseError(format!(
             "Unknown BSS error code: {}",
             code

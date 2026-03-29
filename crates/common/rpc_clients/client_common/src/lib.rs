@@ -75,6 +75,8 @@ pub enum RpcError {
     ConnectionClosed,
     #[error("Checksum mismatch")]
     ChecksumMismatch,
+    #[error("Version skipped")]
+    VersionSkipped,
 }
 
 impl<T> From<tokio::sync::mpsc::error::SendError<T>> for RpcError {
