@@ -607,7 +607,7 @@ impl DataVgProxy {
         // Wait only until we achieve write quorum
         while let Some((node, address, result)) = write_futures.next().await {
             match result {
-                Ok(()) => {
+                Ok(()) | Err(RpcError::VersionSkipped) => {
                     node.record_success();
                     successful_writes += 1;
                     debug!("Successful write to BSS node: {}", address);
@@ -625,7 +625,7 @@ impl DataVgProxy {
                 spawn_background(async move {
                     while let Some((bg_node, addr, res)) = write_futures.next().await {
                         match res {
-                            Ok(()) => {
+                            Ok(()) | Err(RpcError::VersionSkipped) => {
                                 bg_node.record_success();
                                 debug!("Background write to {} completed", addr);
                             }
@@ -762,7 +762,7 @@ impl DataVgProxy {
 
         while let Some((node, address, result)) = write_futures.next().await {
             match result {
-                Ok(()) => {
+                Ok(()) | Err(RpcError::VersionSkipped) => {
                     node.record_success();
                     successful_writes += 1;
                     debug!("Successful vectored write to BSS node: {}", address);
@@ -778,7 +778,7 @@ impl DataVgProxy {
                 spawn_background(async move {
                     while let Some((bg_node, addr, res)) = write_futures.next().await {
                         match res {
-                            Ok(()) => {
+                            Ok(()) | Err(RpcError::VersionSkipped) => {
                                 bg_node.record_success();
                                 debug!("Background vectored write to {} completed", addr);
                             }
@@ -1314,7 +1314,7 @@ impl DataVgProxy {
 
         while let Some((node, address, result)) = write_futures.next().await {
             match result {
-                Ok(()) => {
+                Ok(()) | Err(RpcError::VersionSkipped) => {
                     node.record_success();
                     successful_writes += 1;
                     debug!("EC shard write success to {}", address);
@@ -1331,7 +1331,7 @@ impl DataVgProxy {
                 spawn_background(async move {
                     while let Some((bg_node, addr, res)) = write_futures.next().await {
                         match res {
-                            Ok(()) => {
+                            Ok(()) | Err(RpcError::VersionSkipped) => {
                                 bg_node.record_success();
                                 debug!("EC background write to {} completed", addr);
                             }
