@@ -1,8 +1,10 @@
 use super::common::*;
 use crate::config::{BootstrapConfig, DeployTarget, JournalType};
+use crate::stage_helpers::{InstancesReadyStage, ServicesReadyStageDef};
 use crate::workflow::{StageCompletion, WorkflowBarrier, WorkflowServiceType, stages};
 use cmd_lib::*;
 use std::io::Error;
+use xtask_common::stages::{VerifiedGlobalDep, VerifiedGlobalStage, VerifiedNodeDep};
 
 const POLL_INTERVAL_SECONDS: u64 = 1;
 const MAX_POLL_ATTEMPTS: u64 = 300;
@@ -17,6 +19,74 @@ const META_DATA_VG_QUORUM_R: usize = 4;
 const META_DATA_VG_QUORUM_W: usize = 4;
 
 const BOOTSTRAP_GRACE_PERIOD_SECS: u64 = 300;
+
+struct ServicesReadyStage;
+
+impl ServicesReadyStage {
+    const RSS_INITIALIZED: VerifiedGlobalDep =
+        const { stages::SERVICES_READY.global_dep("rss-initialized") };
+    const NSS_FORMATTED: VerifiedNodeDep =
+        const { stages::SERVICES_READY.node_dep("nss-formatted") };
+    const NSS_JOURNAL_READY: VerifiedNodeDep =
+        const { stages::SERVICES_READY.node_dep("nss-journal-ready") };
+
+    fn wait_for_rss_initialized(barrier: &WorkflowBarrier) -> CmdResult {
+        ServicesReadyStageDef::wait_for_global_dep(barrier, Self::RSS_INITIALIZED)
+    }
+
+    fn wait_for_nss_formatted(
+        barrier: &WorkflowBarrier,
+        expected: usize,
+    ) -> Result<Vec<StageCompletion>, Error> {
+        ServicesReadyStageDef::wait_for_node_dep(barrier, Self::NSS_FORMATTED, expected)
+    }
+
+    fn wait_for_nss_journal_ready(
+        barrier: &WorkflowBarrier,
+        expected: usize,
+    ) -> Result<Vec<StageCompletion>, Error> {
+        ServicesReadyStageDef::wait_for_node_dep(barrier, Self::NSS_JOURNAL_READY, expected)
+    }
+
+    fn complete(barrier: &WorkflowBarrier) -> CmdResult {
+        ServicesReadyStageDef::complete(barrier)
+    }
+}
+
+struct RssInitializedStage;
+
+impl RssInitializedStage {
+    const ETCD_READY: VerifiedGlobalDep =
+        const { stages::RSS_INITIALIZED.global_dep("etcd-ready") };
+    const STAGE: VerifiedGlobalStage = const { stages::RSS_INITIALIZED.global_stage() };
+
+    fn wait_for_etcd_ready(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.wait_for_global(Self::ETCD_READY)
+    }
+
+    fn complete(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.complete_global_stage(Self::STAGE, None)
+    }
+}
+
+struct MetadataVgReadyStage;
+
+impl MetadataVgReadyStage {
+    const INSTANCES_READY: VerifiedNodeDep =
+        const { stages::METADATA_VG_READY.node_dep("instances-ready") };
+    const STAGE: VerifiedGlobalStage = const { stages::METADATA_VG_READY.global_stage() };
+
+    fn wait_for_instances_ready(
+        barrier: &WorkflowBarrier,
+        expected: usize,
+    ) -> Result<Vec<StageCompletion>, Error> {
+        barrier.wait_for_nodes(Self::INSTANCES_READY, expected)
+    }
+
+    fn complete(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.complete_global_stage(Self::STAGE, None)
+    }
+}
 
 pub fn bootstrap(
     config: &BootstrapConfig,
@@ -64,63 +134,9 @@ pub fn bootstrap(
             ha_enabled,
             for_bench,
         )?;
-        post_bootstrap_cleanup(config)?;
         Ok(())
     } else {
         bootstrap_follower(config, nss_endpoint, ha_enabled)
-    }
-}
-
-/// Post-bootstrap cleanup for the RSS leader.
-///
-/// Waits for all nodes to reach SERVICES_READY, then:
-/// - On-prem: copies workflow data from Docker S3 to local filesystem
-///
-/// Errors are best-effort (logged as warnings, never fail bootstrap).
-fn post_bootstrap_cleanup(config: &BootstrapConfig) -> CmdResult {
-    let total_nodes = {
-        let blueprint = xtask_common::generate_blueprint(config);
-        blueprint
-            .stages
-            .iter()
-            .find(|s| s.name == stages::SERVICES_READY.name)
-            .map(|s| s.expected)
-            .unwrap_or(1)
-    };
-
-    info!("Waiting for all {total_nodes} nodes to complete SERVICES_READY before cleanup...");
-    let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Rss)?;
-    if let Err(e) = barrier.wait_for_nodes(stages::SERVICES_READY, total_nodes) {
-        warn!("Timed out waiting for all nodes: {e}");
-        warn!("Proceeding with cleanup anyway");
-    }
-
-    if config.global.deploy_target == DeployTarget::OnPrem
-        && let Err(e) = copy_workflow_to_local()
-    {
-        warn!("Post-bootstrap workflow copy failed (best-effort): {e}");
-    }
-
-    info!("Post-bootstrap cleanup complete");
-    Ok(())
-}
-
-/// Copy workflow data from Docker S3 to local filesystem for on-prem.
-/// On-prem bootstrap inherits Docker S3 env vars (AWS_ENDPOINT_URL_S3, credentials),
-/// so aws s3 commands naturally hit the Docker S3 endpoint.
-fn copy_workflow_to_local() -> CmdResult {
-    let log_dir = "/var/log/fractalbits-bootstrap";
-
-    let blueprint_src = "s3://fractalbits-bootstrap/stage_blueprint.json";
-    let blueprint_dst = format!("{log_dir}/stage_blueprint.json");
-    let workflow_src = "s3://fractalbits-bootstrap/workflow/";
-    let workflow_dst = format!("{log_dir}/workflow/");
-    run_cmd! {
-        info "Copying workflow data from Docker S3 to ${log_dir}/...";
-        mkdir -p $log_dir;
-        aws s3 cp $blueprint_src $blueprint_dst;
-        aws s3 sync $workflow_src $workflow_dst;
-        info "Workflow data copied to ${log_dir}/";
     }
 }
 
@@ -128,7 +144,7 @@ fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: 
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Rss)?;
 
     // Complete instances-ready stage
-    barrier.complete_stage(stages::INSTANCES_READY, None)?;
+    InstancesReadyStage::complete(&barrier)?;
 
     let mut binaries = vec!["rss_admin", "root_server"];
     if config.is_etcd_backend() {
@@ -138,7 +154,7 @@ fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: 
 
     // Wait for leader to initialize RSS
     info!("Follower waiting for RSS leader to initialize...");
-    barrier.wait_for_global(stages::RSS_INITIALIZED)?;
+    ServicesReadyStage::wait_for_rss_initialized(&barrier)?;
 
     create_rss_config(config, nss_endpoint, ha_enabled)?;
     create_rss_bootstrap_env()?;
@@ -146,7 +162,7 @@ fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: 
     register_service(config, "root-server")?;
 
     // Complete services-ready stage
-    barrier.complete_stage(stages::SERVICES_READY, None)?;
+    ServicesReadyStage::complete(&barrier)?;
 
     // Clear bootstrap env so restarts use default grace period
     clear_rss_bootstrap_env()?;
@@ -166,14 +182,13 @@ fn bootstrap_leader(
     for_bench: bool,
 ) -> CmdResult {
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Rss)?;
-
     // Complete instances-ready stage
-    barrier.complete_stage(stages::INSTANCES_READY, None)?;
+    InstancesReadyStage::complete(&barrier)?;
 
     // Wait for etcd cluster if using etcd backend
     if config.is_etcd_backend() {
         info!("Waiting for etcd cluster to be ready...");
-        barrier.wait_for_global(stages::ETCD_READY)?;
+        RssInitializedStage::wait_for_etcd_ready(&barrier)?;
     }
 
     let mut binaries = vec!["rss_admin", "root_server"];
@@ -215,7 +230,7 @@ fn bootstrap_leader(
     }
 
     // Complete RSS initialized stage - signals NSS and other services can proceed
-    barrier.complete_global_stage(stages::RSS_INITIALIZED, None)?;
+    RssInitializedStage::complete(&barrier)?;
 
     // Initialize BSS volume group configurations in service discovery (only for single-AZ mode)
     if remote_az.is_none() {
@@ -225,12 +240,13 @@ fn bootstrap_leader(
 
     // Signal metadata VG ready - NSS active nodes wait for this before starting nss_role_agent
     // This ensures metadata_vg_config is available when nss_role_agent calls wait_for_metadata_vg_ready()
-    barrier.complete_global_stage(stages::METADATA_VG_READY, None)?;
+    MetadataVgReadyStage::complete(&barrier)?;
 
+    // Wait for SERVICES_READY dependencies
     // Wait for NSS formatting to complete via workflow barriers
     let expected_nss = if nss_b_id.is_some() { 2 } else { 1 };
     info!("Waiting for {expected_nss} NSS instance(s) to complete formatting...");
-    barrier.wait_for_nodes(stages::NSS_FORMATTED, expected_nss)?;
+    ServicesReadyStage::wait_for_nss_formatted(&barrier, expected_nss)?;
     info!("All NSS instances have completed formatting");
 
     // Wait for NSS journal to be ready via workflow barriers
@@ -243,14 +259,14 @@ fn bootstrap_leader(
         expected_nss // Solo: the single node signals
     };
     info!("Waiting for {expected_journal_ready} NSS journal(s) to be ready...");
-    barrier.wait_for_nodes(stages::NSS_JOURNAL_READY, expected_journal_ready)?;
+    ServicesReadyStage::wait_for_nss_journal_ready(&barrier, expected_journal_ready)?;
 
     if for_bench {
         run_cmd!($BIN_PATH/rss_admin --rss-addr=127.0.0.1:8088 api-key init-test)?;
     }
 
     // Complete services-ready stage
-    barrier.complete_stage(stages::SERVICES_READY, None)?;
+    ServicesReadyStage::complete(&barrier)?;
 
     // Clear bootstrap env so restarts use default grace period
     clear_rss_bootstrap_env()?;
@@ -371,8 +387,7 @@ fn initialize_bss_volume_groups(
         info!("Getting BSS nodes from bootstrap config...");
         // Wait for BSS nodes to complete instances-ready stage via workflow
         info!("Waiting for {total_bss_nodes} BSS node(s) to be ready...");
-        barrier
-            .wait_for_nodes(stages::INSTANCES_READY, total_bss_nodes + 1)
+        MetadataVgReadyStage::wait_for_instances_ready(barrier, total_bss_nodes + 1)
             .unwrap_or_default(); // Best effort - RSS already counted
         let bss_ips = get_service_ips_with_backend(config, "bss-server", total_bss_nodes);
         bss_ips

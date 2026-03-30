@@ -15,7 +15,112 @@ pub struct StageDef {
     pub timeout_secs: u64,
 }
 
+/// A global dependency that has been validated against a stage's transitive
+/// `depends_on` graph.
+#[derive(Debug, Clone, Copy)]
+pub struct VerifiedGlobalDep(StageDef);
+
+impl VerifiedGlobalDep {
+    pub fn stage(&self) -> StageDef {
+        self.0
+    }
+}
+
+/// A per-node dependency that has been validated against a stage's transitive
+/// `depends_on` graph.
+#[derive(Debug, Clone, Copy)]
+pub struct VerifiedNodeDep(StageDef);
+
+impl VerifiedNodeDep {
+    pub fn stage(&self) -> StageDef {
+        self.0
+    }
+}
+
+/// A global stage that has been validated for completion.
+#[derive(Debug, Clone, Copy)]
+pub struct VerifiedGlobalStage(StageDef);
+
+impl VerifiedGlobalStage {
+    pub fn stage(&self) -> StageDef {
+        self.0
+    }
+}
+
+/// A per-node stage that has been validated for completion.
+#[derive(Debug, Clone, Copy)]
+pub struct VerifiedNodeStage(StageDef);
+
+impl VerifiedNodeStage {
+    pub fn stage(&self) -> StageDef {
+        self.0
+    }
+}
+
+/// Const-compatible string equality (no trait methods in const fn).
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 impl StageDef {
+    /// Look up a dependency by name from this stage's transitive `depends_on`
+    /// graph.
+    ///
+    /// This is a `const fn`, so stage helpers can cache validated proofs in
+    /// associated `const`s and turn typos or invalid relationships into build
+    /// errors.
+    /// ```ignore
+    /// const ETCD_READY: VerifiedGlobalDep =
+    ///     stages::RSS_INITIALIZED.global_dep("etcd-ready");
+    /// ```
+    const fn lookup_dep(&self, name: &str) -> StageDef {
+        if let Some(dep) = find_dep(self, name) {
+            return dep;
+        }
+        panic!("stage is not a declared dependency")
+    }
+
+    pub const fn global_dep(&self, name: &str) -> VerifiedGlobalDep {
+        let dep = self.lookup_dep(name);
+        if !dep.is_global {
+            panic!("dependency is not a global stage");
+        }
+        VerifiedGlobalDep(dep)
+    }
+
+    pub const fn node_dep(&self, name: &str) -> VerifiedNodeDep {
+        let dep = self.lookup_dep(name);
+        if dep.is_global {
+            panic!("dependency is not a per-node stage");
+        }
+        VerifiedNodeDep(dep)
+    }
+
+    pub const fn global_stage(&self) -> VerifiedGlobalStage {
+        if !self.is_global {
+            panic!("stage is not a global stage");
+        }
+        VerifiedGlobalStage(*self)
+    }
+
+    pub const fn node_stage(&self) -> VerifiedNodeStage {
+        if self.is_global {
+            panic!("stage is not a per-node stage");
+        }
+        VerifiedNodeStage(*self)
+    }
+
     /// Returns the cloud storage key name with a sequence prefix derived
     /// from topological order, e.g. "00-instances-ready", "10-etcd-ready".
     /// Uses 2-digit zero-padded prefix so lexicographic order is correct.
@@ -27,6 +132,21 @@ impl StageDef {
             .expect("stage not in ALL_STAGES");
         format!("{:02}-{}", idx * 10, self.name)
     }
+}
+
+const fn find_dep(stage: &StageDef, name: &str) -> Option<StageDef> {
+    let mut i = 0;
+    while i < stage.depends_on.len() {
+        let dep = stage.depends_on[i];
+        if str_eq(dep.name, name) {
+            return Some(*dep);
+        }
+        if let Some(found) = find_dep(dep, name) {
+            return Some(found);
+        }
+        i += 1;
+    }
+    None
 }
 
 pub const INSTANCES_READY: StageDef = StageDef {
@@ -88,7 +208,7 @@ pub const MIRRORD_READY: StageDef = StageDef {
 pub const NSS_JOURNAL_READY: StageDef = StageDef {
     name: "nss-journal-ready",
     desc: "NSS journal ready",
-    depends_on: &[&NSS_FORMATTED, &METADATA_VG_READY],
+    depends_on: &[&NSS_FORMATTED, &METADATA_VG_READY, &MIRRORD_READY],
     is_global: false,
     timeout_secs: 600,
 };
@@ -224,6 +344,68 @@ mod tests {
         // BSS_CONFIGURED and NSS_FORMATTED both depend on RSS_INITIALIZED (parallel branches)
         assert!(pos(RSS_INITIALIZED.name) < pos(BSS_CONFIGURED.name));
         assert!(pos(RSS_INITIALIZED.name) < pos(NSS_FORMATTED.name));
+    }
+
+    #[test]
+    fn dep_returns_declared_dependency() {
+        // const { } forces compile-time evaluation — a typo here is a build error
+        let dep = const { RSS_INITIALIZED.global_dep("etcd-ready") };
+        assert_eq!(dep.stage().name, ETCD_READY.name);
+    }
+
+    #[test]
+    fn dep_returns_transitive_dependency() {
+        let dep = const { SERVICES_READY.global_dep("etcd-ready") };
+        assert_eq!(dep.stage().name, ETCD_READY.name);
+    }
+
+    #[test]
+    #[should_panic(expected = "stage is not a declared dependency")]
+    fn dep_panics_on_undeclared_dependency() {
+        // Runtime call (without const { }) still panics for dynamic lookups
+        RSS_INITIALIZED.global_dep("metadata-vg-ready");
+    }
+
+    #[test]
+    fn node_dep_returns_declared_dependency() {
+        let dep = const { SERVICES_READY.node_dep("nss-journal-ready") };
+        assert_eq!(dep.stage().name, NSS_JOURNAL_READY.name);
+    }
+
+    #[test]
+    #[should_panic(expected = "dependency is not a global stage")]
+    fn global_dep_panics_on_node_stage() {
+        SERVICES_READY.global_dep("nss-formatted");
+    }
+
+    #[test]
+    #[should_panic(expected = "dependency is not a per-node stage")]
+    fn node_dep_panics_on_global_stage() {
+        SERVICES_READY.node_dep("rss-initialized");
+    }
+
+    #[test]
+    fn global_stage_returns_stage() {
+        let stage = const { ETCD_READY.global_stage() };
+        assert_eq!(stage.stage().name, ETCD_READY.name);
+    }
+
+    #[test]
+    fn node_stage_returns_stage() {
+        let stage = const { SERVICES_READY.node_stage() };
+        assert_eq!(stage.stage().name, SERVICES_READY.name);
+    }
+
+    #[test]
+    #[should_panic(expected = "stage is not a global stage")]
+    fn global_stage_panics_on_node_stage() {
+        SERVICES_READY.global_stage();
+    }
+
+    #[test]
+    #[should_panic(expected = "stage is not a per-node stage")]
+    fn node_stage_panics_on_global_stage() {
+        ETCD_READY.node_stage();
     }
 
     #[test]

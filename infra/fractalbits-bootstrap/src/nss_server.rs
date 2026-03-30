@@ -3,11 +3,66 @@ pub mod nvme_journal;
 
 use super::common::*;
 use crate::config::{BootstrapConfig, DeployTarget, JournalType};
+use crate::stage_helpers::{CommonServicesReadyStage, InstancesReadyStage};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use cmd_lib::*;
 use std::io::Error;
+use xtask_common::stages::{VerifiedGlobalDep, VerifiedNodeDep, VerifiedNodeStage};
 
 const BLOB_DRAM_MEM_PERCENT: f64 = 0.8;
+
+struct NssFormattedStage;
+
+impl NssFormattedStage {
+    const STAGE: VerifiedNodeStage = const { stages::NSS_FORMATTED.node_stage() };
+    const ETCD_READY: VerifiedGlobalDep = const { stages::NSS_FORMATTED.global_dep("etcd-ready") };
+    const RSS_INITIALIZED: VerifiedGlobalDep =
+        const { stages::NSS_FORMATTED.global_dep("rss-initialized") };
+
+    fn wait_for_etcd_ready(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.wait_for_global(Self::ETCD_READY)
+    }
+
+    fn wait_for_rss_initialized(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.wait_for_global(Self::RSS_INITIALIZED)
+    }
+
+    fn complete(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.complete_node_stage(Self::STAGE, None)
+    }
+}
+
+struct NssJournalReadyStage;
+
+impl NssJournalReadyStage {
+    const STAGE: VerifiedNodeStage = const { stages::NSS_JOURNAL_READY.node_stage() };
+    const MIRRORD_READY: VerifiedNodeDep =
+        const { stages::NSS_JOURNAL_READY.node_dep("mirrord-ready") };
+    const METADATA_VG_READY: VerifiedGlobalDep =
+        const { stages::NSS_JOURNAL_READY.global_dep("metadata-vg-ready") };
+
+    fn wait_for_mirrord_ready(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.wait_for_nodes(Self::MIRRORD_READY, 1).map(|_| ())
+    }
+
+    fn wait_for_metadata_vg_ready(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.wait_for_global(Self::METADATA_VG_READY)
+    }
+
+    fn complete(barrier: &WorkflowBarrier, metadata: serde_json::Value) -> CmdResult {
+        barrier.complete_node_stage(Self::STAGE, Some(metadata))
+    }
+}
+
+struct MirrordReadyStage;
+
+impl MirrordReadyStage {
+    const STAGE: VerifiedNodeStage = const { stages::MIRRORD_READY.node_stage() };
+
+    fn complete(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.complete_node_stage(Self::STAGE, None)
+    }
+}
 
 pub fn bootstrap(
     config: &BootstrapConfig,
@@ -16,6 +71,7 @@ pub fn bootstrap(
     is_standby: bool,
     for_bench: bool,
 ) -> CmdResult {
+    let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Nss)?;
     let meta_stack_testing = config.global.meta_stack_testing;
     let journal_type = config.global.journal_type;
 
@@ -28,8 +84,6 @@ pub fn bootstrap(
         global_journal_uuid.as_deref()
     };
 
-    let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Nss)?;
-
     // Get private IP for stage completion metadata (used by RSS to discover NSS IP)
     let private_ip = crate::common::get_private_ip(config.global.deploy_target).unwrap_or_default();
     let nss_role = if is_standby { "standby" } else { "primary" };
@@ -39,7 +93,7 @@ pub fn bootstrap(
     });
 
     // Complete instances-ready stage
-    barrier.complete_stage(stages::INSTANCES_READY, Some(instances_ready_meta))?;
+    InstancesReadyStage::complete_with_metadata(&barrier, instances_ready_meta)?;
 
     if journal_type == JournalType::Nvme {
         install_packages(&["nvme-cli", "mdadm"])?;
@@ -65,7 +119,7 @@ pub fn bootstrap(
     // When using etcd backend, wait for etcd cluster to be ready first
     if config.is_etcd_backend() {
         info!("Waiting for etcd cluster to be ready...");
-        barrier.wait_for_global(stages::ETCD_READY)?;
+        NssFormattedStage::wait_for_etcd_ready(&barrier)?;
         info!("etcd cluster is ready");
     }
 
@@ -73,7 +127,7 @@ pub fn bootstrap(
         // Wait for RSS to initialize - RSS will have registered with service discovery by then
         // This must happen before setup_configs because create_nss_role_agent_config needs RSS IPs
         info!("Waiting for RSS to initialize...");
-        barrier.wait_for_global(stages::RSS_INITIALIZED)?;
+        NssFormattedStage::wait_for_rss_initialized(&barrier)?;
     } else {
         info!("Meta-stack testing mode: skipping RSS wait");
     }
@@ -97,14 +151,13 @@ pub fn bootstrap(
         prepare_local_dirs()?;
 
         // Signal formatting complete (standby has nothing to format)
-        barrier.complete_stage(stages::NSS_FORMATTED, None)?;
+        NssFormattedStage::complete(&barrier)?;
 
         // Start role_agent in standby mode (it will be idle)
         run_cmd!(systemctl start nss_role_agent.service)?;
 
         // Complete services-ready stage
-        barrier.complete_stage(stages::SERVICES_READY, None)?;
-
+        CommonServicesReadyStage::complete(&barrier)?;
         return Ok(());
     }
 
@@ -134,7 +187,7 @@ pub fn bootstrap(
     }
 
     // Signal that formatting is complete
-    barrier.complete_stage(stages::NSS_FORMATTED, None)?;
+    NssFormattedStage::complete(&barrier)?;
 
     // For NVMe journal type, coordinate active/standby startup
     // Standby (nss_b) must start mirrord first, then active (nss_a) can start nss_server
@@ -149,18 +202,15 @@ pub fn bootstrap(
             wait_for_service_ready("mirrord", 9999, 120)?;
 
             // Signal that mirrord is ready
-            barrier.complete_stage(stages::MIRRORD_READY, None)?;
+            MirrordReadyStage::complete(&barrier)?;
             info!("Mirrord is ready, signaled MIRRORD_READY");
-
-            // Complete services-ready stage
-            barrier.complete_stage(stages::SERVICES_READY, None)?;
         } else if !is_ha_mode {
             // Solo mode: no mirrord coordination needed, just start nss_server directly
             info!("Starting as solo NSS (no mirrord coordination)");
 
             if !meta_stack_testing {
                 info!("Waiting for metadata VG configuration...");
-                barrier.wait_for_global(stages::METADATA_VG_READY)?;
+                NssJournalReadyStage::wait_for_metadata_vg_ready(&barrier)?;
             }
 
             run_cmd!(systemctl start nss_role_agent.service)?;
@@ -173,19 +223,16 @@ pub fn bootstrap(
                 "private_ip": private_ip,
                 "role": nss_role,
             });
-            barrier.complete_stage(stages::NSS_JOURNAL_READY, Some(journal_ready_meta))?;
-
-            // Complete services-ready stage
-            barrier.complete_stage(stages::SERVICES_READY, None)?;
+            NssJournalReadyStage::complete(&barrier, journal_ready_meta)?;
         } else {
             // Active (HA mode): wait for mirrord to be ready first
             info!("Starting as active NSS, waiting for mirrord to be ready...");
-            barrier.wait_for_nodes(stages::MIRRORD_READY, 1)?;
+            NssJournalReadyStage::wait_for_mirrord_ready(&barrier)?;
             info!("Mirrord is ready");
 
             if !meta_stack_testing {
                 info!("Waiting for metadata VG configuration...");
-                barrier.wait_for_global(stages::METADATA_VG_READY)?;
+                NssJournalReadyStage::wait_for_metadata_vg_ready(&barrier)?;
             }
 
             info!("Starting nss_role_agent");
@@ -199,10 +246,7 @@ pub fn bootstrap(
                 "private_ip": private_ip,
                 "role": nss_role,
             });
-            barrier.complete_stage(stages::NSS_JOURNAL_READY, Some(journal_ready_meta))?;
-
-            // Complete services-ready stage
-            barrier.complete_stage(stages::SERVICES_READY, None)?;
+            NssJournalReadyStage::complete(&barrier, journal_ready_meta)?;
         }
     } else {
         // EBS journal type: active or solo (standby already handled above)
@@ -213,7 +257,7 @@ pub fn bootstrap(
 
         if !meta_stack_testing {
             info!("Waiting for metadata VG configuration...");
-            barrier.wait_for_global(stages::METADATA_VG_READY)?;
+            NssJournalReadyStage::wait_for_metadata_vg_ready(&barrier)?;
         }
 
         run_cmd!(systemctl start nss_role_agent.service)?;
@@ -226,12 +270,11 @@ pub fn bootstrap(
             "private_ip": private_ip,
             "role": nss_role,
         });
-        barrier.complete_stage(stages::NSS_JOURNAL_READY, Some(journal_ready_meta))?;
-
-        // Complete services-ready stage
-        barrier.complete_stage(stages::SERVICES_READY, None)?;
+        NssJournalReadyStage::complete(&barrier, journal_ready_meta)?;
     }
 
+    // Complete services-ready stage
+    CommonServicesReadyStage::complete(&barrier)?;
     Ok(())
 }
 

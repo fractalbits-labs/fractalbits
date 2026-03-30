@@ -1,11 +1,12 @@
 use super::common::*;
 use crate::config::BootstrapConfig;
-use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
+use crate::stage_helpers::{BenchServicesReadyStage, InstancesReadyStage};
+use crate::workflow::{WorkflowBarrier, WorkflowServiceType};
 use cmd_lib::*;
 
 pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Bench)?;
-    barrier.complete_stage(stages::INSTANCES_READY, None)?;
+    InstancesReadyStage::complete(&barrier)?;
 
     let mut binaries = vec!["warp"];
     if config.is_etcd_backend() {
@@ -18,13 +19,13 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     // When using etcd backend, wait for etcd cluster to be ready before registering
     if config.is_etcd_backend() {
         info!("Waiting for etcd cluster to be ready...");
-        barrier.wait_for_global(stages::ETCD_READY)?;
+        BenchServicesReadyStage::wait_for_etcd_ready(&barrier)?;
         info!("etcd cluster is ready");
     }
 
     register_service(config, "bench-client")?;
 
-    barrier.complete_stage(stages::SERVICES_READY, None)?;
+    BenchServicesReadyStage::complete(&barrier)?;
 
     Ok(())
 }

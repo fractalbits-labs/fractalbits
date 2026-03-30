@@ -12,6 +12,7 @@ mod gcp;
 mod gui_server;
 mod nss_server;
 mod root_server;
+mod stage_helpers;
 mod workflow;
 
 use clap::Parser;

@@ -1,22 +1,70 @@
 use super::common::*;
 use crate::config::{BootstrapConfig, DeployTarget};
+use crate::stage_helpers::{CommonServicesReadyStage, InstancesReadyStage};
 use crate::workflow::{StageCompletion, WorkflowBarrier, WorkflowServiceType, stages};
 use cmd_lib::*;
 use std::io::Error;
+use xtask_common::stages::{
+    VerifiedGlobalDep, VerifiedGlobalStage, VerifiedNodeDep, VerifiedNodeStage,
+};
 
 const BLOB_DRAM_MEM_PERCENT: f64 = 0.8;
 const FA_JOURNAL_SEGMENT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 const FLAG_STORAGE_SIZE_PERCENT: f64 = 0.9;
 
+struct BssConfiguredStage;
+
+impl BssConfiguredStage {
+    const STAGE: VerifiedNodeStage = const { stages::BSS_CONFIGURED.node_stage() };
+    const RSS_INITIALIZED: VerifiedGlobalDep =
+        const { stages::BSS_CONFIGURED.global_dep("rss-initialized") };
+
+    fn wait_for_rss_initialized(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.wait_for_global(Self::RSS_INITIALIZED)
+    }
+
+    fn complete(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.complete_node_stage(Self::STAGE, None)
+    }
+}
+
+struct EtcdReadyStage;
+
+impl EtcdReadyStage {
+    const ETCD_NODES_REGISTERED: VerifiedNodeDep =
+        const { stages::ETCD_READY.node_dep("etcd-nodes-registered") };
+    const STAGE: VerifiedGlobalStage = const { stages::ETCD_READY.global_stage() };
+
+    fn wait_for_registered_nodes(
+        barrier: &WorkflowBarrier,
+        expected: usize,
+    ) -> Result<Vec<StageCompletion>, Error> {
+        barrier.wait_for_nodes(Self::ETCD_NODES_REGISTERED, expected)
+    }
+
+    fn complete(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.complete_global_stage(Self::STAGE, None)
+    }
+}
+
+struct EtcdNodesRegisteredStage;
+
+impl EtcdNodesRegisteredStage {
+    const STAGE: VerifiedNodeStage = const { stages::ETCD_NODES_REGISTERED.node_stage() };
+
+    fn complete(barrier: &WorkflowBarrier, my_ip: String) -> CmdResult {
+        barrier.complete_node_stage(Self::STAGE, Some(serde_json::json!({"ip": my_ip})))
+    }
+}
+
 pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
+    let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Bss)?;
+    // Complete instances-ready stage
+    InstancesReadyStage::complete(&barrier)?;
+
     let for_bench = for_bench || config.global.for_bench;
     let meta_stack_testing = config.global.meta_stack_testing;
     let use_etcd = config.is_etcd_backend();
-
-    let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Bss)?;
-
-    // Complete instances-ready stage
-    barrier.complete_stage(stages::INSTANCES_READY, None)?;
 
     install_packages(&["nvme-cli", "mdadm"])?;
     format_local_nvme_disks(false)?; // no twp support since experiment is done
@@ -63,7 +111,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     if !meta_stack_testing {
         // Wait for RSS to initialize and publish volume configs
         info!("Waiting for RSS to initialize...");
-        barrier.wait_for_global(stages::RSS_INITIALIZED)?;
+        BssConfiguredStage::wait_for_rss_initialized(&barrier)?;
     }
 
     create_bss_config()?;
@@ -76,8 +124,8 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     }?;
 
     // Signal that BSS is configured and ready
-    barrier.complete_stage(stages::BSS_CONFIGURED, None)?;
-    barrier.complete_stage(stages::SERVICES_READY, None)?;
+    BssConfiguredStage::complete(&barrier)?;
+    CommonServicesReadyStage::complete(&barrier)?;
 
     Ok(())
 }
@@ -92,14 +140,11 @@ fn bootstrap_etcd(
     // REGISTER: Write node IP to cloud storage via generic stage mechanism
     let my_ip = get_private_ip(config.global.deploy_target)?;
     info!("Registering etcd node (IP: {my_ip}) via workflow stage");
-    barrier.complete_stage(
-        stages::ETCD_NODES_REGISTERED,
-        Some(serde_json::json!({"ip": my_ip})),
-    )?;
+    EtcdNodesRegisteredStage::complete(barrier, my_ip)?;
 
     // DISCOVER: Wait for all nodes to register
     info!("Waiting for {cluster_size} etcd nodes to register");
-    let completions = barrier.wait_for_nodes(stages::ETCD_NODES_REGISTERED, cluster_size)?;
+    let completions = EtcdReadyStage::wait_for_registered_nodes(barrier, cluster_size)?;
     let ips = StageCompletion::extract_metadata_field(&completions, "ip");
     info!("Found {} nodes: {ips:?}", ips.len());
 
@@ -112,7 +157,7 @@ fn bootstrap_etcd(
 
     // Signal that etcd cluster is ready (any node can do this, idempotent)
     // Only one node needs to signal, but it's safe for all to try
-    barrier.complete_global_stage(stages::ETCD_READY, None)?;
+    EtcdReadyStage::complete(barrier)?;
 
     Ok(())
 }

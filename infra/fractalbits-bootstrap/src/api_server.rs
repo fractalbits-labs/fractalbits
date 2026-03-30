@@ -1,14 +1,36 @@
 use crate::config::{BootstrapConfig, DataBlobStorage, DeployTarget, JournalType};
+use crate::stage_helpers::{InstancesReadyStage, ServicesReadyStageDef};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use crate::*;
 use std::io::Error;
+use xtask_common::stages::{VerifiedGlobalDep, VerifiedNodeDep};
+
+struct ServicesReadyStage;
+
+impl ServicesReadyStage {
+    const RSS_INITIALIZED: VerifiedGlobalDep =
+        const { stages::SERVICES_READY.global_dep("rss-initialized") };
+    const NSS_JOURNAL_READY: VerifiedNodeDep =
+        const { stages::SERVICES_READY.node_dep("nss-journal-ready") };
+
+    fn wait_for_rss_initialized(barrier: &WorkflowBarrier) -> CmdResult {
+        ServicesReadyStageDef::wait_for_global_dep(barrier, Self::RSS_INITIALIZED)
+    }
+
+    fn wait_for_nss_journal_ready(barrier: &WorkflowBarrier, expected: usize) -> CmdResult {
+        ServicesReadyStageDef::wait_for_node_dep(barrier, Self::NSS_JOURNAL_READY, expected)
+            .map(|_| ())
+    }
+
+    fn complete(barrier: &WorkflowBarrier) -> CmdResult {
+        ServicesReadyStageDef::complete(barrier)
+    }
+}
 
 pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
-    let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
-
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Api)?;
     // Complete instances-ready stage
-    barrier.complete_stage(stages::INSTANCES_READY, None)?;
+    InstancesReadyStage::complete(&barrier)?;
 
     let mut binaries = vec!["api_server"];
     if config.is_etcd_backend() {
@@ -18,8 +40,9 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
 
     // Wait for RSS to initialize before we can get RSS IPs
     info!("Waiting for RSS to initialize...");
-    barrier.wait_for_global(stages::RSS_INITIALIZED)?;
+    ServicesReadyStage::wait_for_rss_initialized(&barrier)?;
 
+    let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     // Wait for NSS journals to be ready before we can serve requests
     // For NVMe journal, only active (nss-A) publishes journal-ready; standby runs mirrord
     let expected_journal_ready =
@@ -29,7 +52,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
             1
         };
     info!("Waiting for {expected_journal_ready} NSS journal(s) to be ready...");
-    barrier.wait_for_nodes(stages::NSS_JOURNAL_READY, expected_journal_ready)?;
+    ServicesReadyStage::wait_for_nss_journal_ready(&barrier, expected_journal_ready)?;
 
     create_config(config)?;
 
@@ -50,7 +73,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     register_service(config, "api-server")?;
 
     // Signal that API server is ready
-    barrier.complete_stage(stages::SERVICES_READY, None)?;
+    ServicesReadyStage::complete(&barrier)?;
 
     Ok(())
 }

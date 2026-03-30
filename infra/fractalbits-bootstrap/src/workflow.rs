@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::io::Error;
 use std::time::{Duration, Instant};
 use xtask_common::cloud_storage;
-use xtask_common::stages::StageDef;
+use xtask_common::stages::{
+    VerifiedGlobalDep, VerifiedGlobalStage, VerifiedNodeDep, VerifiedNodeStage,
+};
 
 /// Poll interval when waiting for barriers
 const POLL_INTERVAL_SECS: u64 = 2;
@@ -128,11 +130,12 @@ impl WorkflowBarrier {
     }
 
     /// Write stage completion marker (per-node stage)
-    pub fn complete_stage(
+    pub fn complete_node_stage(
         &self,
-        stage: StageDef,
+        stage: VerifiedNodeStage,
         metadata: Option<serde_json::Value>,
     ) -> CmdResult {
+        let stage = stage.stage();
         let key_name = stage.key_name();
         let stage = stage.name;
         let completion = StageCompletion {
@@ -157,9 +160,10 @@ impl WorkflowBarrier {
     /// Write a global stage completion marker (single file, not per-node)
     pub fn complete_global_stage(
         &self,
-        stage: StageDef,
+        stage: VerifiedGlobalStage,
         metadata: Option<serde_json::Value>,
     ) -> CmdResult {
+        let stage = stage.stage();
         let key_name = stage.key_name();
         let stage = stage.name;
         let completion = StageCompletion {
@@ -181,8 +185,10 @@ impl WorkflowBarrier {
         )
     }
 
-    /// Wait for a global stage (single file, no node suffix)
-    pub fn wait_for_global(&self, stage: StageDef) -> CmdResult {
+    /// Wait for a global dependency stage.
+    /// Callers should pass a compile-time validated `VerifiedGlobalDep`.
+    pub fn wait_for_global(&self, dep: VerifiedGlobalDep) -> CmdResult {
+        let stage = dep.stage();
         let key_name = stage.key_name();
         let timeout_secs = stage.timeout_secs;
         let stage = stage.name;
@@ -208,12 +214,14 @@ impl WorkflowBarrier {
         }
     }
 
-    /// Wait for N nodes to complete a per-node stage
+    /// Wait for N nodes to complete a per-node dependency stage.
+    /// Callers should pass a compile-time validated `VerifiedNodeDep`.
     pub fn wait_for_nodes(
         &self,
-        stage: StageDef,
+        dep: VerifiedNodeDep,
         expected: usize,
     ) -> Result<Vec<StageCompletion>, Error> {
+        let stage = dep.stage();
         let key_name = stage.key_name();
         let timeout_secs = stage.timeout_secs;
         let stage = stage.name;

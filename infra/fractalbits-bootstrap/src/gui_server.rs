@@ -1,12 +1,13 @@
 use crate::api_server;
 use crate::config::BootstrapConfig;
-use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
+use crate::stage_helpers::{CommonServicesReadyStage, InstancesReadyStage};
+use crate::workflow::{WorkflowBarrier, WorkflowServiceType};
 use crate::*;
 use xtask_common::cloud_storage;
 
 pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Api)?;
-    barrier.complete_stage(stages::INSTANCES_READY, None)?;
+    InstancesReadyStage::complete(&barrier)?;
 
     download_binaries(config, &["api_server"])?;
     let bootstrap_bucket = config.get_bootstrap_bucket();
@@ -17,7 +18,7 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     // setup_cloudwatch_agent()?;
     create_systemd_unit_file("gui_server", true)?;
 
-    barrier.complete_stage(stages::SERVICES_READY, None)?;
+    CommonServicesReadyStage::complete(&barrier)?;
 
     Ok(())
 }
