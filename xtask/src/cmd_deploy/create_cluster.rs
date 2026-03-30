@@ -202,6 +202,7 @@ impl InputClusterConfig {
             meta_stack_testing: false,
             use_generic_binaries: true,
             journal_uuid: None,
+            storage_alloc_mode: xtask_common::StorageAllocMode::default(),
         };
 
         let nss_endpoint = self

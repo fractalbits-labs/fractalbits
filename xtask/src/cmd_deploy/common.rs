@@ -24,6 +24,7 @@ pub struct VpcConfig {
     pub deploy_os: crate::DeployOS,
     pub gcp_project: Option<String>,
     pub gcp_zone: Option<String>,
+    pub storage_alloc_mode: crate::StorageAllocMode,
 }
 
 #[derive(Clone)]
