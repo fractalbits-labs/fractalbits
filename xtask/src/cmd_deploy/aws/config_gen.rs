@@ -57,7 +57,7 @@ pub fn generate_bootstrap_config(vpc_config: &VpcConfig) -> Result<BootstrapClus
             meta_stack_testing: false,
             use_generic_binaries: vpc_config.use_generic_binaries,
             journal_uuid: Some(journal_uuid),
-            storage_alloc_mode: vpc_config.storage_alloc_mode,
+            bss_storage_alloc_mode: vpc_config.bss_storage_alloc_mode,
         },
         aws: Some(aws_config),
         gcp: None,

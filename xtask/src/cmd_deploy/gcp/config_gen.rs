@@ -19,7 +19,7 @@ pub struct GcpDeployParams<'a> {
     pub num_bench_clients: usize,
     pub with_bench: bool,
     pub use_generic_binaries: bool,
-    pub storage_alloc_mode: xtask_common::StorageAllocMode,
+    pub bss_storage_alloc_mode: xtask_common::BssStorageAllocMode,
 }
 
 /// Generate a global-only BootstrapClusterConfig before Terraform apply.
@@ -72,7 +72,7 @@ pub fn generate_bootstrap_config(
             meta_stack_testing: false,
             use_generic_binaries: params.use_generic_binaries,
             journal_uuid: Some(journal_uuid),
-            storage_alloc_mode: params.storage_alloc_mode,
+            bss_storage_alloc_mode: params.bss_storage_alloc_mode,
         },
         aws: None,
         gcp: Some(gcp_config),

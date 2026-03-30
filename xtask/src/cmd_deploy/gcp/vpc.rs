@@ -36,7 +36,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         num_bench_clients: config.num_bench_clients as usize,
         with_bench: config.with_bench,
         use_generic_binaries: config.use_generic_binaries,
-        storage_alloc_mode: config.storage_alloc_mode,
+        bss_storage_alloc_mode: config.bss_storage_alloc_mode,
     };
     let bootstrap_config = config_gen::generate_bootstrap_config(&params)?;
     let config_toml = bootstrap_config

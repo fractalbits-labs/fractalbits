@@ -149,8 +149,6 @@ pub enum DeployTarget {
     Deserialize,
     Default,
     strum::AsRefStr,
-    strum::Display,
-    strum::EnumString,
     clap::ValueEnum,
 )]
 #[serde(rename_all = "snake_case")]
@@ -172,14 +170,12 @@ pub enum JournalType {
     Deserialize,
     Default,
     strum::AsRefStr,
-    strum::Display,
-    strum::EnumString,
     clap::ValueEnum,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 #[clap(rename_all = "snake_case")]
-pub enum StorageAllocMode {
+pub enum BssStorageAllocMode {
     Sparse,
     ReserveSpace,
     #[default]
@@ -196,8 +192,6 @@ pub enum StorageAllocMode {
     Deserialize,
     Default,
     strum::AsRefStr,
-    strum::Display,
-    strum::EnumString,
     clap::ValueEnum,
 )]
 #[serde(rename_all = "snake_case")]
@@ -220,8 +214,6 @@ pub enum DataBlobStorage {
     Deserialize,
     Default,
     strum::AsRefStr,
-    strum::Display,
-    strum::EnumString,
     clap::ValueEnum,
 )]
 #[serde(rename_all = "snake_case")]
@@ -234,18 +226,7 @@ pub enum RssBackend {
     Firestore,
 }
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
-    strum::AsRefStr,
-    strum::Display,
-    strum::EnumString,
-    clap::ValueEnum,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, strum::AsRefStr, clap::ValueEnum)]
 #[strum(serialize_all = "snake_case")]
 #[clap(rename_all = "snake_case")]
 pub enum DeployOS {
@@ -327,7 +308,7 @@ pub struct ClusterGlobalConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_uuid: Option<String>,
     #[serde(default)]
-    pub storage_alloc_mode: StorageAllocMode,
+    pub bss_storage_alloc_mode: BssStorageAllocMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
