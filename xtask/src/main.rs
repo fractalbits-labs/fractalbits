@@ -18,7 +18,7 @@ use cmd_build::BuildMode;
 use cmd_lib::*;
 use strum::{AsRefStr, EnumString};
 use xtask_common::DeployTarget;
-pub use xtask_common::{DataBlobStorage, DeployOS, JournalType, RssBackend, StorageAllocMode};
+pub use xtask_common::{BssStorageAllocMode, DataBlobStorage, DeployOS, JournalType, RssBackend};
 
 pub const TS_FMT: &str = "%b %d %H:%M:%.S";
 // Need to match with api_server's default config to make authentication work
@@ -385,7 +385,7 @@ pub enum DeployCommand {
             long_help = "BSS storage allocation mode (sparse, reserve_space, write_zero)",
             default_value = "write_zero"
         )]
-        storage_alloc_mode: StorageAllocMode,
+        bss_storage_alloc_mode: BssStorageAllocMode,
     },
 
     #[clap(about = "Destroy VPC infrastructure (including s3 builds bucket cleanup)")]
@@ -903,7 +903,7 @@ async fn main() -> CmdResult {
                 deploy_os,
                 gcp_project,
                 gcp_zone,
-                storage_alloc_mode,
+                bss_storage_alloc_mode,
             } => {
                 let vpc_config = cmd_deploy::VpcConfig {
                     template,
@@ -927,7 +927,7 @@ async fn main() -> CmdResult {
                     deploy_os,
                     gcp_project,
                     gcp_zone,
-                    storage_alloc_mode,
+                    bss_storage_alloc_mode,
                 };
                 match target {
                     CloudProvider::Aws => cmd_deploy::aws::create_vpc(vpc_config)?,
