@@ -3,8 +3,6 @@ use crate::*;
 use super::super::common::{DeployTarget, VpcConfig, upload_config_and_blueprint};
 use super::super::{bootstrap_progress, upload};
 use super::config_gen;
-use xtask_common;
-
 const TERRAFORM_DIR: &str = "infra/fractalbits-terraform";
 
 pub fn create_vpc(config: VpcConfig) -> CmdResult {
@@ -31,13 +29,14 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         project_id: &project_id,
         zone: &zone,
         region,
-        rss_backend: to_common_rss_backend(config.rss_backend),
+        rss_backend: config.rss_backend,
         rss_ha_enabled: config.root_server_ha,
         num_bss_nodes: config.num_bss_nodes as usize,
         num_api_servers: config.num_api_servers as usize,
         num_bench_clients: config.num_bench_clients as usize,
         with_bench: config.with_bench,
         use_generic_binaries: config.use_generic_binaries,
+        storage_alloc_mode: config.storage_alloc_mode,
     };
     let bootstrap_config = config_gen::generate_bootstrap_config(&params)?;
     let config_toml = bootstrap_config
@@ -203,14 +202,6 @@ fn build_terraform_vars(
     }
 
     vars
-}
-
-fn to_common_rss_backend(backend: RssBackend) -> xtask_common::RssBackend {
-    match backend {
-        RssBackend::Etcd => xtask_common::RssBackend::Etcd,
-        RssBackend::Ddb => xtask_common::RssBackend::Ddb,
-        RssBackend::Firestore => xtask_common::RssBackend::Firestore,
-    }
 }
 
 fn clear_firestore_stale_data(project_id: &str) -> CmdResult {

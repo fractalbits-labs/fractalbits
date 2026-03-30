@@ -10,21 +10,6 @@ use xtask_common::{
 
 use super::super::common::VpcConfig;
 
-fn to_common_rss_backend(backend: crate::RssBackend) -> xtask_common::RssBackend {
-    match backend {
-        crate::RssBackend::Etcd => xtask_common::RssBackend::Etcd,
-        crate::RssBackend::Ddb => xtask_common::RssBackend::Ddb,
-        crate::RssBackend::Firestore => xtask_common::RssBackend::Firestore,
-    }
-}
-
-fn to_common_journal_type(jt: crate::JournalType) -> xtask_common::JournalType {
-    match jt {
-        crate::JournalType::Ebs => xtask_common::JournalType::Ebs,
-        crate::JournalType::Nvme => xtask_common::JournalType::Nvme,
-    }
-}
-
 /// Generate a global-only BootstrapClusterConfig before CDK deploy.
 ///
 /// Only static parameters are included — no instance IDs, no NSS endpoint,
@@ -58,8 +43,8 @@ pub fn generate_bootstrap_config(vpc_config: &VpcConfig) -> Result<BootstrapClus
             for_bench: vpc_config.with_bench,
             data_blob_storage: DataBlobStorage::AllInBssSingleAz,
             rss_ha_enabled: vpc_config.root_server_ha,
-            rss_backend: to_common_rss_backend(vpc_config.rss_backend),
-            journal_type: to_common_journal_type(vpc_config.journal_type),
+            rss_backend: vpc_config.rss_backend,
+            journal_type: vpc_config.journal_type,
             num_nss_nodes: Some(2), // CDK always creates nss-A and nss-B unconditionally
             num_bss_nodes: Some(vpc_config.num_bss_nodes as usize),
             num_api_servers: Some(vpc_config.num_api_servers as usize),
@@ -72,6 +57,7 @@ pub fn generate_bootstrap_config(vpc_config: &VpcConfig) -> Result<BootstrapClus
             meta_stack_testing: false,
             use_generic_binaries: vpc_config.use_generic_binaries,
             journal_uuid: Some(journal_uuid),
+            storage_alloc_mode: vpc_config.storage_alloc_mode,
         },
         aws: Some(aws_config),
         gcp: None,

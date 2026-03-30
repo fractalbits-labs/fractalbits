@@ -18,6 +18,9 @@ use cmd_build::BuildMode;
 use cmd_lib::*;
 use strum::{AsRefStr, EnumString};
 use xtask_common::DeployTarget;
+pub use xtask_common::{
+    DataBlobStorage, DeployOS, JournalType, RssBackend, StorageAllocMode,
+};
 
 pub const TS_FMT: &str = "%b %d %H:%M:%.S";
 // Need to match with api_server's default config to make authentication work
@@ -377,6 +380,14 @@ pub enum DeployCommand {
             long_help = "GCP zone (overrides GCP_ZONE env var, default: us-central1-a)"
         )]
         gcp_zone: Option<String>,
+
+        #[clap(
+            long,
+            value_enum,
+            long_help = "BSS storage allocation mode (sparse, reserve_space, write_zero)",
+            default_value = "write_zero"
+        )]
+        storage_alloc_mode: StorageAllocMode,
     },
 
     #[clap(about = "Destroy VPC infrastructure (including s3 builds bucket cleanup)")]
@@ -492,31 +503,11 @@ impl ServiceName {
 #[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
 #[strum(serialize_all = "snake_case")]
 #[clap(rename_all = "snake_case")]
-pub enum DataBlobStorage {
-    S3HybridSingleAz,
-    S3ExpressMultiAz,
-    #[default]
-    AllInBssSingleAz,
-}
-
-#[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
-#[strum(serialize_all = "snake_case")]
-#[clap(rename_all = "snake_case")]
 pub enum DockerTestMode {
     #[default]
     Included,
     Excluded,
     Only,
-}
-
-#[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
-#[strum(serialize_all = "lowercase")]
-#[clap(rename_all = "lowercase")]
-pub enum RssBackend {
-    Ddb,
-    #[default]
-    Etcd,
-    Firestore,
 }
 
 #[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
@@ -551,24 +542,6 @@ pub enum NssRole {
     #[default]
     Active,
     Solo,
-}
-
-#[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
-#[strum(serialize_all = "lowercase")]
-#[clap(rename_all = "lowercase")]
-pub enum JournalType {
-    #[default]
-    Ebs,
-    Nvme,
-}
-
-#[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
-#[strum(serialize_all = "lowercase")]
-#[clap(rename_all = "lowercase")]
-pub enum DeployOS {
-    #[default]
-    Al2023,
-    Ubuntu,
 }
 
 #[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
@@ -612,7 +585,7 @@ impl Default for InitConfig {
             with_https: false,
             bss_count: 1,
             nss_disable_restart_limit: false,
-            rss_backend: Default::default(),
+            rss_backend: RssBackend::Etcd,
             journal_type: Default::default(),
             fs_server: Default::default(),
         }
@@ -648,8 +621,7 @@ pub enum ServiceCommand {
         #[clap(long, long_help = "disable restart limit for NSS role agent")]
         nss_disable_restart_limit: bool,
 
-        #[clap(long, value_enum)]
-        #[arg(default_value_t)]
+        #[clap(long, value_enum, default_value = "etcd")]
         rss_backend: RssBackend,
 
         #[clap(long, value_enum, long_help = "journal type (ebs or nvme)")]
@@ -933,6 +905,7 @@ async fn main() -> CmdResult {
                 deploy_os,
                 gcp_project,
                 gcp_zone,
+                storage_alloc_mode,
             } => {
                 let vpc_config = cmd_deploy::VpcConfig {
                     template,
@@ -956,6 +929,7 @@ async fn main() -> CmdResult {
                     deploy_os,
                     gcp_project,
                     gcp_zone,
+                    storage_alloc_mode,
                 };
                 match target {
                     CloudProvider::Aws => cmd_deploy::aws::create_vpc(vpc_config)?,

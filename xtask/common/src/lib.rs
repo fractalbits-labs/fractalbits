@@ -139,16 +139,40 @@ pub enum DeployTarget {
     Gcp,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+    strum::AsRefStr, strum::Display, strum::EnumString, clap::ValueEnum,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
 pub enum JournalType {
     #[default]
     Ebs,
     Nvme,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+    strum::AsRefStr, strum::Display, strum::EnumString, clap::ValueEnum,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
+pub enum StorageAllocMode {
+    Sparse,
+    ReserveSpace,
+    #[default]
+    WriteZero,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+    strum::AsRefStr, strum::Display, strum::EnumString, clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
 pub enum DataBlobStorage {
     #[default]
     AllInBssSingleAz,
@@ -156,13 +180,30 @@ pub enum DataBlobStorage {
     S3ExpressMultiAz,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+    strum::AsRefStr, strum::Display, strum::EnumString, clap::ValueEnum,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
 pub enum RssBackend {
     Etcd,
     #[default]
     Ddb,
     Firestore,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default,
+    strum::AsRefStr, strum::Display, strum::EnumString, clap::ValueEnum,
+)]
+#[strum(serialize_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
+pub enum DeployOS {
+    #[default]
+    Al2023,
+    Ubuntu,
 }
 
 /// Node entry within a service type group
@@ -237,6 +278,8 @@ pub struct ClusterGlobalConfig {
     /// Replaces per-node journal_uuid in NodeEntry for cloud deployments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_uuid: Option<String>,
+    #[serde(default)]
+    pub storage_alloc_mode: StorageAllocMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
