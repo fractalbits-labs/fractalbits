@@ -1,6 +1,6 @@
 use super::common::*;
 use crate::config::{BootstrapConfig, DeployTarget};
-use crate::workflow::{StageCompletion, WorkflowBarrier, WorkflowServiceType, stages, timeouts};
+use crate::workflow::{StageCompletion, WorkflowBarrier, WorkflowServiceType, stages};
 use cmd_lib::*;
 use std::io::Error;
 
@@ -63,7 +63,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     if !meta_stack_testing {
         // Wait for RSS to initialize and publish volume configs
         info!("Waiting for RSS to initialize...");
-        barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
+        barrier.wait_for_global(stages::RSS_INITIALIZED)?;
     }
 
     create_bss_config()?;
@@ -99,11 +99,7 @@ fn bootstrap_etcd(
 
     // DISCOVER: Wait for all nodes to register
     info!("Waiting for {cluster_size} etcd nodes to register");
-    let completions = barrier.wait_for_nodes(
-        stages::ETCD_NODES_REGISTERED,
-        cluster_size,
-        timeouts::ETCD_READY,
-    )?;
+    let completions = barrier.wait_for_nodes(stages::ETCD_NODES_REGISTERED, cluster_size)?;
     let ips = StageCompletion::extract_metadata_field(&completions, "ip");
     info!("Found {} nodes: {ips:?}", ips.len());
 

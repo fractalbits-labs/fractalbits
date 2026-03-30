@@ -1,6 +1,6 @@
 use super::common::*;
 use crate::config::BootstrapConfig;
-use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
+use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use cmd_lib::*;
 
 pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
@@ -18,7 +18,7 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     // When using etcd backend, wait for etcd cluster to be ready before registering
     if config.is_etcd_backend() {
         info!("Waiting for etcd cluster to be ready...");
-        barrier.wait_for_global(stages::ETCD_READY, timeouts::ETCD_READY)?;
+        barrier.wait_for_global(stages::ETCD_READY)?;
         info!("etcd cluster is ready");
     }
 

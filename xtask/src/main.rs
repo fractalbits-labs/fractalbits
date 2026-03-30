@@ -18,9 +18,7 @@ use cmd_build::BuildMode;
 use cmd_lib::*;
 use strum::{AsRefStr, EnumString};
 use xtask_common::DeployTarget;
-pub use xtask_common::{
-    DataBlobStorage, DeployOS, JournalType, RssBackend, StorageAllocMode,
-};
+pub use xtask_common::{DataBlobStorage, DeployOS, JournalType, RssBackend, StorageAllocMode};
 
 pub const TS_FMT: &str = "%b %d %H:%M:%.S";
 // Need to match with api_server's default config to make authentication work

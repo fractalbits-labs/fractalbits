@@ -1,6 +1,6 @@
 use super::common::*;
 use crate::config::{BootstrapConfig, DeployTarget, JournalType};
-use crate::workflow::{StageCompletion, WorkflowBarrier, WorkflowServiceType, stages, timeouts};
+use crate::workflow::{StageCompletion, WorkflowBarrier, WorkflowServiceType, stages};
 use cmd_lib::*;
 use std::io::Error;
 
@@ -90,7 +90,7 @@ fn post_bootstrap_cleanup(config: &BootstrapConfig) -> CmdResult {
 
     info!("Waiting for all {total_nodes} nodes to complete SERVICES_READY before cleanup...");
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Rss)?;
-    if let Err(e) = barrier.wait_for_nodes(stages::SERVICES_READY, total_nodes, 600) {
+    if let Err(e) = barrier.wait_for_nodes(stages::SERVICES_READY, total_nodes) {
         warn!("Timed out waiting for all nodes: {e}");
         warn!("Proceeding with cleanup anyway");
     }
@@ -138,7 +138,7 @@ fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: 
 
     // Wait for leader to initialize RSS
     info!("Follower waiting for RSS leader to initialize...");
-    barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
+    barrier.wait_for_global(stages::RSS_INITIALIZED)?;
 
     create_rss_config(config, nss_endpoint, ha_enabled)?;
     create_rss_bootstrap_env()?;
@@ -173,7 +173,7 @@ fn bootstrap_leader(
     // Wait for etcd cluster if using etcd backend
     if config.is_etcd_backend() {
         info!("Waiting for etcd cluster to be ready...");
-        barrier.wait_for_global(stages::ETCD_READY, timeouts::ETCD_READY)?;
+        barrier.wait_for_global(stages::ETCD_READY)?;
     }
 
     let mut binaries = vec!["rss_admin", "root_server"];
@@ -230,7 +230,7 @@ fn bootstrap_leader(
     // Wait for NSS formatting to complete via workflow barriers
     let expected_nss = if nss_b_id.is_some() { 2 } else { 1 };
     info!("Waiting for {expected_nss} NSS instance(s) to complete formatting...");
-    barrier.wait_for_nodes(stages::NSS_FORMATTED, expected_nss, timeouts::NSS_FORMATTED)?;
+    barrier.wait_for_nodes(stages::NSS_FORMATTED, expected_nss)?;
     info!("All NSS instances have completed formatting");
 
     // Wait for NSS journal to be ready via workflow barriers
@@ -243,11 +243,7 @@ fn bootstrap_leader(
         expected_nss // Solo: the single node signals
     };
     info!("Waiting for {expected_journal_ready} NSS journal(s) to be ready...");
-    barrier.wait_for_nodes(
-        stages::NSS_JOURNAL_READY,
-        expected_journal_ready,
-        timeouts::NSS_JOURNAL_READY,
-    )?;
+    barrier.wait_for_nodes(stages::NSS_JOURNAL_READY, expected_journal_ready)?;
 
     if for_bench {
         run_cmd!($BIN_PATH/rss_admin --rss-addr=127.0.0.1:8088 api-key init-test)?;
@@ -376,11 +372,7 @@ fn initialize_bss_volume_groups(
         // Wait for BSS nodes to complete instances-ready stage via workflow
         info!("Waiting for {total_bss_nodes} BSS node(s) to be ready...");
         barrier
-            .wait_for_nodes(
-                stages::INSTANCES_READY,
-                total_bss_nodes + 1,
-                timeouts::INSTANCES_READY,
-            )
+            .wait_for_nodes(stages::INSTANCES_READY, total_bss_nodes + 1)
             .unwrap_or_default(); // Best effort - RSS already counted
         let bss_ips = get_service_ips_with_backend(config, "bss-server", total_bss_nodes);
         bss_ips

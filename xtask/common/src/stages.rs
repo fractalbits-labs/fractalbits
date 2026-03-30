@@ -10,8 +10,9 @@ use std::collections::{HashMap, VecDeque};
 pub struct StageDef {
     pub name: &'static str,
     pub desc: &'static str,
-    pub depends_on: &'static [&'static str],
+    pub depends_on: &'static [&'static StageDef],
     pub is_global: bool,
+    pub timeout_secs: u64,
 }
 
 impl StageDef {
@@ -33,69 +34,79 @@ pub const INSTANCES_READY: StageDef = StageDef {
     desc: "Instances ready",
     depends_on: &[],
     is_global: false,
+    timeout_secs: 120,
 };
 
 pub const ETCD_NODES_REGISTERED: StageDef = StageDef {
     name: "etcd-nodes-registered",
     desc: "etcd nodes registered IPs",
-    depends_on: &["instances-ready"],
+    depends_on: &[&INSTANCES_READY],
     is_global: false,
+    timeout_secs: 600,
 };
 
 pub const ETCD_READY: StageDef = StageDef {
     name: "etcd-ready",
     desc: "etcd cluster formed",
-    depends_on: &["etcd-nodes-registered"],
+    depends_on: &[&ETCD_NODES_REGISTERED],
     is_global: true,
+    timeout_secs: 600,
 };
 
 pub const RSS_INITIALIZED: StageDef = StageDef {
     name: "rss-initialized",
     desc: "RSS config published",
-    depends_on: &["etcd-ready"],
+    depends_on: &[&ETCD_READY],
     is_global: true,
+    timeout_secs: 600,
 };
 
 pub const METADATA_VG_READY: StageDef = StageDef {
     name: "metadata-vg-ready",
     desc: "Metadata VG ready",
-    depends_on: &["rss-initialized"],
+    depends_on: &[&RSS_INITIALIZED],
     is_global: true,
+    timeout_secs: 600,
 };
 
 pub const NSS_FORMATTED: StageDef = StageDef {
     name: "nss-formatted",
     desc: "NSS formatted",
-    depends_on: &["rss-initialized"],
+    depends_on: &[&RSS_INITIALIZED],
     is_global: false,
+    timeout_secs: 600,
 };
 
 pub const MIRRORD_READY: StageDef = StageDef {
     name: "mirrord-ready",
     desc: "Mirrord ready",
-    depends_on: &["nss-formatted"],
+    depends_on: &[&NSS_FORMATTED],
     is_global: false,
+    timeout_secs: 120,
 };
 
 pub const NSS_JOURNAL_READY: StageDef = StageDef {
     name: "nss-journal-ready",
     desc: "NSS journal ready",
-    depends_on: &["nss-formatted", "metadata-vg-ready"],
+    depends_on: &[&NSS_FORMATTED, &METADATA_VG_READY],
     is_global: false,
+    timeout_secs: 600,
 };
 
 pub const BSS_CONFIGURED: StageDef = StageDef {
     name: "bss-configured",
     desc: "BSS configured",
-    depends_on: &["rss-initialized"],
+    depends_on: &[&RSS_INITIALIZED],
     is_global: false,
+    timeout_secs: 1200, // storage_alloc_mode=.write_zero is slower
 };
 
 pub const SERVICES_READY: StageDef = StageDef {
     name: "services-ready",
     desc: "Services ready",
-    depends_on: &["nss-journal-ready", "bss-configured"],
+    depends_on: &[&NSS_JOURNAL_READY, &BSS_CONFIGURED],
     is_global: false,
+    timeout_secs: 60,
 };
 
 /// All stage definitions. The blueprint uses this to build the DAG.
@@ -121,7 +132,7 @@ fn topological_order() -> Vec<&'static str> {
         in_degree.entry(stage.name).or_insert(0);
         for dep in stage.depends_on {
             *in_degree.entry(stage.name).or_insert(0) += 1;
-            dependents.entry(dep).or_default().push(stage.name);
+            dependents.entry(dep.name).or_default().push(stage.name);
         }
     }
 
@@ -158,10 +169,10 @@ pub fn validate_dag() -> Result<Vec<&'static str>, String> {
     // Check all depends_on references resolve
     for &stage in ALL_STAGES {
         for dep in stage.depends_on {
-            if !by_name.contains_key(dep) {
+            if !by_name.contains_key(dep.name) {
                 return Err(format!(
                     "stage '{}' depends on '{}' which does not exist",
-                    stage.name, dep
+                    stage.name, dep.name
                 ));
             }
         }

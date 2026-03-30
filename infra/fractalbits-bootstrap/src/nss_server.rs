@@ -3,7 +3,7 @@ pub mod nvme_journal;
 
 use super::common::*;
 use crate::config::{BootstrapConfig, DeployTarget, JournalType};
-use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages, timeouts};
+use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use cmd_lib::*;
 use std::io::Error;
 
@@ -65,7 +65,7 @@ pub fn bootstrap(
     // When using etcd backend, wait for etcd cluster to be ready first
     if config.is_etcd_backend() {
         info!("Waiting for etcd cluster to be ready...");
-        barrier.wait_for_global(stages::ETCD_READY, timeouts::ETCD_READY)?;
+        barrier.wait_for_global(stages::ETCD_READY)?;
         info!("etcd cluster is ready");
     }
 
@@ -73,7 +73,7 @@ pub fn bootstrap(
         // Wait for RSS to initialize - RSS will have registered with service discovery by then
         // This must happen before setup_configs because create_nss_role_agent_config needs RSS IPs
         info!("Waiting for RSS to initialize...");
-        barrier.wait_for_global(stages::RSS_INITIALIZED, timeouts::RSS_INITIALIZED)?;
+        barrier.wait_for_global(stages::RSS_INITIALIZED)?;
     } else {
         info!("Meta-stack testing mode: skipping RSS wait");
     }
@@ -160,7 +160,7 @@ pub fn bootstrap(
 
             if !meta_stack_testing {
                 info!("Waiting for metadata VG configuration...");
-                barrier.wait_for_global(stages::METADATA_VG_READY, timeouts::METADATA_VG_READY)?;
+                barrier.wait_for_global(stages::METADATA_VG_READY)?;
             }
 
             run_cmd!(systemctl start nss_role_agent.service)?;
@@ -180,12 +180,12 @@ pub fn bootstrap(
         } else {
             // Active (HA mode): wait for mirrord to be ready first
             info!("Starting as active NSS, waiting for mirrord to be ready...");
-            barrier.wait_for_nodes(stages::MIRRORD_READY, 1, timeouts::MIRRORD_READY)?;
+            barrier.wait_for_nodes(stages::MIRRORD_READY, 1)?;
             info!("Mirrord is ready");
 
             if !meta_stack_testing {
                 info!("Waiting for metadata VG configuration...");
-                barrier.wait_for_global(stages::METADATA_VG_READY, timeouts::METADATA_VG_READY)?;
+                barrier.wait_for_global(stages::METADATA_VG_READY)?;
             }
 
             info!("Starting nss_role_agent");
@@ -213,7 +213,7 @@ pub fn bootstrap(
 
         if !meta_stack_testing {
             info!("Waiting for metadata VG configuration...");
-            barrier.wait_for_global(stages::METADATA_VG_READY, timeouts::METADATA_VG_READY)?;
+            barrier.wait_for_global(stages::METADATA_VG_READY)?;
         }
 
         run_cmd!(systemctl start nss_role_agent.service)?;

@@ -182,8 +182,9 @@ impl WorkflowBarrier {
     }
 
     /// Wait for a global stage (single file, no node suffix)
-    pub fn wait_for_global(&self, stage: StageDef, timeout_secs: u64) -> CmdResult {
+    pub fn wait_for_global(&self, stage: StageDef) -> CmdResult {
         let key_name = stage.key_name();
+        let timeout_secs = stage.timeout_secs;
         let stage = stage.name;
         let key = format!("{}/stages/{}.json", self.workflow_prefix(), key_name);
         info!("Waiting for global stage '{stage}' ({}/{key})", self.bucket);
@@ -212,9 +213,9 @@ impl WorkflowBarrier {
         &self,
         stage: StageDef,
         expected: usize,
-        timeout_secs: u64,
     ) -> Result<Vec<StageCompletion>, Error> {
         let key_name = stage.key_name();
+        let timeout_secs = stage.timeout_secs;
         let stage = stage.name;
         info!("Waiting for {expected} nodes to complete stage '{stage}'");
 
@@ -306,20 +307,6 @@ fn parse_listing_filenames(output: &str, deploy_target: DeployTarget) -> Vec<Str
 }
 
 pub use xtask_common::stages;
-
-/// Timeout constants for each stage (in seconds)
-#[allow(dead_code)]
-pub mod timeouts {
-    pub const INSTANCES_READY: u64 = 120;
-    pub const ETCD_READY: u64 = 600;
-    pub const RSS_INITIALIZED: u64 = 600;
-    pub const METADATA_VG_READY: u64 = 600;
-    pub const NSS_FORMATTED: u64 = 600;
-    pub const MIRRORD_READY: u64 = 120;
-    pub const NSS_JOURNAL_READY: u64 = 600;
-    pub const BSS_CONFIGURED: u64 = 1200; // 20 min: storage_alloc_mode=.write_zero is slower
-    pub const SERVICES_READY: u64 = 60;
-}
 
 #[cfg(test)]
 mod tests {

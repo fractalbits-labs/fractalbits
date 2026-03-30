@@ -105,8 +105,8 @@ pub fn generate_blueprint(config: &BootstrapClusterConfig) -> StageBlueprint {
             depends_on: def
                 .depends_on
                 .iter()
-                .filter(|d| included.contains(**d))
-                .map(|d| d.to_string())
+                .filter(|d| included.contains(d.name))
+                .map(|d| d.name.to_string())
                 .collect(),
             key_name: def.key_name(),
         })
@@ -140,8 +140,18 @@ pub enum DeployTarget {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
-    strum::AsRefStr, strum::Display, strum::EnumString, clap::ValueEnum,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    strum::AsRefStr,
+    strum::Display,
+    strum::EnumString,
+    clap::ValueEnum,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -153,8 +163,18 @@ pub enum JournalType {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
-    strum::AsRefStr, strum::Display, strum::EnumString, clap::ValueEnum,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    strum::AsRefStr,
+    strum::Display,
+    strum::EnumString,
+    clap::ValueEnum,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -167,8 +187,18 @@ pub enum StorageAllocMode {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
-    strum::AsRefStr, strum::Display, strum::EnumString, clap::ValueEnum,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    strum::AsRefStr,
+    strum::Display,
+    strum::EnumString,
+    clap::ValueEnum,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -181,8 +211,18 @@ pub enum DataBlobStorage {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
-    strum::AsRefStr, strum::Display, strum::EnumString, clap::ValueEnum,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    strum::AsRefStr,
+    strum::Display,
+    strum::EnumString,
+    clap::ValueEnum,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -195,8 +235,16 @@ pub enum RssBackend {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default,
-    strum::AsRefStr, strum::Display, strum::EnumString, clap::ValueEnum,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    strum::AsRefStr,
+    strum::Display,
+    strum::EnumString,
+    clap::ValueEnum,
 )]
 #[strum(serialize_all = "snake_case")]
 #[clap(rename_all = "snake_case")]
