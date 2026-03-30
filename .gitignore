@@ -1,17 +1,20 @@
+# Ignore all dotfiles/dotdirs by default
+.*
+!.cargo/
+!.envrc
+!.github/
+!.gitignore
+!.rustfmt.toml
+
 */.zig-cache/*
 */zig-out/*
 */node_modules/
 */dist/
-.vite/
-.DS_Store
-.idea/
 *.diff
 *.iml
 Cargo.lock
 
-# Build artifacts and cache directories
-.zig-cache/
-zig-out/
+# Build artifacts
 target/
 
 # Runtime data directory
@@ -19,12 +22,6 @@ data/
 
 # Third party downloaded dependencies
 third_party/
-
-# Claude Code configuration
-.claude
-
-# Python virtual environments
-.venv/
 
 # CDK generated JavaScript files (keep TypeScript sources and Lambda JS)
 vpc/fractalbits-cdk/bin/*.js
