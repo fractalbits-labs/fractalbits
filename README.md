@@ -9,16 +9,16 @@
 
 ## Overview
 
-FractalBits is an S3-compatible object storage system designed for high performance and low latency. Using our custom-built metadata engine, it delivers up to **1 million 4K read IOPS** for single bucket with p99 latency ~5ms, at significantly lower cost than AWS S3 Express One Zone. Unlike standard S3, FractalBits provides native **atomic rename support for both objects and directories**.
+FractalBits is an S3-compatible object storage system designed for high performance and low latency. Using our custom-built storage engine, it delivers up to **1 million 4K read IOPS** for single bucket with p99 latency ~5ms, at significantly lower cost than AWS S3 Express One Zone. Unlike standard S3, FractalBits provides native **atomic rename support for both objects and directories**.
 
-The **Fractal ART** (Adaptive Radix Tree) metadata engine uses a full-path name approach that avoids the heavy distributed transactions required by traditional inode-based systems, achieving superior scalability while still providing directory semantics including atomic rename, etc. This makes FractalBits ideal for AI training pipelines and data analytics workflows that require atomic operations for managing datasets and checkpoints. The system implements **two-tier storage**: an NVMe SSD tier for hot small objects with single-digit millisecond latency, and an S3 backend tier for larger objects to optimize costs.
+The **Fractal ART** (Adaptive Radix Tree) storage engine uses a full-path name approach that avoids the heavy distributed transactions required by traditional inode-based systems, achieving superior scalability while still providing directory semantics including atomic rename, etc. This makes FractalBits ideal for AI training pipelines and data analytics workflows that require atomic operations for managing datasets and checkpoints. The system implements **two-tier storage**: an NVMe SSD tier for hot small objects with single-digit millisecond latency, and an S3 backend tier for larger objects to optimize costs.
 
-Built with Rust for the API gateway and control plane, and per core io_uring for asynchronous I/O for the performance-critical metadata engine and data plane. This combination enables hundreds of thousands of operations per second while maintaining ultra low latency.
+Built with Rust for the API gateway and control plane, and per core io_uring for asynchronous I/O for the performance-critical storage engine and data plane. This combination enables hundreds of thousands of operations per second while maintaining ultra low latency.
 
 **Key Highlights:**
 - 🚀 **~1M IOPS** (4KB objects) for single bucket with p99 latency ~5ms
 - 🔄 **Atomic rename support** for both objects and directories - native capability that standard S3 lacks
-- ⚡ **Fractal ART** full-path metadata engine for superior performance and scalability
+- ⚡ **Fractal ART** full-path storage engine for superior performance and scalability
 - 🗂️ **Two-tier storage** - NVMe SSD for hot small objects, S3 backend for large objects
 - 💰 **Cost-efficient** - significantly lower cost than AWS S3 Express One Zone for small object workloads
 - 🌐 **5-minute Bring Your Own Cloud (BYOC)** - to **any** AWS region with `just deploy`
