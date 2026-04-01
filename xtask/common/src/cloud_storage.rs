@@ -45,9 +45,9 @@ pub fn upload_string(content: &str, cloud_uri: &str) -> CmdResult {
 /// Upload a local file
 pub fn upload_file(local_path: &str, cloud_uri: &str) -> CmdResult {
     if cloud_uri.starts_with("gs://") {
-        run_cmd!(gcloud storage cp $local_path $cloud_uri)
+        run_cmd!(gcloud storage cp $local_path $cloud_uri --quiet)
     } else {
-        run_cmd!(aws s3 cp $local_path $cloud_uri)
+        run_cmd!(aws s3 cp $local_path $cloud_uri --quiet)
     }
 }
 
