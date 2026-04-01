@@ -5,42 +5,40 @@
 FractalBits uses a multi-tier architecture optimized for performance:
 
 ```
-┌─────────────┐
-│   S3 Client │
-└──────┬──────┘
-       │ HTTP(S)
-       ▼
+            ┌──────────────┐
+            │   S3 Clients │
+            └──────┬───────┘
+                   │
+                   ▼
 ┌───────────────────────────────────┐
 │┌──────────────────────────────────┴┐
 ││┌──────────────────────────────────┴┐
-│││  API Server (Actix/Axum)          │  ← S3 API Frontend (N instances)
+│││  API Server (Actix)               │ ← S3 API Frontend (N instances)
 │││  - AWS SigV4 Auth                 │
 │││  - Request Routing                │
 │││  - Connection Pooling             │
 │││  - Hybrid Storage Decision        │
-└┤└──┬────┬─────────────┬───────┬────┬┘
- └───┼────┼─────────────┼───────┼────┘
-     │    │             │       │
-     │    │      ┌──────▼─────┐ │
-     │    │      │┌───────────┴┐│       ← Coordination (HA pair)
-     │    │      ││    RSS     ││
-     │    │      ││   (Rust)   ││
-     │    │      ││  - Leader  ││
-     │    │      │└  Election ─┘│
-     │    │      └─────────────┘│
-     │    │                     │
-     │    │    ┌────────────────┘
-     │    │    │
-     │  ┌─▼────▼───────────┐
+└┤│                                   │
+ └┤                                   │
+  └──┬────┬─────────────┬─────────────┘
+     │    │      ┌──────▼───────┐ 
+     │    │      │┌─────────────┴┐      ← Coordination (HA pair)
+     │    │      ││    RSS       │
+     │    │      ││  - Leader    │
+     │    │      ││    Election  │
+     │    │      └┤              │ 
+     │    │       └──────┬───────┘
+     │    │         ┌────┘
+     │    │         │
+     │  ┌─▼─────────▼──────┐
      │  │┌─────────────────┴┐
      │  ││┌─────────────────┴┐          ← Metadata (N instances)
      │  │││     NSS          │           (Full path, infinitely Splittable)
-     │  │││    (Zig)         │
      │  │││  - FractalART    │
      │  │││    Index         │
-     │  └┤└────┬─────────────┘
-     │   └─────┼─────────────┘
-     │         │
+     │  └┤│                  │
+     │   └┤                  │ 
+     │    └────┬─────────────┘    
      │         │  ┌──────────────────────────────────┐
      │         │  │  Hybrid Storage (based on size)  │
      │         │  └──────────────────────────────────┘
@@ -50,19 +48,20 @@ FractalBits uses a multi-tier architecture optimized for performance:
      └─────────┼──┐ ┌────────────┐    ┌──────────────┐
                │  │ │┌───────────┴┐   │   S3 Cloud   │
                │  │ ││┌───────────┴┐  │  (AWS S3)    │
-               │  └─│││    BSS     │  │  - Durable   │
+               │  └►│││    BSS     │  │  - Durable   │
                └───►│││   (Zig)    │  │  - Scalable  │
                     │││  io_uring  │  └──────────────┘
-                    └┤└────────────┘        ▲
-                     └─────────────┘        │
-                          ▲                 │
-                          │ Data Plane      │ Data Plane
-                          │ (Local NVMe)    │ (Cloud Storage)
+                    └┤│            │        ▲
+                     └┤            │        │
+                      └─────┬──────┘        │
+                            ▲               │
+                            │ Data Plane    │ Data Plane
+                            │ (Local NVMe)  │ (Cloud Storage)
 ```
 
 ## Components
 
-### **NSS - Namespace Service Server** (Zig)
+### **NSS - Namespace Service Server**
 Metadata management with:
 - Fractal ART based metadata engine, with efficient checkpoint and blob compaction
 - Enhanced tree operations to support atomic directory and object renaming
@@ -71,21 +70,21 @@ Metadata management with:
 - [LeanStore](https://www.cs.cit.tum.de/dis/research/leanstore/) inspired lightweight buffer manager for efficient memory management
 - Lock coupling (crab-latching) for concurrent access
 
-### **API Server** (Rust)
+### **API Server**
 The S3-compatible HTTP frontend that handles:
 - All S3 API requests (GET, PUT, DELETE, HEAD, POST)
 - AWS Signature V4 authentication
 - Per-core request handling with dedicated worker pools
 - Connection pooling to backend services
 
-### **BSS - Blob Storage Server** (Zig)
+### **BSS - Blob Storage Server**
 High-performance blob data storage engine:
 - io_uring-based async I/O with IOPOLL mode for NVMe
 - Direct I/O bypassing page cache
 - Zero-copy data paths
 - Configurable I/O concurrency and sharding
 
-### **RSS - Root Service Server** (Rust)
+### **RSS - Root Service Server**
 Cluster coordination providing:
 - Leader election using DynamoDB or etcd
 - API key management
