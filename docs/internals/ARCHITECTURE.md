@@ -13,60 +13,59 @@ FractalBits uses a multi-tier architecture optimized for performance:
 ┌───────────────────────────────────┐
 │┌──────────────────────────────────┴┐
 ││┌──────────────────────────────────┴┐
-│││  API Server (Actix)               │ ← S3 API Frontend (N instances)
-│││  - AWS SigV4 Auth                 │
-│││  - Request Routing                │
-│││  - Connection Pooling             │
-│││  - Hybrid Storage Decision        │
-└┤│                                   │
+│││       API Server (Actix)          │ ← S3 API Frontend (N instances)
+│││       - AWS SigV4 Auth            │
+│││       - Request Routing           │
+└┤│       - Connection Pooling        │
  └┤                                   │
-  └──┬────┬─────────────┬─────────────┘
-     │    │      ┌──────▼───────┐ 
+  └──┬────┬──────────────┬────────────┘
+     │    │              ▼
+     │    │      ┌──────────────┐
      │    │      │┌─────────────┴┐      ← Coordination (HA pair)
      │    │      ││    RSS       │
      │    │      ││  - Leader    │
      │    │      ││    Election  │
-     │    │      └┤              │ 
+     │    │      └┤              │
      │    │       └──────┬───────┘
      │    │         ┌────┘
-     │    │         │
-     │  ┌─▼─────────▼──────┐
-     │  │┌─────────────────┴┐
-     │  ││┌─────────────────┴┐          ← Metadata (N instances)
-     │  │││     NSS          │           (Full path, infinitely Splittable)
-     │  │││  - FractalART    │
-     │  │││    Index         │
-     │  └┤│                  │
-     │   └┤                  │ 
-     │    └────┬─────────────┘    
+     │    ▼         ▼
+     │  ┌─────────────────────┐
+     │  │┌────────────────────┴┐
+     │  ││┌────────────────────┴┐       ← Metadata (N instances)
+     │  │││        NSS          │         (Full path, infinitely Splittable)
+     │  │││  - FractalART KV    │
+     │  │││    Metadata Index   │
+     │  └┤│                     │
+     │   └┤                     │
+     │    └────┬────────────────┘
      │         │  ┌──────────────────────────────────┐
      │         │  │  Hybrid Storage (based on size)  │
      │         │  └──────────────────────────────────┘
-     │         │       │                      │
-     │         │       │ < 1MB                │ >= 1MB
-     │         │       ▼                      ▼
-     └─────────┼──┐ ┌────────────┐    ┌──────────────┐
-               │  │ │┌───────────┴┐   │   S3 Cloud   │
-               │  │ ││┌───────────┴┐  │  (AWS S3)    │
-               │  └►│││    BSS     │  │  - Durable   │
-               └───►│││   (Zig)    │  │  - Scalable  │
-                    │││  io_uring  │  └──────────────┘
-                    └┤│            │        ▲
-                     └┤            │        │
-                      └─────┬──────┘        │
-                            ▲               │
-                            │ Data Plane    │ Data Plane
-                            │ (Local NVMe)  │ (Cloud Storage)
+     │         │             │                     │
+     │         │             │ < 1MB               │ >= 1MB
+     │         │             ▼                     ▼
+     │         │      ┌─────────────────┐    ┌───────────────┐
+     │         │      │┌────────────────┴┐   │ Cloud Storage │
+     │         │      ││┌────────────────┴┐  │ (S3, GCS, ..) │
+     │         └────► │││       BSS       │  │  - Durable    │
+     │                │││ - FractalART KV │  │  - Scalable   │
+     └──────────────► │││   Blob Storage  │  └───────────────┘
+                      └┤│                 │        ▲
+                       └┤                 │        │
+                        └─────────────────┘        │
+                             ▲                     │
+                             │ Data Plane          │ Data Plane
+                             │ (Local NVMe)        │ (Cloud Storage)
 ```
 
 ## Components
 
 ### **NSS - Namespace Service Server**
 Metadata management with:
-- Fractal ART based metadata engine, with efficient checkpoint and blob compaction
+- Fractal ART based KV storage engine, with efficient checkpoint and blob compaction
 - Enhanced tree operations to support atomic directory and object renaming
 - Physiological journaling for efficient crash recovery
-- SIMD acceleration for Fractal ART metadata engine
+- SIMD acceleration for Fractal ART storage engine
 - [LeanStore](https://www.cs.cit.tum.de/dis/research/leanstore/) inspired lightweight buffer manager for efficient memory management
 - Lock coupling (crab-latching) for concurrent access
 
@@ -79,6 +78,7 @@ The S3-compatible HTTP frontend that handles:
 
 ### **BSS - Blob Storage Server**
 High-performance blob data storage engine:
+- Fractal ART based KV storage engine
 - io_uring-based async I/O with IOPOLL mode for NVMe
 - Direct I/O bypassing page cache
 - Zero-copy data paths
@@ -86,7 +86,7 @@ High-performance blob data storage engine:
 
 ### **RSS - Root Service Server**
 Cluster coordination providing:
-- Leader election using DynamoDB or etcd
+- Leader election using ETCD (on-prem), DynamoDB (AWS) or FireStore (GCP)
 - API key management
 - Bucket management
 - Volume group configuration
@@ -115,15 +115,10 @@ FractalBits uses a tiered storage approach to optimize performance and cost:
 
 ## Technology Stack
 
-**Languages:**
-- **Zig**: Data plane (BSS, NSS) for maximum performance
-- **Rust**: Control plane (API Server, RSS) for safety and productivity
-- **TypeScript**: AWS CDK for infrastructure deployment
-
 **Key Technologies:**
-- **Fractal ART (Adaptive Radix Tree)**: Efficient metadata engine
+- **Fractal ART (Adaptive Radix Tree)**: Efficient metadata and data storage engine
 - **io_uring**: Linux async I/O (custom library based on TigerBeetle's IO)
-- **Actix/Axum**: Modern async web framework for API server
+- **Actix**: Modern thread-per-core async web framework for API server
 - **High Performance RPC Protocols**:
   - Data: Zero-copy RPC from network to disk, without serialization
   - Metadata: Fixed small size header + ProtoBuf Protocol
