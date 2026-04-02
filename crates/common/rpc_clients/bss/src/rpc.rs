@@ -317,6 +317,157 @@ impl RpcClient {
         check_response_errno(&resp_frame.header)?;
         Ok(())
     }
+
+    pub async fn handshake(
+        &self,
+        fence_token: u64,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<(), RpcError> {
+        let _guard = InflightRpcGuard::new("bss", "handshake");
+        let mut header = MessageHeader::default();
+        let request_id = self.gen_request_id();
+        header.id = request_id;
+        header.command = Command::Handshake;
+        header.fence_token = fence_token;
+        header.size = size_of::<MessageHeader>() as u32;
+        header.retry_count = retry_count as u8;
+        header.trace_id = trace_id.0;
+
+        let msg_frame = MessageFrame::new(header, Bytes::new());
+        let resp_frame = self
+            .send_request(msg_frame, timeout, None)
+            .await
+            .map_err(|e| {
+                if !e.retryable() {
+                    error!(rpc=%"handshake", %request_id, error=?e, "bss rpc failed");
+                }
+                e
+            })?;
+        check_response_errno(&resp_frame.header)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_metadata_blob(
+        &self,
+        blob_id: [u8; 16],
+        volume_id: u16,
+        content_len: usize,
+        fence_token: u64,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<Bytes, RpcError> {
+        let _guard = InflightRpcGuard::new("bss", "get_metadata_blob");
+        let mut header = MessageHeader::default();
+        let request_id = self.gen_request_id();
+        header.id = request_id;
+        header.blob_id = blob_id;
+        header.volume_id = volume_id;
+        header.command = Command::GetMetadataBlob;
+        header.fence_token = fence_token;
+        header.content_len = content_len as u32;
+        header.size = size_of::<MessageHeader>() as u32;
+        header.retry_count = retry_count as u8;
+        header.trace_id = trace_id.0;
+
+        let msg_frame = MessageFrame::new(header, Bytes::new());
+        let resp_frame = self
+            .send_request(msg_frame, timeout, None)
+            .await
+            .map_err(|e| {
+                if !e.retryable() {
+                    error!(rpc=%"get_metadata_blob", %request_id, %volume_id, error=?e, "bss rpc failed");
+                }
+                e
+            })?;
+        check_response_errno(&resp_frame.header)?;
+        let body = resp_frame.body;
+        if content_len != body.len() {
+            return Err(RpcError::InternalResponseError(format!(
+                "BSS returned body length {} but client expected {}",
+                body.len(),
+                content_len
+            )));
+        }
+        Ok(body)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_metadata_blob(
+        &self,
+        blob_id: [u8; 16],
+        volume_id: u16,
+        body: Bytes,
+        body_checksum: u64,
+        version: u64,
+        is_new: bool,
+        fence_token: u64,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<(), RpcError> {
+        let _guard = InflightRpcGuard::new("bss", "put_metadata_blob");
+        let mut header = MessageHeader::default();
+        let request_id = self.gen_request_id();
+        header.id = request_id;
+        header.blob_id = blob_id;
+        header.volume_id = volume_id;
+        header.command = Command::PutMetadataBlob;
+        header.content_len = body.len() as u32;
+        header.size = size_of::<MessageHeader>() as u32 + header.content_len;
+        header.version = version;
+        header.is_new = if is_new { 1 } else { 0 };
+        header.fence_token = fence_token;
+        header.checksum_body = body_checksum;
+        header.retry_count = retry_count as u8;
+        header.trace_id = trace_id.0;
+
+        let msg_frame = MessageFrame::new(header, body);
+        let resp_frame = self.send_request(msg_frame, timeout, None).await.map_err(|e| {
+            if !e.retryable() {
+                error!(rpc=%"put_metadata_blob", %request_id, %volume_id, error=?e, "bss rpc failed");
+            }
+            e
+        })?;
+        check_response_errno(&resp_frame.header)?;
+        Ok(())
+    }
+
+    pub async fn delete_metadata_blob(
+        &self,
+        blob_id: [u8; 16],
+        volume_id: u16,
+        fence_token: u64,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<(), RpcError> {
+        let _guard = InflightRpcGuard::new("bss", "delete_metadata_blob");
+        let mut header = MessageHeader::default();
+        let request_id = self.gen_request_id();
+        header.id = request_id;
+        header.blob_id = blob_id;
+        header.volume_id = volume_id;
+        header.command = Command::DeleteMetadataBlob;
+        header.is_deleted = 1;
+        header.fence_token = fence_token;
+        header.size = size_of::<MessageHeader>() as u32;
+        header.retry_count = retry_count as u8;
+        header.trace_id = trace_id.0;
+
+        let msg_frame = MessageFrame::new(header, Bytes::new());
+        let resp_frame = self.send_request(msg_frame, timeout, None).await.map_err(|e| {
+            if !e.retryable() {
+                error!(rpc=%"delete_metadata_blob", %request_id, %volume_id, error=?e, "bss rpc failed");
+            }
+            e
+        })?;
+        check_response_errno(&resp_frame.header)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

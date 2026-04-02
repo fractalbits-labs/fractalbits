@@ -15,9 +15,13 @@ pub use blob_guid::{DataBlobGuid, MetaBlobGuid};
 pub use bucket::Bucket;
 pub use permission::BucketKeyPerm;
 pub use trace_id::TraceId;
-pub use volume::{BssNode, DataVgInfo, Volume, VolumeMode};
+pub use volume::{
+    BssNode, DataVgInfo, MetadataQuorum, MetadataVgInfo, MetadataVolume, Volume, VolumeMode,
+};
 
-pub use bss_repair_report::{DataRepairReport, DataVolumeReport};
+pub use bss_repair_report::{
+    DataRepairReport, DataVolumeReport, MetaRepairReport, MetaVolumeReport,
+};
 
 pub use observer_types::{
     HealthCheckResponse, MachineState, ObserverPersistentState, ObserverState, ServiceStatus,
