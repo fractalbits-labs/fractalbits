@@ -656,7 +656,7 @@ async fn list_keys_on_node(addr: &str, volume_id: u16) -> TestResult<Vec<String>
 // --- Metadata repair helpers ---
 
 fn new_meta_test_volumes() -> MetaTestVolumes {
-    let seed = (Uuid::now_v7().as_u128() % 10_000) as u16;
+    let seed = (Uuid::now_v7().as_u128() % 9_000) as u16;
     let base = 20_000 + seed * 5;
     MetaTestVolumes {
         version_skew: base,
