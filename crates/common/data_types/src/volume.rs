@@ -40,3 +40,22 @@ pub struct BssNode {
     pub ip: String,
     pub port: u16,
 }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MetadataVgInfo {
+    pub volumes: Vec<MetadataVolume>,
+    pub quorum: MetadataQuorum,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MetadataVolume {
+    pub volume_id: u16,
+    pub bss_nodes: Vec<BssNode>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct MetadataQuorum {
+    pub n: u32,
+    pub r: u32,
+    pub w: u32,
+}

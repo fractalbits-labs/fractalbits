@@ -544,6 +544,18 @@ impl RpcClient {
         }
     }
 
+    pub async fn get_metadata_vg_info(
+        &self,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+    ) -> Result<data_types::MetadataVgInfo, RpcError> {
+        let json = self.get_metadata_vg_info_json(timeout, trace_id, 0).await?;
+        serde_json::from_str(&json).map_err(|e| {
+            error!(rpc=%"get_metadata_vg_info", "failed to parse JSON response: {e}");
+            RpcError::DecodeError(format!("Failed to parse metadata VG JSON: {e}"))
+        })
+    }
+
     /// Get metadata VG info as raw JSON string for forwarding to NSS
     pub async fn get_metadata_vg_info_json(
         &self,
