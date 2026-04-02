@@ -132,6 +132,10 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
 
     // prepare
     cmd_service::stop_service(ServiceName::All)?;
+    cmd_build::build_zig_servers(cmd_build::ZigBuildOpts {
+        mode: BuildMode::Debug,
+        ..Default::default()
+    })?;
     cmd_build::build_rust_servers(BuildMode::Debug)?;
     match test_type {
         TestType::MultiAz { subcommand } => multi_az::run_multi_az_tests(subcommand).await,
