@@ -8,7 +8,7 @@ use cmd_lib::*;
 use colored::*;
 use data_types::{DataBlobGuid, TraceId};
 use data_types::{DataRepairReport, MetaRepairReport};
-use rpc_client_bss::RpcClientBss;
+use rpc_client_bss::{RpcClientBss, RpcErrorBss};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -193,6 +193,14 @@ async fn run_bss_repair_tests_inner() -> TestResult {
             .green()
     );
     test_meta_repair_propagates_tombstone().await?;
+
+    println!(
+        "\n{}",
+        "=== Test: Meta Delete Is Rejected When Target Has Newer Version ==="
+            .bold()
+            .green()
+    );
+    test_meta_delete_version_guard().await?;
 
     println!("\n{}", "=== All BSS Repair Tests PASSED ===".green().bold());
     Ok(())
@@ -473,7 +481,7 @@ fn install_test_data_vg_config(volumes: TestVolumes) -> CmdResult {
 }
 
 fn new_test_volumes() -> TestVolumes {
-    let seed = (Uuid::now_v7().as_u128() % 10_000) as u16;
+    let seed = (Uuid::now_v7().as_u128() % 9_000) as u16;
     let base = 10_000 + seed * 6;
     TestVolumes {
         scan: base,
@@ -683,9 +691,15 @@ fn install_test_metadata_vg_config(volumes: MetaTestVolumes) -> CmdResult {
 fn parse_meta_blob_id_from_key(key: &str, volume_id: u16) -> [u8; 16] {
     let key = key.trim_end_matches('\0');
     let prefix = format!("/m{volume_id}/");
-    let suffix = key.strip_prefix(&prefix).expect("key should have volume prefix");
+    let suffix = key
+        .strip_prefix(&prefix)
+        .expect("key should have volume prefix");
     let parts: Vec<&str> = suffix.split('-').collect();
-    assert_eq!(parts.len(), 4, "MetaBlobGuid should have 4 dash-separated hex parts");
+    assert_eq!(
+        parts.len(),
+        4,
+        "MetaBlobGuid should have 4 dash-separated hex parts"
+    );
 
     let device_id = u32::from_str_radix(parts[0], 16).expect("valid device_id hex");
     let uuid_val = u64::from_str_radix(parts[1], 16).expect("valid uuid hex");
@@ -1060,13 +1074,8 @@ async fn test_meta_repair_propagates_tombstone() -> TestResult {
             false,
         )
         .await?;
-        delete_meta_blob_on_node(
-            &format!("127.0.0.1:{port}"),
-            blob_id,
-            volumes.tombstone,
-            7,
-        )
-        .await?;
+        delete_meta_blob_on_node(&format!("127.0.0.1:{port}"), blob_id, volumes.tombstone, 7)
+            .await?;
     }
 
     let volume_id = volumes.tombstone.to_string();
@@ -1081,7 +1090,10 @@ async fn test_meta_repair_propagates_tombstone() -> TestResult {
         &fence_token,
         "--json",
     ])?;
-    assert_eq!(scan_report.repair_candidates, 1, "stale node 2 should be a repair candidate");
+    assert_eq!(
+        scan_report.repair_candidates, 1,
+        "stale node 2 should be a repair candidate"
+    );
 
     // Repair should propagate delete to node 2
     let repair_report = run_bss_repair_meta_json(&[
@@ -1093,7 +1105,10 @@ async fn test_meta_repair_propagates_tombstone() -> TestResult {
         "--json",
     ])?;
     assert_eq!(repair_report.failed_volumes, 0, "repair should succeed");
-    assert_eq!(repair_report.repaired_blobs, 1, "expected one repaired blob");
+    assert_eq!(
+        repair_report.repaired_blobs, 1,
+        "expected one repaired blob"
+    );
 
     // Follow-up scan should be clean (tombstone propagated, no more stale nodes)
     let post_repair = run_bss_repair_meta_json(&[
@@ -1111,5 +1126,58 @@ async fn test_meta_repair_propagates_tombstone() -> TestResult {
     assert_eq!(post_repair.anomalies, 0, "no anomalies expected");
 
     println!("  OK: repair-meta propagated tombstone to stale node and converged");
+    Ok(())
+}
+
+async fn test_meta_delete_version_guard() -> TestResult {
+    let volumes = *META_TEST_VOLUMES
+        .get()
+        .expect("meta test volumes initialized");
+    let blob_id = *Uuid::now_v7().as_bytes();
+    let body = Bytes::from_static(b"meta-delete-guard-test");
+
+    // Put v=10 on node 0
+    put_meta_blob_on_node(
+        "127.0.0.1:8088",
+        blob_id,
+        volumes.tombstone,
+        body.clone(),
+        10,
+        true,
+    )
+    .await?;
+
+    // Attempt to delete with version=5 (stale). The server's erase_check_fn
+    // should reject this because the existing version (10) > request version (5).
+    let client = Arc::new(RpcClientBss::new_from_address(
+        "127.0.0.1:8088".to_string(),
+        Duration::from_secs(5),
+    ));
+    let result = client
+        .delete_metadata_blob(
+            blob_id,
+            volumes.tombstone,
+            5, // stale version
+            META_FENCE_TOKEN,
+            Some(Duration::from_secs(5)),
+            &TraceId::new(),
+            0,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(RpcErrorBss::VersionSkipped)),
+        "delete with stale version should be rejected with VersionSkipped, got: {result:?}"
+    );
+
+    // Verify the blob is still alive at v=10
+    let fetched =
+        get_meta_blob_from_node("127.0.0.1:8088", blob_id, volumes.tombstone, body.len()).await?;
+    assert_eq!(
+        fetched, body,
+        "blob should be unchanged after rejected delete"
+    );
+
+    println!("  OK: metadata delete with stale version was rejected (VersionSkipped)");
     Ok(())
 }
