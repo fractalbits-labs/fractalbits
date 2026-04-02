@@ -346,7 +346,7 @@ fn get_current_leader_etcd(table_name: &str) -> Option<String> {
 
 fn get_current_leader_firestore() -> Option<String> {
     let url = firestore_leader_doc_url();
-    let result = run_fun!(curl -sf $url);
+    let result = run_fun!(curl -sf $url | jq -c);
 
     match result {
         Ok(output) => {

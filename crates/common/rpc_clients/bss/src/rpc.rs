@@ -439,6 +439,7 @@ impl RpcClient {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn delete_metadata_blob(
         &self,
         blob_id: [u8; 16],
