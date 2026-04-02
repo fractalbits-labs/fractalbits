@@ -1,5 +1,6 @@
 use crate::DataVgError;
 use bytes::Bytes;
+use data_types::ec_utils::{ec_padded_len, ec_rotation};
 use data_types::{DataBlobGuid, DataVgInfo, TraceId, Volume, VolumeMode};
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics_wrapper::{counter, histogram};
@@ -1193,22 +1194,6 @@ impl DataVgProxy {
 
     // ---- EC (Erasure-Coded) blob operations ----
 
-    /// Compute shard-to-node rotation for load balancing.
-    /// rotation = crc32(blob_id bytes) % total_shards
-    fn ec_rotation(blob_id: &Uuid, total_shards: u32) -> usize {
-        let hash = crc32fast::hash(blob_id.as_bytes());
-        (hash % total_shards) as usize
-    }
-
-    fn ec_padded_len(content_len: usize, data_shards: usize) -> usize {
-        let stripe_size = data_shards * 2;
-        if content_len.is_multiple_of(stripe_size) {
-            content_len
-        } else {
-            content_len + (stripe_size - content_len % stripe_size)
-        }
-    }
-
     /// EC put: RS-encode block into k+m shards, send to nodes with W=k+1 quorum
     async fn put_blob_ec(
         &self,
@@ -1244,7 +1229,7 @@ impl DataVgProxy {
 
         // Pad body to a full RS stripe with even shard size.
         let original_len = body.len();
-        let padded_len = Self::ec_padded_len(original_len, k);
+        let padded_len = ec_padded_len(original_len, k);
         let shard_size = padded_len / k;
 
         let mut padded = body.to_vec();
@@ -1260,7 +1245,7 @@ impl DataVgProxy {
         shards.extend(parity_shards);
 
         // Compute rotation for shard-to-node mapping
-        let rotation = Self::ec_rotation(&blob_guid.blob_id, total as u32);
+        let rotation = ec_rotation(&blob_guid.blob_id, total as u32);
 
         let rpc_timeout = self.rpc_timeout;
 
@@ -1399,10 +1384,10 @@ impl DataVgProxy {
         };
         let total = k + m;
 
-        let rotation = Self::ec_rotation(&blob_guid.blob_id, total as u32);
+        let rotation = ec_rotation(&blob_guid.blob_id, total as u32);
 
         // Compute shard size, matching put_blob_ec padding.
-        let padded_len = Self::ec_padded_len(content_len, k);
+        let padded_len = ec_padded_len(content_len, k);
         let shard_size = padded_len / k;
 
         // Fetch the k data shards (indices 0..k) from their rotated nodes
@@ -1718,8 +1703,8 @@ mod tests {
     fn ec_rotation_deterministic() {
         let blob_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap();
         let total = 6u32;
-        let r1 = DataVgProxy::ec_rotation(&blob_id, total);
-        let r2 = DataVgProxy::ec_rotation(&blob_id, total);
+        let r1 = ec_rotation(&blob_id, total);
+        let r2 = ec_rotation(&blob_id, total);
         assert_eq!(r1, r2);
         assert!(r1 < total as usize);
     }
@@ -1731,7 +1716,7 @@ mod tests {
         // Generate many blob IDs and check we get variety in rotations
         for i in 0..100u128 {
             let blob_id = Uuid::from_u128(i);
-            let r = DataVgProxy::ec_rotation(&blob_id, total);
+            let r = ec_rotation(&blob_id, total);
             assert!(r < total as usize);
             rotations.insert(r);
         }
@@ -1787,7 +1772,7 @@ mod tests {
         let original_len = 99;
         let original: Vec<u8> = (0..original_len).map(|i| (i * 7 % 256) as u8).collect();
 
-        let padded_len = DataVgProxy::ec_padded_len(original_len, k);
+        let padded_len = ec_padded_len(original_len, k);
         assert_eq!(padded_len, 104);
         let shard_size = padded_len / k;
         assert_eq!(shard_size, 26);

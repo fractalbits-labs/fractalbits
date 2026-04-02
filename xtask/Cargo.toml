@@ -31,3 +31,5 @@ xxhash-rust.workspace = true
 libc.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
+reed-solomon-simd.workspace = true
+crc32fast.workspace = true

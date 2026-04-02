@@ -2,6 +2,7 @@ mod api_key;
 mod blob_guid;
 mod bss_repair_report;
 mod bucket;
+pub mod ec_utils;
 pub mod hash;
 pub mod object_layout;
 pub mod observer_types;

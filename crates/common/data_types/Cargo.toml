@@ -12,6 +12,7 @@ sha2.workspace = true
 blake2.workspace = true
 xxhash-rust.workspace = true
 uuid.workspace = true
+crc32fast.workspace = true
 rkyv.workspace = true
 thiserror.workspace = true
 serde_bytes.workspace = true
