@@ -183,6 +183,7 @@ impl RpcClient {
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
         header.checksum_body = body_checksum;
+        header.version = 1;
 
         let msg_frame = MessageFrame::new(header, body);
         let resp_frame = self
@@ -223,6 +224,7 @@ impl RpcClient {
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
         header.checksum_body = body_checksum;
+        header.version = 1;
 
         let msg_frame = MessageFrame::new(header, chunks);
         let resp_frame = self
@@ -303,6 +305,7 @@ impl RpcClient {
         header.size = size_of::<MessageHeader>() as u32;
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
+        header.version = 1;
 
         let msg_frame = MessageFrame::new(header, Bytes::new());
         let resp_frame = self
