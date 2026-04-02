@@ -440,6 +440,7 @@ impl RpcClient {
         &self,
         blob_id: [u8; 16],
         volume_id: u16,
+        version: u64,
         fence_token: u64,
         timeout: Option<Duration>,
         trace_id: &TraceId,
@@ -453,6 +454,7 @@ impl RpcClient {
         header.volume_id = volume_id;
         header.command = Command::DeleteMetadataBlob;
         header.is_deleted = 1;
+        header.version = version;
         header.fence_token = fence_token;
         header.size = size_of::<MessageHeader>() as u32;
         header.retry_count = retry_count as u8;

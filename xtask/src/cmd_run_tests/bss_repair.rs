@@ -773,6 +773,7 @@ async fn delete_meta_blob_on_node(
     addr: &str,
     blob_id: [u8; 16],
     volume_id: u16,
+    version: u64,
 ) -> TestResult {
     let client = Arc::new(RpcClientBss::new_from_address(
         addr.to_string(),
@@ -782,6 +783,7 @@ async fn delete_meta_blob_on_node(
         .delete_metadata_blob(
             blob_id,
             volume_id,
+            version,
             META_FENCE_TOKEN,
             Some(Duration::from_secs(5)),
             &TraceId::new(),
@@ -1062,6 +1064,7 @@ async fn test_meta_repair_propagates_tombstone() -> TestResult {
             &format!("127.0.0.1:{port}"),
             blob_id,
             volumes.tombstone,
+            7,
         )
         .await?;
     }
