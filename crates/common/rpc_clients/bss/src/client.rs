@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-const CONNS_PER_CORE: usize = 8;
+const CONNS_PER_CORE: usize = 2;
 
 pub struct RpcClient {
     connections:
