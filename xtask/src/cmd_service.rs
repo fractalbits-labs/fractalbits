@@ -276,8 +276,9 @@ pub fn init_service(
             let port = 8088 + id;
             run_cmd! {
                 info "formatting bss_server instance $id";
-                WORKING_DIR=$working_dir SERVER_PORT=$port $bss_binary format
-                    |& ts -m $TS_FMT >>$format_log;
+                WORKING_DIR=$working_dir
+                SERVER_PORT=$port
+                $bss_binary format --storage-alloc-mode sparse |& ts -m $TS_FMT >>$format_log;
             }?;
         }
         Ok(())
