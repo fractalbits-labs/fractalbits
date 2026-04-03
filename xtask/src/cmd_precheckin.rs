@@ -72,14 +72,13 @@ fn run_fractal_art_tests() -> CmdResult {
 
     // Start BSS instance for testing
     cmd_service::start_service(ServiceName::Bss)?;
-    run_cmd! {
-        mkdir -p data/logs;
-    }?;
+    run_cmd!(mkdir -p data/logs)?;
 
     let async_fractal_art_log = "data/logs/test_async_fractal_art_fat.log";
     run_cmd! {
         info "Running async fractal art fat tests with log $async_fractal_art_log";
-        $test_async_fractal_art --tests fat 
+        $nss_server format --init_test_tree |& $[ts] >$format_log;
+        $test_async_fractal_art --tests fat
             --ops 100000 --parallelism 1000 |& $[ts] >$async_fractal_art_log;
     }?;
 
@@ -90,19 +89,6 @@ fn run_fractal_art_tests() -> CmdResult {
         $test_async_fractal_art --prefill 100000 --tests rename
             --ops 10000 --parallelism 1000 --debug |& $[ts] >$async_fractal_art_log;
     }?;
-
-    // Reformat BSS between rename and async tests to clear stale blob versions.
-    // The rename test writes many versions of the init_test_tree root blob to BSS.
-    // Without reformatting, BSS rejects the new init_test_tree blob with VersionSkipped.
-    cmd_service::stop_service(ServiceName::Bss)?;
-    let bss_binary = format!("{working_dir}/{ZIG_DEBUG_OUT}/bin/bss_server");
-    let bss_format_log = "data/logs/bss_format.log";
-    run_cmd! {
-        info "Reformatting BSS instance 0";
-        WORKING_DIR=data/bss0 SERVER_PORT=8088 $bss_binary format
-            |& $[ts] >$bss_format_log;
-    }?;
-    cmd_service::start_service(ServiceName::Bss)?;
 
     let async_fractal_art_log = "data/logs/test_async_fractal_art.log";
     run_cmd! {

@@ -268,18 +268,8 @@ pub fn init_service(
             create_bss_dirs(Path::new("data"), id)?;
         }
 
-        // Format each BSS instance (like NSS, BSS now requires format before use)
-        let bss_binary = resolve_binary_path("bss_server", build_mode);
-        let format_log = "data/logs/bss_format.log";
         for id in 0..count {
-            let working_dir = format!("data/bss{}", id);
-            let port = 8088 + id;
-            run_cmd! {
-                info "formatting bss_server instance $id";
-                WORKING_DIR=$working_dir
-                SERVER_PORT=$port
-                $bss_binary format --storage-alloc-mode sparse |& ts -m $TS_FMT >>$format_log;
-            }?;
+            format_bss_instance(id, build_mode)?;
         }
         Ok(())
     };
@@ -1642,6 +1632,20 @@ fn register_local_api_server() -> CmdResult {
     }
 
     info!("Local api_server registered in service discovery");
+    Ok(())
+}
+
+pub fn format_bss_instance(id: u32, build_mode: BuildMode) -> CmdResult {
+    let bss_binary = resolve_binary_path("bss_server", build_mode);
+    let format_log = "data/logs/bss_format.log";
+    let working_dir = format!("data/bss{id}");
+    let port = 8088 + id;
+    run_cmd! {
+        info "formatting bss_server instance $id";
+        WORKING_DIR=$working_dir
+        SERVER_PORT=$port
+        $bss_binary format --storage-alloc-mode sparse |& ts -m $TS_FMT >>$format_log;
+    }?;
     Ok(())
 }
 
