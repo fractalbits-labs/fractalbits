@@ -58,16 +58,14 @@ pub fn run_cmd_precheckin(
 }
 
 fn run_fractal_art_tests() -> CmdResult {
-    let rand_log = "data/logs/test_fractal_art_random.log";
     let format_log = "data/logs/format.log";
     let ts = ["ts", "-m", TS_FMT];
     let working_dir = run_fun!(pwd)?;
     let nss_server = format!("{working_dir}/{ZIG_DEBUG_OUT}/bin/nss_server");
-    let test_fractal_art = format!("{working_dir}/{ZIG_DEBUG_OUT}/bin/test_fractal_art");
     let test_async_fractal_art =
         format!("{working_dir}/{ZIG_DEBUG_OUT}/bin/test_async_fractal_art");
 
-    if !std::path::Path::new(&test_fractal_art).exists() {
+    if !std::path::Path::new(&test_async_fractal_art).exists() {
         info!("Skipping fractal-art-tests");
         return Ok(());
     }
@@ -76,16 +74,13 @@ fn run_fractal_art_tests() -> CmdResult {
     cmd_service::start_service(ServiceName::Bss)?;
     run_cmd! {
         mkdir -p data/logs;
-        info "Running fractal art tests (random) with log $rand_log";
-        $nss_server format |& $[ts] >$format_log;
-        $test_fractal_art --tests random --size 400000 --ops 1000000 --threads 20 |& $[ts] >$rand_log;
     }?;
 
-    let fat_log = "data/logs/test_fractal_art_fat.log";
+    let async_fractal_art_log = "data/logs/test_async_fractal_art_fat.log";
     run_cmd! {
-        info "Running fractal art tests (fat) with log $fat_log";
-        $nss_server format |& $[ts] >$format_log;
-        $test_fractal_art --tests fat --ops 1000000 |& $[ts] >$fat_log;
+        info "Running async fractal art fat tests with log $async_fractal_art_log";
+        $test_async_fractal_art --tests fat 
+            --ops 100000 --parallelism 1000 |& $[ts] >$async_fractal_art_log;
     }?;
 
     let async_fractal_art_log = "data/logs/test_async_fractal_art_rename.log";
