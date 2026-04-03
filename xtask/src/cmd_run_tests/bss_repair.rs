@@ -23,7 +23,6 @@ type TestResult<T = ()> = Result<T, BssRepairTestError>;
 static TEST_VOLUMES: OnceLock<TestVolumes> = OnceLock::new();
 static META_TEST_VOLUMES: OnceLock<MetaTestVolumes> = OnceLock::new();
 static EC_TEST_VOLUMES: OnceLock<EcTestVolumes> = OnceLock::new();
-const META_FENCE_TOKEN: u64 = 9999;
 const EC_K: usize = 4;
 const EC_M: usize = 2;
 const EC_TOTAL: usize = EC_K + EC_M;
@@ -167,7 +166,6 @@ async fn run_bss_repair_tests_inner() -> TestResult {
 
     let meta_volumes = *META_TEST_VOLUMES.get_or_init(new_meta_test_volumes);
     install_test_metadata_vg_config(meta_volumes)?;
-    setup_metadata_fence_token().await?;
 
     println!(
         "\n{}",
@@ -782,21 +780,6 @@ fn parse_meta_blob_id_from_key(key: &str, volume_id: u16) -> [u8; 16] {
     blob_id
 }
 
-async fn setup_metadata_fence_token() -> TestResult {
-    let timeout = Some(Duration::from_secs(5));
-    let trace_id = TraceId::new();
-    for port in [8088, 8089, 8090] {
-        let client = Arc::new(RpcClientBss::new_from_address(
-            format!("127.0.0.1:{port}"),
-            Duration::from_secs(5),
-        ));
-        client
-            .handshake(META_FENCE_TOKEN, timeout, &trace_id, 0)
-            .await?;
-    }
-    Ok(())
-}
-
 async fn put_meta_blob_on_node(
     addr: &str,
     blob_id: [u8; 16],
@@ -818,7 +801,6 @@ async fn put_meta_blob_on_node(
             checksum,
             version,
             is_new,
-            META_FENCE_TOKEN,
             Some(Duration::from_secs(5)),
             &TraceId::new(),
             0,
@@ -842,7 +824,6 @@ async fn get_meta_blob_from_node(
             blob_id,
             volume_id,
             content_len,
-            META_FENCE_TOKEN,
             Some(Duration::from_secs(5)),
             &TraceId::new(),
             0,
@@ -866,7 +847,6 @@ async fn delete_meta_blob_on_node(
             blob_id,
             volume_id,
             version,
-            META_FENCE_TOKEN,
             Some(Duration::from_secs(5)),
             &TraceId::new(),
             0,
@@ -953,15 +933,7 @@ async fn test_meta_scan_detects_version_skew() -> TestResult {
     .await?;
 
     let volume_id = volumes.version_skew.to_string();
-    let fence_token = META_FENCE_TOKEN.to_string();
-    let report = run_bss_repair_meta_json(&[
-        "scan-meta",
-        "--volume-id",
-        &volume_id,
-        "--fence-token",
-        &fence_token,
-        "--json",
-    ])?;
+    let report = run_bss_repair_meta_json(&["scan-meta", "--volume-id", &volume_id, "--json"])?;
 
     assert_eq!(report.scanned_volumes, 1, "expected one scanned volume");
     assert_eq!(report.failed_volumes, 0, "scan-only should not fail");
@@ -980,15 +952,7 @@ async fn test_meta_repair_heals_version_skew() -> TestResult {
     let body = Bytes::from_static(b"meta-version-skew-test");
 
     let volume_id = volumes.version_skew.to_string();
-    let fence_token = META_FENCE_TOKEN.to_string();
-    let report = run_bss_repair_meta_json(&[
-        "repair-meta",
-        "--volume-id",
-        &volume_id,
-        "--fence-token",
-        &fence_token,
-        "--json",
-    ])?;
+    let report = run_bss_repair_meta_json(&["repair-meta", "--volume-id", &volume_id, "--json"])?;
 
     assert_eq!(report.failed_volumes, 0, "repair should succeed");
     assert_eq!(report.repair_candidates, 1, "expected one repair candidate");
@@ -1006,14 +970,8 @@ async fn test_meta_repair_heals_version_skew() -> TestResult {
     assert_eq!(repaired_body, body, "repaired blob should match source");
 
     // Follow-up scan should be clean
-    let post_repair = run_bss_repair_meta_json(&[
-        "scan-meta",
-        "--volume-id",
-        &volume_id,
-        "--fence-token",
-        &fence_token,
-        "--json",
-    ])?;
+    let post_repair =
+        run_bss_repair_meta_json(&["scan-meta", "--volume-id", &volume_id, "--json"])?;
     assert_eq!(
         post_repair.repair_candidates, 0,
         "healthy volume should be clean after repair"
@@ -1051,15 +1009,7 @@ async fn test_meta_repair_propagates_missing_blob() -> TestResult {
     .await?;
 
     let volume_id = volumes.missing_blob.to_string();
-    let fence_token = META_FENCE_TOKEN.to_string();
-    let report = run_bss_repair_meta_json(&[
-        "repair-meta",
-        "--volume-id",
-        &volume_id,
-        "--fence-token",
-        &fence_token,
-        "--json",
-    ])?;
+    let report = run_bss_repair_meta_json(&["repair-meta", "--volume-id", &volume_id, "--json"])?;
 
     assert_eq!(report.failed_volumes, 0, "repair should succeed");
     assert_eq!(report.repair_candidates, 1, "expected one repair candidate");
@@ -1088,15 +1038,7 @@ async fn test_meta_scan_reports_anomaly() -> TestResult {
     put_meta_blob_on_node("127.0.0.1:8089", blob_id, volumes.anomaly, body_b, 5, true).await?;
 
     let volume_id = volumes.anomaly.to_string();
-    let fence_token = META_FENCE_TOKEN.to_string();
-    let report = run_bss_repair_meta_json(&[
-        "scan-meta",
-        "--volume-id",
-        &volume_id,
-        "--fence-token",
-        &fence_token,
-        "--json",
-    ])?;
+    let report = run_bss_repair_meta_json(&["scan-meta", "--volume-id", &volume_id, "--json"])?;
 
     assert_eq!(report.scanned_volumes, 1, "expected one scanned volume");
     assert_eq!(report.failed_volumes, 0, "anomaly should not fail the scan");
@@ -1147,31 +1089,18 @@ async fn test_meta_repair_propagates_tombstone() -> TestResult {
     }
 
     let volume_id = volumes.tombstone.to_string();
-    let fence_token = META_FENCE_TOKEN.to_string();
 
     // Scan should detect 1 repair candidate (node 2 is stale at v=5)
-    let scan_report = run_bss_repair_meta_json(&[
-        "scan-meta",
-        "--volume-id",
-        &volume_id,
-        "--fence-token",
-        &fence_token,
-        "--json",
-    ])?;
+    let scan_report =
+        run_bss_repair_meta_json(&["scan-meta", "--volume-id", &volume_id, "--json"])?;
     assert_eq!(
         scan_report.repair_candidates, 1,
         "stale node 2 should be a repair candidate"
     );
 
     // Repair should propagate delete to node 2
-    let repair_report = run_bss_repair_meta_json(&[
-        "repair-meta",
-        "--volume-id",
-        &volume_id,
-        "--fence-token",
-        &fence_token,
-        "--json",
-    ])?;
+    let repair_report =
+        run_bss_repair_meta_json(&["repair-meta", "--volume-id", &volume_id, "--json"])?;
     assert_eq!(repair_report.failed_volumes, 0, "repair should succeed");
     assert_eq!(
         repair_report.repaired_blobs, 1,
@@ -1179,14 +1108,8 @@ async fn test_meta_repair_propagates_tombstone() -> TestResult {
     );
 
     // Follow-up scan should be clean (tombstone propagated, no more stale nodes)
-    let post_repair = run_bss_repair_meta_json(&[
-        "scan-meta",
-        "--volume-id",
-        &volume_id,
-        "--fence-token",
-        &fence_token,
-        "--json",
-    ])?;
+    let post_repair =
+        run_bss_repair_meta_json(&["scan-meta", "--volume-id", &volume_id, "--json"])?;
     assert_eq!(
         post_repair.repair_candidates, 0,
         "volume should be clean after tombstone repair"
@@ -1226,7 +1149,6 @@ async fn test_meta_delete_version_guard() -> TestResult {
             blob_id,
             volumes.tombstone,
             5, // stale version
-            META_FENCE_TOKEN,
             Some(Duration::from_secs(5)),
             &TraceId::new(),
             0,

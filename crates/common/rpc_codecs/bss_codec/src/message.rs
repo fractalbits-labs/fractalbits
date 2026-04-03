@@ -54,8 +54,10 @@ pub struct MessageHeader {
     pub is_new: u8,
     /// Flag to indicate whether this blob is deleted
     pub is_deleted: u8,
+    /// When set to 1, skip fence token validation (used by repair service)
+    pub skip_fence_token: u8,
     /// Padding for fence_token alignment
-    pub reserve0: [u8; 2],
+    pub _pad0: u8,
     /// Fence token for fencing stale NSS instances
     pub fence_token: u64,
     /// Reserved parts for padding
@@ -112,7 +114,8 @@ impl Default for MessageHeader {
             retry_count: 0,
             is_new: 0,
             is_deleted: 0,
-            reserve0: [0u8; 2],
+            skip_fence_token: 0,
+            _pad0: 0,
             fence_token: 0,
             reserve1: [0u8; 24],
             reserve2: [0u8; 32],
