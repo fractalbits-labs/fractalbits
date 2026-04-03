@@ -69,7 +69,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     install_packages(&["nvme-cli", "mdadm"])?;
     format_local_nvme_disks(false)?; // no twp support since experiment is done
 
-    let mut binaries = vec!["bss_server", "test_bss_storage_engine", "fbs"];
+    let mut binaries = vec!["bss_server", "test_bss_storage_engine", "nss_tool", "bss_tool"];
     if use_etcd {
         binaries.push("etcdctl");
     }
