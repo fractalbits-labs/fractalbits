@@ -21,7 +21,7 @@ pub fn create_vpc(mut config: VpcConfig) -> CmdResult {
     }
 
     // 2. CDK deploy (instances self-bootstrap via UserData)
-    let cdk_dir = "infra/fractalbits-cdk";
+    let cdk_dir = "infra/aws-cdk";
 
     // Check if node_modules exists, if not run npm install
     let node_modules_path = format!("{}/node_modules/", cdk_dir);
@@ -114,7 +114,7 @@ pub fn destroy_vpc() -> CmdResult {
     // First destroy the CDK stack
     run_cmd! {
         info "Destroying CDK stack...";
-        cd infra/fractalbits-cdk;
+        cd infra/aws-cdk;
         npx cdk destroy FractalbitsVpcStack 2>&1;
         info "CDK stack destroyed successfully";
     }?;

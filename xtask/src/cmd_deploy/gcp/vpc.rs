@@ -3,7 +3,7 @@ use crate::*;
 use super::super::common::{DeployTarget, VpcConfig, upload_config_and_blueprint};
 use super::super::{bootstrap_progress, upload};
 use super::config_gen;
-const TERRAFORM_DIR: &str = "infra/fractalbits-terraform";
+const TERRAFORM_DIR: &str = "infra/gcp-terraform";
 
 pub fn create_vpc(config: VpcConfig) -> CmdResult {
     let project_id = super::resolve_gcp_project(config.gcp_project.as_deref())?;
