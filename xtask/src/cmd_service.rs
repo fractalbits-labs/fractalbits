@@ -345,7 +345,7 @@ pub fn init_service(
     };
 
     match service {
-        ServiceName::ApiServer | ServiceName::GuiServer => {
+        ServiceName::ApiServer => {
             if init_config.with_https {
                 generate_https_certificates()?;
             }
@@ -982,7 +982,7 @@ pub fn start_service(service: ServiceName) -> CmdResult {
                 ServiceName::MinioAz2 => {
                     create_minio_bucket(9002, "fractalbits-localdev-az2-data-bucket")?
                 }
-                ServiceName::ApiServer | ServiceName::GuiServer => register_local_api_server()?,
+                ServiceName::ApiServer => register_local_api_server()?,
                 _ => {}
             }
 
@@ -1111,14 +1111,9 @@ fn create_systemd_unit_files_for_init(
     build_mode: BuildMode,
     init_config: &InitConfig,
 ) -> CmdResult {
-    let api_server_service = if init_config.for_gui {
-        ServiceName::GuiServer
-    } else {
-        ServiceName::ApiServer
-    };
     match service {
-        ServiceName::ApiServer | ServiceName::GuiServer => {
-            create_systemd_unit_file(api_server_service, build_mode, init_config)?;
+        ServiceName::ApiServer => {
+            create_systemd_unit_file(service, build_mode, init_config)?;
         }
         ServiceName::Bss
         | ServiceName::Nss
@@ -1283,19 +1278,10 @@ Environment="RUST_LOG=warn""##
             if !init_config.with_https {
                 env_settings += "\nEnvironment=\"HTTPS_DISABLED=1\"";
             }
-            format!("{pwd}/target/{build}/api_server")
-        }
-        ServiceName::GuiServer => {
-            env_settings += env_rust_log(build_mode);
-            env_settings += &format!(
-                "\nEnvironment=\"APP_BLOB_STORAGE_BACKEND={}\"",
-                init_config.data_blob_storage.as_ref()
-            );
-            if !init_config.with_https {
-                env_settings += "\nEnvironment=\"HTTPS_DISABLED=1\"";
-            }
-            env_settings += r##"
+            if init_config.for_gui {
+                env_settings += r##"
 Environment="GUI_WEB_ROOT=../ui/dist""##;
+            }
             format!("{pwd}/target/{build}/api_server")
         }
         ServiceName::DdbLocal => {
@@ -1373,7 +1359,7 @@ Environment="MINIO_REGION=localdev""##
                 "After=firestore_emulator.service\nWants=firestore_emulator.service\n".to_string()
             }
         },
-        ServiceName::ApiServer | ServiceName::GuiServer => {
+        ServiceName::ApiServer => {
             match init_config.data_blob_storage {
                 DataBlobStorage::AllInBssSingleAz => {
                     "After=rss.service nss_role_agent_a.service\nWants=rss.service nss_role_agent_a.service\n".to_string()
@@ -1437,7 +1423,6 @@ WantedBy=multi-user.target
 "##
     );
     let service_file = match service {
-        ServiceName::GuiServer => "api_server.service".to_string(),
         ServiceName::Bss => "bss@.service".to_string(),
         ServiceName::Nss => "nss@.service".to_string(),
         ServiceName::Mirrord => "mirrord@.service".to_string(),
@@ -1521,7 +1506,7 @@ pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdRes
         }
         ServiceName::Nss => ("port 8087", vec![8087]),
         ServiceName::Mirrord => ("port 9999", vec![9999]),
-        ServiceName::ApiServer | ServiceName::GuiServer => ("port 8080", vec![8080]),
+        ServiceName::ApiServer => ("port 8080", vec![8080]),
         ServiceName::NssRoleAgentA => ("managed nss port 8087", vec![8087]),
         ServiceName::NssRoleAgentB => {
             if get_journal_type_setting() == JournalType::Ebs {
