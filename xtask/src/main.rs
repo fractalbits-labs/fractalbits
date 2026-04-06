@@ -474,7 +474,6 @@ pub enum ServiceAction {
 #[strum(serialize_all = "snake_case")]
 #[clap(rename_all = "snake_case")]
 pub enum ServiceName {
-    GuiServer,
     ApiServer,
     Bss,
     NssRoleAgentA,
