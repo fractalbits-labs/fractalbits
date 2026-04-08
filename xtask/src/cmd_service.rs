@@ -310,37 +310,17 @@ pub fn init_service(
         Ok(())
     };
     let init_mirrord = || -> CmdResult {
-        let format_log = "data/logs/format_mirrord.log";
         let journal_type = init_config.journal_type;
         let journal_uuid = get_or_create_shared_journal_uuid()?;
         let is_ebs_journal = journal_type == JournalType::Ebs;
         create_dirs_for_mirrord_server(is_ebs_journal, &journal_uuid)?;
-        let nss_binary = resolve_binary_path("nss_server", build_mode);
         info!(
             "Initializing mirrord with journal_type={:?}",
             journal_type.as_ref()
         );
-
-        // Compute shared_dir based on journal type (relative to working_dir which is ./data/nss-B)
-        // For EBS: shared_dir is "../ebs/<journal_uuid>" to reach ./data/ebs/<uuid>
-        // For NVMe: shared_dir is "local/journal/<journal_uuid>"
-        let shared_dir = match journal_type {
-            JournalType::Ebs => format!("../ebs/{}", journal_uuid),
-            JournalType::Nvme => format!("local/journal/{}", journal_uuid),
-        };
-
-        match build_mode {
-            BuildMode::Debug => run_cmd! {
-                info "formatting mirrord with default configs";
-                WORKING_DIR="./data/nss-B" SHARED_DIR=$shared_dir JOURNAL_UUID=$journal_uuid $nss_binary format
-                    |& ts -m $TS_FMT >$format_log;
-            }?,
-            BuildMode::Release => run_cmd! {
-                info "formatting mirrord for benchmarking";
-                WORKING_DIR="./data/nss-B" SHARED_DIR=$shared_dir JOURNAL_UUID=$journal_uuid $nss_binary format
-                    |& ts -m $TS_FMT >$format_log;
-            }?,
-        }
+        // The nss state log now lives in BSS as a metadata blob keyed by journal_uuid
+        // and is created by init_nss; mirrord no longer needs its own local state log,
+        // so just creating the working directories is enough.
         Ok(())
     };
 
