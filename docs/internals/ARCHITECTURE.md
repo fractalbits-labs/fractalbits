@@ -38,24 +38,25 @@ FractalBits uses a multi-tier architecture optimized for performance:
      │  └┤│                     │
      │   └┤                     │
      │    └────┬────────────────┘
-     │         │  ┌──────────────────────────────────┐
-     │         │  │  Hybrid Storage (based on size)  │
-     │         │  └──────────────────────────────────┘
-     │         │             │                     │
-     │         │             │ < 1MB               │ >= 1MB
-     │         │             ▼                     ▼
+     │         │       ┌───────────────────────────────────┐
+     │         │       │  Configurable Data Blob Storage   │
+     │         │       │  (AllInBss, Hybrid, or MultiAz)   │
+     │         │       └───────────────────────────────────┘
+     │         │             │                       │
+     │         │             │EC or Replication      │ (for Hybrid)
+     │         │             ▼                       ▼
      │         │      ┌─────────────────┐    ┌───────────────┐
      │         │      │┌────────────────┴┐   │ Cloud Storage │
      │         │      ││┌────────────────┴┐  │ (S3, GCS, ..) │
      │         └────► │││       BSS       │  │  - Durable    │
      │                │││ - FractalART KV │  │  - Scalable   │
      └──────────────► │││   Blob Storage  │  └───────────────┘
-                      └┤│                 │        ▲
-                       └┤                 │        │
-                        └─────────────────┘        │
-                             ▲                     │
-                             │ Data Plane          │ Data Plane
-                             │ (Local NVMe)        │ (Cloud Storage)
+                      └┤│                 │          ▲
+                       └┤                 │          │
+                        └─────────────────┘          │
+                             ▲                       │
+                             │ Data Plane            │ Data Plane
+                             │ (Local NVMe)          │ (Cloud Storage)
 ```
 
 ## Components
@@ -90,28 +91,6 @@ Cluster coordination providing:
 - API key management
 - Bucket management
 - Volume group configuration
-
-## Storage Architecture
-
-### **Hybrid Storage Backend**
-FractalBits uses a tiered storage approach to optimize performance and cost:
-
-**Small Blobs (< 1MB):**
-- Stored locally in BSS (Blob Storage Server)
-- Ultra-low latency access via io_uring
-- Direct NVMe storage with zero-copy paths
-
-**Large Blobs (>= 1MB):**
-- Automatically stored in S3 cloud storage
-- Cost-effective for larger objects
-- Leverages S3's durability and scalability
-- Transparent to S3 API clients
-
-**Benefits:**
-- Hot path optimization: small objects get local NVMe performance
-- Cost efficiency: large objects stored in cheaper S3 storage
-- Seamless S3 API compatibility with automatic tiering
-- No client-side changes required
 
 ## Technology Stack
 
