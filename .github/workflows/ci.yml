@@ -142,6 +142,6 @@ jobs:
     - name: Delete old container images
       uses: actions/delete-package-versions@v5
       with:
-        package-name: fractalbits-main
+        package-name: fractalbits
         package-type: container
         min-versions-to-keep: 5
