@@ -2,7 +2,7 @@
 
 **High-Performance S3-Compatible Object Storage**
 
-[![CI](https://github.com/fractalbits-labs/fractalbits-main/actions/workflows/ci.yml/badge.svg)](https://github.com/fractalbits-labs/fractalbits-main/actions/workflows/ci.yml)
+[![CI](https://github.com/fractalbits-labs/fractalbits/actions/workflows/ci.yml/badge.svg)](https://github.com/fractalbits-labs/fractalbits/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 > **Beta Software**: FractalBits is currently in beta. While it demonstrates exceptional performance, we recommend thorough testing before production use. We welcome feedback, bug reports, and contributions!
@@ -11,7 +11,7 @@
 
 FractalBits is an S3-compatible object storage system designed for high performance and low latency. Using our custom-built storage engine, it delivers up to **1 million 4K read IOPS** for single bucket with p99 latency ~5ms, at significantly lower cost than AWS S3 Express One Zone. Unlike standard S3, FractalBits provides native **atomic rename support for both objects and directories**.
 
-The **Fractal ART** (Adaptive Radix Tree) storage engine uses a full-path name approach that avoids the heavy distributed transactions required by traditional inode-based systems, achieving superior scalability while still providing directory semantics including atomic rename, etc. This makes FractalBits ideal for AI training pipelines and data analytics workflows that require atomic operations for managing datasets and checkpoints. The system implements **two-tier storage**: an NVMe SSD tier for hot small objects with single-digit millisecond latency, and an S3 backend tier for larger objects to optimize costs.
+The **Fractal ART** (Adaptive Radix Tree) storage engine uses a full-path name approach that avoids the heavy distributed transactions required by traditional inode-based systems, achieving superior scalability while still providing directory semantics including atomic rename, etc. This makes FractalBits ideal for AI training pipelines and data analytics workflows that require atomic operations for managing datasets and checkpoints.
 
 Built with Rust for the API gateway and control plane, and per core io_uring for asynchronous I/O for the performance-critical storage engine and data plane. This combination enables hundreds of thousands of operations per second while maintaining ultra low latency.
 
@@ -19,9 +19,8 @@ Built with Rust for the API gateway and control plane, and per core io_uring for
 - 🚀 **~1M IOPS** (4KB objects) for single bucket with p99 latency ~5ms
 - 🔄 **Atomic rename support** for both objects and directories - native capability that standard S3 lacks
 - ⚡ **Fractal ART** full-path storage engine for superior performance and scalability
-- 🗂️ **Two-tier storage** - NVMe SSD for hot small objects, S3 backend for large objects
 - 💰 **Cost-efficient** - significantly lower cost than AWS S3 Express One Zone for small object workloads
-- 🌐 **5-minute Bring Your Own Cloud (BYOC)** - to **any** AWS region with `just deploy`
+- 🌐 **5-minute Bring Your Own Cloud (BYOC)** - to **any** AWS/GCP region with `just deploy`
 
 ## Performance Benchmarks
 
@@ -41,13 +40,13 @@ FractalBits delivers exceptional performance that exceeds AWS S3 Express One Zon
 ### PUT Workload
 | Metric | Value |
 |--------|-------|
-| IOPS | 248544.77 obj/s |
-| Throughput | 970.88 MiB/s |
-| Avg Latency | 6.6 ms |
+| IOPS | 333308 obj/s |
+| Throughput | 1301.98 MiB/s |
+| Avg Latency | 4.4 ms |
 
 **Benchmark Configuration:**
 - Object size: 4 KiB
-- Instance types: 14 c8g.xlarge (API), 6 i8g.2xlarge (BSS), 1 m7gd.4xlarge (NSS)
+- Instance types: 14 c8g.xlarge (API), 6 i8g.2xlarge (BSS), 1 r7g.4xlarge (NSS)
 - Cost: ~$8/hour based on AWS on-demand EC2 instance pricing
 - Replication: 3-way data blob quorum, 6-way metadata blob quorum
 - AWS Region: us-west-2
@@ -72,8 +71,8 @@ For detailed information about development prerequisites and setup, see the [Pre
 Clone the repository and build all components:
 
 ```bash
-git clone https://github.com/fractalbits-labs/fractalbits-main.git
-cd fractalbits-main
+git clone https://github.com/fractalbits-labs/fractalbits.git
+cd fractalbits
 
 # Initialize repo
 just repo init
@@ -184,10 +183,10 @@ The container requires `--privileged` mode because the storage engine uses io_ur
 
 ```bash
 # Run the latest image
-docker run --rm --privileged -p 8080:8080 ghcr.io/fractalbits-labs/fractalbits-main:latest
+docker run --rm --privileged -p 8080:8080 ghcr.io/fractalbits-labs/fractalbits:latest
 
 # Run a specific version
-docker run --rm --privileged -p 8080:8080 ghcr.io/fractalbits-labs/fractalbits-main:<commit-sha>
+docker run --rm --privileged -p 8080:8080 ghcr.io/fractalbits-labs/fractalbits:<commit-sha>
 
 # Run your custom-built image (after `cargo xtask docker build`)
 docker run --rm --privileged -p 8080:8080 fractalbits:latest
@@ -196,16 +195,14 @@ docker run --rm --privileged -p 8080:8080 fractalbits:latest
 docker run -d --privileged --name fractalbits \
     -p 8080:8080 \
     -v fractalbits-data:/data \
-    ghcr.io/fractalbits-labs/fractalbits-main:latest
+    ghcr.io/fractalbits-labs/fractalbits:latest
 ```
 
 Once running, see [Basic Usage Example](#basic-usage-example) for S3 client commands.
 
 ## Bring Your Own Cloud (BYOC)
 
-FractalBits makes BYOC simple: build once, deploy with a single command, and launch a fully operational cloud storage system on AWS in under 5 minutes.
-
-*Note: Currently focused on AWS, with plans to expand to other cloud providers in the future.*
+FractalBits makes BYOC simple: build once, deploy with a single command, and launch a fully operational cloud storage system on AWS/GCP in under 5 minutes.
 
 ### Building from Source (Optional)
 
@@ -242,17 +239,6 @@ WORKLOAD=get_4k /opt/fractalbits/bin/bench_start.sh
 just deploy destroy-vpc
 ```
 
-### Recommended Instance Types
-
-Based on performance testing, we recommend:
-
-| Component | Instance Type | Notes |
-|-----------|---------------|-------|
-| API Server | c8g.xlarge | Compute-optimized, Graviton3/4 |
-| BSS | i8g.2xlarge | NVMe-optimized storage instances |
-| NSS | m7gd.4xlarge | NVMe + memory for metadata |
-| RSS | c7g.medium | Lightweight coordination |
-
 ## S3 API Compatibility
 
 FractalBits supports the most commonly used S3 operations with full AWS Signature V4 authentication. For complete details including supported operations, extension APIs, authentication, and limitations, see [S3 API Compatibility](docs/S3_API_COMPATIBILITY.md).
@@ -262,10 +248,10 @@ We're actively working on expanding S3 API coverage. See our [Roadmap](docs/ROAD
 ## Support
 
 - 📖 **Documentation**: See [docs/](docs/) directory
-- 🐛 **Bug Reports**: [GitHub Issues](https://github.com/fractalbits-labs/fractalbits-main/issues)
-- 💬 **Discussions**: [GitHub Discussions](https://github.com/fractalbits-labs/fractalbits-main/discussions)
+- 🐛 **Bug Reports**: [GitHub Issues](https://github.com/fractalbits-labs/fractalbits/issues)
+- 💬 **Discussions**: [GitHub Discussions](https://github.com/fractalbits-labs/fractalbits/discussions)
 - 👥 **Slack**: [Join FractalBits Community](https://join.slack.com/t/fractalbitscommunity/shared_invite/zt-3j9b3iw0l-NFSW3cjo~DEF~jqfBp1mzA)
-- 📧 **Email**: fractalbits.com@gmail.com (for private inquiries)
+- 📧 **Email**: thomas@fractalbits.com (for private inquiries)
 
 ---
 
