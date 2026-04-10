@@ -556,6 +556,51 @@ impl RpcClient {
         })
     }
 
+    /// Get journal VG info as raw JSON string for forwarding to NSS
+    pub async fn get_journal_vg_info_json(
+        &self,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<String, RpcError> {
+        let _guard = InflightRpcGuard::new("rss", "get_journal_vg_info_json");
+        let start = Instant::now();
+        let body = GetJournalVgInfoRequest {};
+        let mut header = MessageHeader::default();
+        let request_id = self.gen_request_id();
+        header.id = request_id;
+        header.command = Command::GetJournalVgInfo;
+        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
+        header.retry_count = retry_count as u8;
+        header.set_trace_id(trace_id);
+
+        let body_bytes = encode_protobuf(body, trace_id)?;
+        header.set_body_checksum(&body_bytes);
+        let frame = MessageFrame::new(header, body_bytes);
+        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
+            if !e.retryable() {
+                error!(rpc=%"get_journal_vg_info_json", %request_id, error=?e, "rss rpc failed");
+            }
+            e
+        })?;
+        let resp: GetJournalVgInfoResponse =
+            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        let duration = start.elapsed();
+        match resp.result.unwrap() {
+            rss_codec::get_journal_vg_info_response::Result::InfoJson(info_json) => {
+                histogram!("rss_rpc_nanos", "status" => "GetJournalVgInfoJson_Ok")
+                    .record(duration.as_nanos() as f64);
+                Ok(info_json)
+            }
+            rss_codec::get_journal_vg_info_response::Result::Error(err) => {
+                histogram!("rss_rpc_nanos", "status" => "GetJournalVgInfoJson_Error")
+                    .record(duration.as_nanos() as f64);
+                error!(rpc=%"get_journal_vg_info_json", "rss rpc failed: {err}");
+                Err(RpcError::InternalResponseError(err))
+            }
+        }
+    }
+
     /// Get metadata VG info as raw JSON string for forwarding to NSS
     pub async fn get_metadata_vg_info_json(
         &self,

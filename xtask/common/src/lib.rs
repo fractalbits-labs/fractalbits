@@ -745,6 +745,20 @@ pub fn generate_bss_metadata_vg_config(bss_count: u32) -> String {
     }
 }
 
+/// Generate BSS journal volume group config for given bss_count.
+/// Same JSON shape and quorum defaults as the metadata vg, but consumed via
+/// the JOURNAL_VG_CONFIG env var. The journal vg lives on its own volume_id
+/// namespace independent of the metadata vg.
+pub fn generate_bss_journal_vg_config(bss_count: u32) -> String {
+    match bss_count {
+        1 => generate_metadata_vg_config(1, 1, 1, 1),
+        3 => generate_metadata_vg_config(3, 3, 2, 2),
+        // Two volumes of 3 nodes each, quorum (n=3, r=2, w=2)
+        6 => generate_metadata_vg_config(6, 3, 2, 2),
+        _ => generate_metadata_vg_config(1, 1, 1, 1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
