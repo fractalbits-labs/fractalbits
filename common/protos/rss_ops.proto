@@ -32,6 +32,9 @@ enum Command {
 
   // Active NSS address query
   GetActiveNssAddress = 28;
+
+  // Journal Volume Group management
+  GetJournalVgInfo = 29;
 }
 
 // Put
@@ -197,6 +200,17 @@ message GetMetadataVgInfoRequest {
 }
 
 message GetMetadataVgInfoResponse {
+  oneof result {
+    string info_json = 1;
+    string error = 2;
+  }
+}
+
+// GetJournalVgInfo - Get journal volume group configuration
+message GetJournalVgInfoRequest {
+}
+
+message GetJournalVgInfoResponse {
   oneof result {
     string info_json = 1;
     string error = 2;

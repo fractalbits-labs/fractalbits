@@ -10,7 +10,7 @@ use colored::*;
 use uuid::Uuid;
 use xtask_common::{
     LOCAL_DDB_ENVS, LOCAL_DDB_ENVS_SYSTEMD, create_bss_dirs, create_nss_dirs,
-    generate_bss_data_vg_config, generate_bss_metadata_vg_config,
+    generate_bss_data_vg_config, generate_bss_journal_vg_config, generate_bss_metadata_vg_config,
 };
 
 pub fn init_service(
@@ -152,6 +152,23 @@ pub fn init_service(
                 --item $bss_metadata_vg_config_item >/dev/null;
         }?;
 
+        // Initialize BSS journal volume group configuration in service-discovery table
+        let bss_journal_vg_config_json = generate_bss_journal_vg_config(init_config.bss_count);
+        let bss_journal_vg_config_item = format!(
+            r#"{{"service_id":{{"S":"bss-journal-vg-config"}},"value":{{"S":"{}"}}}}"#,
+            bss_journal_vg_config_json
+                .replace('"', r#"\""#)
+                .replace('\n', "")
+        );
+
+        run_cmd! {
+            info "Initializing BSS journal volume group configuration in service-discovery table ...";
+            $[LOCAL_DDB_ENVS]
+            aws dynamodb put-item
+                --table-name $SERVICE_DISCOVERY_TABLE
+                --item $bss_journal_vg_config_item >/dev/null;
+        }?;
+
         // Initialize shared journal UUID in service-discovery table
         let journal_uuid = get_or_create_shared_journal_uuid()?;
         let journal_uuid_item = format!(
@@ -198,6 +215,7 @@ pub fn init_service(
         let az_status_json = r#"{"status":{"localdev-az1":"Normal","localdev-az2":"Normal"}}"#;
         let bss_data_vg_config = generate_bss_data_vg_config(init_config.bss_count);
         let bss_metadata_vg_config = generate_bss_metadata_vg_config(init_config.bss_count);
+        let bss_journal_vg_config = generate_bss_journal_vg_config(init_config.bss_count);
 
         run_cmd! {
             info "Initializing etcd service-discovery keys...";
@@ -205,6 +223,7 @@ pub fn init_service(
             $etcdctl put /fractalbits-service-discovery/az_status $az_status_json >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-data-vg-config $bss_data_vg_config >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-metadata-vg-config $bss_metadata_vg_config >/dev/null;
+            $etcdctl put /fractalbits-service-discovery/bss-journal-vg-config $bss_journal_vg_config >/dev/null;
         }?;
 
         // Initialize shared journal UUID
@@ -284,6 +303,8 @@ pub fn init_service(
         let is_ebs_journal = journal_type == JournalType::Ebs;
         create_dirs_for_nss_server(is_ebs_journal, &journal_uuid)?;
         let nss_binary = resolve_binary_path("nss_server", build_mode);
+        let metadata_vg = generate_bss_metadata_vg_config(init_config.bss_count);
+        let journal_vg = generate_bss_journal_vg_config(init_config.bss_count);
 
         // Compute shared_dir based on journal type (relative to working_dir which is ./data/nss-A)
         // For EBS: shared_dir is "../ebs/<journal_uuid>" to reach ./data/ebs/<uuid>
@@ -296,12 +317,14 @@ pub fn init_service(
         match build_mode {
             BuildMode::Debug => run_cmd! {
                 info "formatting nss_server with default configs";
-                SHARED_DIR=$shared_dir JOURNAL_UUID=$journal_uuid $nss_binary format --init_test_tree
+                SHARED_DIR=$shared_dir JOURNAL_UUID=$journal_uuid METADATA_VG_CONFIG=$metadata_vg JOURNAL_VG_CONFIG=$journal_vg
+                    $nss_binary format --init_test_tree
                     |& ts -m $TS_FMT >$format_log;
             }?,
             BuildMode::Release => run_cmd! {
                 info "formatting nss_server for benchmarking";
-                SHARED_DIR=$shared_dir JOURNAL_UUID=$journal_uuid $nss_binary format --init_test_tree
+                SHARED_DIR=$shared_dir JOURNAL_UUID=$journal_uuid METADATA_VG_CONFIG=$metadata_vg JOURNAL_VG_CONFIG=$journal_vg
+                    $nss_binary format --init_test_tree
                     |& ts -m $TS_FMT >$format_log;
             }?,
         }
@@ -434,6 +457,7 @@ fn seed_firestore_emulator() -> CmdResult {
     };
     let bss_data_vg_config = generate_bss_data_vg_config(bss_count);
     let bss_metadata_vg_config = generate_bss_metadata_vg_config(bss_count);
+    let bss_journal_vg_config = generate_bss_journal_vg_config(bss_count);
     let journal_uuid = get_or_create_shared_journal_uuid()?;
 
     let firestore_put = |collection: &str, doc_id: &str, fields_json: &str| -> CmdResult {
@@ -488,6 +512,19 @@ fn seed_firestore_emulator() -> CmdResult {
         "fractalbits-service-discovery",
         "bss-metadata-vg-config",
         &meta_vg_fields,
+    )?;
+
+    let escaped_journal_vg = bss_journal_vg_config
+        .replace('"', r#"\""#)
+        .replace('\n', "");
+    let journal_vg_fields = format!(
+        r#"{{"fields":{{"value":{{"stringValue":"{escaped_journal_vg}"}},"version":{{"integerValue":"1"}}}}}}"#
+    );
+    info!("Seeding BSS journal VG config in Firestore...");
+    firestore_put(
+        "fractalbits-service-discovery",
+        "bss-journal-vg-config",
+        &journal_vg_fields,
     )?;
 
     let journal_fields = format!(
