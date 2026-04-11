@@ -476,9 +476,8 @@ pub enum ServiceAction {
 pub enum ServiceName {
     ApiServer,
     Bss,
-    NssRoleAgentA,
+    NssRoleAgent,
     Nss,
-    NssRoleAgentB,
     Mirrord,
     Rss,
     All,
