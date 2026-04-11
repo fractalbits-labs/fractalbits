@@ -478,7 +478,6 @@ pub enum ServiceName {
     Bss,
     NssRoleAgent,
     Nss,
-    Mirrord,
     Rss,
     All,
     Minio,
@@ -652,7 +651,6 @@ pub enum TestType {
     LeaderElection,
     BssNodeFailure,
     BssRepair,
-    NssHaWithMirrord,
     NssHaWithEBS,
     FsServer {
         #[clap(long, help = "Run only FUSE tests")]

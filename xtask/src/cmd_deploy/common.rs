@@ -112,7 +112,6 @@ pub(super) const RUST_BINS: &[&str] = &[
 pub(super) const ZIG_BINS: &[&str] = &[
     "nss_server",
     "bss_server",
-    "mirrord",
     "nss_tool",
     "bss_tool",
     "test_bss_storage_engine",

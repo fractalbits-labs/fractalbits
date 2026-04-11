@@ -244,7 +244,7 @@ impl InputClusterConfig {
             endpoints: None,
         });
 
-        // Generate a shared journal UUID for NSS nodes (used by both nss_server and mirrord)
+        // Generate a shared journal UUID for NSS nodes
         let shared_journal_uuid = Uuid::new_v4().to_string();
 
         // Extract NSS node IDs based on role for resources config

@@ -62,9 +62,8 @@ pub fn generate_blueprint(config: &BootstrapClusterConfig) -> StageBlueprint {
     let all = num_bss + num_nss + num_rss + num_api + num_bench;
 
     let use_etcd = config.global.rss_backend == RssBackend::Etcd;
-    let use_nvme = config.global.journal_type == JournalType::Nvme;
     // In HA mode (2 NSS nodes), only the active node signals journal-ready;
-    // the standby runs mirrord (NVMe) or is idle (EBS).
+    // the standby is idle.
     let has_nss_standby = num_nss > 1;
     let num_journal_ready = if has_nss_standby { 1 } else { num_nss };
 
@@ -81,7 +80,6 @@ pub fn generate_blueprint(config: &BootstrapClusterConfig) -> StageBlueprint {
         (&stages::RSS_INITIALIZED, 1, true),
         (&stages::METADATA_VG_READY, 1, true),
         (&stages::NSS_FORMATTED, num_nss, true),
-        (&stages::MIRRORD_READY, 1, use_nvme),
         (&stages::NSS_JOURNAL_READY, num_journal_ready, true),
         (&stages::BSS_CONFIGURED, num_bss, true),
         (&stages::SERVICES_READY, all, true),
