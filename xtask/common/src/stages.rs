@@ -197,18 +197,10 @@ pub const NSS_FORMATTED: StageDef = StageDef {
     timeout_secs: 600,
 };
 
-pub const MIRRORD_READY: StageDef = StageDef {
-    name: "mirrord-ready",
-    desc: "Mirrord ready",
-    depends_on: &[&NSS_FORMATTED],
-    is_global: false,
-    timeout_secs: 120,
-};
-
 pub const NSS_JOURNAL_READY: StageDef = StageDef {
     name: "nss-journal-ready",
     desc: "NSS journal ready",
-    depends_on: &[&NSS_FORMATTED, &METADATA_VG_READY, &MIRRORD_READY],
+    depends_on: &[&NSS_FORMATTED, &METADATA_VG_READY],
     is_global: false,
     timeout_secs: 600,
 };
@@ -237,7 +229,6 @@ pub const ALL_STAGES: &[&StageDef] = &[
     &RSS_INITIALIZED,
     &METADATA_VG_READY,
     &NSS_FORMATTED,
-    &MIRRORD_READY,
     &NSS_JOURNAL_READY,
     &BSS_CONFIGURED,
     &SERVICES_READY,

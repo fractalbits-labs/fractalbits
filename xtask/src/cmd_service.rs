@@ -82,18 +82,10 @@ pub fn init_service(
                 --provisioned-throughput ReadCapacityUnits=1,WriteCapacityUnits=1 >/dev/null;
         }?;
 
-        // Initialize observer_state in service-discovery table
-        // NVMe: active/standby with mirrord on standby machine
-        // EBS: active/standby with idle standby (no mirrord, role agent reports standby health)
-        // Fields match root_server's ObserverPersistentState and MachineState structs
-        let observer_state_json = match init_config.journal_type {
-            JournalType::Nvme => {
-                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-1","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0,"nss_node_map":{"nss-0":1,"nss-1":2},"next_nss_node_id":3}"#
-            }
-            JournalType::Ebs => {
-                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-1","running_service":"noop","expected_role":"standby","network_address":null},"version":1,"last_updated":0,"nss_node_map":{"nss-0":1,"nss-1":2},"next_nss_node_id":3}"#
-            }
-        };
+        // Initialize observer_state in service-discovery table.
+        // active/standby with idle standby: role agent reports standby health.
+        // Fields match root_server's ObserverPersistentState and MachineState structs.
+        let observer_state_json = r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-1","running_service":"noop","expected_role":"standby","network_address":null},"version":1,"last_updated":0,"nss_node_map":{"nss-0":1,"nss-1":2},"next_nss_node_id":3}"#;
         let observer_state_item = format!(
             r#"{{"service_id":{{"S":"observer_state"}},"state":{{"S":"{}"}}}}"#,
             observer_state_json.replace('"', "\\\"")
@@ -199,18 +191,10 @@ pub fn init_service(
         // Initialize service-discovery keys using etcdctl
         let etcdctl = resolve_etcd_bin("etcdctl");
 
-        // Always use observer_state for role management
-        // NVMe: active/standby with mirrord on standby machine
-        // EBS: active/standby with idle standby (no mirrord, role agent reports standby health)
-        // Fields match root_server's ObserverPersistentState and MachineState structs
-        let observer_state_json = match init_config.journal_type {
-            JournalType::Nvme => {
-                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-1","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0,"nss_node_map":{"nss-0":1,"nss-1":2},"next_nss_node_id":3}"#
-            }
-            JournalType::Ebs => {
-                r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-1","running_service":"noop","expected_role":"standby","network_address":null},"version":1,"last_updated":0,"nss_node_map":{"nss-0":1,"nss-1":2},"next_nss_node_id":3}"#
-            }
-        };
+        // Always use observer_state for role management.
+        // active/standby with idle standby: role agent reports standby health.
+        // Fields match root_server's ObserverPersistentState and MachineState structs.
+        let observer_state_json = r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-1","running_service":"noop","expected_role":"standby","network_address":null},"version":1,"last_updated":0,"nss_node_map":{"nss-0":1,"nss-1":2},"next_nss_node_id":3}"#;
 
         let az_status_json = r#"{"status":{"localdev-az1":"Normal","localdev-az2":"Normal"}}"#;
         let bss_data_vg_config = generate_bss_data_vg_config(init_config.bss_count);
@@ -332,21 +316,6 @@ pub fn init_service(
         stop_service(ServiceName::Bss)?;
         Ok(())
     };
-    let init_mirrord = || -> CmdResult {
-        let journal_type = init_config.journal_type;
-        let journal_uuid = get_or_create_shared_journal_uuid()?;
-        let is_ebs_journal = journal_type == JournalType::Ebs;
-        create_dirs_for_mirrord_server(is_ebs_journal, &journal_uuid)?;
-        info!(
-            "Initializing mirrord with journal_type={:?}",
-            journal_type.as_ref()
-        );
-        // The nss state log now lives in BSS as a metadata blob keyed by journal_uuid
-        // and is created by init_nss; mirrord no longer needs its own local state log,
-        // so just creating the working directories is enough.
-        Ok(())
-    };
-
     match service {
         ServiceName::ApiServer => {
             if init_config.with_https {
@@ -363,7 +332,6 @@ pub fn init_service(
         ServiceName::Rss => init_rss()?,
         ServiceName::Nss => init_nss()?,
         ServiceName::NssRoleAgent => {}
-        ServiceName::Mirrord => init_mirrord()?,
         ServiceName::Etcd => init_etcd()?,
         ServiceName::FirestoreEmulator => firestore_utils::ensure_firestore_emulator()?,
         ServiceName::FsServer => {}
@@ -373,7 +341,6 @@ pub fn init_service(
             }
             init_rss()?;
             init_nss()?; // bss is initialized inside
-            init_mirrord()?;
             init_minio("data/s3")?;
             init_minio("data/s3-localdev-az1")?;
             init_minio("data/s3-localdev-az2")?;
@@ -444,17 +411,9 @@ fn ensure_minio() -> CmdResult {
 /// The emulator must already be running on port 8282.
 /// This is called both during init and during start (since the emulator is in-memory only).
 fn seed_firestore_emulator() -> CmdResult {
-    let journal_type = get_journal_type_setting();
     let bss_count = get_bss_count_from_config();
 
-    let observer_state_json = match journal_type {
-        JournalType::Nvme => {
-            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-1","running_service":"mirrord","expected_role":"standby","network_address":"127.0.0.1:9999"},"version":1,"last_updated":0,"nss_node_map":{"nss-0":1,"nss-1":2},"next_nss_node_id":3}"#
-        }
-        JournalType::Ebs => {
-            r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-1","running_service":"noop","expected_role":"standby","network_address":null},"version":1,"last_updated":0,"nss_node_map":{"nss-0":1,"nss-1":2},"next_nss_node_id":3}"#
-        }
-    };
+    let observer_state_json = r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-1","running_service":"noop","expected_role":"standby","network_address":null},"version":1,"last_updated":0,"nss_node_map":{"nss-0":1,"nss-1":2},"next_nss_node_id":3}"#;
     let bss_data_vg_config = generate_bss_data_vg_config(bss_count);
     let bss_metadata_vg_config = generate_bss_metadata_vg_config(bss_count);
     let bss_journal_vg_config = generate_bss_journal_vg_config(bss_count);
@@ -611,26 +570,6 @@ fn get_nss_service_status(service_name: &str) -> String {
     }
 }
 
-fn get_mirrord_service_names() -> Vec<&'static str> {
-    vec!["mirrord@0", "mirrord@1"]
-}
-
-fn get_mirrord_service_status(service_name: &str) -> String {
-    match run_fun!(systemctl --user is-active $service_name.service 2>/dev/null) {
-        Ok(output) => match output.trim() {
-            "active" => "active".green().to_string(),
-            status => status.yellow().to_string(),
-        },
-        Err(_) => {
-            if run_cmd!(systemctl --user is-failed --quiet $service_name.service).is_ok() {
-                "failed".red().to_string()
-            } else {
-                "inactive (dead)".bright_black().to_string()
-            }
-        }
-    }
-}
-
 /// Default nss_role_agent instance count at init time. Today this is 2 because
 /// NSS runs as an active/standby pair; each role agent supervises one NSS node.
 /// As the NSS topology grows, the count grows with it — one role agent per NSS.
@@ -692,14 +631,11 @@ pub fn start_nss_role_agent_instance(id: u32) -> CmdResult {
     run_cmd!(systemctl --user start $service_name.service)?;
 
     // Today's 2-instance active/standby topology: instance 0 supervises the
-    // active NSS (port 8087); instance 1 supervises mirrord (port 9999) for
-    // NVMe journals, or sits as an idle standby for EBS.
+    // active NSS (port 8087); instance 1 sits as an idle standby.
     if id == 0 {
         wait_for_port_ready(8087, 30)?;
-    } else if id == 1 && get_journal_type_setting() != JournalType::Ebs {
-        wait_for_port_ready(9999, 30)?;
     } else {
-        // EBS idle standby (or future scaled instances): no managed service port.
+        // Idle standby (or future scaled instances): no managed service port.
         // Fall back to systemd's is-active check.
         use std::time::{Duration, Instant};
         let start = Instant::now();
@@ -787,7 +723,6 @@ pub fn stop_service(service: ServiceName) -> CmdResult {
         ServiceName::All => all_services(
             get_data_blob_storage_setting(),
             get_rss_backend_setting(),
-            get_journal_type_setting(),
             false,
             false,
         ),
@@ -795,7 +730,7 @@ pub fn stop_service(service: ServiceName) -> CmdResult {
     };
 
     for service in services {
-        if service == ServiceName::Nss || service == ServiceName::Mirrord {
+        if service == ServiceName::Nss {
             let service_name = service.as_ref();
             cmd_die!(
                 "$service_name is managed by nss_role_agent service - stop nss_role_agent instead"
@@ -859,7 +794,6 @@ pub fn stop_service(service: ServiceName) -> CmdResult {
 fn all_services(
     data_blob_storage: DataBlobStorage,
     rss_backend: RssBackend,
-    journal_type: JournalType,
     with_managed_service: bool,
     sort: bool,
 ) -> Vec<ServiceName> {
@@ -868,9 +802,6 @@ fn all_services(
         RssBackend::Etcd => ServiceName::Etcd,
         RssBackend::Firestore => ServiceName::FirestoreEmulator,
     };
-    // Mirrord service is only needed for NVMe journal or S3ExpressMultiAz
-    let with_mirrord =
-        journal_type == JournalType::Nvme || data_blob_storage == DataBlobStorage::S3ExpressMultiAz;
 
     let mut services = match data_blob_storage {
         DataBlobStorage::S3HybridSingleAz => {
@@ -883,9 +814,6 @@ fn all_services(
             ];
             if with_managed_service {
                 services.push(ServiceName::Nss);
-                if with_mirrord {
-                    services.push(ServiceName::Mirrord);
-                }
             }
             services
         }
@@ -901,7 +829,6 @@ fn all_services(
             ];
             if with_managed_service {
                 services.push(ServiceName::Nss);
-                services.push(ServiceName::Mirrord);
             }
             services
         }
@@ -914,9 +841,6 @@ fn all_services(
             ];
             if with_managed_service {
                 services.push(ServiceName::Nss);
-                if with_mirrord {
-                    services.push(ServiceName::Mirrord);
-                }
             }
             services
         }
@@ -949,24 +873,6 @@ fn get_data_blob_storage_setting() -> DataBlobStorage {
     }
 }
 
-fn get_journal_type_setting() -> JournalType {
-    // Check the nss_role_agent@.service template file for the actual journal type setting.
-    // We can't just check mirrord@.service existence because mirrord is also used
-    // with S3ExpressMultiAz + EBS journal type.
-    let service_file = Path::new("data/etc/nss_role_agent@.service");
-    if service_file.exists()
-        && let Ok(content) = std::fs::read_to_string(service_file)
-        && content.contains("APP_JOURNAL_TYPE=ebs")
-    {
-        return JournalType::Ebs;
-    }
-    if Path::new("data/etc/mirrord@.service").exists() {
-        JournalType::Nvme
-    } else {
-        JournalType::Ebs
-    }
-}
-
 pub fn show_service_status(service: ServiceName) -> CmdResult {
     match service {
         ServiceName::All => {
@@ -976,7 +882,6 @@ pub fn show_service_status(service: ServiceName) -> CmdResult {
             for svc in all_services(
                 get_data_blob_storage_setting(),
                 get_rss_backend_setting(),
-                get_journal_type_setting(),
                 true,
                 true,
             ) {
@@ -991,12 +896,6 @@ pub fn show_service_status(service: ServiceName) -> CmdResult {
                     for nss_service_name in get_nss_service_names() {
                         let status = get_nss_service_status(nss_service_name);
                         println!("{nss_service_name:<16}: {status}");
-                    }
-                } else if svc == ServiceName::Mirrord {
-                    // Handle Mirrord template instances
-                    for mirrord_service_name in get_mirrord_service_names() {
-                        let status = get_mirrord_service_status(mirrord_service_name);
-                        println!("{mirrord_service_name:<16}: {status}");
                     }
                 } else if svc == ServiceName::NssRoleAgent {
                     // Handle nss_role_agent template instances
@@ -1063,16 +962,6 @@ pub fn show_service_status(service: ServiceName) -> CmdResult {
                         println!();
                     }
                 }
-            } else if single_service == ServiceName::Mirrord {
-                // Show all Mirrord template instances
-                let mirrord_services = get_mirrord_service_names();
-                for (i, service_name) in mirrord_services.iter().enumerate() {
-                    println!("=== {} ===", service_name);
-                    run_cmd! { ignore systemctl --user status $service_name.service --no-pager; }?;
-                    if i < mirrord_services.len() - 1 {
-                        println!();
-                    }
-                }
             } else if single_service == ServiceName::NssRoleAgent {
                 // Show all nss_role_agent template instances
                 let services = get_nss_role_agent_service_names();
@@ -1108,8 +997,8 @@ pub fn start_service(service: ServiceName) -> CmdResult {
         }
         ServiceName::NssRoleAgent => {
             // Start all nss_role_agent template instances in reverse order so the
-            // standby-side agent (which supervises mirrord for NVMe) is up before
-            // the active-side agent begins managing NSS.
+            // standby-side agent is up before the active-side agent begins
+            // managing NSS.
             let mut ids: Vec<u32> = (0..get_nss_role_agent_count_from_config()).collect();
             ids.reverse();
             for id in ids {
@@ -1233,8 +1122,8 @@ fn start_all_services() -> CmdResult {
             for id in 0..bss_count {
                 start_bss_instance(id)?;
             }
-            // Start nss_role_agent instance 1 first (supervises mirrord for NVMe,
-            // or sits as an idle standby for EBS), then instance 0 (active NSS).
+            // Start nss_role_agent instance 1 first (idle standby), then
+            // instance 0 (active NSS).
             start_nss_role_agent_instance(1)?;
             start_nss_role_agent_instance(0)?;
             start_service(ServiceName::ApiServer)?;
@@ -1272,7 +1161,6 @@ fn create_systemd_unit_files_for_init(
         ServiceName::Bss
         | ServiceName::Nss
         | ServiceName::NssRoleAgent
-        | ServiceName::Mirrord
         | ServiceName::Rss
         | ServiceName::DdbLocal
         | ServiceName::Minio
@@ -1290,7 +1178,6 @@ fn create_systemd_unit_files_for_init(
             let services = all_services(
                 init_config.data_blob_storage,
                 init_config.rss_backend,
-                init_config.journal_type,
                 true,
                 false,
             );
@@ -1299,15 +1186,11 @@ fn create_systemd_unit_files_for_init(
             }
             create_nss_role_agent_service_symlinks(DEFAULT_NSS_ROLE_AGENT_COUNT)?;
 
-            // Clean up service files that don't belong to the current configuration
-            // This prevents stale service files from previous runs affecting startup
-            let with_mirrord = init_config.journal_type == JournalType::Nvme
-                || init_config.data_blob_storage == DataBlobStorage::S3ExpressMultiAz;
-            if !with_mirrord {
-                run_cmd! {
-                    rm -f "data/etc/mirrord@.service";
-                }?;
-            }
+            // Remove any stale mirrord unit left over from a previous init;
+            // mirrord is no longer part of the service topology.
+            run_cmd! {
+                rm -f "data/etc/mirrord@.service";
+            }?;
         }
     }
     Ok(())
@@ -1364,25 +1247,6 @@ Environment="RUST_LOG=warn""##
             };
             format!(
                 r#"/bin/bash -c 'JOURNAL_UUID=$(cat ./etc/journal_uuid.txt); export JOURNAL_UUID; export SHARED_DIR="{shared_dir_prefix}/$JOURNAL_UUID"; if [ "%i" = "0" ]; then HEALTH_PORT=29999; else HEALTH_PORT=29998; fi; export HEALTH_PORT; if [ -n "$LOGS" ]; then {nss_binary} serve 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/nss-%i.log"; else exec {nss_binary} serve; fi'"#
-            )
-        }
-        ServiceName::Mirrord => {
-            managed_service = true;
-            // Use template-based service with instance suffix (0 or 1)
-            // WORKING_DIR, SHARED_DIR, JOURNAL_UUID, and HEALTH_PORT are set based on instance
-            env_settings += "\nEnvironment=\"WORKING_DIR=./nss-%i\"";
-            env_settings += &format!("\nEnvironmentFile=-{pwd}/data/etc/mirrord.env");
-            let mirrord_binary = resolve_binary_path("mirrord", build_mode);
-            // Read journal_uuid from shared file and compute SHARED_DIR based on journal type
-            // For EBS: "../ebs/<uuid>" (relative to ./nss-%i to reach ./ebs/<uuid>)
-            // For NVMe: "local/journal/<uuid>"
-            let journal_type = init_config.journal_type;
-            let shared_dir_prefix = match journal_type {
-                JournalType::Ebs => "../ebs",
-                JournalType::Nvme => "local/journal",
-            };
-            format!(
-                r#"/bin/bash -c 'JOURNAL_UUID=$(cat ./etc/journal_uuid.txt); export JOURNAL_UUID; export SHARED_DIR="{shared_dir_prefix}/$JOURNAL_UUID"; if [ "%i" = "0" ]; then HEALTH_PORT=19999; else HEALTH_PORT=19998; fi; export HEALTH_PORT; if [ -n "$LOGS" ]; then {mirrord_binary} 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/mirrord-%i.log"; else exec {mirrord_binary}; fi'"#
             )
         }
         ServiceName::NssRoleAgent => {
@@ -1572,7 +1436,6 @@ WantedBy=multi-user.target
     let service_file = match service {
         ServiceName::Bss => "bss@.service".to_string(),
         ServiceName::Nss => "nss@.service".to_string(),
-        ServiceName::Mirrord => "mirrord@.service".to_string(),
         ServiceName::NssRoleAgent => "nss_role_agent@.service".to_string(),
         _ => format!("{service_name}.service"),
     };
@@ -1591,16 +1454,14 @@ WantedBy=multi-user.target
 fn create_dirs_for_nss_server(is_ebs_journal: bool, journal_uuid: &str) -> CmdResult {
     info!("Creating necessary directories for nss_server");
     run_cmd!(mkdir -p data/logs)?;
+    // Create working directories for both the active (nss-0) and the standby
+    // (nss-1) so the standby has a valid ./nss-1 path for when it gets promoted.
     create_nss_dirs(
         Path::new("data"),
         "nss-0",
         is_ebs_journal,
         Some(journal_uuid),
-    )
-}
-
-fn create_dirs_for_mirrord_server(is_ebs_journal: bool, journal_uuid: &str) -> CmdResult {
-    info!("Creating necessary directories for mirrord");
+    )?;
     create_nss_dirs(
         Path::new("data"),
         "nss-1",
@@ -1653,7 +1514,6 @@ pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdRes
             ("BSS ports", ports)
         }
         ServiceName::Nss => ("port 8087", vec![8087]),
-        ServiceName::Mirrord => ("port 9999", vec![9999]),
         ServiceName::ApiServer => ("port 8080", vec![8080]),
         ServiceName::NssRoleAgent => {
             unreachable!(
@@ -1785,7 +1645,7 @@ pub(crate) fn resolve_binary_path(binary_name: &str, build_mode: BuildMode) -> S
 
     // Check different locations based on binary type
     let candidates = match binary_name {
-        "bss_server" | "nss_server" | "mirrord" => {
+        "bss_server" | "nss_server" => {
             vec![
                 format!("{pwd}/target/{build}/zig-out/bin/{binary_name}"),
                 format!("{pwd}/{ZIG_DEBUG_OUT}/bin/{binary_name}"),
