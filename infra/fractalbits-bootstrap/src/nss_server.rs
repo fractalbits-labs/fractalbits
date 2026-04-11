@@ -7,7 +7,7 @@ use crate::stage_helpers::{CommonServicesReadyStage, InstancesReadyStage};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use cmd_lib::*;
 use std::io::Error;
-use xtask_common::stages::{VerifiedGlobalDep, VerifiedNodeDep, VerifiedNodeStage};
+use xtask_common::stages::{VerifiedGlobalDep, VerifiedNodeStage};
 
 const BLOB_DRAM_MEM_PERCENT: f64 = 0.8;
 
@@ -36,14 +36,8 @@ struct NssJournalReadyStage;
 
 impl NssJournalReadyStage {
     const STAGE: VerifiedNodeStage = const { stages::NSS_JOURNAL_READY.node_stage() };
-    const MIRRORD_READY: VerifiedNodeDep =
-        const { stages::NSS_JOURNAL_READY.node_dep("mirrord-ready") };
     const METADATA_VG_READY: VerifiedGlobalDep =
         const { stages::NSS_JOURNAL_READY.global_dep("metadata-vg-ready") };
-
-    fn wait_for_mirrord_ready(barrier: &WorkflowBarrier) -> CmdResult {
-        barrier.wait_for_nodes(Self::MIRRORD_READY, 1).map(|_| ())
-    }
 
     fn wait_for_metadata_vg_ready(barrier: &WorkflowBarrier) -> CmdResult {
         barrier.wait_for_global(Self::METADATA_VG_READY)
@@ -51,16 +45,6 @@ impl NssJournalReadyStage {
 
     fn complete(barrier: &WorkflowBarrier, metadata: serde_json::Value) -> CmdResult {
         barrier.complete_node_stage(Self::STAGE, Some(metadata))
-    }
-}
-
-struct MirrordReadyStage;
-
-impl MirrordReadyStage {
-    const STAGE: VerifiedNodeStage = const { stages::MIRRORD_READY.node_stage() };
-
-    fn complete(barrier: &WorkflowBarrier) -> CmdResult {
-        barrier.complete_node_stage(Self::STAGE, None)
     }
 }
 
@@ -189,89 +173,41 @@ pub fn bootstrap(
     // Signal that formatting is complete
     NssFormattedStage::complete(&barrier)?;
 
-    // For NVMe journal type, coordinate active/standby startup
-    // Standby (nss_b) must start mirrord first, then active (nss_a) can start nss_server
-    // In solo mode (no nss_b), just start nss_server directly without mirrord coordination
-    if journal_type == JournalType::Nvme {
-        if is_standby {
-            // Standby: start mirrord first
-            info!("Starting as standby NSS (mirrord)");
-            run_cmd!(systemctl start nss_role_agent.service)?;
-
-            // Wait for mirrord to be ready
-            wait_for_service_ready("mirrord", 9999, 120)?;
-
-            // Signal that mirrord is ready
-            MirrordReadyStage::complete(&barrier)?;
-            info!("Mirrord is ready, signaled MIRRORD_READY");
-        } else if !is_ha_mode {
-            // Solo mode: no mirrord coordination needed, just start nss_server directly
-            info!("Starting as solo NSS (no mirrord coordination)");
-
-            if !meta_stack_testing {
-                info!("Waiting for metadata VG configuration...");
-                NssJournalReadyStage::wait_for_metadata_vg_ready(&barrier)?;
-            }
-
-            run_cmd!(systemctl start nss_role_agent.service)?;
-
-            // Wait for nss_server to be ready before signaling
-            wait_for_service_ready("nss_server", 8088, 360)?;
-
-            // Signal that journal is ready and nss_server is accepting connections
-            let journal_ready_meta = serde_json::json!({
-                "private_ip": private_ip,
-                "role": nss_role,
-            });
-            NssJournalReadyStage::complete(&barrier, journal_ready_meta)?;
-        } else {
-            // Active (HA mode): wait for mirrord to be ready first
-            info!("Starting as active NSS, waiting for mirrord to be ready...");
-            NssJournalReadyStage::wait_for_mirrord_ready(&barrier)?;
-            info!("Mirrord is ready");
-
-            if !meta_stack_testing {
-                info!("Waiting for metadata VG configuration...");
-                NssJournalReadyStage::wait_for_metadata_vg_ready(&barrier)?;
-            }
-
-            info!("Starting nss_role_agent");
-            run_cmd!(systemctl start nss_role_agent.service)?;
-
-            // Wait for nss_server to be ready before signaling
-            wait_for_service_ready("nss_server", 8088, 360)?;
-
-            // Signal that journal is ready and nss_server is accepting connections
-            let journal_ready_meta = serde_json::json!({
-                "private_ip": private_ip,
-                "role": nss_role,
-            });
-            NssJournalReadyStage::complete(&barrier, journal_ready_meta)?;
-        }
-    } else {
-        // EBS journal type: active or solo (standby already handled above)
-        info!(
-            "Starting as EBS {} NSS",
-            if is_ha_mode { "HA active" } else { "solo" }
-        );
-
-        if !meta_stack_testing {
-            info!("Waiting for metadata VG configuration...");
-            NssJournalReadyStage::wait_for_metadata_vg_ready(&barrier)?;
-        }
-
+    // NVMe HA standby: local disks are formatted, but nss_server stays idle
+    // until promoted. Start role_agent (which will sit in standby) and skip
+    // journal-ready signaling (the active node signals for the HA pair).
+    if journal_type == JournalType::Nvme && is_standby {
+        info!("Starting as NVMe HA standby NSS (idle)");
         run_cmd!(systemctl start nss_role_agent.service)?;
-
-        // Wait for nss_server to be ready before signaling
-        wait_for_service_ready("nss_server", 8088, 360)?;
-
-        // Signal that journal is ready and nss_server is accepting connections
-        let journal_ready_meta = serde_json::json!({
-            "private_ip": private_ip,
-            "role": nss_role,
-        });
-        NssJournalReadyStage::complete(&barrier, journal_ready_meta)?;
+        CommonServicesReadyStage::complete(&barrier)?;
+        return Ok(());
     }
+
+    // Active or solo path — identical for NVMe and EBS now that mirrord is gone.
+    let nss_mode = match (journal_type, is_ha_mode) {
+        (JournalType::Ebs, true) => "EBS HA active",
+        (JournalType::Ebs, false) => "EBS solo",
+        (JournalType::Nvme, true) => "NVMe HA active",
+        (JournalType::Nvme, false) => "NVMe solo",
+    };
+    info!("Starting as {nss_mode} NSS");
+
+    if !meta_stack_testing {
+        info!("Waiting for metadata VG configuration...");
+        NssJournalReadyStage::wait_for_metadata_vg_ready(&barrier)?;
+    }
+
+    run_cmd!(systemctl start nss_role_agent.service)?;
+
+    // Wait for nss_server to be ready before signaling
+    wait_for_service_ready("nss_server", 8088, 360)?;
+
+    // Signal that journal is ready and nss_server is accepting connections
+    let journal_ready_meta = serde_json::json!({
+        "private_ip": private_ip,
+        "role": nss_role,
+    });
+    NssJournalReadyStage::complete(&barrier, journal_ready_meta)?;
 
     // Complete services-ready stage
     CommonServicesReadyStage::complete(&barrier)?;
