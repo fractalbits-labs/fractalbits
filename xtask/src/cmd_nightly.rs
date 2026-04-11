@@ -51,10 +51,7 @@ fn run_crash_recovery_test(multi_bss: bool, initial_run: bool) -> CmdResult {
     crate::cmd_precheckin::check_for_core_dumps()?;
 
     // Create timestamp-based log directory
-    let log_dir = format!(
-        "data/logs/nightly/{}",
-        Local::now().format("%Y%m%d_%H%M%S")
-    );
+    let log_dir = format!("data/logs/nightly/{}", Local::now().format("%Y%m%d_%H%M%S"));
     run_cmd! {
         mkdir -p $log_dir;
         rm -rf data/coredumps;
