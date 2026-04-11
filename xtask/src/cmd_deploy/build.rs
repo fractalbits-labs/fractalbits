@@ -105,49 +105,20 @@ fn get_aws_cpu_deploy_dir(target: &ArchTarget) -> String {
 
 fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[String]) -> CmdResult {
     info!("Building Rust projects for all arch targets (generic + AWS CPU-specific)");
-    let build_envs = cmd_build::get_build_envs();
 
     // Build for ARCH_TARGETS (generic/baseline builds)
     // container-all-in-one is included in generic builds for Docker image staging
     for target in ARCH_TARGETS {
-        let rust_cpu = target.rust_cpu;
-        let rust_target = target.rust_target;
-        let arch = target.arch;
-
-        if api_server_build_env.is_empty() {
-            run_cmd! {
-                info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [generic]";
-                RUSTFLAGS="-C target-cpu=$rust_cpu"
-                $[build_envs] cargo zigbuild
-                    --target $rust_target $rust_build_opt --workspace
-                    --exclude xtask
-                    --exclude fractalbits-bootstrap
-                    --exclude fractal-s3;
-            }?;
-        } else {
-            run_cmd! {
-                info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [generic]";
-                RUSTFLAGS="-C target-cpu=$rust_cpu"
-                $[build_envs] cargo zigbuild
-                    --target $rust_target $rust_build_opt --workspace
-                    --exclude xtask
-                    --exclude fractalbits-bootstrap
-                    --exclude fractal-s3
-                    --exclude api_server;
-
-                info "Building api_server ...";
-                RUSTFLAGS="-C target-cpu=$rust_cpu"
-                $[api_server_build_env] $[build_envs] cargo zigbuild
-                    --target $rust_target $rust_build_opt
-                    --package api_server;
-            }?;
-        }
+        build_rust_for_target(target, rust_build_opt, api_server_build_env, &[], "generic")?;
 
         // Copy Rust binaries to generic directory (excluding fractalbits-bootstrap)
-        copy_rust_binaries_to_generic(target, rust_target, build_dir)?;
+        copy_rust_binaries_to_generic(target, target.rust_target, build_dir)?;
 
         // Copy container-all-in-one to generic directory (only for Docker staging)
-        let container_src = format!("target/{}/{}/container-all-in-one", rust_target, build_dir);
+        let container_src = format!(
+            "target/{}/{}/container-all-in-one",
+            target.rust_target, build_dir
+        );
         if Path::new(&container_src).exists() {
             let generic_dir = get_generic_deploy_dir(target);
             let container_dst = format!("{}/container-all-in-one", generic_dir);
@@ -158,44 +129,73 @@ fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[Str
     // Build for AWS_CPU_TARGETS (CPU-specific AWS builds)
     // container-all-in-one is excluded here (only needs generic build)
     for target in AWS_CPU_TARGETS {
-        let rust_cpu = target.rust_cpu;
-        let rust_target = target.rust_target;
-        let arch = target.arch;
-        let cpu_name = target.cpu_name;
-
-        if api_server_build_env.is_empty() {
-            run_cmd! {
-                info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [aws/$cpu_name]";
-                RUSTFLAGS="-C target-cpu=$rust_cpu"
-                $[build_envs] cargo zigbuild
-                    --target $rust_target $rust_build_opt --workspace
-                    --exclude xtask
-                    --exclude fractalbits-bootstrap
-                    --exclude fractal-s3
-                    --exclude container-all-in-one;
-            }?;
-        } else {
-            run_cmd! {
-                info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [aws/$cpu_name]";
-                RUSTFLAGS="-C target-cpu=$rust_cpu"
-                $[build_envs] cargo zigbuild
-                    --target $rust_target $rust_build_opt --workspace
-                    --exclude xtask
-                    --exclude fractalbits-bootstrap
-                    --exclude fractal-s3
-                    --exclude container-all-in-one
-                    --exclude api_server;
-
-                info "Building api_server ...";
-                RUSTFLAGS="-C target-cpu=$rust_cpu"
-                $[api_server_build_env] $[build_envs] cargo zigbuild
-                    --target $rust_target $rust_build_opt
-                    --package api_server;
-            }?;
-        }
+        let label = format!("aws/{}", target.cpu_name);
+        build_rust_for_target(
+            target,
+            rust_build_opt,
+            api_server_build_env,
+            &["container-all-in-one"],
+            &label,
+        )?;
 
         // Copy Rust binaries to AWS CPU-specific directory (excluding bootstrap/etcd/warp)
-        copy_rust_binaries_to_aws_cpu(target, rust_target, build_dir)?;
+        copy_rust_binaries_to_aws_cpu(target, target.rust_target, build_dir)?;
+    }
+    Ok(())
+}
+
+fn build_rust_for_target(
+    target: &ArchTarget,
+    rust_build_opt: &str,
+    api_server_build_env: &[String],
+    extra_excludes: &[&str],
+    label: &str,
+) -> CmdResult {
+    let build_envs = cmd_build::get_build_envs();
+    let rust_cpu = target.rust_cpu;
+    let rust_target = target.rust_target;
+    let arch = target.arch;
+
+    // Common excludes for all deploy builds
+    let mut excludes: Vec<String> = [
+        "xtask",
+        "fractalbits-bootstrap",
+        "fractal-s3",
+        "data_blob_resync_server",
+    ]
+    .iter()
+    .flat_map(|pkg| vec!["--exclude".to_string(), pkg.to_string()])
+    .collect();
+    for pkg in extra_excludes {
+        excludes.push("--exclude".to_string());
+        excludes.push(pkg.to_string());
+    }
+
+    if api_server_build_env.is_empty() {
+        let excludes = &excludes;
+        run_cmd! {
+            info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [$label]";
+            RUSTFLAGS="-C target-cpu=$rust_cpu"
+            $[build_envs] cargo zigbuild
+                --target $rust_target $rust_build_opt --workspace $[excludes];
+        }?;
+    } else {
+        let mut excludes_with_api = excludes.clone();
+        excludes_with_api.push("--exclude".to_string());
+        excludes_with_api.push("api_server".to_string());
+        let excludes_with_api = &excludes_with_api;
+        run_cmd! {
+            info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [$label]";
+            RUSTFLAGS="-C target-cpu=$rust_cpu"
+            $[build_envs] cargo zigbuild
+                --target $rust_target $rust_build_opt --workspace $[excludes_with_api];
+
+            info "Building api_server ...";
+            RUSTFLAGS="-C target-cpu=$rust_cpu"
+            $[api_server_build_env] $[build_envs] cargo zigbuild
+                --target $rust_target $rust_build_opt
+                --package api_server;
+        }?;
     }
     Ok(())
 }
