@@ -447,14 +447,24 @@ fn initialize_bss_volume_groups(
         metadata_vg_quorum_w,
     );
 
+    // Journal VG uses the same topology as metadata VG
+    let bss_journal_vg_config_json = build_metadata_volume_group_config(
+        &bss_addresses,
+        metadata_vg_quorum_n,
+        metadata_vg_quorum_r,
+        metadata_vg_quorum_w,
+    );
+
     if config.is_etcd_backend() {
         let etcdctl = format!("{BIN_PATH}etcdctl");
         let etcd_endpoints = get_etcd_endpoints_from_workflow(config)?;
         let data_key = "/fractalbits-service-discovery/bss-data-vg-config";
         let metadata_key = "/fractalbits-service-discovery/bss-metadata-vg-config";
+        let journal_key = "/fractalbits-service-discovery/bss-journal-vg-config";
         run_cmd! {
             $etcdctl --endpoints=$etcd_endpoints put $data_key $bss_data_vg_config_json >/dev/null;
             $etcdctl --endpoints=$etcd_endpoints put $metadata_key $bss_metadata_vg_config_json >/dev/null;
+            $etcdctl --endpoints=$etcd_endpoints put $journal_key $bss_journal_vg_config_json >/dev/null;
         }?;
     } else if config.is_firestore_backend() {
         let data_escaped = bss_data_vg_config_json
@@ -477,6 +487,18 @@ fn initialize_bss_volume_groups(
             "fractalbits-service-discovery",
             BSS_METADATA_VG_CONFIG_KEY,
             &meta_fields,
+        )?;
+
+        let journal_escaped = bss_journal_vg_config_json
+            .replace('"', r#"\""#)
+            .replace('\n', "");
+        let journal_fields =
+            format!(r#"{{"fields":{{"value":{{"stringValue":"{journal_escaped}"}}}}}}"#);
+        firestore_put_document(
+            config,
+            "fractalbits-service-discovery",
+            BSS_JOURNAL_VG_CONFIG_KEY,
+            &journal_fields,
         )?;
     } else {
         let region = get_current_aws_region()?;
@@ -507,6 +529,21 @@ fn initialize_bss_volume_groups(
             aws dynamodb put-item
                 --table-name $DDB_SERVICE_DISCOVERY_TABLE
                 --item $bss_metadata_vg_config_item
+                --region $region
+        }?;
+
+        let bss_journal_vg_config_item = format!(
+            r#"{{"service_id":{{"S":"{}"}},"value":{{"S":"{}"}}}}"#,
+            BSS_JOURNAL_VG_CONFIG_KEY,
+            bss_journal_vg_config_json
+                .replace('"', r#"\""#)
+                .replace('\n', "")
+        );
+
+        run_cmd! {
+            aws dynamodb put-item
+                --table-name $DDB_SERVICE_DISCOVERY_TABLE
+                --item $bss_journal_vg_config_item
                 --region $region
         }?;
     }

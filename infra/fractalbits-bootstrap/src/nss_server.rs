@@ -145,10 +145,19 @@ pub fn bootstrap(
         return Ok(());
     }
 
+    // Wait for metadata VG configuration before format, since nss_server format
+    // needs BSS addresses to initialize the buffer_manager state.
+    if !meta_stack_testing {
+        info!("Waiting for metadata VG configuration...");
+        NssJournalReadyStage::wait_for_metadata_vg_ready(&barrier)?;
+    }
+    let metadata_vg_config = get_service_discovery_value(config, BSS_METADATA_VG_CONFIG_KEY)?;
+    info!("Fetched metadata VG config from service discovery");
+
     // Format journal based on type (active or solo nodes only)
     match journal_type {
         JournalType::Nvme => {
-            nvme_journal::format()?;
+            nvme_journal::format(&metadata_vg_config)?;
         }
         JournalType::Ebs => {
             // On GCP, the pd_ssd journal disk is pre-attached as device "nss-journal".
@@ -166,7 +175,11 @@ pub fn bootstrap(
             };
             let journal_uuid = journal_uuid
                 .ok_or_else(|| Error::other("journal_uuid required for ebs journal type"))?;
-            ebs_journal::format_with_volume_id(volume_id, journal_uuid)?;
+            ebs_journal::format_with_volume_id(
+                volume_id,
+                journal_uuid,
+                &metadata_vg_config,
+            )?;
         }
     }
 
@@ -191,11 +204,6 @@ pub fn bootstrap(
         (JournalType::Nvme, false) => "NVMe solo",
     };
     info!("Starting as {nss_mode} NSS");
-
-    if !meta_stack_testing {
-        info!("Waiting for metadata VG configuration...");
-        NssJournalReadyStage::wait_for_metadata_vg_ready(&barrier)?;
-    }
 
     run_cmd!(systemctl start nss_role_agent.service)?;
 
@@ -363,7 +371,8 @@ fn prepare_local_dirs() -> CmdResult {
 
 /// Prepare local directories and run nss_server format.
 /// If `create_journal_dir` is true, also creates /data/local/journal (for nvme mode).
-pub(crate) fn format_nss(create_journal_dir: bool) -> CmdResult {
+/// `metadata_vg_config` provides BSS addresses for buffer_manager initialization.
+pub(crate) fn format_nss(create_journal_dir: bool, metadata_vg_config: &str) -> CmdResult {
     if create_journal_dir {
         run_cmd! {
             info "Creating journal directory for nvme mode";
@@ -375,6 +384,7 @@ pub(crate) fn format_nss(create_journal_dir: bool) -> CmdResult {
 
     run_cmd! {
         info "Running format for nss_server";
+        METADATA_VG_CONFIG=$metadata_vg_config
         /opt/fractalbits/bin/nss_server format -c ${ETC_PATH}${NSS_SERVER_CONFIG};
     }?;
 
