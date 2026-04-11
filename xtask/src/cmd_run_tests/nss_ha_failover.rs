@@ -115,7 +115,6 @@ fn kill_nss_process() -> CmdResult {
     Ok(())
 }
 
-
 async fn test_observer_restart(backend: RssBackend) -> CmdResult {
     info!("Testing RSS/observer restart and state persistence...");
 
@@ -178,7 +177,6 @@ async fn test_observer_restart(backend: RssBackend) -> CmdResult {
     );
     Ok(())
 }
-
 
 pub async fn run_ebs_ha_failover_tests(backend: RssBackend) -> CmdResult {
     info!(
