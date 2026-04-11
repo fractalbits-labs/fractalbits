@@ -20,7 +20,7 @@ pub fn get_gcp_private_ip() -> FunResult {
 }
 
 /// Get a GCP access token from the instance metadata service.
-fn get_gcp_access_token() -> FunResult {
+pub(crate) fn get_gcp_access_token() -> FunResult {
     run_fun!(
         curl -sf -H "Metadata-Flavor: Google"
             "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"

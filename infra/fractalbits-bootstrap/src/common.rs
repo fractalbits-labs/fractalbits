@@ -32,6 +32,7 @@ pub const STORAGE_TUNING_SYS_CONFIG: &str = "99-storage-tuning.conf";
 // DDB Service Discovery Keys
 pub const BSS_DATA_VG_CONFIG_KEY: &str = "bss-data-vg-config";
 pub const BSS_METADATA_VG_CONFIG_KEY: &str = "bss-metadata-vg-config";
+pub const BSS_JOURNAL_VG_CONFIG_KEY: &str = "bss-journal-vg-config";
 pub const BSS_SERVER_KEY: &str = "bss-server";
 pub const AZ_STATUS_KEY: &str = "az_status";
 #[allow(dead_code)]
@@ -536,6 +537,72 @@ pub fn get_service_ips_with_backend(
         crate::gcp::get_service_ips_firestore(config, service_id, expected_count)
     } else {
         crate::aws::get_service_ips(service_id, expected_count)
+    }
+}
+
+/// Fetch a single string value from service discovery by key.
+/// Returns the raw value string (e.g. the VG config JSON).
+pub fn get_service_discovery_value(
+    config: &BootstrapConfig,
+    key: &str,
+) -> Result<String, std::io::Error> {
+    if config.is_etcd_backend() {
+        let endpoints =
+            crate::etcd::get_etcd_endpoints(config).expect("etcd endpoints required");
+        let etcdctl = format!("{BIN_PATH}etcdctl");
+        let etcd_key = format!("/fractalbits-service-discovery/{key}");
+        let value = run_fun! {
+            $etcdctl --endpoints=$endpoints get $etcd_key --print-value-only
+        }?;
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "Service discovery key '{key}' not found in etcd"
+            )));
+        }
+        Ok(value)
+    } else if config.is_firestore_backend() {
+        let gcp = config
+            .gcp
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("GCP config required"))?;
+        let project_id = &gcp.project_id;
+        let database_id = gcp.firestore_database.as_deref().unwrap_or("fractalbits");
+        let token = crate::gcp::get_gcp_access_token()?;
+        let url = format!(
+            "https://firestore.googleapis.com/v1/projects/{project_id}/databases/{database_id}/documents/{DDB_SERVICE_DISCOVERY_TABLE}/{key}"
+        );
+        let output = run_fun!(curl -sf $url -H "Authorization: Bearer $token")?;
+        let parsed: serde_json::Value = serde_json::from_str(&output)
+            .map_err(|e| std::io::Error::other(format!("Failed to parse Firestore response: {e}")))?;
+        parsed["fields"]["value"]["stringValue"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "Service discovery key '{key}' not found in Firestore"
+                ))
+            })
+    } else {
+        let key_json = format!(r#"{{"service_id":{{"S":"{key}"}}}}"#);
+        // "value" is a DDB reserved word, must use expression-attribute-names
+        let expr_attr = r##"{"#v":"value"}"##;
+        let output = run_fun! {
+            aws dynamodb get-item
+                --table-name $DDB_SERVICE_DISCOVERY_TABLE
+                --key $key_json
+                --projection-expression "#v"
+                --expression-attribute-names $expr_attr
+                --query "Item.value.S"
+                --output text
+        }?;
+        let output = output.trim().to_string();
+        if output.is_empty() || output == "None" || output == "null" {
+            return Err(std::io::Error::other(format!(
+                "Service discovery key '{key}' not found in DDB"
+            )));
+        }
+        Ok(output)
     }
 }
 
