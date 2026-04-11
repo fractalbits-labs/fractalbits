@@ -204,18 +204,18 @@ async fn test_full_stack_initialization(backend: RssBackend) -> CmdResult {
         state.observer_state, state.nss_machine.machine_id, state.standby_machine.machine_id
     );
 
-    // Verify nss-A is running NSS
-    if state.nss_machine.machine_id != "nss-A" {
+    // Verify nss-0 is running NSS
+    if state.nss_machine.machine_id != "nss-0" {
         return Err(Error::other(format!(
-            "Expected nss-A to be NSS machine, got {}",
+            "Expected nss-0 to be NSS machine, got {}",
             state.nss_machine.machine_id
         )));
     }
 
-    // Verify nss-B is running mirrord
-    if state.standby_machine.machine_id != "nss-B" {
+    // Verify nss-1 is running mirrord
+    if state.standby_machine.machine_id != "nss-1" {
         return Err(Error::other(format!(
-            "Expected nss-B to be mirrord machine, got {}",
+            "Expected nss-1 to be mirrord machine, got {}",
             state.standby_machine.machine_id
         )));
     }
@@ -794,16 +794,16 @@ async fn test_ebs_full_stack_initialization(backend: RssBackend) -> CmdResult {
         state.observer_state, state.nss_machine.machine_id, state.standby_machine.machine_id
     );
 
-    if state.nss_machine.machine_id != "nss-A" {
+    if state.nss_machine.machine_id != "nss-0" {
         return Err(Error::other(format!(
-            "Expected nss-A to be NSS machine, got {}",
+            "Expected nss-0 to be NSS machine, got {}",
             state.nss_machine.machine_id
         )));
     }
 
-    if state.standby_machine.machine_id != "nss-B" {
+    if state.standby_machine.machine_id != "nss-1" {
         return Err(Error::other(format!(
-            "Expected nss-B to be standby machine, got {}",
+            "Expected nss-1 to be standby machine, got {}",
             state.standby_machine.machine_id
         )));
     }
