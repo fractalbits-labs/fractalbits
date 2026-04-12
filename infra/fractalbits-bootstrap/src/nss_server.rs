@@ -175,11 +175,7 @@ pub fn bootstrap(
             };
             let journal_uuid = journal_uuid
                 .ok_or_else(|| Error::other("journal_uuid required for ebs journal type"))?;
-            ebs_journal::format_with_volume_id(
-                volume_id,
-                journal_uuid,
-                &metadata_vg_config,
-            )?;
+            ebs_journal::format_with_volume_id(volume_id, journal_uuid, &metadata_vg_config)?;
         }
     }
 

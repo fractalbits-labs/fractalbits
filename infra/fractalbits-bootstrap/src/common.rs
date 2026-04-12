@@ -547,8 +547,7 @@ pub fn get_service_discovery_value(
     key: &str,
 ) -> Result<String, std::io::Error> {
     if config.is_etcd_backend() {
-        let endpoints =
-            crate::etcd::get_etcd_endpoints(config).expect("etcd endpoints required");
+        let endpoints = crate::etcd::get_etcd_endpoints(config).expect("etcd endpoints required");
         let etcdctl = format!("{BIN_PATH}etcdctl");
         let etcd_key = format!("/fractalbits-service-discovery/{key}");
         let value = run_fun! {
@@ -573,8 +572,9 @@ pub fn get_service_discovery_value(
             "https://firestore.googleapis.com/v1/projects/{project_id}/databases/{database_id}/documents/{DDB_SERVICE_DISCOVERY_TABLE}/{key}"
         );
         let output = run_fun!(curl -sf $url -H "Authorization: Bearer $token")?;
-        let parsed: serde_json::Value = serde_json::from_str(&output)
-            .map_err(|e| std::io::Error::other(format!("Failed to parse Firestore response: {e}")))?;
+        let parsed: serde_json::Value = serde_json::from_str(&output).map_err(|e| {
+            std::io::Error::other(format!("Failed to parse Firestore response: {e}"))
+        })?;
         parsed["fields"]["value"]["stringValue"]
             .as_str()
             .map(|s| s.to_string())
