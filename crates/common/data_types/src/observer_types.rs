@@ -216,10 +216,10 @@ mod tests {
     #[test]
     fn test_machine_state_serialization() {
         let machine =
-            MachineState::new("nss-A".to_string(), ServiceType::Nss, "active".to_string());
+            MachineState::new("nss-0".to_string(), ServiceType::Nss, "active".to_string());
         let json = serde_json::to_string(&machine).unwrap();
         let parsed: MachineState = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.machine_id, "nss-A");
+        assert_eq!(parsed.machine_id, "nss-0");
         assert_eq!(parsed.expected_role, "active");
     }
 
@@ -227,9 +227,9 @@ mod tests {
     fn test_persistent_state_serialization() {
         let state = ObserverPersistentState::new(
             ObserverState::ActiveStandby,
-            MachineState::new("nss-A".to_string(), ServiceType::Nss, "active".to_string()),
+            MachineState::new("nss-0".to_string(), ServiceType::Nss, "active".to_string()),
             MachineState::new(
-                "nss-B".to_string(),
+                "nss-1".to_string(),
                 ServiceType::Noop,
                 "standby".to_string(),
             ),
@@ -237,10 +237,10 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let parsed: ObserverPersistentState = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.observer_state, ObserverState::ActiveStandby);
-        assert_eq!(parsed.nss_machine.machine_id, "nss-A");
-        assert_eq!(parsed.standby_machine.machine_id, "nss-B");
-        assert_eq!(parsed.nss_node_map.get("nss-A"), Some(&1));
-        assert_eq!(parsed.nss_node_map.get("nss-B"), Some(&2));
+        assert_eq!(parsed.nss_machine.machine_id, "nss-0");
+        assert_eq!(parsed.standby_machine.machine_id, "nss-1");
+        assert_eq!(parsed.nss_node_map.get("nss-0"), Some(&1));
+        assert_eq!(parsed.nss_node_map.get("nss-1"), Some(&2));
         assert_eq!(parsed.next_nss_node_id, 3);
     }
 
@@ -248,11 +248,11 @@ mod tests {
     fn test_nss_node_map_solo_mode() {
         let state = ObserverPersistentState::new(
             ObserverState::Solo,
-            MachineState::new("nss-A".to_string(), ServiceType::Nss, "solo".to_string()),
+            MachineState::new("nss-0".to_string(), ServiceType::Nss, "solo".to_string()),
             MachineState::new(String::new(), ServiceType::Noop, String::new()),
         );
         assert_eq!(state.nss_node_map.len(), 1);
-        assert_eq!(state.nss_node_map.get("nss-A"), Some(&1));
+        assert_eq!(state.nss_node_map.get("nss-0"), Some(&1));
         assert_eq!(state.next_nss_node_id, 2);
     }
 
@@ -260,26 +260,26 @@ mod tests {
     fn test_ensure_nss_node_id() {
         let mut state = ObserverPersistentState::new(
             ObserverState::ActiveStandby,
-            MachineState::new("nss-A".to_string(), ServiceType::Nss, "active".to_string()),
+            MachineState::new("nss-0".to_string(), ServiceType::Nss, "active".to_string()),
             MachineState::new(
-                "nss-B".to_string(),
+                "nss-1".to_string(),
                 ServiceType::Noop,
                 "standby".to_string(),
             ),
         );
-        assert_eq!(state.ensure_nss_node_id("nss-A"), 1);
-        assert_eq!(state.ensure_nss_node_id("nss-B"), 2);
-        assert_eq!(state.ensure_nss_node_id("nss-C"), 3);
+        assert_eq!(state.ensure_nss_node_id("nss-0"), 1);
+        assert_eq!(state.ensure_nss_node_id("nss-1"), 2);
+        assert_eq!(state.ensure_nss_node_id("nss-2"), 3);
         assert_eq!(state.next_nss_node_id, 4);
         // Calling again returns same ID
-        assert_eq!(state.ensure_nss_node_id("nss-C"), 3);
+        assert_eq!(state.ensure_nss_node_id("nss-2"), 3);
         assert_eq!(state.next_nss_node_id, 4);
     }
 
     #[test]
     fn test_noop_service_type_serialization() {
         let machine = MachineState::new(
-            "nss-B".to_string(),
+            "nss-1".to_string(),
             ServiceType::Noop,
             "standby".to_string(),
         );

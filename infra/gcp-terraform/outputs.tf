@@ -13,24 +13,24 @@ output "rss_b_ip" {
   description = "RSS-B private IP (HA only)"
 }
 
-output "nss_a_ip" {
+output "nss_0_ip" {
   value       = google_compute_instance.nss_a.network_interface[0].network_ip
-  description = "NSS-A private IP"
+  description = "NSS-0 private IP"
 }
 
-output "nss_a_name" {
+output "nss_0_name" {
   value       = google_compute_instance.nss_a.name
-  description = "NSS-A instance name"
+  description = "NSS-0 instance name"
 }
 
-output "nss_b_ip" {
+output "nss_1_ip" {
   value       = google_compute_instance.nss_b[0].network_interface[0].network_ip
-  description = "NSS-B private IP"
+  description = "NSS-1 private IP"
 }
 
-output "nss_b_name" {
+output "nss_1_name" {
   value       = google_compute_instance.nss_b[0].name
-  description = "NSS-B instance name"
+  description = "NSS-1 instance name"
 }
 
 output "api_lb_ip" {

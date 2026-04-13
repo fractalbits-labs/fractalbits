@@ -1,4 +1,4 @@
-# NSS journal disk (hyperdisk-balanced) - shared between NSS-A and NSS-B via multi-writer
+# NSS journal disk (hyperdisk-balanced) - shared between NSS-0 and NSS-1 via multi-writer
 # Note: pd-ssd does not support READ_WRITE_MANY; hyperdisk-balanced does.
 resource "google_compute_disk" "nss_journal" {
   count                     = var.journal_type == "pd_ssd" ? 1 : 0
