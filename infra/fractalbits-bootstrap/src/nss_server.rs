@@ -94,10 +94,6 @@ pub fn bootstrap(
     if config.is_etcd_backend() {
         binaries.push("etcdctl");
     }
-    // Download mirrord for NVMe journal type (active/standby mode)
-    if journal_type == JournalType::Nvme {
-        binaries.push("mirrord");
-    }
     download_binaries(config, &binaries)?;
 
     // When using etcd backend, wait for etcd cluster to be ready first
@@ -192,7 +188,7 @@ pub fn bootstrap(
         return Ok(());
     }
 
-    // Active or solo path — identical for NVMe and EBS now that mirrord is gone.
+    // Active or solo path — identical for NVMe and EBS.
     let nss_mode = match (journal_type, is_ha_mode) {
         (JournalType::Ebs, true) => "EBS HA active",
         (JournalType::Ebs, false) => "EBS solo",
@@ -251,7 +247,6 @@ fn setup_configs(
     };
 
     create_nss_config(volume_dev.as_deref(), &shared_dir, journal_uuid)?;
-    create_mirrord_config(volume_dev.as_deref(), &shared_dir)?;
 
     // Common configs
     create_coredump_config()?;
@@ -259,9 +254,6 @@ fn setup_configs(
         create_nss_role_agent_config(config)?;
     }
     create_systemd_unit_file("nss_role_agent", false)?;
-
-    // Systemd units - NVMe needs journal_type for local mount dependency
-    create_systemd_unit_file_with_journal_type("mirrord", false, Some(journal_type))?;
     create_systemd_unit_file_with_journal_type(service_name, false, Some(journal_type))?;
 
     create_logrotate_for_stats()?;
@@ -315,36 +307,11 @@ fa_thread_dataop_count = {fa_thread_dataop_count}
 blob_dram_kilo_bytes = {blob_dram_kilo_bytes}
 fa_journal_segment_size = {fa_journal_segment_size}
 log_level = "info"
-mirrord_port = 9999
 {journal_uuid_line}"##
     );
     run_cmd! {
         mkdir -p $ETC_PATH;
         echo $config_content > $ETC_PATH/$NSS_SERVER_CONFIG
-    }?;
-    Ok(())
-}
-
-fn create_mirrord_config(volume_dev: Option<&str>, shared_dir: &str) -> CmdResult {
-    let num_cores = run_fun!(nproc)?;
-    let fa_journal_segment_size = if volume_dev.is_some() {
-        ebs_journal::FA_JOURNAL_SEGMENT_SIZE
-    } else {
-        nvme_journal::FA_JOURNAL_SEGMENT_SIZE
-    };
-    let config_content = format!(
-        r##"working_dir = "/data"
-shared_dir = "{shared_dir}"
-server_port = 9999
-health_port = 19999
-num_threads = {num_cores}
-log_level = "info"
-fa_journal_segment_size = {fa_journal_segment_size}
-"##
-    );
-    run_cmd! {
-        mkdir -p $ETC_PATH;
-        echo $config_content > $ETC_PATH/$MIRRORD_CONFIG
     }?;
     Ok(())
 }
@@ -448,10 +415,9 @@ aws_region = "{region}"
         String::new()
     };
 
-    // mirrord_endpoint is fetched from RSS at runtime, not configured here
     let config_content = format!(
         r##"# NSS Role Agent Configuration
-# Role and mirrord_endpoint are fetched from RSS at startup
+# Role is fetched from RSS at startup
 
 rss_addrs = [{rss_addrs_toml}]
 instance_id = "{instance_id}"

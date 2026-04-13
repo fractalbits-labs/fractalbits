@@ -269,8 +269,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     // Always create nss-B for HA active/standby mode:
     // - multiAz: nss-B in second AZ
-    // - single-AZ NVMe: nss-B runs mirrord for journal replication
-    // - single-AZ EBS: nss-B is idle standby, takes over EBS volume on failover
+    // - single-AZ: nss-B is idle standby, takes over on failover
     instanceConfigs.push({
       id: "nss-B",
       instanceType: nssInstanceType,
@@ -474,7 +473,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     // Create PrivateLink setup for NSS and RSS services
     const servicePort = 8088;
-    const mirrordPort = 9999;
 
     // NSS PrivateLink - only for multiAz mode
     // For single-AZ, use direct instance IP to avoid VPC endpoint latency
@@ -487,20 +485,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
         this.vpc,
         nssTargets,
         servicePort,
-        privateSubnets,
-      );
-    }
-
-    // Create mirrord PrivateLink only for multiAz mode
-    // For single-AZ nvme, use direct IP instead
-    let mirrordPrivateLink: any;
-    if (multiAz) {
-      mirrordPrivateLink = createPrivateLinkNlb(
-        this,
-        "Mirrord",
-        this.vpc,
-        [instances["nss-A"], instances["nss-B"]],
-        mirrordPort,
         privateSubnets,
       );
     }
