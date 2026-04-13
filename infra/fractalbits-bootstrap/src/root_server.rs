@@ -1,5 +1,5 @@
 use super::common::*;
-use crate::config::{BootstrapConfig, DeployTarget, JournalType};
+use crate::config::{BootstrapConfig, DeployTarget};
 use crate::stage_helpers::{InstancesReadyStage, ServicesReadyStageDef};
 use crate::workflow::{StageCompletion, WorkflowBarrier, WorkflowServiceType, stages};
 use cmd_lib::*;
@@ -250,7 +250,7 @@ fn bootstrap_leader(
     info!("All NSS instances have completed formatting");
 
     // Wait for NSS journal to be ready via workflow barriers
-    // For NVMe HA: only active (nss-A) signals journal-ready; standby runs mirrord
+    // For NVMe HA: only active (nss-A) signals journal-ready; standby is idle
     // For EBS HA: only active (nss-A) signals journal-ready; standby is idle
     // For solo (any journal type): the single node signals
     let expected_journal_ready = if nss_b_id.is_some() {
@@ -287,7 +287,7 @@ fn initialize_observer_state(
         .unwrap_or(0.0);
 
     // Get shared journal_uuid: prefer per-node entry (on-prem TOML path), fall back to global config
-    // Both NSS and mirrord use the same journal_uuid
+    // Get shared journal_uuid for NSS
     let nss_nodes = config.get_node_entries("nss_server");
     let node_journal_uuid = nss_nodes
         .and_then(|nodes| nodes.iter().find(|n| n.id == nss_a_id))
@@ -303,21 +303,15 @@ fn initialize_observer_state(
     // Create ObserverPersistentState JSON
     let observer_state_json = if let Some(nss_b_id) = nss_b_id {
         // HA mode: active/standby - both machines share the same journal_uuid
-        // For EBS journal: standby runs "noop" (idle), for NVMe: standby runs "mirrord"
-        let standby_service = if config.global.journal_type == JournalType::Ebs {
-            "noop"
-        } else {
-            "mirrord"
-        };
-        info!("HA mode: {nss_a_id} as active NSS, {nss_b_id} as standby {standby_service}");
+        info!("HA mode: {nss_a_id} as active NSS, {nss_b_id} as standby (idle)");
         format!(
-            r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"active","network_address":null,"journal_uuid":{journal_uuid_json}}},"standby_machine":{{"machine_id":"{nss_b_id}","running_service":"{standby_service}","expected_role":"standby","network_address":null,"journal_uuid":{journal_uuid_json}}},"last_updated":{timestamp},"version":1,"nss_node_map":{{"{nss_a_id}":1,"{nss_b_id}":2}},"next_nss_node_id":3}}"#
+            r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"active","network_address":null,"journal_uuid":{journal_uuid_json}}},"standby_machine":{{"machine_id":"{nss_b_id}","running_service":"noop","expected_role":"standby","network_address":null,"journal_uuid":{journal_uuid_json}}},"last_updated":{timestamp},"version":1,"nss_node_map":{{"{nss_a_id}":1,"{nss_b_id}":2}},"next_nss_node_id":3}}"#
         )
     } else {
         // Solo mode: single NSS
         info!("Solo mode: {nss_a_id} as solo NSS");
         format!(
-            r#"{{"observer_state":"solo","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"solo","network_address":null,"journal_uuid":{journal_uuid_json}}},"standby_machine":{{"machine_id":"","running_service":"mirrord","expected_role":"","network_address":null,"journal_uuid":null}},"last_updated":{timestamp},"version":1,"nss_node_map":{{"{nss_a_id}":1}},"next_nss_node_id":2}}"#
+            r#"{{"observer_state":"solo","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"solo","network_address":null,"journal_uuid":{journal_uuid_json}}},"standby_machine":{{"machine_id":"","running_service":"noop","expected_role":"","network_address":null,"journal_uuid":null}},"last_updated":{timestamp},"version":1,"nss_node_map":{{"{nss_a_id}":1}},"next_nss_node_id":2}}"#
         )
     };
 

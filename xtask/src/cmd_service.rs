@@ -1185,12 +1185,6 @@ fn create_systemd_unit_files_for_init(
                 create_systemd_unit_file(*service, build_mode, init_config)?;
             }
             create_nss_role_agent_service_symlinks(DEFAULT_NSS_ROLE_AGENT_COUNT)?;
-
-            // Remove any stale mirrord unit left over from a previous init;
-            // mirrord is no longer part of the service topology.
-            run_cmd! {
-                rm -f "data/etc/mirrord@.service";
-            }?;
         }
     }
     Ok(())

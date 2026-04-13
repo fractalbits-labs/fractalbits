@@ -158,7 +158,7 @@ hostname = "api-1"
 
 The NSS uses NVMe journal for metadata persistence. Two NSS nodes are required:
 - **active**: Runs the primary NSS server and nss_role_agent
-- **standby**: Runs mirrord for journal replication
+- **standby**: Idle standby, waits for promotion on failover
 
 The bootstrap process automatically generates a shared journal UUID for both nodes to coordinate replication.
 
@@ -296,8 +296,8 @@ ssh <rss-ip> "journalctl -u rss"
 # NSS logs (active node)
 ssh <nss-active-ip> "journalctl -u nss"
 
-# Mirrord logs (standby node)
-ssh <nss-standby-ip> "journalctl -u mirrord"
+# NSS role agent logs (standby node)
+ssh <nss-standby-ip> "journalctl -u nss_role_agent"
 
 # BSS logs
 ssh <bss-ip> "journalctl -u bss"

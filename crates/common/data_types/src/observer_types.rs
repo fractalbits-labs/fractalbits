@@ -5,13 +5,13 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObserverState {
-    /// Single NSS instance running solo (no HA, no mirrord)
+    /// Single NSS instance running solo (no HA)
     Solo,
-    /// Normal HA: NSS active, Mirrord standby
+    /// Normal HA: NSS active, standby idle
     ActiveStandby,
-    /// Failover mode: NSS solo, Mirrord degraded (recovering)
+    /// Failover mode: NSS solo, standby degraded (recovering)
     SoloDegraded,
-    /// Recovery mode: NSS active, Mirrord degraded/syncing
+    /// Recovery mode: NSS active, standby degraded/syncing
     ActiveDegraded,
 }
 
@@ -30,7 +30,6 @@ impl fmt::Display for ObserverState {
 #[serde(rename_all = "lowercase")]
 pub enum ServiceType {
     Nss,
-    Mirrord,
     Noop,
 }
 
@@ -38,7 +37,6 @@ impl fmt::Display for ServiceType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ServiceType::Nss => write!(f, "nss"),
-            ServiceType::Mirrord => write!(f, "mirrord"),
             ServiceType::Noop => write!(f, "noop"),
         }
     }
@@ -232,7 +230,7 @@ mod tests {
             MachineState::new("nss-A".to_string(), ServiceType::Nss, "active".to_string()),
             MachineState::new(
                 "nss-B".to_string(),
-                ServiceType::Mirrord,
+                ServiceType::Noop,
                 "standby".to_string(),
             ),
         );
@@ -251,7 +249,7 @@ mod tests {
         let state = ObserverPersistentState::new(
             ObserverState::Solo,
             MachineState::new("nss-A".to_string(), ServiceType::Nss, "solo".to_string()),
-            MachineState::new(String::new(), ServiceType::Mirrord, String::new()),
+            MachineState::new(String::new(), ServiceType::Noop, String::new()),
         );
         assert_eq!(state.nss_node_map.len(), 1);
         assert_eq!(state.nss_node_map.get("nss-A"), Some(&1));
@@ -265,7 +263,7 @@ mod tests {
             MachineState::new("nss-A".to_string(), ServiceType::Nss, "active".to_string()),
             MachineState::new(
                 "nss-B".to_string(),
-                ServiceType::Mirrord,
+                ServiceType::Noop,
                 "standby".to_string(),
             ),
         );
@@ -279,15 +277,6 @@ mod tests {
     }
 
     #[test]
-    fn test_backward_compat_missing_nss_node_map() {
-        // Old JSON without nss_node_map should deserialize with defaults
-        let json = r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active"},"standby_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby"},"last_updated":0.0,"version":1}"#;
-        let parsed: ObserverPersistentState = serde_json::from_str(json).unwrap();
-        assert!(parsed.nss_node_map.is_empty());
-        assert_eq!(parsed.next_nss_node_id, 0);
-    }
-
-    #[test]
     fn test_noop_service_type_serialization() {
         let machine = MachineState::new(
             "nss-B".to_string(),
@@ -298,17 +287,5 @@ mod tests {
         assert!(json.contains("\"noop\""));
         let parsed: MachineState = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.running_service, ServiceType::Noop);
-    }
-
-    #[test]
-    fn test_backward_compat_mirrord_machine_field() {
-        // Verify that JSON with old "mirrord_machine" field name can still be deserialized
-        // This is NOT supported - we use a clean rename. This test documents the break.
-        let json = r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"active"},"mirrord_machine":{"machine_id":"nss-B","running_service":"mirrord","expected_role":"standby"},"last_updated":0.0,"version":0}"#;
-        let result = serde_json::from_str::<ObserverPersistentState>(json);
-        assert!(
-            result.is_err(),
-            "Old mirrord_machine field should not deserialize - clean rename"
-        );
     }
 }
