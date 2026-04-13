@@ -374,7 +374,7 @@ fn create_nss_role_agent_config(config: &BootstrapConfig) -> CmdResult {
         let resources = config.get_resources();
         let nss_nodes = config.get_node_entries("nss_server");
 
-        // Get the shared EBS volume_id and journal_uuid from nss-A's node entry
+        // Get the shared EBS volume_id and journal_uuid from nss-0's node entry
         let nss_a_entry =
             nss_nodes.and_then(|nodes| nodes.iter().find(|n| n.id == resources.nss_a_id));
         let ebs_volume_id = nss_a_entry

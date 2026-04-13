@@ -250,8 +250,8 @@ fn bootstrap_leader(
     info!("All NSS instances have completed formatting");
 
     // Wait for NSS journal to be ready via workflow barriers
-    // For NVMe HA: only active (nss-A) signals journal-ready; standby is idle
-    // For EBS HA: only active (nss-A) signals journal-ready; standby is idle
+    // For NVMe HA: only active (nss-0) signals journal-ready; standby is idle
+    // For EBS HA: only active (nss-0) signals journal-ready; standby is idle
     // For solo (any journal type): the single node signals
     let expected_journal_ready = if nss_b_id.is_some() {
         1 // HA mode: only active node signals journal-ready
