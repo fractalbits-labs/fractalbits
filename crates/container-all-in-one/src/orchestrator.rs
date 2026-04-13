@@ -107,7 +107,7 @@ impl Orchestrator {
 
         create_bss_dirs(&self.data_dir, 0)?;
         // Container uses NVMe journal type without journal_uuid for simplicity
-        create_nss_dirs(&self.data_dir, "nss-A", false, None)?;
+        create_nss_dirs(&self.data_dir, "nss-0", false, None)?;
 
         Ok(())
     }
@@ -137,7 +137,7 @@ impl Orchestrator {
         let bss_journal_vg = generate_bss_journal_vg_config(1);
 
         // Initialize observer_state for solo mode (single NSS)
-        let observer_state_json = r#"{"observer_state":"solo","nss_machine":{"machine_id":"nss-A","running_service":"nss","expected_role":"solo","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"","running_service":"noop","expected_role":"","network_address":null},"last_updated":0.0,"version":0}"#;
+        let observer_state_json = r#"{"observer_state":"solo","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"solo","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"","running_service":"noop","expected_role":"","network_address":null},"last_updated":0.0,"version":0}"#;
 
         run_cmd! {
             $etcdctl put /fractalbits-service-discovery/bss-data-vg-config $bss_data_vg >/dev/null;
@@ -214,7 +214,7 @@ impl Orchestrator {
 
     fn format_nss(&self) -> Result<()> {
         let nss_bin = self.bin_dir.join("nss_server");
-        let working_dir = self.data_dir.join("nss-A");
+        let working_dir = self.data_dir.join("nss-0");
 
         // Skip formatting if journal file already exists (data already formatted)
         let journal_file = working_dir.join("local/journal/journal.data");
@@ -232,9 +232,9 @@ impl Orchestrator {
 
     fn start_nss_role_agent(&mut self) -> Result<()> {
         let mut child = Command::new(self.bin_dir.join("nss_role_agent"))
-            .env("INSTANCE_ID", "nss-A")
+            .env("INSTANCE_ID", "nss-0")
             .env("APP_SERVICE_MANAGER_BACKEND", "direct")
-            .env("APP_WORKING_DIR", self.data_dir.join("nss-A"))
+            .env("APP_WORKING_DIR", self.data_dir.join("nss-0"))
             .env("RUST_LOG", "info")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -31,7 +31,7 @@ resource "google_compute_instance" "rss_a" {
     rss-backend   = var.rss_backend
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
-      role_args  = "--role root_server --rss-role leader --nss-a-ip ${google_compute_instance.nss_a.network_interface[0].network_ip} --nss-a-id nss-a-${var.cluster_id} --nss-b-id nss-b-${var.cluster_id}"
+      role_args  = "--role root_server --rss-role leader --nss-a-ip ${google_compute_instance.nss_a.network_interface[0].network_ip} --nss-a-id nss-0-${var.cluster_id} --nss-b-id nss-1-${var.cluster_id}"
     })
   }
 
@@ -100,9 +100,9 @@ resource "google_compute_instance" "rss_b" {
   ]
 }
 
-# NSS-A (Namespace Server)
+# NSS-0 (Namespace Server)
 resource "google_compute_instance" "nss_a" {
-  name         = "nss-a-${var.cluster_id}"
+  name         = "nss-0-${var.cluster_id}"
   machine_type = var.nss_machine_type
   zone         = var.zone_a
 
@@ -165,10 +165,10 @@ resource "google_compute_instance" "nss_a" {
   ]
 }
 
-# NSS-B (Namespace Server - standby, same zone as NSS-A, shares journal disk)
+# NSS-1 (Namespace Server - standby, same zone as NSS-0, shares journal disk)
 resource "google_compute_instance" "nss_b" {
   count        = 1
-  name         = "nss-b-${var.cluster_id}"
+  name         = "nss-1-${var.cluster_id}"
   machine_type = var.nss_machine_type
   zone         = var.zone_a
 

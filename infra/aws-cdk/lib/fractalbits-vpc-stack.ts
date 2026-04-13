@@ -249,7 +249,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         rootVolumeSize: 30,
       },
       {
-        id: "nss-A",
+        id: "nss-0",
         instanceType: nssInstanceType,
         specificSubnet: subnet1,
         sg: privateSg,
@@ -267,11 +267,11 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
-    // Always create nss-B for HA active/standby mode:
-    // - multiAz: nss-B in second AZ
-    // - single-AZ: nss-B is idle standby, takes over on failover
+    // Always create nss-1 for HA mode:
+    // - multiAz: nss-1 in second AZ
+    // - single-AZ: nss-1 is idle standby, takes over on failover
     instanceConfigs.push({
-      id: "nss-B",
+      id: "nss-1",
       instanceType: nssInstanceType,
       specificSubnet: multiAz ? subnet2 : subnet1,
       sg: privateSg,
@@ -354,12 +354,12 @@ export class FractalbitsVpcStack extends cdk.Stack {
         deployOS,
         "--role root_server --rss-role follower",
       ),
-      "nss-A": createUserData(
+      "nss-0": createUserData(
         this,
         deployOS,
         `--role nss_server --nss-role primary${nssVolumeIdArg}`,
       ),
-      "nss-B": createUserData(
+      "nss-1": createUserData(
         this,
         deployOS,
         `--role nss_server --nss-role standby${nssVolumeBIdArg}`,
@@ -393,9 +393,9 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     // Build RSS leader UserData with the NSS instance IDs embedded so the
     // RSS bootstrap can call initialize_observer_state with the real IDs.
-    const nssAInstanceId = instances["nss-A"].instanceId;
-    const nssAPrivateIp = instances["nss-A"].instancePrivateIp;
-    const nssBInstance = instances["nss-B"];
+    const nssAInstanceId = instances["nss-0"].instanceId;
+    const nssAPrivateIp = instances["nss-0"].instancePrivateIp;
+    const nssBInstance = instances["nss-1"];
     const nssIdArgs = nssBInstance
       ? ` --nss-a-id ${nssAInstanceId} --nss-b-id ${nssBInstance.instanceId}`
       : ` --nss-a-id ${nssAInstanceId}`;
@@ -432,22 +432,22 @@ export class FractalbitsVpcStack extends cdk.Stack {
         this,
         "MultiAttachVolumeAToNssA",
         ebsVolumeA,
-        instances["nss-A"].instanceId,
+        instances["nss-0"].instanceId,
       );
       if (multiAz && ebsVolumeB) {
         attachEbsVolume(
           this,
           "MultiAttachVolumeBToNssB",
           ebsVolumeB,
-          instances["nss-B"].instanceId,
+          instances["nss-1"].instanceId,
         );
       } else {
-        // Single-AZ EBS HA: attach same volume to nss-B for NVMe reservation failover
+        // Single-AZ EBS HA: attach same volume to nss-1 for failover
         attachEbsVolume(
           this,
           "MultiAttachVolumeAToNssB",
           ebsVolumeA,
-          instances["nss-B"].instanceId,
+          instances["nss-1"].instanceId,
         );
       }
     }
@@ -478,7 +478,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
     // For single-AZ, use direct instance IP to avoid VPC endpoint latency
     let nssPrivateLink: any;
     if (multiAz) {
-      const nssTargets = [instances["nss-A"], instances["nss-B"]];
+      const nssTargets = [instances["nss-0"], instances["nss-1"]];
       nssPrivateLink = createPrivateLinkNlb(
         this,
         "Nss",

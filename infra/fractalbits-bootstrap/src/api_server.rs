@@ -44,7 +44,7 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
 
     let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     // Wait for NSS journals to be ready before we can serve requests
-    // For NVMe journal, only active (nss-A) publishes journal-ready; standby is idle
+    // For NVMe journal, only active (nss-0) publishes journal-ready; standby is idle
     let expected_journal_ready =
         if remote_az.is_some() && config.global.journal_type != JournalType::Nvme {
             2
