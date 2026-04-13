@@ -19,7 +19,6 @@ pub const GUI_WEB_ROOT: &str = "/opt/fractalbits/www/";
 pub const API_SERVER_CONFIG: &str = "api_server_cloud_config.toml";
 pub const BSS_SERVER_CONFIG: &str = "bss_server_cloud_config.toml";
 pub const NSS_SERVER_CONFIG: &str = "nss_server_cloud_config.toml";
-pub const MIRRORD_CONFIG: &str = "mirrord_cloud_config.toml";
 pub const ROOT_SERVER_CONFIG: &str = "root_server_cloud_config.toml";
 pub const NSS_ROLE_AGENT_CONFIG: &str = "nss_role_agent_cloud_config.toml";
 pub const BENCH_SERVER_BENCH_START_SCRIPT: &str = "bench_start.sh";
@@ -179,21 +178,6 @@ EnvironmentFile=-{ETC_PATH}nss.env"##
             };
             format!(
                 r#"/bin/bash -c 'if [ -n "$LOGS" ]; then {BIN_PATH}nss_server serve -c {ETC_PATH}{NSS_SERVER_CONFIG} 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/nss.log"; else exec {BIN_PATH}nss_server serve -c {ETC_PATH}{NSS_SERVER_CONFIG}; fi'"#
-            )
-        }
-        "mirrord" => {
-            managed_service = true;
-            env_settings = format!(
-                r##"
-EnvironmentFile=-{ETC_PATH}mirrord.env"##
-            );
-            requires = match journal_type {
-                Some(JournalType::Nvme) => "data-local.mount".to_string(),
-                Some(JournalType::Ebs) => String::new(),
-                None => unreachable!(),
-            };
-            format!(
-                r#"/bin/bash -c 'if [ -n "$LOGS" ]; then {BIN_PATH}{service_name} -c {ETC_PATH}{MIRRORD_CONFIG} 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/mirrord.log"; else exec {BIN_PATH}{service_name} -c {ETC_PATH}{MIRRORD_CONFIG}; fi'"#
             )
         }
         "rss" => {
@@ -667,7 +651,7 @@ pub fn create_nvme_tuning_service() -> CmdResult {
         r##"[Unit]
 Description=NVMe Direct I/O Tuning
 After=local-fs.target
-Before=api_server.service bss.service nss.service mirrord.service bench_client.service
+Before=api_server.service bss.service nss.service bench_client.service
 
 [Service]
 Type=oneshot

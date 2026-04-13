@@ -35,7 +35,7 @@ resource "google_compute_firewall" "internal" {
       "8086",  # RSS RPC
       "8087",  # NSS RPC
       "8088",  # BSS RPC
-      "9999",  # mirrord
+      "9999",  # reserved
       "18080", # Docker S3 mgmt / API mgmt
       "18086", # RSS health
       "18087", # RSS metrics
