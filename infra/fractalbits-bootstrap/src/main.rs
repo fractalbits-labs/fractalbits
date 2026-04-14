@@ -96,17 +96,10 @@ fn generic_bootstrap_with_args(cli_args: CliArgs) -> CmdResult {
             "root_server"
         }
         ServiceType::NssServer {
-            volume_id,
             journal_uuid,
             is_standby,
         } => {
-            nss_server::bootstrap(
-                &config,
-                volume_id.as_deref(),
-                journal_uuid.as_deref(),
-                is_standby,
-                for_bench,
-            )?;
+            nss_server::bootstrap(&config, journal_uuid.as_deref(), is_standby, for_bench)?;
             "nss_server"
         }
         ServiceType::ApiServer => {

@@ -50,14 +50,12 @@ const benchClientInstanceType =
 const dataBlobStorage =
   app.node.tryGetContext("dataBlobStorage") ?? "all_in_bss_single_az";
 const rssBackend = app.node.tryGetContext("rssBackend") ?? "ddb";
-const journalType = app.node.tryGetContext("journalType") ?? "ebs";
+const journalType = app.node.tryGetContext("journalType") ?? "remote";
 const browserIp = app.node.tryGetContext("browserIp") ?? null;
 // Note: Context values from CLI are always strings, so convert to numbers
 const numApiServers = Number(app.node.tryGetContext("numApiServers")) || 1;
 const numBenchClients = Number(app.node.tryGetContext("numBenchClients")) || 1;
 const numBssNodes = Number(app.node.tryGetContext("numBssNodes")) || 1;
-const ebsVolumeIops = Number(app.node.tryGetContext("ebsVolumeIops")) || 10000;
-const ebsVolumeSize = Number(app.node.tryGetContext("ebsVolumeSize")) || 20;
 const rootServerHa = app.node.tryGetContext("rootServerHa") || false;
 const deployOS = (app.node.tryGetContext("deployOS") ?? "al2023") as DeployOS;
 
@@ -92,8 +90,6 @@ const vpcStack = new FractalbitsVpcStack(app, "FractalbitsVpcStack", {
   rssBackend: rssBackend,
   journalType: journalType,
   rootServerHa: rootServerHa,
-  ebsVolumeSize: ebsVolumeSize,
-  ebsVolumeIops: ebsVolumeIops,
   deployOS: deployOS,
 });
 

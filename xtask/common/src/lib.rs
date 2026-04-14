@@ -591,7 +591,6 @@ pub fn create_bss_dirs(data_dir: &Path, bss_id: u32) -> CmdResult {
 }
 
 /// Create directories for NSS server
-/// - is_ebs_journal: true for EBS journal, false for NVMe journal
 /// Create NSS directories. Journal at data/<dir_name>/local/journal/<journal_uuid>/
 pub fn create_nss_dirs(data_dir: &Path, dir_name: &str, journal_uuid: Option<&str>) -> CmdResult {
     info!("Creating directories for {} server", dir_name);

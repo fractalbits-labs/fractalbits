@@ -1,5 +1,3 @@
-pub mod ebs_journal;
-
 use super::common::*;
 use crate::config::{BootstrapConfig, DeployTarget};
 use crate::stage_helpers::{CommonServicesReadyStage, InstancesReadyStage};
@@ -49,7 +47,6 @@ impl NssJournalReadyStage {
 
 pub fn bootstrap(
     config: &BootstrapConfig,
-    volume_id: Option<&str>,
     journal_uuid: Option<&str>,
     is_standby: bool,
     for_bench: bool,
@@ -79,8 +76,6 @@ pub fn bootstrap(
     // Complete instances-ready stage
     InstancesReadyStage::complete_with_metadata(&barrier, instances_ready_meta)?;
 
-    // NVMe persistent reservations used for multi-attach failover
-    install_packages(&["nvme-cli"])?;
     if meta_stack_testing || for_bench {
         let _ = download_binaries(config, &["rewrk_rpc"]);
     }
@@ -114,7 +109,7 @@ pub fn bootstrap(
     } else {
         config.get_resources().nss_b_id.is_some()
     };
-    setup_configs(config, volume_id, journal_uuid, "nss")?;
+    setup_configs(config, journal_uuid, "nss")?;
 
     if is_standby {
         // HA standby: skip format/mount entirely, start role_agent idle
@@ -144,26 +139,8 @@ pub fn bootstrap(
     let journal_vg_config = get_service_discovery_value(config, BSS_JOURNAL_VG_CONFIG_KEY)?;
     info!("Fetched metadata and journal VG configs from service discovery");
 
-    // Format journal (active or solo nodes only)
-    // On GCP, the pd_ssd journal disk is pre-attached as device "nss-journal".
-    // No volume_id is passed via CLI; use the fixed GCP device name instead.
-    let gcp_default;
-    let volume_id = match volume_id {
-        Some(v) => v,
-        None if config.global.deploy_target == DeployTarget::Gcp => {
-            gcp_default = "gcp:nss-journal".to_string();
-            &gcp_default
-        }
-        None => {
-            return Err(Error::other("volume_id required for remote journal"));
-        }
-    };
-    ebs_journal::format_with_volume_id(
-        volume_id,
-        journal_uuid,
-        &metadata_vg_config,
-        &journal_vg_config,
-    )?;
+    // Format journal via quorum journal (BSS storage)
+    format_nss(&metadata_vg_config, &journal_vg_config)?;
 
     // Signal that formatting is complete
     NssFormattedStage::complete(&barrier)?;
@@ -189,20 +166,8 @@ pub fn bootstrap(
     Ok(())
 }
 
-fn setup_configs(
-    config: &BootstrapConfig,
-    volume_id: Option<&str>,
-    journal_uuid: &str,
-    service_name: &str,
-) -> CmdResult {
-    // Validate volume_id is present (GCP pre-attaches as "nss-journal")
-    if volume_id.is_none() && config.global.deploy_target != DeployTarget::Gcp {
-        return Err(Error::other("volume_id required"));
-    }
-    // shared_dir is relative to /data, so "ebs/{uuid}" means /data/ebs/{uuid}/
-    let shared_dir = format!("ebs/{journal_uuid}");
-
-    create_nss_config(&shared_dir, journal_uuid)?;
+fn setup_configs(config: &BootstrapConfig, journal_uuid: &str, service_name: &str) -> CmdResult {
+    create_nss_config(journal_uuid)?;
 
     // Common configs
     create_coredump_config()?;
@@ -220,7 +185,7 @@ fn setup_configs(
     Ok(())
 }
 
-fn create_nss_config(shared_dir: &str, journal_uuid: &str) -> CmdResult {
+fn create_nss_config(journal_uuid: &str) -> CmdResult {
     // Get total memory in kilobytes from /proc/meminfo
     let total_mem_kb_str = run_fun!(cat /proc/meminfo | grep MemTotal | awk r"{print $2}")?;
     let total_mem_kb = total_mem_kb_str
@@ -231,7 +196,8 @@ fn create_nss_config(shared_dir: &str, journal_uuid: &str) -> CmdResult {
     // Calculate total memory for blob_dram_kilo_bytes
     let blob_dram_kilo_bytes = (total_mem_kb as f64 * BLOB_DRAM_MEM_PERCENT) as u64;
 
-    let fa_journal_segment_size = ebs_journal::FA_JOURNAL_SEGMENT_SIZE;
+    // 4GB journal segment size for quorum journal
+    let fa_journal_segment_size: u64 = 4 * 1024 * 1024 * 1024;
 
     let num_cores = num_cpus()?;
     let net_worker_thread_count = num_cores / 2;
@@ -242,7 +208,6 @@ fn create_nss_config(shared_dir: &str, journal_uuid: &str) -> CmdResult {
 
     let config_content = format!(
         r##"working_dir = "/data"
-shared_dir = "{shared_dir}"
 server_port = 8088
 health_port = 19999
 net_worker_thread_count = {net_worker_thread_count}
@@ -277,20 +242,8 @@ fn prepare_local_dirs() -> CmdResult {
 }
 
 /// Prepare local directories and run nss_server format.
-/// If `create_journal_dir` is true, also creates /data/local/journal (for nvme mode).
 /// `metadata_vg_config` provides BSS addresses for buffer_manager initialization.
-pub(crate) fn format_nss(
-    create_journal_dir: bool,
-    metadata_vg_config: &str,
-    journal_vg_config: &str,
-) -> CmdResult {
-    if create_journal_dir {
-        run_cmd! {
-            info "Creating journal directory";
-            mkdir -p /data/local/journal;
-        }?;
-    }
-
+fn format_nss(metadata_vg_config: &str, journal_vg_config: &str) -> CmdResult {
     prepare_local_dirs()?;
 
     run_cmd! {
@@ -317,45 +270,6 @@ fn create_nss_role_agent_config(config: &BootstrapConfig) -> CmdResult {
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Build EBS failover config section
-    let resources = config.get_resources();
-    let nss_nodes = config.get_node_entries("nss_server");
-
-    // Get the shared EBS volume_id and journal_uuid from nss-0's node entry
-    let nss_a_entry = nss_nodes.and_then(|nodes| nodes.iter().find(|n| n.id == resources.nss_a_id));
-    let ebs_volume_id = nss_a_entry
-        .and_then(|n| n.volume_id.as_deref())
-        .unwrap_or("");
-    let ebs_journal_uuid = nss_a_entry
-        .and_then(|n| n.journal_uuid.as_deref())
-        .unwrap_or("");
-
-    // Determine peer instance ID: A's peer is B, B's peer is A
-    let peer_instance_id = if let Some(ref nss_b_id) = resources.nss_b_id {
-        if instance_id == *nss_b_id {
-            resources.nss_a_id.clone()
-        } else {
-            nss_b_id.clone()
-        }
-    } else {
-        String::new()
-    };
-
-    let region = &config.global.region;
-
-    let mut ebs_failover_section = format!(
-        r##"
-journal_type = "remote"
-ebs_volume_id = "{ebs_volume_id}"
-ebs_journal_uuid = "{ebs_journal_uuid}"
-aws_region = "{region}"
-"##
-    );
-
-    if !peer_instance_id.is_empty() {
-        ebs_failover_section.push_str(&format!("peer_instance_id = \"{peer_instance_id}\"\n"));
-    }
-
     let config_content = format!(
         r##"# NSS Role Agent Configuration
 # Role is fetched from RSS at startup
@@ -363,7 +277,8 @@ aws_region = "{region}"
 rss_addrs = [{rss_addrs_toml}]
 instance_id = "{instance_id}"
 network_address = "{private_ip}:{nss_port}"
-{ebs_failover_section}"##
+journal_type = "remote"
+"##
     );
 
     run_cmd! {
