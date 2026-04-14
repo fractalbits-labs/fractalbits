@@ -8,8 +8,6 @@ import * as autoscaling from "aws-cdk-lib/aws-autoscaling";
 import {
   createInstance,
   createEc2Asg,
-  createEbsVolume,
-  attachEbsVolume,
   createDynamoDbTable,
   createEc2Role,
   createVpcEndpoints,
@@ -38,8 +36,6 @@ export interface FractalbitsVpcStackProps extends cdk.StackProps {
   browserIp?: string;
   dataBlobStorage: DataBlobStorage;
   rootServerHa: boolean;
-  ebsVolumeSize: number;
-  ebsVolumeIops: number;
   rssBackend: "etcd" | "ddb";
   journalType: "remote";
   deployOS?: DeployOS;
@@ -312,41 +308,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
-    // For EBS journal: create volumes BEFORE instances so their IDs are available in UserData.
-    // CloudFormation resolves the volumeId token at deploy time.
-    let ebsVolumeA: ec2.Volume | undefined;
-    let ebsVolumeB: ec2.Volume | undefined;
-    if (props.journalType === "remote") {
-      ebsVolumeA = createEbsVolume(
-        this,
-        "MultiAttachVolumeA",
-        subnet1.availabilityZone,
-        props.ebsVolumeSize,
-        props.ebsVolumeIops,
-      );
-      if (multiAz) {
-        ebsVolumeB = createEbsVolume(
-          this,
-          "MultiAttachVolumeB",
-          subnet2.availabilityZone,
-          props.ebsVolumeSize,
-          props.ebsVolumeIops,
-        );
-      }
-    }
-
     // Per-service UserData: each instance gets --role (and optional sub-args) appended
-    const nssVolumeIdArg =
-      props.journalType === "remote" && ebsVolumeA
-        ? ` --volume-id ${ebsVolumeA.volumeId}`
-        : "";
-    const nssVolumeBIdArg =
-      props.journalType === "remote"
-        ? multiAz && ebsVolumeB
-          ? ` --volume-id ${ebsVolumeB.volumeId}`
-          : ` --volume-id ${ebsVolumeA!.volumeId}` // single-AZ: same volume for standby
-        : "";
-
     const perServiceUserData: Record<string, ec2.UserData> = {
       // rss-A is set below after NSS instances are created (needs their instanceIds)
       "rss-B": createUserData(
@@ -357,12 +319,12 @@ export class FractalbitsVpcStack extends cdk.Stack {
       "nss-0": createUserData(
         this,
         deployOS,
-        `--role nss_server --nss-role primary${nssVolumeIdArg}`,
+        "--role nss_server --nss-role primary",
       ),
       "nss-1": createUserData(
         this,
         deployOS,
-        `--role nss_server --nss-role standby${nssVolumeBIdArg}`,
+        "--role nss_server --nss-role standby",
       ),
       gui_server: createUserData(this, deployOS, "--role gui_server"),
       // bench_server UserData is set after NLB creation so we can embed the NLB DNS name
@@ -425,32 +387,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
           userData,
         );
       });
-
-    // Attach EBS volumes to NSS instances (volumes were created before instances above)
-    if (props.journalType === "remote" && ebsVolumeA) {
-      attachEbsVolume(
-        this,
-        "MultiAttachVolumeAToNssA",
-        ebsVolumeA,
-        instances["nss-0"].instanceId,
-      );
-      if (multiAz && ebsVolumeB) {
-        attachEbsVolume(
-          this,
-          "MultiAttachVolumeBToNssB",
-          ebsVolumeB,
-          instances["nss-1"].instanceId,
-        );
-      } else {
-        // Single-AZ EBS HA: attach same volume to nss-1 for failover
-        attachEbsVolume(
-          this,
-          "MultiAttachVolumeAToNssB",
-          ebsVolumeA,
-          instances["nss-1"].instanceId,
-        );
-      }
-    }
 
     // Create BSS nodes in ASG (dynamic cluster discovery via S3)
     let bssAsg: autoscaling.AutoScalingGroup | undefined;
@@ -606,22 +542,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
     });
 
     this.nlbLoadBalancerDnsName = nlb.loadBalancerDnsName;
-
-    // Output EBS volume IDs
-    if (ebsVolumeA) {
-      new cdk.CfnOutput(this, "VolumeAId", {
-        value: ebsVolumeA.volumeId,
-        description: "EBS volume A ID",
-      });
-    }
-
-    // Only output volume B for multiAz mode with EBS
-    if (multiAz && ebsVolumeB) {
-      new cdk.CfnOutput(this, "VolumeBId", {
-        value: ebsVolumeB.volumeId,
-        description: "EBS volume B ID",
-      });
-    }
 
     new cdk.CfnOutput(this, "apiServerAsgName", {
       value: apiServerAsg.autoScalingGroupName,

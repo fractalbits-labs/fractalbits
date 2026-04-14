@@ -5,8 +5,6 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import * as TOML from "@iarna/toml";
 import {
-  createEbsVolume,
-  attachEbsVolume,
   createEc2Asg,
   createInstance,
   createUserData,
@@ -123,24 +121,9 @@ export class FractalbitsMetaStack extends cdk.Stack {
         undefined,
         nssUserData,
       );
-      const ebsVolume = createEbsVolume(
-        this,
-        "MultiAttachVolume",
-        az,
-        20,
-        10000,
-      );
-      attachEbsVolume(
-        this,
-        "MultiAttachVolume",
-        ebsVolume,
-        instance.instanceId,
-      );
-
       const nodeEntries = [
         "[[nodes.nss_server]]",
         cdk.Fn.join("", ['id = "', instance.instanceId, '"']),
-        cdk.Fn.join("", ['volume_id = "', ebsVolume.volumeId, '"']),
         "",
       ];
 

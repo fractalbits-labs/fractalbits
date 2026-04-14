@@ -11,7 +11,6 @@ pub enum ServiceType {
         is_leader: bool,
     },
     NssServer {
-        volume_id: Option<String>,
         journal_uuid: Option<String>,
         is_standby: bool,
     },
@@ -43,10 +42,6 @@ pub struct CliArgs {
     /// NSS sub-role: primary or standby (for nss_server)
     #[clap(long)]
     pub nss_role: Option<String>,
-
-    /// EBS volume ID (for nss_server with EBS journal)
-    #[clap(long)]
-    pub volume_id: Option<String>,
 
     /// NSS-A instance ID (for root_server leader — used to initialize observer state)
     #[clap(long)]
@@ -80,7 +75,6 @@ pub fn discover_from_args(args: &CliArgs) -> Result<ServiceType, Error> {
             let is_standby = args.nss_role.as_deref().unwrap_or("primary") == "standby";
             // journal_uuid is no longer per-node; it comes from config.global.journal_uuid
             Ok(ServiceType::NssServer {
-                volume_id: args.volume_id.clone(),
                 journal_uuid: None, // read from config.global.journal_uuid at bootstrap time
                 is_standby,
             })
@@ -127,18 +121,9 @@ fn parse_instance_config(
             Ok(ServiceType::RootServer { is_leader })
         }
         "nss_server" => {
-            let volume_id = instance_config.volume_id.clone();
             let journal_uuid = instance_config.journal_uuid.clone();
-            // volume_id and journal_uuid are required for remote journal type
-            if volume_id.is_none() {
-                return Err(Error::other(
-                    "NSS server config missing volume_id for remote journal type",
-                ));
-            }
             if journal_uuid.is_none() {
-                return Err(Error::other(
-                    "NSS server config missing journal_uuid for remote journal type",
-                ));
+                return Err(Error::other("NSS server config missing journal_uuid"));
             }
             // Determine if this is the standby NSS node via resources (TOML path)
             let resources = config.get_resources();
@@ -148,7 +133,6 @@ fn parse_instance_config(
                 .map(|b| b == instance_config.id)
                 .unwrap_or(false);
             Ok(ServiceType::NssServer {
-                volume_id,
                 journal_uuid,
                 is_standby,
             })
