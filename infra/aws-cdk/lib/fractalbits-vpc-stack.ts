@@ -263,16 +263,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
-    // Always create nss-1 for HA mode:
-    // - multiAz: nss-1 in second AZ
-    // - single-AZ: nss-1 is idle standby, takes over on failover
-    instanceConfigs.push({
-      id: "nss-1",
-      instanceType: nssInstanceType,
-      specificSubnet: multiAz ? subnet2 : subnet1,
-      sg: privateSg,
-    });
-
     if (props.browserIp) {
       const guiServerSg = new ec2.SecurityGroup(this, "GuiServerSG", {
         vpc: this.vpc,
@@ -321,11 +311,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
         deployOS,
         "--role nss_server --nss-role primary",
       ),
-      "nss-1": createUserData(
-        this,
-        deployOS,
-        "--role nss_server --nss-role standby",
-      ),
       gui_server: createUserData(this, deployOS, "--role gui_server"),
       // bench_server UserData is set after NLB creation so we can embed the NLB DNS name
     };
@@ -353,18 +338,14 @@ export class FractalbitsVpcStack extends cdk.Stack {
         );
       });
 
-    // Build RSS leader UserData with the NSS instance IDs embedded so the
-    // RSS bootstrap can call initialize_observer_state with the real IDs.
+    // Build RSS leader UserData with the NSS instance ID embedded so the
+    // RSS bootstrap can initialize journal config with the real ID.
     const nssAInstanceId = instances["nss-0"].instanceId;
     const nssAPrivateIp = instances["nss-0"].instancePrivateIp;
-    const nssBInstance = instances["nss-1"];
-    const nssIdArgs = nssBInstance
-      ? ` --nss-a-id ${nssAInstanceId} --nss-b-id ${nssBInstance.instanceId}`
-      : ` --nss-a-id ${nssAInstanceId}`;
     perServiceUserData["rss-A"] = createUserData(
       this,
       deployOS,
-      `--role root_server --rss-role leader${nssIdArgs} --nss-a-ip ${nssAPrivateIp}`,
+      `--role root_server --rss-role leader --nss-a-id ${nssAInstanceId} --nss-a-ip ${nssAPrivateIp}`,
     );
 
     // Second pass: create all remaining (non-NSS, non-bench_server) instances.

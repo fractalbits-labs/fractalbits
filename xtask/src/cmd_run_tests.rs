@@ -3,7 +3,6 @@ pub mod bss_repair;
 pub mod fs_server;
 pub mod leader_election;
 pub mod multi_az;
-pub mod nss_ha_failover;
 
 use crate::{
     CmdResult, DataBlobStorage, InitConfig, MultiAzTestType, RssBackend, ServiceName, TestType,
@@ -68,18 +67,6 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         cmd_service::stop_service(ServiceName::All)
     };
 
-    let test_nss_ha_with_ebs = || async {
-        // Test with etcd backend
-        info!("Testing NSS HA (EBS) failover with etcd backend...");
-        nss_ha_failover::run_ebs_ha_failover_tests(RssBackend::Etcd).await?;
-
-        // Test with DDB backend
-        info!("Testing NSS HA (EBS) failover with DDB backend...");
-        nss_ha_failover::run_ebs_ha_failover_tests(RssBackend::Ddb).await?;
-
-        Ok(())
-    };
-
     let test_fs_server = |run_fuse: bool, run_nfs: bool, disk_cache: bool| async move {
         fs_server::build_fs_server()?;
         if run_fuse {
@@ -130,7 +117,6 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         TestType::LeaderElection => test_leader_election(),
         TestType::BssNodeFailure => test_bss_node_failure().await,
         TestType::BssRepair => test_bss_repair().await,
-        TestType::NssHaWithEBS => test_nss_ha_with_ebs().await,
         TestType::FsServer {
             fuse,
             nfs,

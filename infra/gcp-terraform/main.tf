@@ -22,9 +22,8 @@ locals {
   rss_a_name = "rss-a"
   rss_b_name = "rss-b"
   nss_a_name = "nss-0"
-  nss_b_name = "nss-1"
 
-  # Mini template: two NSS, single BSS, single API server
-  # Standard template: two NSS (HA), multiple BSS/API
+  # Mini template: single NSS, single BSS, single API server
+  # Standard template: single NSS, multiple BSS/API
   rss_ha_enabled = var.vpc_template == "standard" || var.root_server_ha
 }

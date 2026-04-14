@@ -141,7 +141,7 @@ pub fn bootstrap(
     info!("Fetched metadata VG, journal VG, and journal configs from service discovery");
 
     // Format journal via quorum journal (BSS storage)
-    format_nss(&metadata_vg_config, &journal_vg_config, &journal_config)?;
+    format_journal(&metadata_vg_config, &journal_vg_config, &journal_config)?;
 
     // Signal that formatting is complete
     NssFormattedStage::complete(&barrier)?;
@@ -245,7 +245,11 @@ fn prepare_local_dirs() -> CmdResult {
 /// Prepare local directories and run nss_server format.
 /// `metadata_vg_config` provides BSS addresses for buffer_manager initialization.
 /// `journal_config` provides journal UUID, device ID, size, and fence token.
-fn format_nss(metadata_vg_config: &str, journal_vg_config: &str, journal_config: &str) -> CmdResult {
+fn format_journal(
+    metadata_vg_config: &str,
+    journal_vg_config: &str,
+    journal_config: &str,
+) -> CmdResult {
     prepare_local_dirs()?;
 
     run_cmd! {
