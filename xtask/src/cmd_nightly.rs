@@ -1,8 +1,8 @@
 use crate::cmd_service::{start_service, stop_service};
-use xtask_common::generate_initial_journal_config;
 use crate::*;
 use chrono::Local;
 use std::path::Path;
+use xtask_common::generate_initial_journal_config;
 use xtask_common::{generate_bss_journal_vg_config, generate_bss_metadata_vg_config};
 
 fn setup_python_venv() -> CmdResult {

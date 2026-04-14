@@ -120,13 +120,13 @@ message NssAgentHealthReport {
 
 message GetNssRoleResponse {
   oneof result {
-    string role = 1;  // "active", "standby", "solo", or "degraded"
+    string role = 1;
     string error = 2;
   }
   uint64 version = 3;
-  uint64 nss_node_id = 4;  // NVMe reservation node sequence ID for this instance
-  uint64 peer_nss_node_id = 5;  // NVMe reservation node sequence ID for peer instance
-  optional string journal_uuid = 6;  // UUID of the journal device for validation
+  // field 4 removed (was nss_node_id)
+  // field 5 removed (was peer_nss_node_id)
+  optional string journal_uuid = 6;
 }
 
 // GetAzStatus - Query AZ availability status from service-discovery table

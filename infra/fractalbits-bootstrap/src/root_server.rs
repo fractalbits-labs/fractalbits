@@ -206,7 +206,7 @@ fn bootstrap_leader(
 
     // Initialize NSS role states in service discovery BEFORE starting RSS
     // This ensures the observer state exists when RSS starts
-    initialize_observer_state(config, nss_a_id, nss_b_id)?;
+    initialize_observer_state(config, nss_a_id, nss_endpoint)?;
 
     create_rss_config(config, nss_endpoint, ha_enabled)?;
     create_rss_bootstrap_env()?;
@@ -277,17 +277,11 @@ fn bootstrap_leader(
 fn initialize_observer_state(
     config: &BootstrapConfig,
     nss_a_id: &str,
-    nss_b_id: Option<&str>,
+    nss_endpoint: &str,
 ) -> CmdResult {
-    info!("Initializing observer state in service discovery");
-
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+    info!("Initializing journal config and nss-store in service discovery");
 
     // Get shared journal_uuid: prefer per-node entry (on-prem TOML path), fall back to global config
-    // Get shared journal_uuid for NSS
     let nss_nodes = config.get_node_entries("nss_server");
     let node_journal_uuid = nss_nodes
         .and_then(|nodes| nodes.iter().find(|n| n.id == nss_a_id))
@@ -296,65 +290,12 @@ fn initialize_observer_state(
         .as_deref()
         .or(config.global.journal_uuid.as_deref());
 
-    let journal_uuid_json = shared_journal_uuid
-        .map(|u| format!("\"{u}\""))
-        .unwrap_or_else(|| "null".to_string());
-
-    // Create ObserverPersistentState JSON
-    let observer_state_json = if let Some(nss_b_id) = nss_b_id {
-        // HA mode: active/standby - both machines share the same journal_uuid
-        info!("HA mode: {nss_a_id} as active NSS, {nss_b_id} as standby (idle)");
-        format!(
-            r#"{{"observer_state":"active_standby","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"active","network_address":null,"journal_uuid":{journal_uuid_json}}},"standby_machine":{{"machine_id":"{nss_b_id}","running_service":"noop","expected_role":"standby","network_address":null,"journal_uuid":{journal_uuid_json}}},"last_updated":{timestamp},"version":1,"nss_node_map":{{"{nss_a_id}":1,"{nss_b_id}":2}},"next_nss_node_id":3}}"#
-        )
-    } else {
-        // Solo mode: single NSS
-        info!("Solo mode: {nss_a_id} as solo NSS");
-        format!(
-            r#"{{"observer_state":"solo","nss_machine":{{"machine_id":"{nss_a_id}","running_service":"nss","expected_role":"solo","network_address":null,"journal_uuid":{journal_uuid_json}}},"standby_machine":{{"machine_id":"","running_service":"noop","expected_role":"","network_address":null,"journal_uuid":null}},"last_updated":{timestamp},"version":1,"nss_node_map":{{"{nss_a_id}":1}},"next_nss_node_id":2}}"#
-        )
-    };
-
-    if config.is_etcd_backend() {
-        let etcdctl = format!("{BIN_PATH}etcdctl");
-        let etcd_endpoints = get_etcd_endpoints_from_workflow(config)?;
-        let key = "/fractalbits-service-discovery/observer_state";
-        run_cmd!($etcdctl --endpoints=$etcd_endpoints put $key $observer_state_json >/dev/null)?;
-    } else if config.is_firestore_backend() {
-        let escaped = observer_state_json.replace('"', r#"\""#);
-        let fields_json = format!(
-            r#"{{"fields":{{"state":{{"stringValue":"{escaped}"}},"version":{{"integerValue":"1"}}}}}}"#
-        );
-        firestore_put_document(
-            config,
-            "fractalbits-service-discovery",
-            "observer_state",
-            &fields_json,
-        )?;
-    } else {
-        let region = get_current_aws_region()?;
-        // Escape JSON for DynamoDB attribute value
-        let escaped_json = observer_state_json.replace('"', r#"\""#);
-        let observer_state_item = format!(
-            r#"{{"service_id":{{"S":"observer_state"}},"state":{{"S":"{escaped_json}"}},"version":{{"N":"1"}}}}"#
-        );
-
-        run_cmd! {
-            aws dynamodb put-item
-                --table-name $DDB_SERVICE_DISCOVERY_TABLE
-                --item $observer_state_item
-                --region $region
-        }?;
-    }
-
-    info!("Observer state initialized in service discovery");
-
-    // Initialize journal config in service discovery
+    // Initialize journal config in service discovery with running_nss_id set to nss_a_id
     if let Some(journal_uuid) = shared_journal_uuid {
         let journal_size: u64 = 4 * 1024 * 1024 * 1024; // 4GB for cloud deployment
         let journal_config_json = format!(
-            r#"{{"journal_uuid":"{}","device_id":1,"journal_size":{},"version":1,"journal_volume_ids":[],"metadata_volume_ids":[],"running_nss_id":null}}"#,
-            journal_uuid, journal_size
+            r#"{{"journal_uuid":"{}","device_id":1,"journal_size":{},"version":1,"journal_volume_ids":[],"metadata_volume_ids":[],"running_nss_id":"{}"}}"#,
+            journal_uuid, journal_size, nss_a_id
         );
 
         if config.is_etcd_backend() {
@@ -386,6 +327,42 @@ fn initialize_observer_state(
             }?;
         }
         info!("Journal config initialized in service discovery");
+    }
+
+    // Initialize nss-store with the NSS address
+    if !nss_endpoint.is_empty() {
+        let nss_store_json =
+            format!(r#"{{"nodes":{{"{nss_a_id}":{{"network_address":"{nss_endpoint}:8088"}}}}}}"#);
+
+        if config.is_etcd_backend() {
+            let etcdctl = format!("{BIN_PATH}etcdctl");
+            let etcd_endpoints = get_etcd_endpoints_from_workflow(config)?;
+            let key = "/fractalbits-service-discovery/nss-store";
+            run_cmd!($etcdctl --endpoints=$etcd_endpoints put $key $nss_store_json >/dev/null)?;
+        } else if config.is_firestore_backend() {
+            let escaped = nss_store_json.replace('"', r#"\""#);
+            let fields_json = format!(
+                r#"{{"fields":{{"value":{{"stringValue":"{escaped}"}},"version":{{"integerValue":"1"}}}}}}"#
+            );
+            firestore_put_document(
+                config,
+                "fractalbits-service-discovery",
+                "nss-store",
+                &fields_json,
+            )?;
+        } else {
+            let region = get_current_aws_region()?;
+            let escaped = nss_store_json.replace('"', r#"\""#);
+            let nss_store_item =
+                format!(r#"{{"service_id":{{"S":"nss-store"}},"value":{{"S":"{escaped}"}}}}"#);
+            run_cmd! {
+                aws dynamodb put-item
+                    --table-name $DDB_SERVICE_DISCOVERY_TABLE
+                    --item $nss_store_item
+                    --region $region
+            }?;
+        }
+        info!("NSS store initialized in service discovery");
     }
 
     Ok(())

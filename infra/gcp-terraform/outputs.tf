@@ -23,16 +23,6 @@ output "nss_0_name" {
   description = "NSS-0 instance name"
 }
 
-output "nss_1_ip" {
-  value       = google_compute_instance.nss_b[0].network_interface[0].network_ip
-  description = "NSS-1 private IP"
-}
-
-output "nss_1_name" {
-  value       = google_compute_instance.nss_b[0].name
-  description = "NSS-1 instance name"
-}
-
 output "api_lb_ip" {
   value       = google_compute_forwarding_rule.api_lb.ip_address
   description = "API server load balancer IP"

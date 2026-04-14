@@ -83,23 +83,6 @@ pub fn init_service(
                 --provisioned-throughput ReadCapacityUnits=1,WriteCapacityUnits=1 >/dev/null;
         }?;
 
-        // Initialize observer_state in service-discovery table.
-        // active/standby with idle standby: role agent reports standby health.
-        // Fields match root_server's ObserverPersistentState and MachineState structs.
-        let observer_state_json = r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-1","running_service":"noop","expected_role":"standby","network_address":null},"version":1,"last_updated":0,"nss_node_map":{"nss-0":1,"nss-1":2},"next_nss_node_id":3}"#;
-        let observer_state_item = format!(
-            r#"{{"service_id":{{"S":"observer_state"}},"state":{{"S":"{}"}}}}"#,
-            observer_state_json.replace('"', "\\\"")
-        );
-
-        run_cmd! {
-            info "Initializing observer_state in service-discovery table ...";
-            $[LOCAL_DDB_ENVS]
-            aws dynamodb put-item
-                --table-name $SERVICE_DISCOVERY_TABLE
-                --item $observer_state_item >/dev/null;
-        }?;
-
         // Initialize AZ status in service-discovery table (using mock AZ names for local testing)
         let az_status_item = r#"{"service_id":{"S":"az_status"},"status":{"M":{"localdev-az1":{"S":"Normal"},"localdev-az2":{"S":"Normal"}}}}"#;
 
@@ -109,6 +92,21 @@ pub fn init_service(
             aws dynamodb put-item
                 --table-name $SERVICE_DISCOVERY_TABLE
                 --item $az_status_item >/dev/null;
+        }?;
+
+        // Initialize nss-store in service-discovery table
+        let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"}}}"#;
+        let nss_store_item = format!(
+            r#"{{"service_id":{{"S":"nss-store"}},"value":{{"S":"{}"}}}}"#,
+            nss_store_json.replace('"', r#"\""#)
+        );
+
+        run_cmd! {
+            info "Initializing nss-store in service-discovery table ...";
+            $[LOCAL_DDB_ENVS]
+            aws dynamodb put-item
+                --table-name $SERVICE_DISCOVERY_TABLE
+                --item $nss_store_item >/dev/null;
         }?;
 
         // Initialize BSS data volume group configuration in service-discovery table
@@ -207,11 +205,6 @@ pub fn init_service(
         // Initialize service-discovery keys using etcdctl
         let etcdctl = resolve_etcd_bin("etcdctl");
 
-        // Always use observer_state for role management.
-        // active/standby with idle standby: role agent reports standby health.
-        // Fields match root_server's ObserverPersistentState and MachineState structs.
-        let observer_state_json = r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-1","running_service":"noop","expected_role":"standby","network_address":null},"version":1,"last_updated":0,"nss_node_map":{"nss-0":1,"nss-1":2},"next_nss_node_id":3}"#;
-
         let az_status_json = r#"{"status":{"localdev-az1":"Normal","localdev-az2":"Normal"}}"#;
         let bss_data_vg_config = generate_bss_data_vg_config(init_config.bss_count);
         let bss_metadata_vg_config = generate_bss_metadata_vg_config(init_config.bss_count);
@@ -219,7 +212,6 @@ pub fn init_service(
 
         run_cmd! {
             info "Initializing etcd service-discovery keys...";
-            $etcdctl put /fractalbits-service-discovery/observer_state $observer_state_json >/dev/null;
             $etcdctl put /fractalbits-service-discovery/az_status $az_status_json >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-data-vg-config $bss_data_vg_config >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-metadata-vg-config $bss_metadata_vg_config >/dev/null;
@@ -234,9 +226,11 @@ pub fn init_service(
         }?;
 
         let journal_config_json = generate_initial_journal_config(&journal_uuid);
+        let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"}}}"#;
         run_cmd! {
-            info "Initializing journal config in etcd ...";
+            info "Initializing journal config and nss-store in etcd ...";
             $etcdctl put /fractalbits-service-discovery/journal-config $journal_config_json >/dev/null;
+            $etcdctl put /fractalbits-service-discovery/nss-store $nss_store_json >/dev/null;
         }?;
 
         stop_service(ServiceName::Etcd)?;
@@ -430,7 +424,6 @@ fn ensure_minio() -> CmdResult {
 fn seed_firestore_emulator() -> CmdResult {
     let bss_count = get_bss_count_from_config();
 
-    let observer_state_json = r#"{"observer_state":"active_standby","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"active","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"nss-1","running_service":"noop","expected_role":"standby","network_address":null},"version":1,"last_updated":0,"nss_node_map":{"nss-0":1,"nss-1":2},"next_nss_node_id":3}"#;
     let bss_data_vg_config = generate_bss_data_vg_config(bss_count);
     let bss_metadata_vg_config = generate_bss_metadata_vg_config(bss_count);
     let bss_journal_vg_config = generate_bss_journal_vg_config(bss_count);
@@ -446,17 +439,6 @@ fn seed_firestore_emulator() -> CmdResult {
                 -d $fields_json >/dev/null
         )
     };
-
-    let escaped_observer = observer_state_json.replace('"', r#"\""#);
-    let observer_fields = format!(
-        r#"{{"fields":{{"state":{{"stringValue":"{escaped_observer}"}},"version":{{"integerValue":"1"}}}}}}"#
-    );
-    info!("Seeding observer_state in Firestore...");
-    firestore_put(
-        "fractalbits-service-discovery",
-        "observer_state",
-        &observer_fields,
-    )?;
 
     let az_status_json = r#"{"status":{"localdev-az1":"Normal","localdev-az2":"Normal"}}"#;
     let escaped_az = az_status_json.replace('"', r#"\""#);
@@ -523,6 +505,18 @@ fn seed_firestore_emulator() -> CmdResult {
         "fractalbits-service-discovery",
         "journal-config",
         &journal_config_fields,
+    )?;
+
+    let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"}}}"#;
+    let escaped_nss_store = nss_store_json.replace('"', r#"\""#);
+    let nss_store_fields = format!(
+        r#"{{"fields":{{"value":{{"stringValue":"{escaped_nss_store}"}},"version":{{"integerValue":"1"}}}}}}"#
+    );
+    info!("Seeding nss-store in Firestore...");
+    firestore_put(
+        "fractalbits-service-discovery",
+        "nss-store",
+        &nss_store_fields,
     )?;
 
     Ok(())
@@ -1498,7 +1492,6 @@ fn get_or_create_shared_journal_uuid() -> Result<String, std::io::Error> {
 
     Ok(uuid)
 }
-
 
 pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdResult {
     use std::time::{Duration, Instant};

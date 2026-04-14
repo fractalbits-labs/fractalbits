@@ -24,10 +24,7 @@ pub use bss_repair_report::{
     DataRepairReport, DataVolumeReport, MetaRepairReport, MetaVolumeReport,
 };
 
-pub use observer_types::{
-    HealthCheckResponse, JournalConfig, MachineState, ObserverPersistentState, ObserverState,
-    ServiceStatus, ServiceType,
-};
+pub use observer_types::{JournalConfig, NssNodeState, NssStore, ServiceStatus};
 
 #[derive(Clone)]
 pub struct Versioned<T: Sized> {
