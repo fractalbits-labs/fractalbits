@@ -154,8 +154,7 @@ pub enum DeployTarget {
 #[clap(rename_all = "snake_case")]
 pub enum JournalType {
     #[default]
-    Ebs,
-    Nvme,
+    Remote,
 }
 
 #[derive(
@@ -593,14 +592,8 @@ pub fn create_bss_dirs(data_dir: &Path, bss_id: u32) -> CmdResult {
 
 /// Create directories for NSS server
 /// - is_ebs_journal: true for EBS journal, false for NVMe journal
-/// - For EBS: journal at data/ebs/<journal_uuid>/
-/// - For NVMe: journal at data/<dir_name>/local/journal/<journal_uuid>/
-pub fn create_nss_dirs(
-    data_dir: &Path,
-    dir_name: &str,
-    is_ebs_journal: bool,
-    journal_uuid: Option<&str>,
-) -> CmdResult {
+/// Create NSS directories. Journal at data/<dir_name>/local/journal/<journal_uuid>/
+pub fn create_nss_dirs(data_dir: &Path, dir_name: &str, journal_uuid: Option<&str>) -> CmdResult {
     info!("Creating directories for {} server", dir_name);
 
     let nss_dir = data_dir.join(dir_name);
@@ -608,20 +601,10 @@ pub fn create_nss_dirs(
     // Always create local/journal directory (needed for fbs.state and unit tests)
     fs::create_dir_all(nss_dir.join("local/journal"))?;
 
-    // Create journal directory based on journal type
-    if is_ebs_journal {
-        if let Some(uuid) = journal_uuid {
-            let ebs_journal_dir = data_dir.join("ebs").join(uuid);
-            fs::create_dir_all(&ebs_journal_dir)?;
-            info!("Created EBS journal directory: {:?}", ebs_journal_dir);
-        }
-    } else {
-        // NVMe journal
-        if let Some(uuid) = journal_uuid {
-            let local_journal_dir = nss_dir.join("local/journal").join(uuid);
-            fs::create_dir_all(&local_journal_dir)?;
-            info!("Created NVMe journal directory: {:?}", local_journal_dir);
-        }
+    if let Some(uuid) = journal_uuid {
+        let journal_dir = nss_dir.join("local/journal").join(uuid);
+        fs::create_dir_all(&journal_dir)?;
+        info!("Created journal directory: {:?}", journal_dir);
     }
 
     fs::create_dir_all(nss_dir.join("local/stats"))?;

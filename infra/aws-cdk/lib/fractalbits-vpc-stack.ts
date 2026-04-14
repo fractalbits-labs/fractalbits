@@ -41,7 +41,7 @@ export interface FractalbitsVpcStackProps extends cdk.StackProps {
   ebsVolumeSize: number;
   ebsVolumeIops: number;
   rssBackend: "etcd" | "ddb";
-  journalType: "ebs" | "nvme";
+  journalType: "remote";
   deployOS?: DeployOS;
 }
 
@@ -316,7 +316,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
     // CloudFormation resolves the volumeId token at deploy time.
     let ebsVolumeA: ec2.Volume | undefined;
     let ebsVolumeB: ec2.Volume | undefined;
-    if (props.journalType === "ebs") {
+    if (props.journalType === "remote") {
       ebsVolumeA = createEbsVolume(
         this,
         "MultiAttachVolumeA",
@@ -337,11 +337,11 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     // Per-service UserData: each instance gets --role (and optional sub-args) appended
     const nssVolumeIdArg =
-      props.journalType === "ebs" && ebsVolumeA
+      props.journalType === "remote" && ebsVolumeA
         ? ` --volume-id ${ebsVolumeA.volumeId}`
         : "";
     const nssVolumeBIdArg =
-      props.journalType === "ebs"
+      props.journalType === "remote"
         ? multiAz && ebsVolumeB
           ? ` --volume-id ${ebsVolumeB.volumeId}`
           : ` --volume-id ${ebsVolumeA!.volumeId}` // single-AZ: same volume for standby
@@ -427,7 +427,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
 
     // Attach EBS volumes to NSS instances (volumes were created before instances above)
-    if (props.journalType === "ebs" && ebsVolumeA) {
+    if (props.journalType === "remote" && ebsVolumeA) {
       attachEbsVolume(
         this,
         "MultiAttachVolumeAToNssA",
@@ -607,7 +607,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     this.nlbLoadBalancerDnsName = nlb.loadBalancerDnsName;
 
-    // Only output EBS volume IDs when journalType is "ebs"
+    // Output EBS volume IDs
     if (ebsVolumeA) {
       new cdk.CfnOutput(this, "VolumeAId", {
         value: ebsVolumeA.volumeId,

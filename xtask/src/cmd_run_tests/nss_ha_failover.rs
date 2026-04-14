@@ -232,10 +232,10 @@ pub async fn run_ebs_ha_failover_tests(backend: RssBackend) -> CmdResult {
 }
 
 async fn test_ebs_full_stack_initialization(backend: RssBackend) -> CmdResult {
-    info!("Initializing services with JournalType::Ebs...");
+    info!("Initializing services with JournalType::Remote...");
 
     let init_config = InitConfig {
-        journal_type: JournalType::Ebs,
+        journal_type: JournalType::Remote,
         rss_backend: backend,
         data_blob_storage: DataBlobStorage::AllInBssSingleAz,
         bss_count: 1,

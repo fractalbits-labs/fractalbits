@@ -1,8 +1,7 @@
 pub mod ebs_journal;
-pub mod nvme_journal;
 
 use super::common::*;
-use crate::config::{BootstrapConfig, DeployTarget, JournalType};
+use crate::config::{BootstrapConfig, DeployTarget};
 use crate::stage_helpers::{CommonServicesReadyStage, InstancesReadyStage};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use cmd_lib::*;
@@ -57,15 +56,16 @@ pub fn bootstrap(
 ) -> CmdResult {
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Nss)?;
     let meta_stack_testing = config.global.meta_stack_testing;
-    let journal_type = config.global.journal_type;
 
     // Resolve journal_uuid: prefer CLI/NodeEntry value, fall back to global config
     let global_journal_uuid;
-    let journal_uuid: Option<&str> = if journal_uuid.is_some() {
-        journal_uuid
+    let journal_uuid: &str = if let Some(uuid) = journal_uuid {
+        uuid
     } else {
         global_journal_uuid = config.global.journal_uuid.clone();
-        global_journal_uuid.as_deref()
+        global_journal_uuid
+            .as_deref()
+            .ok_or_else(|| Error::other("journal_uuid is required"))?
     };
 
     // Get private IP for stage completion metadata (used by RSS to discover NSS IP)
@@ -79,13 +79,8 @@ pub fn bootstrap(
     // Complete instances-ready stage
     InstancesReadyStage::complete_with_metadata(&barrier, instances_ready_meta)?;
 
-    if journal_type == JournalType::Nvme {
-        install_packages(&["nvme-cli", "mdadm"])?;
-        format_local_nvme_disks(false)?;
-    } else if journal_type == JournalType::Ebs {
-        // EBS HA uses NVMe persistent reservations for multi-attach failover
-        install_packages(&["nvme-cli"])?;
-    }
+    // NVMe persistent reservations used for multi-attach failover
+    install_packages(&["nvme-cli"])?;
     if meta_stack_testing || for_bench {
         let _ = download_binaries(config, &["rewrk_rpc"]);
     }
@@ -119,13 +114,11 @@ pub fn bootstrap(
     } else {
         config.get_resources().nss_b_id.is_some()
     };
-    let is_ebs_standby = journal_type == JournalType::Ebs && is_standby;
+    setup_configs(config, volume_id, journal_uuid, "nss")?;
 
-    setup_configs(config, journal_type, volume_id, journal_uuid, "nss")?;
-
-    if is_ebs_standby {
-        // EBS HA standby: skip format/mount entirely, start role_agent idle
-        info!("Starting as EBS HA standby NSS (idle)");
+    if is_standby {
+        // HA standby: skip format/mount entirely, start role_agent idle
+        info!("Starting as HA standby NSS (idle)");
 
         // Create local directories needed when standby becomes active
         prepare_local_dirs()?;
@@ -148,53 +141,35 @@ pub fn bootstrap(
         NssJournalReadyStage::wait_for_metadata_vg_ready(&barrier)?;
     }
     let metadata_vg_config = get_service_discovery_value(config, BSS_METADATA_VG_CONFIG_KEY)?;
-    info!("Fetched metadata VG config from service discovery");
+    let journal_vg_config = get_service_discovery_value(config, BSS_JOURNAL_VG_CONFIG_KEY)?;
+    info!("Fetched metadata and journal VG configs from service discovery");
 
-    // Format journal based on type (active or solo nodes only)
-    match journal_type {
-        JournalType::Nvme => {
-            nvme_journal::format(&metadata_vg_config)?;
+    // Format journal (active or solo nodes only)
+    // On GCP, the pd_ssd journal disk is pre-attached as device "nss-journal".
+    // No volume_id is passed via CLI; use the fixed GCP device name instead.
+    let gcp_default;
+    let volume_id = match volume_id {
+        Some(v) => v,
+        None if config.global.deploy_target == DeployTarget::Gcp => {
+            gcp_default = "gcp:nss-journal".to_string();
+            &gcp_default
         }
-        JournalType::Ebs => {
-            // On GCP, the pd_ssd journal disk is pre-attached as device "nss-journal".
-            // No volume_id is passed via CLI; use the fixed GCP device name instead.
-            let gcp_default;
-            let volume_id = match volume_id {
-                Some(v) => v,
-                None if config.global.deploy_target == DeployTarget::Gcp => {
-                    gcp_default = "gcp:nss-journal".to_string();
-                    &gcp_default
-                }
-                None => {
-                    return Err(Error::other("volume_id required for ebs journal type"));
-                }
-            };
-            let journal_uuid = journal_uuid
-                .ok_or_else(|| Error::other("journal_uuid required for ebs journal type"))?;
-            ebs_journal::format_with_volume_id(volume_id, journal_uuid, &metadata_vg_config)?;
+        None => {
+            return Err(Error::other("volume_id required for remote journal"));
         }
-    }
+    };
+    ebs_journal::format_with_volume_id(
+        volume_id,
+        journal_uuid,
+        &metadata_vg_config,
+        &journal_vg_config,
+    )?;
 
     // Signal that formatting is complete
     NssFormattedStage::complete(&barrier)?;
 
-    // NVMe HA standby: local disks are formatted, but nss_server stays idle
-    // until promoted. Start role_agent (which will sit in standby) and skip
-    // journal-ready signaling (the active node signals for the HA pair).
-    if journal_type == JournalType::Nvme && is_standby {
-        info!("Starting as NVMe HA standby NSS (idle)");
-        run_cmd!(systemctl start nss_role_agent.service)?;
-        CommonServicesReadyStage::complete(&barrier)?;
-        return Ok(());
-    }
-
-    // Active or solo path — identical for NVMe and EBS.
-    let nss_mode = match (journal_type, is_ha_mode) {
-        (JournalType::Ebs, true) => "EBS HA active",
-        (JournalType::Ebs, false) => "EBS solo",
-        (JournalType::Nvme, true) => "NVMe HA active",
-        (JournalType::Nvme, false) => "NVMe solo",
-    };
+    // Active or solo path
+    let nss_mode = if is_ha_mode { "HA active" } else { "solo" };
     info!("Starting as {nss_mode} NSS");
 
     run_cmd!(systemctl start nss_role_agent.service)?;
@@ -216,37 +191,18 @@ pub fn bootstrap(
 
 fn setup_configs(
     config: &BootstrapConfig,
-    journal_type: JournalType,
     volume_id: Option<&str>,
-    journal_uuid: Option<&str>,
+    journal_uuid: &str,
     service_name: &str,
 ) -> CmdResult {
-    // Journal-type specific config paths
-    // For EBS: journal at /data/ebs/{uuid}/ (mount handled by nss_role_agent)
-    // For NVMe: journal at /data/local/journal/
-    let (volume_dev, shared_dir) = match journal_type {
-        JournalType::Ebs => {
-            // On GCP, pd_ssd is pre-attached as "nss-journal"; no volume_id from CLI.
-            let gcp_default;
-            let vid = match volume_id {
-                Some(v) => v,
-                None if config.global.deploy_target == DeployTarget::Gcp => {
-                    gcp_default = "gcp:nss-journal".to_string();
-                    &gcp_default
-                }
-                None => return Err(Error::other("volume_id required for EBS")),
-            };
-            let uuid = journal_uuid.ok_or_else(|| Error::other("journal_uuid required for EBS"))?;
-            // shared_dir is relative to /data, so "ebs/{uuid}" means /data/ebs/{uuid}/
-            (
-                Some(ebs_journal::get_volume_dev(vid)),
-                format!("ebs/{uuid}"),
-            )
-        }
-        JournalType::Nvme => (None, "local/journal".to_string()),
-    };
+    // Validate volume_id is present (GCP pre-attaches as "nss-journal")
+    if volume_id.is_none() && config.global.deploy_target != DeployTarget::Gcp {
+        return Err(Error::other("volume_id required"));
+    }
+    // shared_dir is relative to /data, so "ebs/{uuid}" means /data/ebs/{uuid}/
+    let shared_dir = format!("ebs/{journal_uuid}");
 
-    create_nss_config(volume_dev.as_deref(), &shared_dir, journal_uuid)?;
+    create_nss_config(&shared_dir, journal_uuid)?;
 
     // Common configs
     create_coredump_config()?;
@@ -254,7 +210,7 @@ fn setup_configs(
         create_nss_role_agent_config(config)?;
     }
     create_systemd_unit_file("nss_role_agent", false)?;
-    create_systemd_unit_file_with_journal_type(service_name, false, Some(journal_type))?;
+    create_systemd_unit_file(service_name, false)?;
 
     create_logrotate_for_stats()?;
     if config.global.deploy_target == DeployTarget::Aws {
@@ -264,11 +220,7 @@ fn setup_configs(
     Ok(())
 }
 
-fn create_nss_config(
-    volume_dev: Option<&str>,
-    shared_dir: &str,
-    journal_uuid: Option<&str>,
-) -> CmdResult {
+fn create_nss_config(shared_dir: &str, journal_uuid: &str) -> CmdResult {
     // Get total memory in kilobytes from /proc/meminfo
     let total_mem_kb_str = run_fun!(cat /proc/meminfo | grep MemTotal | awk r"{print $2}")?;
     let total_mem_kb = total_mem_kb_str
@@ -279,22 +231,14 @@ fn create_nss_config(
     // Calculate total memory for blob_dram_kilo_bytes
     let blob_dram_kilo_bytes = (total_mem_kb as f64 * BLOB_DRAM_MEM_PERCENT) as u64;
 
-    let fa_journal_segment_size = if volume_dev.is_some() {
-        ebs_journal::FA_JOURNAL_SEGMENT_SIZE
-    } else {
-        nvme_journal::FA_JOURNAL_SEGMENT_SIZE
-    };
+    let fa_journal_segment_size = ebs_journal::FA_JOURNAL_SEGMENT_SIZE;
 
     let num_cores = num_cpus()?;
     let net_worker_thread_count = num_cores / 2;
     let fa_thread_dataop_count = num_cores / 2;
     let fa_thread_count = fa_thread_dataop_count + 4;
 
-    // Include journal_uuid in config if provided
-    let journal_uuid_line = match journal_uuid {
-        Some(uuid) => format!("journal_uuid = \"{uuid}\"\n"),
-        None => String::new(),
-    };
+    let journal_uuid_line = format!("journal_uuid = \"{journal_uuid}\"\n");
 
     let config_content = format!(
         r##"working_dir = "/data"
@@ -335,10 +279,14 @@ fn prepare_local_dirs() -> CmdResult {
 /// Prepare local directories and run nss_server format.
 /// If `create_journal_dir` is true, also creates /data/local/journal (for nvme mode).
 /// `metadata_vg_config` provides BSS addresses for buffer_manager initialization.
-pub(crate) fn format_nss(create_journal_dir: bool, metadata_vg_config: &str) -> CmdResult {
+pub(crate) fn format_nss(
+    create_journal_dir: bool,
+    metadata_vg_config: &str,
+    journal_vg_config: &str,
+) -> CmdResult {
     if create_journal_dir {
         run_cmd! {
-            info "Creating journal directory for nvme mode";
+            info "Creating journal directory";
             mkdir -p /data/local/journal;
         }?;
     }
@@ -347,7 +295,7 @@ pub(crate) fn format_nss(create_journal_dir: bool, metadata_vg_config: &str) -> 
 
     run_cmd! {
         info "Running format for nss_server";
-        METADATA_VG_CONFIG=$metadata_vg_config
+        METADATA_VG_CONFIG=$metadata_vg_config JOURNAL_VG_CONFIG=$journal_vg_config
         /opt/fractalbits/bin/nss_server format -c ${ETC_PATH}${NSS_SERVER_CONFIG};
     }?;
 
@@ -369,51 +317,44 @@ fn create_nss_role_agent_config(config: &BootstrapConfig) -> CmdResult {
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Build EBS failover config section if applicable
-    let ebs_failover_section = if config.global.journal_type == JournalType::Ebs {
-        let resources = config.get_resources();
-        let nss_nodes = config.get_node_entries("nss_server");
+    // Build EBS failover config section
+    let resources = config.get_resources();
+    let nss_nodes = config.get_node_entries("nss_server");
 
-        // Get the shared EBS volume_id and journal_uuid from nss-0's node entry
-        let nss_a_entry =
-            nss_nodes.and_then(|nodes| nodes.iter().find(|n| n.id == resources.nss_a_id));
-        let ebs_volume_id = nss_a_entry
-            .and_then(|n| n.volume_id.as_deref())
-            .unwrap_or("");
-        let ebs_journal_uuid = nss_a_entry
-            .and_then(|n| n.journal_uuid.as_deref())
-            .unwrap_or("");
+    // Get the shared EBS volume_id and journal_uuid from nss-0's node entry
+    let nss_a_entry = nss_nodes.and_then(|nodes| nodes.iter().find(|n| n.id == resources.nss_a_id));
+    let ebs_volume_id = nss_a_entry
+        .and_then(|n| n.volume_id.as_deref())
+        .unwrap_or("");
+    let ebs_journal_uuid = nss_a_entry
+        .and_then(|n| n.journal_uuid.as_deref())
+        .unwrap_or("");
 
-        // Determine peer instance ID: A's peer is B, B's peer is A
-        let peer_instance_id = if let Some(ref nss_b_id) = resources.nss_b_id {
-            if instance_id == *nss_b_id {
-                resources.nss_a_id.clone()
-            } else {
-                nss_b_id.clone()
-            }
+    // Determine peer instance ID: A's peer is B, B's peer is A
+    let peer_instance_id = if let Some(ref nss_b_id) = resources.nss_b_id {
+        if instance_id == *nss_b_id {
+            resources.nss_a_id.clone()
         } else {
-            String::new()
-        };
+            nss_b_id.clone()
+        }
+    } else {
+        String::new()
+    };
 
-        let region = &config.global.region;
+    let region = &config.global.region;
 
-        let mut section = format!(
-            r##"
-journal_type = "ebs"
+    let mut ebs_failover_section = format!(
+        r##"
+journal_type = "remote"
 ebs_volume_id = "{ebs_volume_id}"
 ebs_journal_uuid = "{ebs_journal_uuid}"
 aws_region = "{region}"
 "##
-        );
+    );
 
-        if !peer_instance_id.is_empty() {
-            section.push_str(&format!("peer_instance_id = \"{peer_instance_id}\"\n"));
-        }
-
-        section
-    } else {
-        String::new()
-    };
+    if !peer_instance_id.is_empty() {
+        ebs_failover_section.push_str(&format!("peer_instance_id = \"{peer_instance_id}\"\n"));
+    }
 
     let config_content = format!(
         r##"# NSS Role Agent Configuration

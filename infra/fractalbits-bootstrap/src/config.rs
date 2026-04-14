@@ -7,7 +7,7 @@ use crate::common::{BOOTSTRAP_CLUSTER_CONFIG, ETC_PATH, ensure_aws_cli, ensure_e
 // Re-export types from xtask_common
 pub use xtask_common::{
     BootstrapClusterConfig, ClusterEtcdConfig, ClusterNodeConfig, DataBlobStorage, DeployTarget,
-    JournalType, cloud_storage,
+    cloud_storage,
 };
 
 // Type aliases for backwards compatibility
