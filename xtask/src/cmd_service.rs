@@ -283,20 +283,13 @@ pub fn init_service(
 
         let format_log = "data/logs/format.log";
         let journal_uuid = get_or_create_shared_journal_uuid()?;
-        let journal_type = init_config.journal_type;
-        let is_ebs_journal = journal_type == JournalType::Ebs;
-        create_dirs_for_nss_server(is_ebs_journal, &journal_uuid)?;
+        create_dirs_for_nss_server(&journal_uuid)?;
         let nss_binary = resolve_binary_path("nss_server", build_mode);
         let metadata_vg = generate_bss_metadata_vg_config(init_config.bss_count);
         let journal_vg = generate_bss_journal_vg_config(init_config.bss_count);
 
-        // Compute shared_dir based on journal type (relative to working_dir which is ./data/nss-0)
-        // For EBS: shared_dir is "../ebs/<journal_uuid>" to reach ./data/ebs/<uuid>
-        // For NVMe: shared_dir is "local/journal/<journal_uuid>"
-        let shared_dir = match journal_type {
-            JournalType::Ebs => format!("../ebs/{}", journal_uuid),
-            JournalType::Nvme => format!("local/journal/{}", journal_uuid),
-        };
+        // Compute shared_dir (relative to working_dir which is ./data/nss-0)
+        let shared_dir = format!("local/journal/{}", journal_uuid);
 
         match build_mode {
             BuildMode::Debug => run_cmd! {
@@ -1231,14 +1224,8 @@ Environment="RUST_LOG=warn""##
             env_settings += "\nEnvironment=\"WORKING_DIR=./nss-%i\"";
             env_settings += &format!("\nEnvironmentFile=-{pwd}/data/etc/nss.env");
             let nss_binary = resolve_binary_path("nss_server", build_mode);
-            // Read journal_uuid from shared file and compute SHARED_DIR based on journal type
-            // For EBS: "../ebs/<uuid>" (relative to ./nss-%i to reach ./ebs/<uuid>)
-            // For NVMe: "local/journal/<uuid>"
-            let journal_type = init_config.journal_type;
-            let shared_dir_prefix = match journal_type {
-                JournalType::Ebs => "../ebs",
-                JournalType::Nvme => "local/journal",
-            };
+            // Read journal_uuid from shared file and compute SHARED_DIR
+            let shared_dir_prefix = "local/journal";
             format!(
                 r#"/bin/bash -c 'JOURNAL_UUID=$(cat ./etc/journal_uuid.txt); export JOURNAL_UUID; export SHARED_DIR="{shared_dir_prefix}/$JOURNAL_UUID"; if [ "%i" = "0" ]; then HEALTH_PORT=29999; else HEALTH_PORT=29998; fi; export HEALTH_PORT; if [ -n "$LOGS" ]; then {nss_binary} serve 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/nss-%i.log"; else exec {nss_binary} serve; fi'"#
             )
@@ -1250,9 +1237,7 @@ Environment="RUST_LOG=warn""##
             if init_config.nss_disable_restart_limit {
                 env_settings += "\nEnvironment=\"NSS_DISABLE_RESTART_LIMIT=1\"";
             }
-            if init_config.journal_type == JournalType::Ebs {
-                env_settings += "\nEnvironment=\"APP_JOURNAL_TYPE=ebs\"";
-            }
+            env_settings += "\nEnvironment=\"APP_JOURNAL_TYPE=remote\"";
             resolve_binary_path("nss_role_agent", build_mode)
         }
         ServiceName::Rss => {
@@ -1445,23 +1430,13 @@ WantedBy=multi-user.target
     Ok(())
 }
 
-fn create_dirs_for_nss_server(is_ebs_journal: bool, journal_uuid: &str) -> CmdResult {
+fn create_dirs_for_nss_server(journal_uuid: &str) -> CmdResult {
     info!("Creating necessary directories for nss_server");
     run_cmd!(mkdir -p data/logs)?;
     // Create working directories for both the active (nss-0) and the standby
     // (nss-1) so the standby has a valid ./nss-1 path for when it gets promoted.
-    create_nss_dirs(
-        Path::new("data"),
-        "nss-0",
-        is_ebs_journal,
-        Some(journal_uuid),
-    )?;
-    create_nss_dirs(
-        Path::new("data"),
-        "nss-1",
-        is_ebs_journal,
-        Some(journal_uuid),
-    )
+    create_nss_dirs(Path::new("data"), "nss-0", Some(journal_uuid))?;
+    create_nss_dirs(Path::new("data"), "nss-1", Some(journal_uuid))
 }
 
 fn get_or_create_shared_journal_uuid() -> Result<String, std::io::Error> {

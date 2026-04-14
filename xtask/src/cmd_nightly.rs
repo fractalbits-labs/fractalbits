@@ -91,7 +91,7 @@ fn run_crash_recovery_test(multi_bss: bool, initial_run: bool) -> CmdResult {
     core_dump_result
 }
 
-pub fn run_cmd_nightly(multi_bss: bool, _nightly_journal_type: NightlyJournalType) -> CmdResult {
+pub fn run_cmd_nightly(multi_bss: bool) -> CmdResult {
     info!("Running nightly crash recovery test (NSS mode, release build)");
     run_crash_recovery_test(multi_bss, true)
 }

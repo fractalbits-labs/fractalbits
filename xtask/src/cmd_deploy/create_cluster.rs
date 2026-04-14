@@ -193,7 +193,7 @@ impl InputClusterConfig {
             data_blob_storage: DataBlobStorage::AllInBssSingleAz,
             rss_ha_enabled: self.global.rss_ha_enabled,
             rss_backend: RssBackend::Etcd,
-            journal_type: JournalType::Nvme,
+            journal_type: JournalType::Remote,
             num_nss_nodes: None, // derived from populated nodes map at blueprint time
             num_bss_nodes: Some(self.global.num_bss_nodes),
             num_api_servers: self.global.num_api_servers,

@@ -57,9 +57,7 @@ pub fn generate_bootstrap_config(
             data_blob_storage: DataBlobStorage::AllInBssSingleAz,
             rss_ha_enabled: params.rss_ha_enabled,
             rss_backend: params.rss_backend,
-            // GCP uses pd_ssd (persistent disk) which is handled via the Ebs code path.
-            // No volume_id needed — the disk is pre-attached as device "nss-journal".
-            journal_type: xtask_common::JournalType::Ebs,
+            journal_type: xtask_common::JournalType::Remote,
             num_nss_nodes: Some(2), // Terraform always creates nss-0 and nss-1 unconditionally
             num_bss_nodes: Some(params.num_bss_nodes),
             num_api_servers: Some(params.num_api_servers),

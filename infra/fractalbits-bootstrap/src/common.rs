@@ -1,4 +1,4 @@
-use crate::config::{BootstrapConfig, DeployTarget, JournalType};
+use crate::config::{BootstrapConfig, DeployTarget};
 use cmd_lib::*;
 use std::io::Error;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -128,14 +128,6 @@ pub fn backup_config_to_workflow(config: &BootstrapConfig, cluster_id: &str) -> 
 }
 
 pub fn create_systemd_unit_file(service_name: &str, enable_now: bool) -> CmdResult {
-    create_systemd_unit_file_with_journal_type(service_name, enable_now, None)
-}
-
-pub fn create_systemd_unit_file_with_journal_type(
-    service_name: &str,
-    enable_now: bool,
-    journal_type: Option<JournalType>,
-) -> CmdResult {
     let working_dir = "/data";
     let mut requires = String::new();
     let mut env_settings = String::new();
@@ -171,11 +163,7 @@ Environment="HOST_ID={instance_id}"
                 r##"
 EnvironmentFile=-{ETC_PATH}nss.env"##
             );
-            requires = match journal_type {
-                Some(JournalType::Nvme) => "data-local.mount".to_string(),
-                Some(JournalType::Ebs) => String::new(),
-                None => unreachable!(),
-            };
+            requires = String::new();
             format!(
                 r#"/bin/bash -c 'if [ -n "$LOGS" ]; then {BIN_PATH}nss_server serve -c {ETC_PATH}{NSS_SERVER_CONFIG} 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/nss.log"; else exec {BIN_PATH}nss_server serve -c {ETC_PATH}{NSS_SERVER_CONFIG}; fi'"#
             )
