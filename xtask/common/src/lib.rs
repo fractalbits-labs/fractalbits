@@ -742,10 +742,14 @@ pub fn generate_bss_journal_vg_config(bss_count: u32) -> String {
 /// Generate initial JournalConfig JSON for seeding into service discovery.
 /// journal_size defaults to 1GB.
 pub fn generate_initial_journal_config(journal_uuid: &str) -> String {
+    generate_initial_journal_config_with_nss(journal_uuid, "nss-0")
+}
+
+pub fn generate_initial_journal_config_with_nss(journal_uuid: &str, nss_id: &str) -> String {
     let journal_size: u64 = 1024 * 1024 * 1024; // 1GB
     format!(
-        r#"{{"journal_uuid":"{}","device_id":1,"journal_size":{},"version":1,"journal_volume_ids":[],"metadata_volume_ids":[],"running_nss_id":null}}"#,
-        journal_uuid, journal_size
+        r#"{{"journal_uuid":"{}","device_id":1,"journal_size":{},"version":1,"journal_volume_ids":[],"metadata_volume_ids":[],"running_nss_id":"{}"}}"#,
+        journal_uuid, journal_size, nss_id
     )
 }
 

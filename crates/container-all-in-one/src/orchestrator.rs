@@ -66,7 +66,7 @@ impl Orchestrator {
 
         // Phase 3: Init API key and format+start NSS in parallel
         // - init_test_api_key needs RSS
-        // - format_nss + start_nss_role_agent needs BSS
+        // - format_journal + start_nss_role_agent needs BSS
         let phase_start = Instant::now();
         info!("Initializing API key and starting nss_role_agent in parallel");
 
@@ -74,8 +74,8 @@ impl Orchestrator {
         let api_key_task = tokio::task::spawn_blocking(move || init_test_api_key_static(&bin_dir));
 
         let format_start = Instant::now();
-        self.format_nss()?;
-        info!("format_nss completed in {:?}", format_start.elapsed());
+        self.format_journal()?;
+        info!("format_journal completed in {:?}", format_start.elapsed());
 
         self.start_nss_role_agent()?;
 
@@ -136,19 +136,16 @@ impl Orchestrator {
         let bss_metadata_vg = generate_bss_metadata_vg_config(1);
         let bss_journal_vg = generate_bss_journal_vg_config(1);
 
-        // Initialize observer_state for solo mode (single NSS)
-        let observer_state_json = r#"{"observer_state":"solo","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"solo","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"","running_service":"noop","expected_role":"","network_address":null},"last_updated":0.0,"version":0}"#;
-
-        // Journal config with default 1GB journal size
         let journal_config =
             generate_initial_journal_config("00000000-0000-0000-0000-000000000000");
+        let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"}}}"#;
 
         run_cmd! {
             $etcdctl put /fractalbits-service-discovery/bss-data-vg-config $bss_data_vg >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-metadata-vg-config $bss_metadata_vg >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-journal-vg-config $bss_journal_vg >/dev/null;
-            $etcdctl put /fractalbits-service-discovery/observer_state $observer_state_json >/dev/null;
             $etcdctl put /fractalbits-service-discovery/journal-config $journal_config >/dev/null;
+            $etcdctl put /fractalbits-service-discovery/nss-store $nss_store_json >/dev/null;
         }?;
 
         Ok(())
@@ -217,16 +214,9 @@ impl Orchestrator {
         Ok(())
     }
 
-    fn format_nss(&self) -> Result<()> {
+    fn format_journal(&self) -> Result<()> {
         let nss_bin = self.bin_dir.join("nss_server");
         let working_dir = self.data_dir.join("nss-0");
-
-        // Skip formatting if journal file already exists (data already formatted)
-        let journal_file = working_dir.join("local/journal/journal.data");
-        if journal_file.exists() {
-            info!("NSS data already formatted, skipping format_nss");
-            return Ok(());
-        }
 
         let journal_config =
             generate_initial_journal_config("00000000-0000-0000-0000-000000000000");

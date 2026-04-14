@@ -628,7 +628,6 @@ pub enum TestType {
     LeaderElection,
     BssNodeFailure,
     BssRepair,
-    NssHaWithEBS,
     FsServer {
         #[clap(long, help = "Run only FUSE tests")]
         fuse: bool,
