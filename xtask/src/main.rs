@@ -325,12 +325,7 @@ pub enum DeployCommand {
         )]
         rss_backend: RssBackend,
 
-        #[clap(
-            long,
-            value_enum,
-            long_help = "Journal type",
-            default_value = "remote"
-        )]
+        #[clap(long, value_enum, long_help = "Journal type", default_value = "remote")]
         journal_type: JournalType,
 
         #[clap(long, long_help = "EBS volume size in GiB", default_value = "20")]

@@ -1,4 +1,5 @@
 use crate::cmd_service::{start_service, stop_service};
+use xtask_common::generate_initial_journal_config;
 use crate::*;
 use chrono::Local;
 use std::path::Path;
@@ -61,7 +62,7 @@ fn run_crash_recovery_test(multi_bss: bool, initial_run: bool) -> CmdResult {
     let nightly_log = format!("{}/crash_recovery.log", log_dir);
     let venv_python = "./core/crash_recovery_test/.venv/bin/python3";
 
-    // Export VG configs and journal UUID so nss_server format and
+    // Export VG configs and journal config so nss_server format and
     // test_async_fractal_art (launched by the Python test harness) pick them up.
     let journal_uuid = std::fs::read_to_string("data/etc/journal_uuid.txt")?
         .trim()
@@ -69,11 +70,12 @@ fn run_crash_recovery_test(multi_bss: bool, initial_run: bool) -> CmdResult {
     let shared_dir = "local/journal/".to_string() + &journal_uuid;
     let metadata_vg_config = generate_bss_metadata_vg_config(init_config.bss_count);
     let journal_vg_config = generate_bss_journal_vg_config(init_config.bss_count);
+    let journal_config = generate_initial_journal_config(&journal_uuid);
 
     // Run crash recovery test
     let result = run_cmd! {
         info "Running crash_recovery_test with log $nightly_log ...";
-        METADATA_VG_CONFIG=$metadata_vg_config JOURNAL_VG_CONFIG=$journal_vg_config JOURNAL_UUID=$journal_uuid SHARED_DIR=$shared_dir
+        METADATA_VG_CONFIG=$metadata_vg_config JOURNAL_VG_CONFIG=$journal_vg_config JOURNAL_CONFIG=$journal_config SHARED_DIR=$shared_dir
             $venv_python ./core/crash_recovery_test/main.py --mode nss --build-mode release &>$nightly_log;
     }
     .inspect_err(|_| {

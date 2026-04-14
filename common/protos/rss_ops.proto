@@ -35,6 +35,9 @@ enum Command {
 
   // Journal Volume Group management
   GetJournalVgInfo = 29;
+
+  // Journal config management
+  GetJournalConfig = 30;
 }
 
 // Put
@@ -212,6 +215,17 @@ message GetJournalVgInfoRequest {
 message GetJournalVgInfoResponse {
   oneof result {
     string info_json = 1;
+    string error = 2;
+  }
+}
+
+// GetJournalConfig - Get per-journal configuration
+message GetJournalConfigRequest {
+}
+
+message GetJournalConfigResponse {
+  oneof result {
+    string config_json = 1;  // JSON-serialized JournalConfig
     string error = 2;
   }
 }

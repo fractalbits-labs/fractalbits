@@ -11,6 +11,7 @@ use tracing::{error, info, warn};
 use xtask_common::{
     check_port_ready, create_bss_dirs, create_nss_dirs, generate_bss_data_vg_config,
     generate_bss_journal_vg_config, generate_bss_metadata_vg_config,
+    generate_initial_journal_config,
 };
 
 pub struct Orchestrator {
@@ -138,11 +139,16 @@ impl Orchestrator {
         // Initialize observer_state for solo mode (single NSS)
         let observer_state_json = r#"{"observer_state":"solo","nss_machine":{"machine_id":"nss-0","running_service":"nss","expected_role":"solo","network_address":"127.0.0.1:8087"},"standby_machine":{"machine_id":"","running_service":"noop","expected_role":"","network_address":null},"last_updated":0.0,"version":0}"#;
 
+        // Journal config with default 1GB journal size
+        let journal_config =
+            generate_initial_journal_config("00000000-0000-0000-0000-000000000000");
+
         run_cmd! {
             $etcdctl put /fractalbits-service-discovery/bss-data-vg-config $bss_data_vg >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-metadata-vg-config $bss_metadata_vg >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-journal-vg-config $bss_journal_vg >/dev/null;
             $etcdctl put /fractalbits-service-discovery/observer_state $observer_state_json >/dev/null;
+            $etcdctl put /fractalbits-service-discovery/journal-config $journal_config >/dev/null;
         }?;
 
         Ok(())
@@ -222,8 +228,10 @@ impl Orchestrator {
             return Ok(());
         }
 
+        let journal_config =
+            generate_initial_journal_config("00000000-0000-0000-0000-000000000000");
         run_cmd! {
-            WORKING_DIR=$working_dir $nss_bin format;
+            WORKING_DIR=$working_dir JOURNAL_CONFIG=$journal_config $nss_bin format;
         }?;
 
         Ok(())

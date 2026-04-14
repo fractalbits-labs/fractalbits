@@ -348,6 +348,46 @@ fn initialize_observer_state(
     }
 
     info!("Observer state initialized in service discovery");
+
+    // Initialize journal config in service discovery
+    if let Some(journal_uuid) = shared_journal_uuid {
+        let journal_size: u64 = 4 * 1024 * 1024 * 1024; // 4GB for cloud deployment
+        let journal_config_json = format!(
+            r#"{{"journal_uuid":"{}","device_id":1,"journal_size":{},"version":1,"journal_volume_ids":[],"metadata_volume_ids":[],"running_nss_id":null}}"#,
+            journal_uuid, journal_size
+        );
+
+        if config.is_etcd_backend() {
+            let etcdctl = format!("{BIN_PATH}etcdctl");
+            let etcd_endpoints = get_etcd_endpoints_from_workflow(config)?;
+            let key = "/fractalbits-service-discovery/journal-config";
+            run_cmd!($etcdctl --endpoints=$etcd_endpoints put $key $journal_config_json >/dev/null)?;
+        } else if config.is_firestore_backend() {
+            let escaped = journal_config_json.replace('"', r#"\""#);
+            let fields_json = format!(
+                r#"{{"fields":{{"value":{{"stringValue":"{escaped}"}},"version":{{"integerValue":"1"}}}}}}"#
+            );
+            firestore_put_document(
+                config,
+                "fractalbits-service-discovery",
+                "journal-config",
+                &fields_json,
+            )?;
+        } else {
+            let region = get_current_aws_region()?;
+            let escaped = journal_config_json.replace('"', r#"\""#);
+            let journal_config_item =
+                format!(r#"{{"service_id":{{"S":"journal-config"}},"value":{{"S":"{escaped}"}}}}"#);
+            run_cmd! {
+                aws dynamodb put-item
+                    --table-name $DDB_SERVICE_DISCOVERY_TABLE
+                    --item $journal_config_item
+                    --region $region
+            }?;
+        }
+        info!("Journal config initialized in service discovery");
+    }
+
     Ok(())
 }
 
