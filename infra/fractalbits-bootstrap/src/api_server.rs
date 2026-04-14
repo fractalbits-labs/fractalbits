@@ -1,4 +1,4 @@
-use crate::config::{BootstrapConfig, DataBlobStorage, DeployTarget, JournalType};
+use crate::config::{BootstrapConfig, DataBlobStorage, DeployTarget};
 use crate::stage_helpers::{InstancesReadyStage, ServicesReadyStageDef};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use crate::*;
@@ -44,13 +44,8 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
 
     let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     // Wait for NSS journals to be ready before we can serve requests
-    // For NVMe journal, only active (nss-0) publishes journal-ready; standby is idle
-    let expected_journal_ready =
-        if remote_az.is_some() && config.global.journal_type != JournalType::Nvme {
-            2
-        } else {
-            1
-        };
+    // For multi-AZ, both active and standby publish journal-ready
+    let expected_journal_ready = if remote_az.is_some() { 2 } else { 1 };
     info!("Waiting for {expected_journal_ready} NSS journal(s) to be ready...");
     ServicesReadyStage::wait_for_nss_journal_ready(&barrier, expected_journal_ready)?;
 

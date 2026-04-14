@@ -3,7 +3,7 @@ use log::info;
 use std::io::Error;
 
 use crate::common::get_instance_id;
-use crate::config::{BootstrapConfig, InstanceConfig, JournalType};
+use crate::config::{BootstrapConfig, InstanceConfig};
 
 #[derive(Debug, Clone)]
 pub enum ServiceType {
@@ -129,18 +129,16 @@ fn parse_instance_config(
         "nss_server" => {
             let volume_id = instance_config.volume_id.clone();
             let journal_uuid = instance_config.journal_uuid.clone();
-            // volume_id and journal_uuid are required for ebs journal type
-            if config.global.journal_type == JournalType::Ebs {
-                if volume_id.is_none() {
-                    return Err(Error::other(
-                        "NSS server config missing volume_id for ebs journal type",
-                    ));
-                }
-                if journal_uuid.is_none() {
-                    return Err(Error::other(
-                        "NSS server config missing journal_uuid for ebs journal type",
-                    ));
-                }
+            // volume_id and journal_uuid are required for remote journal type
+            if volume_id.is_none() {
+                return Err(Error::other(
+                    "NSS server config missing volume_id for remote journal type",
+                ));
+            }
+            if journal_uuid.is_none() {
+                return Err(Error::other(
+                    "NSS server config missing journal_uuid for remote journal type",
+                ));
             }
             // Determine if this is the standby NSS node via resources (TOML path)
             let resources = config.get_resources();

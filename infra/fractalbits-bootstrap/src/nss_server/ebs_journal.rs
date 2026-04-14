@@ -8,10 +8,11 @@ pub fn format_with_volume_id(
     volume_id: &str,
     journal_uuid: &str,
     metadata_vg_config: &str,
+    journal_vg_config: &str,
 ) -> CmdResult {
     let ebs_dev = get_volume_dev(volume_id);
     info!("Formatting EBS device: {ebs_dev} for volume {volume_id} with UUID {journal_uuid}");
-    format_internal(&ebs_dev, journal_uuid, metadata_vg_config)?;
+    format_internal(&ebs_dev, journal_uuid, metadata_vg_config, journal_vg_config)?;
     Ok(())
 }
 
@@ -19,6 +20,7 @@ pub(crate) fn format_internal(
     ebs_dev: &str,
     journal_uuid: &str,
     metadata_vg_config: &str,
+    journal_vg_config: &str,
 ) -> CmdResult {
     // Mount EBS at /data/ebs/{journal_uuid} (dynamic mount point per volume)
     let mount_point = format!("/data/ebs/{journal_uuid}");
@@ -42,7 +44,7 @@ pub(crate) fn format_internal(
         mkdir -p $journal_dir;
     }?;
 
-    format_nss(false, metadata_vg_config)?;
+    format_nss(false, metadata_vg_config, journal_vg_config)?;
 
     run_cmd! {
         info "Enabling udev rules for EBS";
