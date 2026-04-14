@@ -25,8 +25,8 @@ pub use bss_repair_report::{
 };
 
 pub use observer_types::{
-    HealthCheckResponse, MachineState, ObserverPersistentState, ObserverState, ServiceStatus,
-    ServiceType,
+    HealthCheckResponse, JournalConfig, MachineState, ObserverPersistentState, ObserverState,
+    ServiceStatus, ServiceType,
 };
 
 #[derive(Clone)]

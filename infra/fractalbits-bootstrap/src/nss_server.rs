@@ -137,10 +137,11 @@ pub fn bootstrap(
     }
     let metadata_vg_config = get_service_discovery_value(config, BSS_METADATA_VG_CONFIG_KEY)?;
     let journal_vg_config = get_service_discovery_value(config, BSS_JOURNAL_VG_CONFIG_KEY)?;
-    info!("Fetched metadata and journal VG configs from service discovery");
+    let journal_config = get_service_discovery_value(config, "journal-config")?;
+    info!("Fetched metadata VG, journal VG, and journal configs from service discovery");
 
     // Format journal via quorum journal (BSS storage)
-    format_nss(&metadata_vg_config, &journal_vg_config)?;
+    format_nss(&metadata_vg_config, &journal_vg_config, &journal_config)?;
 
     // Signal that formatting is complete
     NssFormattedStage::complete(&barrier)?;
@@ -243,12 +244,13 @@ fn prepare_local_dirs() -> CmdResult {
 
 /// Prepare local directories and run nss_server format.
 /// `metadata_vg_config` provides BSS addresses for buffer_manager initialization.
-fn format_nss(metadata_vg_config: &str, journal_vg_config: &str) -> CmdResult {
+/// `journal_config` provides journal UUID, device ID, size, and fence token.
+fn format_nss(metadata_vg_config: &str, journal_vg_config: &str, journal_config: &str) -> CmdResult {
     prepare_local_dirs()?;
 
     run_cmd! {
         info "Running format for nss_server";
-        METADATA_VG_CONFIG=$metadata_vg_config JOURNAL_VG_CONFIG=$journal_vg_config
+        METADATA_VG_CONFIG=$metadata_vg_config JOURNAL_VG_CONFIG=$journal_vg_config JOURNAL_CONFIG=$journal_config
         /opt/fractalbits/bin/nss_server format -c ${ETC_PATH}${NSS_SERVER_CONFIG};
     }?;
 

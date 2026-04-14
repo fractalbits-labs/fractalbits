@@ -11,6 +11,7 @@ use uuid::Uuid;
 use xtask_common::{
     LOCAL_DDB_ENVS, LOCAL_DDB_ENVS_SYSTEMD, create_bss_dirs, create_nss_dirs,
     generate_bss_data_vg_config, generate_bss_journal_vg_config, generate_bss_metadata_vg_config,
+    generate_initial_journal_config,
 };
 
 pub fn init_service(
@@ -176,6 +177,21 @@ pub fn init_service(
                 --item $journal_uuid_item >/dev/null;
         }?;
 
+        // Initialize journal config in service-discovery table
+        let journal_config_json = generate_initial_journal_config(&journal_uuid);
+        let journal_config_item = format!(
+            r#"{{"service_id":{{"S":"journal-config"}},"value":{{"S":"{}"}}}}"#,
+            journal_config_json.replace('"', r#"\""#)
+        );
+
+        run_cmd! {
+            info "Initializing journal config in service-discovery table ...";
+            $[LOCAL_DDB_ENVS]
+            aws dynamodb put-item
+                --table-name $SERVICE_DISCOVERY_TABLE
+                --item $journal_config_item >/dev/null;
+        }?;
+
         Ok(())
     };
     let init_minio = |data_dir: &str| -> CmdResult { run_cmd!(mkdir -p $data_dir) };
@@ -215,6 +231,12 @@ pub fn init_service(
         run_cmd! {
             info "Initializing shared journal UUID in etcd ...";
             $etcdctl put /fractalbits-service-discovery/journal-uuid $journal_uuid >/dev/null;
+        }?;
+
+        let journal_config_json = generate_initial_journal_config(&journal_uuid);
+        run_cmd! {
+            info "Initializing journal config in etcd ...";
+            $etcdctl put /fractalbits-service-discovery/journal-config $journal_config_json >/dev/null;
         }?;
 
         stop_service(ServiceName::Etcd)?;
@@ -291,16 +313,18 @@ pub fn init_service(
         // Compute shared_dir (relative to working_dir which is ./data/nss-0)
         let shared_dir = format!("local/journal/{}", journal_uuid);
 
+        let journal_config = generate_initial_journal_config(&journal_uuid);
+
         match build_mode {
             BuildMode::Debug => run_cmd! {
                 info "formatting nss_server with default configs";
-                SHARED_DIR=$shared_dir JOURNAL_UUID=$journal_uuid METADATA_VG_CONFIG=$metadata_vg JOURNAL_VG_CONFIG=$journal_vg
+                SHARED_DIR=$shared_dir JOURNAL_CONFIG=$journal_config METADATA_VG_CONFIG=$metadata_vg JOURNAL_VG_CONFIG=$journal_vg
                     $nss_binary format --init_test_tree
                     |& ts -m $TS_FMT >$format_log;
             }?,
             BuildMode::Release => run_cmd! {
                 info "formatting nss_server for benchmarking";
-                SHARED_DIR=$shared_dir JOURNAL_UUID=$journal_uuid METADATA_VG_CONFIG=$metadata_vg JOURNAL_VG_CONFIG=$journal_vg
+                SHARED_DIR=$shared_dir JOURNAL_CONFIG=$journal_config METADATA_VG_CONFIG=$metadata_vg JOURNAL_VG_CONFIG=$journal_vg
                     $nss_binary format --init_test_tree
                     |& ts -m $TS_FMT >$format_log;
             }?,
@@ -487,6 +511,18 @@ fn seed_firestore_emulator() -> CmdResult {
         "fractalbits-service-discovery",
         "journal-uuid",
         &journal_fields,
+    )?;
+
+    let journal_config_json = generate_initial_journal_config(&journal_uuid);
+    let escaped_journal_config = journal_config_json.replace('"', r#"\""#);
+    let journal_config_fields = format!(
+        r#"{{"fields":{{"value":{{"stringValue":"{escaped_journal_config}"}},"version":{{"integerValue":"1"}}}}}}"#
+    );
+    info!("Seeding journal config in Firestore...");
+    firestore_put(
+        "fractalbits-service-discovery",
+        "journal-config",
+        &journal_config_fields,
     )?;
 
     Ok(())
@@ -1220,14 +1256,14 @@ Environment="RUST_LOG=warn""##
         ServiceName::Nss => {
             managed_service = true;
             // Use template-based service with instance suffix (A or B)
-            // WORKING_DIR, SHARED_DIR, JOURNAL_UUID, and HEALTH_PORT are set based on instance
+            // WORKING_DIR, SHARED_DIR, JOURNAL_CONFIG, and HEALTH_PORT are set based on instance
             env_settings += "\nEnvironment=\"WORKING_DIR=./nss-%i\"";
             env_settings += &format!("\nEnvironmentFile=-{pwd}/data/etc/nss.env");
             let nss_binary = resolve_binary_path("nss_server", build_mode);
             // Read journal_uuid from shared file and compute SHARED_DIR
             let shared_dir_prefix = "local/journal";
             format!(
-                r#"/bin/bash -c 'JOURNAL_UUID=$(cat ./etc/journal_uuid.txt); export JOURNAL_UUID; export SHARED_DIR="{shared_dir_prefix}/$JOURNAL_UUID"; if [ "%i" = "0" ]; then HEALTH_PORT=29999; else HEALTH_PORT=29998; fi; export HEALTH_PORT; if [ -n "$LOGS" ]; then {nss_binary} serve 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/nss-%i.log"; else exec {nss_binary} serve; fi'"#
+                r#"/bin/bash -c 'JOURNAL_UUID=$(cat ./etc/journal_uuid.txt); export SHARED_DIR="{shared_dir_prefix}/$JOURNAL_UUID"; if [ "%i" = "0" ]; then HEALTH_PORT=29999; else HEALTH_PORT=29998; fi; export HEALTH_PORT; if [ -n "$LOGS" ]; then {nss_binary} serve 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/nss-%i.log"; else exec {nss_binary} serve; fi'"#
             )
         }
         ServiceName::NssRoleAgent => {
@@ -1462,6 +1498,7 @@ fn get_or_create_shared_journal_uuid() -> Result<String, std::io::Error> {
 
     Ok(uuid)
 }
+
 
 pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdResult {
     use std::time::{Duration, Instant};
