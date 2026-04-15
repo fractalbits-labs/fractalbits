@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 use xtask_common::{
     check_port_ready, create_bss_dirs, create_nss_dirs, generate_bss_data_vg_config,
     generate_bss_journal_vg_config, generate_bss_metadata_vg_config,
-    generate_initial_journal_config,
+    generate_initial_journal_config, generate_initial_journal_configs,
 };
 
 pub struct Orchestrator {
@@ -136,15 +136,15 @@ impl Orchestrator {
         let bss_metadata_vg = generate_bss_metadata_vg_config(1);
         let bss_journal_vg = generate_bss_journal_vg_config(1);
 
-        let journal_config =
-            generate_initial_journal_config("00000000-0000-0000-0000-000000000000");
+        let journal_configs =
+            generate_initial_journal_configs("00000000-0000-0000-0000-000000000000", "nss-0");
         let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"}}}"#;
 
         run_cmd! {
             $etcdctl put /fractalbits-service-discovery/bss-data-vg-config $bss_data_vg >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-metadata-vg-config $bss_metadata_vg >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-journal-vg-config $bss_journal_vg >/dev/null;
-            $etcdctl put /fractalbits-service-discovery/journal-config $journal_config >/dev/null;
+            $etcdctl put /fractalbits-service-discovery/journal-configs $journal_configs >/dev/null;
             $etcdctl put /fractalbits-service-discovery/nss-store $nss_store_json >/dev/null;
         }?;
 
@@ -219,7 +219,7 @@ impl Orchestrator {
         let working_dir = self.data_dir.join("nss-0");
 
         let journal_config =
-            generate_initial_journal_config("00000000-0000-0000-0000-000000000000");
+            generate_initial_journal_config("00000000-0000-0000-0000-000000000000", "nss-0");
         run_cmd! {
             WORKING_DIR=$working_dir JOURNAL_CONFIG=$journal_config $nss_bin format;
         }?;

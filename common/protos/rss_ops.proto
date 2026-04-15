@@ -123,10 +123,7 @@ message GetNssRoleResponse {
     string role = 1;
     string error = 2;
   }
-  uint64 version = 3;
-  // field 4 removed (was nss_node_id)
-  // field 5 removed (was peer_nss_node_id)
-  optional string journal_uuid = 6;
+  optional string journal_config_json = 3;
 }
 
 // GetAzStatus - Query AZ availability status from service-discovery table
@@ -230,8 +227,9 @@ message GetJournalConfigResponse {
   }
 }
 
-// GetActiveNssAddress - Query the active NSS network address from observer state
+// GetActiveNssAddress - Query the NSS network address for a given routing key
 message GetActiveNssAddressRequest {
+  bytes routing_key = 1;  // 16-byte routing key; empty means use default journal
 }
 
 message GetActiveNssAddressResponse {

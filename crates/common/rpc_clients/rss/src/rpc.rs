@@ -169,7 +169,7 @@ impl RpcClient {
         }
     }
 
-    /// Returns (role, version, journal_uuid)
+    /// Returns (role, journal_config_json)
     pub async fn get_nss_role(
         &self,
         instance_id: &str,
@@ -177,7 +177,7 @@ impl RpcClient {
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
-    ) -> Result<(String, u64, Option<String>), RpcError> {
+    ) -> Result<(String, Option<String>), RpcError> {
         let _guard = InflightRpcGuard::new("rss", "get_nss_role");
         let start = Instant::now();
         let body = GetNssRoleRequest {
@@ -205,13 +205,12 @@ impl RpcClient {
         let resp: GetNssRoleResponse =
             PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
         let duration = start.elapsed();
-        let version = resp.version;
-        let journal_uuid = resp.journal_uuid;
+        let journal_config_json = resp.journal_config_json;
         match resp.result.unwrap() {
             rss_codec::get_nss_role_response::Result::Role(role) => {
                 histogram!("rss_rpc_nanos", "status" => "GetNssRole_Ok")
                     .record(duration.as_nanos() as f64);
-                Ok((role, version, journal_uuid))
+                Ok((role, journal_config_json))
             }
             rss_codec::get_nss_role_response::Result::Error(err) => {
                 histogram!("rss_rpc_nanos", "status" => "GetNssRole_Error")
@@ -686,13 +685,16 @@ impl RpcClient {
 
     pub async fn get_active_nss_address(
         &self,
+        routing_key: &[u8],
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<String, RpcError> {
         let _guard = InflightRpcGuard::new("rss", "get_active_nss_address");
         let start = Instant::now();
-        let body = GetActiveNssAddressRequest {};
+        let body = GetActiveNssAddressRequest {
+            routing_key: bytes::Bytes::copy_from_slice(routing_key),
+        };
 
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
