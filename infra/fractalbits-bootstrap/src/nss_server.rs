@@ -137,7 +137,16 @@ pub fn bootstrap(
     }
     let metadata_vg_config = get_service_discovery_value(config, BSS_METADATA_VG_CONFIG_KEY)?;
     let journal_vg_config = get_service_discovery_value(config, BSS_JOURNAL_VG_CONFIG_KEY)?;
-    let journal_config = get_service_discovery_value(config, "journal-config")?;
+    let journal_configs_json = get_service_discovery_value(config, "journal-configs")?;
+    // Extract the first journal config from the list for this NSS
+    let journal_configs: Vec<serde_json::Value> =
+        serde_json::from_str(&journal_configs_json).map_err(|e| {
+            Error::other(format!("Failed to parse journal-configs: {e}"))
+        })?;
+    let journal_config = journal_configs
+        .first()
+        .ok_or_else(|| Error::other("journal-configs list is empty"))?
+        .to_string();
     info!("Fetched metadata VG, journal VG, and journal configs from service discovery");
 
     // Format journal via quorum journal (BSS storage)

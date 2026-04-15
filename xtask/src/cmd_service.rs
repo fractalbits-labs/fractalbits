@@ -11,7 +11,7 @@ use uuid::Uuid;
 use xtask_common::{
     LOCAL_DDB_ENVS, LOCAL_DDB_ENVS_SYSTEMD, create_bss_dirs, create_nss_dirs,
     generate_bss_data_vg_config, generate_bss_journal_vg_config, generate_bss_metadata_vg_config,
-    generate_initial_journal_config,
+    generate_initial_journal_config, generate_initial_journal_configs,
 };
 
 pub fn init_service(
@@ -175,19 +175,19 @@ pub fn init_service(
                 --item $journal_uuid_item >/dev/null;
         }?;
 
-        // Initialize journal config in service-discovery table
-        let journal_config_json = generate_initial_journal_config(&journal_uuid);
-        let journal_config_item = format!(
-            r#"{{"service_id":{{"S":"journal-config"}},"value":{{"S":"{}"}}}}"#,
-            journal_config_json.replace('"', r#"\""#)
+        // Initialize journal configs in service-discovery table
+        let journal_configs_json = generate_initial_journal_configs(&journal_uuid, "nss-0");
+        let journal_configs_item = format!(
+            r#"{{"service_id":{{"S":"journal-configs"}},"value":{{"S":"{}"}}}}"#,
+            journal_configs_json.replace('"', r#"\""#)
         );
 
         run_cmd! {
-            info "Initializing journal config in service-discovery table ...";
+            info "Initializing journal configs in service-discovery table ...";
             $[LOCAL_DDB_ENVS]
             aws dynamodb put-item
                 --table-name $SERVICE_DISCOVERY_TABLE
-                --item $journal_config_item >/dev/null;
+                --item $journal_configs_item >/dev/null;
         }?;
 
         Ok(())
@@ -225,11 +225,11 @@ pub fn init_service(
             $etcdctl put /fractalbits-service-discovery/journal-uuid $journal_uuid >/dev/null;
         }?;
 
-        let journal_config_json = generate_initial_journal_config(&journal_uuid);
+        let journal_configs_json = generate_initial_journal_configs(&journal_uuid, "nss-0");
         let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"}}}"#;
         run_cmd! {
-            info "Initializing journal config and nss-store in etcd ...";
-            $etcdctl put /fractalbits-service-discovery/journal-config $journal_config_json >/dev/null;
+            info "Initializing journal configs and nss-store in etcd ...";
+            $etcdctl put /fractalbits-service-discovery/journal-configs $journal_configs_json >/dev/null;
             $etcdctl put /fractalbits-service-discovery/nss-store $nss_store_json >/dev/null;
         }?;
 
@@ -307,7 +307,7 @@ pub fn init_service(
         // Compute shared_dir (relative to working_dir which is ./data/nss-0)
         let shared_dir = format!("local/journal/{}", journal_uuid);
 
-        let journal_config = generate_initial_journal_config(&journal_uuid);
+        let journal_config = generate_initial_journal_config(&journal_uuid, "nss-0");
 
         match build_mode {
             BuildMode::Debug => run_cmd! {
@@ -495,16 +495,16 @@ fn seed_firestore_emulator() -> CmdResult {
         &journal_fields,
     )?;
 
-    let journal_config_json = generate_initial_journal_config(&journal_uuid);
-    let escaped_journal_config = journal_config_json.replace('"', r#"\""#);
-    let journal_config_fields = format!(
-        r#"{{"fields":{{"value":{{"stringValue":"{escaped_journal_config}"}},"version":{{"integerValue":"1"}}}}}}"#
+    let journal_configs_json = generate_initial_journal_configs(&journal_uuid, "nss-0");
+    let escaped_journal_configs = journal_configs_json.replace('"', r#"\""#);
+    let journal_configs_fields = format!(
+        r#"{{"fields":{{"value":{{"stringValue":"{escaped_journal_configs}"}},"version":{{"integerValue":"1"}}}}}}"#
     );
-    info!("Seeding journal config in Firestore...");
+    info!("Seeding journal configs in Firestore...");
     firestore_put(
         "fractalbits-service-discovery",
-        "journal-config",
-        &journal_config_fields,
+        "journal-configs",
+        &journal_configs_fields,
     )?;
 
     let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"}}}"#;

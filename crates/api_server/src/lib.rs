@@ -127,14 +127,15 @@ impl AppState {
 
     /// Try to refresh NSS address from RSS when connection fails.
     /// Returns true if address was refreshed and caller should retry the operation.
+    /// TODO: handle multi-NSS routing with per-bucket routing_key
     pub async fn try_refresh_nss_address(&self, trace_id: &TraceId) -> bool {
         let current_addr = self.get_nss_address().await;
 
-        // Fetch latest NSS address from RSS
+        // Fetch latest NSS address from RSS (empty routing_key = default journal)
         let rss_client = self.get_rss_rpc_client();
         match rss_rpc_retry!(
             rss_client,
-            get_active_nss_address(Some(self.config.rss_rpc_timeout()), trace_id)
+            get_active_nss_address(&[], Some(self.config.rss_rpc_timeout()), trace_id)
         )
         .await
         {
@@ -159,19 +160,20 @@ impl AppState {
         }
     }
 
-    /// Ensures NSS client is initialized by fetching address from RSS if needed
+    /// Ensures NSS client is initialized by fetching address from RSS if needed.
+    /// TODO: handle multi-NSS routing with per-bucket routing_key
     pub async fn ensure_nss_client_initialized(&self, trace_id: &TraceId) -> bool {
         // Fast path: check if already initialized
         if self.get_nss_rpc_client().await.is_ok() {
             return true;
         }
 
-        // Fetch NSS address from RSS
+        // Fetch NSS address from RSS (empty routing_key = default journal)
         tracing::info!("NSS client not initialized, fetching address from RSS");
         let rss_client = self.get_rss_rpc_client();
         match rss_rpc_retry!(
             rss_client,
-            get_active_nss_address(Some(self.config.rss_rpc_timeout()), trace_id)
+            get_active_nss_address(&[], Some(self.config.rss_rpc_timeout()), trace_id)
         )
         .await
         {

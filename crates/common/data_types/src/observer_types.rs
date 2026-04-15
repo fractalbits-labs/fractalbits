@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,13 +39,15 @@ pub struct JournalConfig {
     pub journal_size: u64,
     /// Config version, also used as fence token
     pub version: u64,
-    /// Journal volume IDs this journal can write to (no dups, must be valid)
-    pub journal_volume_ids: Vec<u16>,
-    /// Metadata volume IDs for NSS running with this journal (no dups, must be valid)
-    pub metadata_volume_ids: Vec<u16>,
     /// Which NSS instance is currently running with this journal
     #[serde(default)]
     pub running_nss_id: Option<String>,
+    /// Metadata VG config JSON, passed to NSS as METADATA_VG_CONFIG env var
+    #[serde(default)]
+    pub metadata_vg_config_json: Option<String>,
+    /// Journal VG config JSON, passed to NSS as JOURNAL_VG_CONFIG env var
+    #[serde(default)]
+    pub journal_vg_config_json: Option<String>,
 }
 
 impl JournalConfig {
@@ -54,21 +56,6 @@ impl JournalConfig {
         if self.device_id == 0 {
             return Err("device_id must be >= 1".to_string());
         }
-
-        let mut seen = HashSet::new();
-        for &id in &self.journal_volume_ids {
-            if !seen.insert(id) {
-                return Err(format!("duplicate journal_volume_id: {id}"));
-            }
-        }
-
-        let mut seen = HashSet::new();
-        for &id in &self.metadata_volume_ids {
-            if !seen.insert(id) {
-                return Err(format!("duplicate metadata_volume_id: {id}"));
-            }
-        }
-
         Ok(())
     }
 }
@@ -108,9 +95,9 @@ mod tests {
             device_id: 1,
             journal_size: 1024 * 1024 * 1024,
             version: 1,
-            journal_volume_ids: vec![1, 2, 3],
-            metadata_volume_ids: vec![10, 20],
             running_nss_id: Some("nss-0".to_string()),
+            metadata_vg_config_json: None,
+            journal_vg_config_json: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: JournalConfig = serde_json::from_str(&json).unwrap();
@@ -119,7 +106,7 @@ mod tests {
 
     #[test]
     fn test_journal_config_default_running_nss_id() {
-        let json = r#"{"journal_uuid":"test-uuid","device_id":1,"journal_size":0,"version":1,"journal_volume_ids":[],"metadata_volume_ids":[]}"#;
+        let json = r#"{"journal_uuid":"test-uuid","device_id":1,"journal_size":0,"version":1}"#;
         let config: JournalConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.running_nss_id, None);
     }
@@ -131,9 +118,9 @@ mod tests {
             device_id: 1,
             journal_size: 0,
             version: 1,
-            journal_volume_ids: vec![1, 2, 3],
-            metadata_volume_ids: vec![10, 20],
             running_nss_id: None,
+            metadata_vg_config_json: None,
+            journal_vg_config_json: None,
         };
         assert!(config.validate().is_ok());
     }
@@ -145,40 +132,10 @@ mod tests {
             device_id: 0,
             journal_size: 0,
             version: 1,
-            journal_volume_ids: vec![],
-            metadata_volume_ids: vec![],
             running_nss_id: None,
+            metadata_vg_config_json: None,
+            journal_vg_config_json: None,
         };
         assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_journal_config_validate_dup_journal_volume_ids() {
-        let config = JournalConfig {
-            journal_uuid: "test-uuid".to_string(),
-            device_id: 1,
-            journal_size: 0,
-            version: 1,
-            journal_volume_ids: vec![1, 2, 1],
-            metadata_volume_ids: vec![],
-            running_nss_id: None,
-        };
-        let err = config.validate().expect_err("should fail on dup");
-        assert!(err.contains("duplicate journal_volume_id"));
-    }
-
-    #[test]
-    fn test_journal_config_validate_dup_metadata_volume_ids() {
-        let config = JournalConfig {
-            journal_uuid: "test-uuid".to_string(),
-            device_id: 1,
-            journal_size: 0,
-            version: 1,
-            journal_volume_ids: vec![],
-            metadata_volume_ids: vec![5, 5],
-            running_nss_id: None,
-        };
-        let err = config.validate().expect_err("should fail on dup");
-        assert!(err.contains("duplicate metadata_volume_id"));
     }
 }

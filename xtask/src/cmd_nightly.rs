@@ -70,7 +70,7 @@ fn run_crash_recovery_test(multi_bss: bool, initial_run: bool) -> CmdResult {
     let shared_dir = "local/journal/".to_string() + &journal_uuid;
     let metadata_vg_config = generate_bss_metadata_vg_config(init_config.bss_count);
     let journal_vg_config = generate_bss_journal_vg_config(init_config.bss_count);
-    let journal_config = generate_initial_journal_config(&journal_uuid);
+    let journal_config = generate_initial_journal_config(&journal_uuid, "nss-0");
 
     // Run crash recovery test
     let result = run_cmd! {

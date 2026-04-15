@@ -185,7 +185,7 @@ pub fn run_zig_unit_tests(init_config: &InitConfig) -> CmdResult {
         .trim()
         .to_string();
     let shared_dir = format!("local/journal/{}", journal_uuid);
-    let journal_config = xtask_common::generate_initial_journal_config(&journal_uuid);
+    let journal_config = xtask_common::generate_initial_journal_config(&journal_uuid, "nss-0");
     run_cmd! {
         info "Formatting nss_server";
         SHARED_DIR=$shared_dir JOURNAL_CONFIG=$journal_config $working_dir/$ZIG_DEBUG_OUT/bin/nss_server format;

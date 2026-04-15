@@ -7,6 +7,7 @@ pub mod hash;
 pub mod object_layout;
 pub mod observer_types;
 mod permission;
+mod routing_key;
 mod trace_id;
 mod volume;
 
@@ -25,6 +26,7 @@ pub use bss_repair_report::{
 };
 
 pub use observer_types::{JournalConfig, NssNodeState, NssStore, ServiceStatus};
+pub use routing_key::RoutingKey;
 
 #[derive(Clone)]
 pub struct Versioned<T: Sized> {
