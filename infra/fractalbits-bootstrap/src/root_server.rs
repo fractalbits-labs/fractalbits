@@ -366,6 +366,33 @@ fn initialize_observer_state(
         info!("NSS store initialized in service discovery");
     }
 
+    // Initialize observer leader fence token
+    if config.is_etcd_backend() {
+        let etcdctl = format!("{BIN_PATH}etcdctl");
+        let etcd_endpoints = get_etcd_endpoints_from_workflow(config)?;
+        let key = "/fractalbits-service-discovery/observer-leader-fence";
+        run_cmd!($etcdctl --endpoints=$etcd_endpoints put $key "0" >/dev/null)?;
+    } else if config.is_firestore_backend() {
+        let fields_json = r#"{"fields":{"value":{"integerValue":"0"}}}"#;
+        firestore_put_document(
+            config,
+            "fractalbits-service-discovery",
+            "observer-leader-fence",
+            fields_json,
+        )?;
+    } else {
+        let region = get_current_aws_region()?;
+        let fence_item =
+            r#"{"service_id":{"S":"observer-leader-fence"},"value":{"N":"0"}}"#;
+        run_cmd! {
+            aws dynamodb put-item
+                --table-name $DDB_SERVICE_DISCOVERY_TABLE
+                --item $fence_item
+                --region $region
+        }?;
+    }
+    info!("Observer leader fence token initialized in service discovery");
+
     Ok(())
 }
 

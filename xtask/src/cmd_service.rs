@@ -95,11 +95,14 @@ pub fn init_service(
         }?;
 
         // Initialize nss-store in service-discovery table
-        let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"}}}"#;
+        let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"},"nss-1":{"network_address":"127.0.0.1:8087"}}}"#;
         let nss_store_item = format!(
             r#"{{"service_id":{{"S":"nss-store"}},"value":{{"S":"{}"}}}}"#,
             nss_store_json.replace('"', r#"\""#)
         );
+
+        let observer_fence_item =
+            r#"{"service_id":{"S":"observer-leader-fence"},"value":{"N":"0"}}"#;
 
         run_cmd! {
             info "Initializing nss-store in service-discovery table ...";
@@ -107,6 +110,11 @@ pub fn init_service(
             aws dynamodb put-item
                 --table-name $SERVICE_DISCOVERY_TABLE
                 --item $nss_store_item >/dev/null;
+            info "Initializing observer-leader-fence in service-discovery table ...";
+            $[LOCAL_DDB_ENVS]
+            aws dynamodb put-item
+                --table-name $SERVICE_DISCOVERY_TABLE
+                --item $observer_fence_item >/dev/null;
         }?;
 
         // Initialize BSS data volume group configuration in service-discovery table
@@ -226,11 +234,12 @@ pub fn init_service(
         }?;
 
         let journal_configs_json = generate_initial_journal_configs(&journal_uuid, "nss-0");
-        let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"}}}"#;
+        let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"},"nss-1":{"network_address":"127.0.0.1:8087"}}}"#;
         run_cmd! {
-            info "Initializing journal configs and nss-store in etcd ...";
+            info "Initializing journal configs, nss-store, and observer fence in etcd ...";
             $etcdctl put /fractalbits-service-discovery/journal-configs $journal_configs_json >/dev/null;
             $etcdctl put /fractalbits-service-discovery/nss-store $nss_store_json >/dev/null;
+            $etcdctl put /fractalbits-service-discovery/observer-leader-fence 0 >/dev/null;
         }?;
 
         stop_service(ServiceName::Etcd)?;
@@ -507,7 +516,7 @@ fn seed_firestore_emulator() -> CmdResult {
         &journal_configs_fields,
     )?;
 
-    let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"}}}"#;
+    let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"},"nss-1":{"network_address":"127.0.0.1:8087"}}}"#;
     let escaped_nss_store = nss_store_json.replace('"', r#"\""#);
     let nss_store_fields = format!(
         r#"{{"fields":{{"value":{{"stringValue":"{escaped_nss_store}"}},"version":{{"integerValue":"1"}}}}}}"#
@@ -517,6 +526,14 @@ fn seed_firestore_emulator() -> CmdResult {
         "fractalbits-service-discovery",
         "nss-store",
         &nss_store_fields,
+    )?;
+
+    let observer_fence_fields = r#"{"fields":{"value":{"integerValue":"0"}}}"#;
+    info!("Seeding observer-leader-fence in Firestore...");
+    firestore_put(
+        "fractalbits-service-discovery",
+        "observer-leader-fence",
+        observer_fence_fields,
     )?;
 
     Ok(())
@@ -1286,7 +1303,7 @@ Environment="RUST_LOG=warn""##
                 "\nEnvironment=\"LEADER_TABLE_NAME=fractalbits-leader-election-observer\"";
             env_settings += "\nEnvironment=\"INSTANCE_ID=rss-local\"";
             // Give services time to start before observer starts triggering failovers
-            env_settings += "\nEnvironment=\"OBSERVER_INITIAL_GRACE_PERIOD_SECS=30\"";
+            env_settings += "\nEnvironment=\"OBSERVER_INITIAL_GRACE_PERIOD_SECS=15\"";
             resolve_binary_path("root_server", build_mode)
         }
         ServiceName::ApiServer => {
