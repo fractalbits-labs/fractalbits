@@ -3,6 +3,7 @@ pub mod bss_repair;
 pub mod fs_server;
 pub mod leader_election;
 pub mod multi_az;
+pub mod nss_failover;
 
 use crate::{
     CmdResult, DataBlobStorage, InitConfig, MultiAzTestType, RssBackend, ServiceName, TestType,
@@ -89,6 +90,24 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         result
     };
 
+    let test_nss_failover = |backend: RssBackend| async move {
+        cmd_service::init_service(
+            ServiceName::All,
+            BuildMode::Debug,
+            &InitConfig {
+                rss_backend: backend,
+                data_blob_storage: DataBlobStorage::AllInBssSingleAz,
+                bss_count: 1,
+                nss_disable_restart_limit: true,
+                ..Default::default()
+            },
+        )?;
+        cmd_service::start_service(ServiceName::All)?;
+        let result = nss_failover::run_nss_failover_tests(backend).await;
+        cmd_service::stop_service(ServiceName::All)?;
+        result
+    };
+
     let test_bss_repair = || async {
         cmd_service::init_service(
             ServiceName::All,
@@ -117,6 +136,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         TestType::LeaderElection => test_leader_election(),
         TestType::BssNodeFailure => test_bss_node_failure().await,
         TestType::BssRepair => test_bss_repair().await,
+        TestType::NssFailover => test_nss_failover(RssBackend::Etcd).await,
         TestType::FsServer {
             fuse,
             nfs,

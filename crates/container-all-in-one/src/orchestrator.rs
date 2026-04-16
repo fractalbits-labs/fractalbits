@@ -146,6 +146,7 @@ impl Orchestrator {
             $etcdctl put /fractalbits-service-discovery/bss-journal-vg-config $bss_journal_vg >/dev/null;
             $etcdctl put /fractalbits-service-discovery/journal-configs $journal_configs >/dev/null;
             $etcdctl put /fractalbits-service-discovery/nss-store $nss_store_json >/dev/null;
+            $etcdctl put /fractalbits-service-discovery/observer-leader-fence 0 >/dev/null;
         }?;
 
         Ok(())
