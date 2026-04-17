@@ -189,22 +189,6 @@ pub const METADATA_VG_READY: StageDef = StageDef {
     timeout_secs: 600,
 };
 
-pub const NSS_FORMATTED: StageDef = StageDef {
-    name: "nss-formatted",
-    desc: "NSS formatted",
-    depends_on: &[&RSS_INITIALIZED],
-    is_global: false,
-    timeout_secs: 600,
-};
-
-pub const NSS_JOURNAL_READY: StageDef = StageDef {
-    name: "nss-journal-ready",
-    desc: "NSS journal ready",
-    depends_on: &[&NSS_FORMATTED, &METADATA_VG_READY],
-    is_global: false,
-    timeout_secs: 600,
-};
-
 pub const BSS_CONFIGURED: StageDef = StageDef {
     name: "bss-configured",
     desc: "BSS configured",
@@ -213,10 +197,54 @@ pub const BSS_CONFIGURED: StageDef = StageDef {
     timeout_secs: 1200, // storage_alloc_mode=.write_zero is slower
 };
 
+pub const BSS_READY: StageDef = StageDef {
+    name: "bss-ready",
+    desc: "BSS serving on its port",
+    // BSS_CONFIGURED signals that format finished and the systemd unit was
+    // installed, but bss_server still takes a few seconds to bind its port.
+    // BSS_READY is signaled only after the port is accepting connections, so
+    // NSS quorum writes don't race against a not-yet-listening BSS.
+    depends_on: &[&BSS_CONFIGURED],
+    is_global: false,
+    // Only covers the port-bind gap (typically seconds). The long zero-write
+    // format is covered by the prior BSS_CONFIGURED wait, so callers should
+    // wait for bss-configured first and then bss-ready.
+    timeout_secs: 300,
+};
+
+pub const NSS_CONFIGURED: StageDef = StageDef {
+    name: "nss-configured",
+    desc: "NSS configured",
+    depends_on: &[&RSS_INITIALIZED],
+    is_global: false,
+    timeout_secs: 600,
+};
+
+pub const JOURNAL_FORMATTED: StageDef = StageDef {
+    name: "journal-formatted",
+    desc: "Journal formatted",
+    // Global because exactly one NSS (the journal owner, nss-0) formats the
+    // quorum journal — concurrent formats would corrupt it. All other NSS
+    // wait on this single signal before starting nss_server.
+    // BSS_READY: format issues quorum writes to BSS, so every BSS node must
+    // be serving on its port (not just done with format) first.
+    depends_on: &[&NSS_CONFIGURED, &METADATA_VG_READY, &BSS_READY],
+    is_global: true,
+    timeout_secs: 600,
+};
+
+pub const NSS_JOURNAL_READY: StageDef = StageDef {
+    name: "nss-journal-ready",
+    desc: "NSS journal ready",
+    depends_on: &[&JOURNAL_FORMATTED],
+    is_global: false,
+    timeout_secs: 600,
+};
+
 pub const SERVICES_READY: StageDef = StageDef {
     name: "services-ready",
     desc: "Services ready",
-    depends_on: &[&NSS_JOURNAL_READY, &BSS_CONFIGURED],
+    depends_on: &[&NSS_JOURNAL_READY, &BSS_READY],
     is_global: false,
     timeout_secs: 60,
 };
@@ -228,9 +256,11 @@ pub const ALL_STAGES: &[&StageDef] = &[
     &ETCD_READY,
     &RSS_INITIALIZED,
     &METADATA_VG_READY,
-    &NSS_FORMATTED,
-    &NSS_JOURNAL_READY,
     &BSS_CONFIGURED,
+    &BSS_READY,
+    &NSS_CONFIGURED,
+    &JOURNAL_FORMATTED,
+    &NSS_JOURNAL_READY,
     &SERVICES_READY,
 ];
 
@@ -328,13 +358,19 @@ mod tests {
         // RSS_INITIALIZED depends on ETCD_READY
         assert!(pos(ETCD_READY.name) < pos(RSS_INITIALIZED.name));
 
-        // NSS_JOURNAL_READY depends on both NSS_FORMATTED and METADATA_VG_READY
-        assert!(pos(NSS_FORMATTED.name) < pos(NSS_JOURNAL_READY.name));
+        // NSS_JOURNAL_READY depends on JOURNAL_FORMATTED (and transitively METADATA_VG_READY)
+        assert!(pos(JOURNAL_FORMATTED.name) < pos(NSS_JOURNAL_READY.name));
         assert!(pos(METADATA_VG_READY.name) < pos(NSS_JOURNAL_READY.name));
 
-        // BSS_CONFIGURED and NSS_FORMATTED both depend on RSS_INITIALIZED (parallel branches)
+        // BSS_READY depends on BSS_CONFIGURED; JOURNAL_FORMATTED depends on
+        // NSS_CONFIGURED + METADATA_VG_READY + BSS_READY (quorum-writes need
+        // BSS serving on its port, not just finished formatting).
         assert!(pos(RSS_INITIALIZED.name) < pos(BSS_CONFIGURED.name));
-        assert!(pos(RSS_INITIALIZED.name) < pos(NSS_FORMATTED.name));
+        assert!(pos(BSS_CONFIGURED.name) < pos(BSS_READY.name));
+        assert!(pos(RSS_INITIALIZED.name) < pos(NSS_CONFIGURED.name));
+        assert!(pos(NSS_CONFIGURED.name) < pos(JOURNAL_FORMATTED.name));
+        assert!(pos(METADATA_VG_READY.name) < pos(JOURNAL_FORMATTED.name));
+        assert!(pos(BSS_READY.name) < pos(JOURNAL_FORMATTED.name));
     }
 
     #[test]
@@ -366,7 +402,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "dependency is not a global stage")]
     fn global_dep_panics_on_node_stage() {
-        SERVICES_READY.global_dep("nss-formatted");
+        SERVICES_READY.global_dep("bss-configured");
     }
 
     #[test]

@@ -25,8 +25,8 @@ struct ServicesReadyStage;
 impl ServicesReadyStage {
     const RSS_INITIALIZED: VerifiedGlobalDep =
         const { stages::SERVICES_READY.global_dep("rss-initialized") };
-    const NSS_FORMATTED: VerifiedNodeDep =
-        const { stages::SERVICES_READY.node_dep("nss-formatted") };
+    const JOURNAL_FORMATTED: VerifiedGlobalDep =
+        const { stages::SERVICES_READY.global_dep("journal-formatted") };
     const NSS_JOURNAL_READY: VerifiedNodeDep =
         const { stages::SERVICES_READY.node_dep("nss-journal-ready") };
 
@@ -34,11 +34,8 @@ impl ServicesReadyStage {
         ServicesReadyStageDef::wait_for_global_dep(barrier, Self::RSS_INITIALIZED)
     }
 
-    fn wait_for_nss_formatted(
-        barrier: &WorkflowBarrier,
-        expected: usize,
-    ) -> Result<Vec<StageCompletion>, Error> {
-        ServicesReadyStageDef::wait_for_node_dep(barrier, Self::NSS_FORMATTED, expected)
+    fn wait_for_journal_formatted(barrier: &WorkflowBarrier) -> CmdResult {
+        ServicesReadyStageDef::wait_for_global_dep(barrier, Self::JOURNAL_FORMATTED)
     }
 
     fn wait_for_nss_journal_ready(
@@ -92,14 +89,13 @@ pub fn bootstrap(
     config: &BootstrapConfig,
     is_leader: bool,
     for_bench: bool,
-    cli_nss_a_id: Option<&str>,
-    cli_nss_b_id: Option<&str>,
-    cli_nss_a_ip: Option<&str>,
+    cli_nss_id: Option<&str>,
+    cli_nss_ip: Option<&str>,
 ) -> CmdResult {
     // CLI-provided IP takes precedence (injected via UserData on cloud deployments
     // where the instance IP is known at CDK/Terraform synthesis time but not in
     // the bootstrap config, which is generated before instances are created).
-    let nss_endpoint = cli_nss_a_ip
+    let nss_endpoint = cli_nss_ip
         .filter(|s| !s.is_empty())
         .or_else(|| {
             config
@@ -111,14 +107,13 @@ pub fn bootstrap(
         .unwrap_or("");
     let resources = config.get_resources();
     // CLI-provided IDs take precedence (AWS cloud path); fall back to TOML resources (on-prem path)
-    let nss_a_id_owned;
-    let nss_a_id = if let Some(id) = cli_nss_a_id {
+    let nss_id_owned;
+    let nss_id = if let Some(id) = cli_nss_id {
         id
     } else {
-        nss_a_id_owned = resources.nss_a_id.clone();
-        &nss_a_id_owned
+        nss_id_owned = resources.nss_id.clone();
+        &nss_id_owned
     };
-    let nss_b_id = cli_nss_b_id.or(resources.nss_b_id.as_deref());
     let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     let num_bss_nodes = config.global.num_bss_nodes;
     let ha_enabled = config.global.rss_ha_enabled;
@@ -127,8 +122,7 @@ pub fn bootstrap(
         bootstrap_leader(
             config,
             nss_endpoint,
-            nss_a_id,
-            nss_b_id,
+            nss_id,
             remote_az,
             num_bss_nodes,
             ha_enabled,
@@ -174,8 +168,7 @@ fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: 
 fn bootstrap_leader(
     config: &BootstrapConfig,
     nss_endpoint: &str,
-    nss_a_id: &str,
-    nss_b_id: Option<&str>,
+    nss_id: &str,
     remote_az: Option<&str>,
     num_bss_nodes: Option<usize>,
     ha_enabled: bool,
@@ -206,7 +199,7 @@ fn bootstrap_leader(
 
     // Initialize NSS role states in service discovery BEFORE starting RSS
     // This ensures the observer state exists when RSS starts
-    initialize_observer_state(config, nss_a_id, nss_endpoint)?;
+    initialize_observer_state(config, nss_id, nss_endpoint)?;
 
     create_rss_config(config, nss_endpoint, ha_enabled)?;
     create_rss_bootstrap_env()?;
@@ -242,24 +235,16 @@ fn bootstrap_leader(
     // This ensures metadata_vg_config is available when nss_role_agent calls wait_for_metadata_vg_ready()
     MetadataVgReadyStage::complete(&barrier)?;
 
-    // Wait for SERVICES_READY dependencies
-    // Wait for NSS formatting to complete via workflow barriers
-    let expected_nss = if nss_b_id.is_some() { 2 } else { 1 };
-    info!("Waiting for {expected_nss} NSS instance(s) to complete formatting...");
-    ServicesReadyStage::wait_for_nss_formatted(&barrier, expected_nss)?;
-    info!("All NSS instances have completed formatting");
+    // Wait for the journal owner (nss-0) to finish formatting. JOURNAL_FORMATTED
+    // is global — exactly one NSS formats, everyone else waits on it.
+    info!("Waiting for journal to be formatted...");
+    ServicesReadyStage::wait_for_journal_formatted(&barrier)?;
+    info!("Journal is formatted");
 
-    // Wait for NSS journal to be ready via workflow barriers
-    // For NVMe HA: only active (nss-0) signals journal-ready; standby is idle
-    // For EBS HA: only active (nss-0) signals journal-ready; standby is idle
-    // For solo (any journal type): the single node signals
-    let expected_journal_ready = if nss_b_id.is_some() {
-        1 // HA mode: only active node signals journal-ready
-    } else {
-        expected_nss // Solo: the single node signals
-    };
-    info!("Waiting for {expected_journal_ready} NSS journal(s) to be ready...");
-    ServicesReadyStage::wait_for_nss_journal_ready(&barrier, expected_journal_ready)?;
+    // Only the journal owner runs nss_server and signals NSS_JOURNAL_READY;
+    // idle NSS nodes stay idle via role_agent.
+    info!("Waiting for NSS journal to be ready...");
+    ServicesReadyStage::wait_for_nss_journal_ready(&barrier, 1)?;
 
     if for_bench {
         run_cmd!($BIN_PATH/rss_admin --rss-addr=127.0.0.1:8088 api-key init-test)?;
@@ -276,7 +261,7 @@ fn bootstrap_leader(
 
 fn initialize_observer_state(
     config: &BootstrapConfig,
-    nss_a_id: &str,
+    nss_id: &str,
     nss_endpoint: &str,
 ) -> CmdResult {
     info!("Initializing journal config and nss-store in service discovery");
@@ -284,18 +269,18 @@ fn initialize_observer_state(
     // Get shared journal_uuid: prefer per-node entry (on-prem TOML path), fall back to global config
     let nss_nodes = config.get_node_entries("nss_server");
     let node_journal_uuid = nss_nodes
-        .and_then(|nodes| nodes.iter().find(|n| n.id == nss_a_id))
+        .and_then(|nodes| nodes.iter().find(|n| n.id == nss_id))
         .and_then(|n| n.journal_uuid.clone());
     let shared_journal_uuid = node_journal_uuid
         .as_deref()
         .or(config.global.journal_uuid.as_deref());
 
-    // Initialize journal config in service discovery with running_nss_id set to nss_a_id
+    // Initialize journal config in service discovery with running_nss_id set to nss_id
     if let Some(journal_uuid) = shared_journal_uuid {
         let journal_size: u64 = 4 * 1024 * 1024 * 1024; // 4GB for cloud deployment
         let journal_config_json = format!(
             r#"[{{"journal_uuid":"{}","device_id":1,"journal_size":{},"version":1,"running_nss_id":"{}"}}]"#,
-            journal_uuid, journal_size, nss_a_id
+            journal_uuid, journal_size, nss_id
         );
 
         if config.is_etcd_backend() {
@@ -333,7 +318,7 @@ fn initialize_observer_state(
     // Initialize nss-store with the NSS address
     if !nss_endpoint.is_empty() {
         let nss_store_json =
-            format!(r#"{{"nodes":{{"{nss_a_id}":{{"network_address":"{nss_endpoint}:8088"}}}}}}"#);
+            format!(r#"{{"nodes":{{"{nss_id}":{{"network_address":"{nss_endpoint}:8088"}}}}}}"#);
 
         if config.is_etcd_backend() {
             let etcdctl = format!("{BIN_PATH}etcdctl");

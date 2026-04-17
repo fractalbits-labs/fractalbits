@@ -340,12 +340,12 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     // Build RSS leader UserData with the NSS instance ID embedded so the
     // RSS bootstrap can initialize journal config with the real ID.
-    const nssAInstanceId = instances["nss-0"].instanceId;
-    const nssAPrivateIp = instances["nss-0"].instancePrivateIp;
+    const nssInstanceId = instances["nss-0"].instanceId;
+    const nssPrivateIp = instances["nss-0"].instancePrivateIp;
     perServiceUserData["rss-A"] = createUserData(
       this,
       deployOS,
-      `--role root_server --rss-role leader --nss-a-id ${nssAInstanceId} --nss-a-ip ${nssAPrivateIp}`,
+      `--role root_server --rss-role leader --nss-id ${nssInstanceId} --nss-ip ${nssPrivateIp}`,
     );
 
     // Second pass: create all remaining (non-NSS, non-bench_server) instances.
