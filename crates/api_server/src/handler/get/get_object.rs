@@ -91,7 +91,14 @@ pub async fn get_object_handler(ctx: ObjectRequestContext) -> Result<HttpRespons
     let checksum_mode_enabled = header_opts.x_amz_checksum_mode_enabled;
 
     // Get the raw object
-    let object = get_raw_object(&ctx.app, &bucket.root_blob_name, &ctx.key, &ctx.trace_id).await?;
+    let object = get_raw_object(
+        &ctx.app,
+        &bucket.routing_key,
+        &bucket.root_blob_name,
+        &ctx.key,
+        &ctx.trace_id,
+    )
+    .await?;
     let total_size = object.size()?;
     histogram!("object_size", "operation" => "get").record(total_size as f64);
 
@@ -206,7 +213,7 @@ pub async fn get_object_content(
     S3Error,
 > {
     let blob_client = app
-        .get_blob_client()
+        .get_blob_client(&bucket.routing_key)
         .await
         .map_err(|_| S3Error::InternalError)?;
     match object.state {
@@ -237,6 +244,7 @@ pub async fn get_object_content(
                 let mpu_prefix = mpu_get_part_prefix(key, 0);
                 let mut mpus = list_raw_objects(
                     &app,
+                    &bucket.routing_key,
                     &bucket.root_blob_name,
                     10000,
                     &mpu_prefix,
@@ -297,7 +305,7 @@ async fn get_object_range_content(
     trace_id: &TraceId,
 ) -> Result<std::pin::Pin<Box<dyn stream::Stream<Item = Result<Bytes, S3Error>> + Send>>, S3Error> {
     let blob_client = app
-        .get_blob_client()
+        .get_blob_client(&bucket.routing_key)
         .await
         .map_err(|_| S3Error::InternalError)?;
     let block_size = object.block_size as usize;
@@ -329,6 +337,7 @@ async fn get_object_range_content(
                 let mpu_prefix = mpu_get_part_prefix(key, 0);
                 let mpus = list_raw_objects(
                     &app,
+                    &bucket.routing_key,
                     &bucket.root_blob_name,
                     10000,
                     &mpu_prefix,

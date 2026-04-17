@@ -382,8 +382,7 @@ fn initialize_observer_state(
         )?;
     } else {
         let region = get_current_aws_region()?;
-        let fence_item =
-            r#"{"service_id":{"S":"observer-leader-fence"},"value":{"N":"0"}}"#;
+        let fence_item = r#"{"service_id":{"S":"observer-leader-fence"},"value":{"N":"0"}}"#;
         run_cmd! {
             aws dynamodb put-item
                 --table-name $DDB_SERVICE_DISCOVERY_TABLE

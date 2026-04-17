@@ -102,9 +102,13 @@ impl ObjectRequestContext {
     }
 
     pub async fn resolve_bucket(&self) -> Result<Bucket, S3Error> {
-        // Ensure NSS client is initialized (fetches address from RSS if needed)
-        self.app.ensure_nss_client_initialized(&self.trace_id).await;
-        bucket::resolve_bucket(&self.app, &self.bucket_name, &self.trace_id).await
+        let bucket = bucket::resolve_bucket(&self.app, &self.bucket_name, &self.trace_id).await?;
+        // Ensure the NSS client for this bucket's routing_key is cached before
+        // handlers issue NSS RPCs.
+        self.app
+            .ensure_nss_client_initialized(&bucket.routing_key, &self.trace_id)
+            .await;
+        Ok(bucket)
     }
 }
 

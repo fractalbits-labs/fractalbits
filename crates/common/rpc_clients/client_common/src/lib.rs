@@ -292,59 +292,53 @@ macro_rules! bss_rpc_retry {
     };
 }
 
-/// NSS RPC retry macro with automatic address refresh on connection failure.
-/// When all retries are exhausted due to connection errors, it will enter a
-/// failover retry loop that keeps trying for up to 30 seconds, periodically
-/// checking for NSS address changes from RSS.
-///
-/// Use the 4-argument version (with app and trace_id) for api_server handlers
-/// to get automatic NSS address refresh on failover.
+/// Internal: shared retry loop body used by both nss_rpc_retry! arms.
+/// Callers supply the expressions for refresh/get-client so the retry logic
+/// itself lives in exactly one place, independent of whether the caller caches
+/// NSS clients per routing_key (api_server) or holds a single client
+/// (fs_server). Do not invoke directly — use `nss_rpc_retry!`.
+#[doc(hidden)]
 #[macro_export]
-macro_rules! nss_rpc_retry {
-    // Version with automatic NSS address refresh (use in api_server handlers)
-    ($client:expr, $method:ident($($args:expr),*), $app:expr, $trace_id:expr) => {
+macro_rules! __nss_rpc_retry_body {
+    ($client:expr, $method:ident($($args:expr),*), $refresh:expr, $get_client:expr) => {
         async {
             let failover_timeout = std::time::Duration::from_secs(30);
             let failover_start = std::time::Instant::now();
             let mut refresh_attempt = 0u32;
 
-            // Initial attempt with provided client
             let initial_result = $crate::rpc_retry!("nss", $client, $method($($args),*)).await;
-
-            // If success or non-retryable error, return immediately
-            if initial_result.is_ok() || !initial_result.as_ref().err().map(|e| e.retryable()).unwrap_or(false) {
+            if initial_result.is_ok()
+                || !initial_result.as_ref().err().map(|e| e.retryable()).unwrap_or(false)
+            {
                 return initial_result;
             }
 
-            // Enter failover retry loop
             loop {
-                // Check if we've exceeded failover timeout
                 if failover_start.elapsed() > failover_timeout {
                     ::tracing::warn!(
                         "NSS RPC failed after {}s failover timeout",
                         failover_start.elapsed().as_secs()
                     );
-                    // Return the last error
                     return $crate::rpc_retry!("nss", $client, $method($($args),*)).await;
                 }
 
-                // Try to refresh NSS address from RSS
-                if $app.try_refresh_nss_address($trace_id).await {
-                    // Address changed - get new client and retry
+                if $refresh.await {
                     ::tracing::info!(
                         "NSS address refreshed after {}ms, retrying with new address",
                         failover_start.elapsed().as_millis()
                     );
-                    if let Ok(new_client) = $app.get_nss_rpc_client().await {
-                        let result = $crate::rpc_retry!("nss", new_client, $method($($args),*)).await;
-                        if result.is_ok() || !result.as_ref().err().map(|e| e.retryable()).unwrap_or(false) {
+                    if let Ok(new_client) = $get_client.await {
+                        let result =
+                            $crate::rpc_retry!("nss", new_client, $method($($args),*)).await;
+                        if result.is_ok()
+                            || !result.as_ref().err().map(|e| e.retryable()).unwrap_or(false)
+                        {
                             return result;
                         }
                     }
                     refresh_attempt = 0;
                 }
 
-                // Wait before next retry attempt
                 // Exponential backoff: 200ms, 400ms, 800ms, 1000ms (capped)
                 let backoff_ms = std::cmp::min(200 * (1u64 << refresh_attempt.min(3)), 1000);
                 ::tracing::debug!(
@@ -356,10 +350,18 @@ macro_rules! nss_rpc_retry {
                 $crate::rpc_sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 refresh_attempt = refresh_attempt.saturating_add(1);
 
-                // Retry with same address — NSS may have recovered without an address change
-                // (e.g., nss_role_agent briefly restarted on the same port).
-                let same_addr_result = $crate::rpc_retry!("nss", $client, $method($($args),*)).await;
-                if same_addr_result.is_ok() || !same_addr_result.as_ref().err().map(|e| e.retryable()).unwrap_or(false) {
+                // Retry with same address — NSS may have recovered without an
+                // address change (e.g., nss_role_agent briefly restarted on
+                // the same port).
+                let same_addr_result =
+                    $crate::rpc_retry!("nss", $client, $method($($args),*)).await;
+                if same_addr_result.is_ok()
+                    || !same_addr_result
+                        .as_ref()
+                        .err()
+                        .map(|e| e.retryable())
+                        .unwrap_or(false)
+                {
                     if same_addr_result.is_ok() {
                         ::tracing::info!(
                             "NSS recovered at same address after {}ms",
@@ -371,7 +373,44 @@ macro_rules! nss_rpc_retry {
             }
         }
     };
-    // Simple version without refresh (for use outside api_server)
+}
+
+/// NSS RPC retry macro with automatic address refresh on connection failure.
+/// When all retries are exhausted due to connection errors, it enters a
+/// failover retry loop that keeps trying for up to 30 seconds, periodically
+/// asking the caller to refresh the NSS address from RSS.
+///
+/// Two forms:
+/// - 5-arg (multi-NSS): `(client, method(args), app, routing_key, trace_id)` —
+///   caller's `app` exposes `get_nss_rpc_client(&RoutingKey)` and
+///   `try_refresh_nss_address(&RoutingKey, &TraceId)`. Used by api_server.
+/// - 4-arg (single-NSS): `(client, method(args), app, trace_id)` — caller's
+///   `app` exposes `get_nss_rpc_client()` and `try_refresh_nss_address(&TraceId)`.
+///   Used by fs_server.
+///
+/// Both forms share the retry loop in `__nss_rpc_retry_body!`; only the refresh
+/// and get-client expressions differ.
+#[macro_export]
+macro_rules! nss_rpc_retry {
+    // Multi-NSS form: keyed lookup per routing_key.
+    ($client:expr, $method:ident($($args:expr),*), $app:expr, $routing_key:expr, $trace_id:expr) => {
+        $crate::__nss_rpc_retry_body!(
+            $client,
+            $method($($args),*),
+            $app.try_refresh_nss_address($routing_key, $trace_id),
+            $app.get_nss_rpc_client($routing_key)
+        )
+    };
+    // Single-NSS form: caller holds exactly one NSS client.
+    ($client:expr, $method:ident($($args:expr),*), $app:expr, $trace_id:expr) => {
+        $crate::__nss_rpc_retry_body!(
+            $client,
+            $method($($args),*),
+            $app.try_refresh_nss_address($trace_id),
+            $app.get_nss_rpc_client()
+        )
+    };
+    // No-refresh form (used outside api_server/fs_server).
     ($client:expr, $method:ident($($args:expr),*)) => {
         $crate::rpc_retry!("nss", $client, $method($($args),*))
     };

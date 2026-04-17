@@ -12,7 +12,7 @@ pub use blob_client::BlobClient;
 use blob_client::BlobDeletionRequest;
 pub use config::{BlobStorageBackend, BlobStorageConfig, Config, S3HybridSingleAzConfig};
 pub use data_blob_tracking::{DataBlobTracker, DataBlobTrackingError};
-use data_types::{ApiKey, Bucket, TraceId, Versioned};
+use data_types::{ApiKey, Bucket, RoutingKey, TraceId, Versioned};
 use handler::common::s3_error::S3Error;
 use metrics_wrapper::counter;
 use moka::future::Cache;
@@ -22,6 +22,7 @@ use rpc_client_rss::RpcClientRss;
 
 pub use cache_registry::CacheCoordinator;
 use std::{
+    collections::HashMap,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
@@ -43,16 +44,21 @@ pub struct AppState {
     pub az_status_enabled: AtomicBool,
     pub worker_id: u16,
 
-    // NSS client is lazily initialized - set when we receive address from RSS
-    // We store both the client and the address for refresh detection
-    rpc_client_nss: Arc<RwLock<Option<RpcClientNss>>>,
-    nss_address: Arc<RwLock<Option<String>>>,
+    // Per-routing-key NSS clients, lazily populated as buckets are resolved.
+    // A single api_server instance can cache clients for multiple distinct
+    // routing keys (each routing key maps to one NSS endpoint).
+    nss_clients: Arc<RwLock<HashMap<RoutingKey, NssEntry>>>,
     rpc_client_rss: RpcClientRss,
 
     blob_client: OnceCell<Arc<BlobClient>>,
     blob_deletion_tx: Sender<BlobDeletionRequest>,
     blob_deletion_rx: Mutex<Option<Receiver<BlobDeletionRequest>>>,
     pub data_blob_tracker: OnceCell<Arc<DataBlobTracker>>,
+}
+
+struct NssEntry {
+    address: String,
+    client: RpcClientNss,
 }
 
 impl AppState {
@@ -78,9 +84,8 @@ impl AppState {
 
         debug!("Per-core AppState initialized with lazy BlobClient initialization");
 
-        // NSS client starts uninitialized - will be set when we receive address from RSS
-        let rpc_client_nss = Arc::new(RwLock::new(None));
-        let nss_address = Arc::new(RwLock::new(None));
+        // NSS clients start empty - populated per-routing-key on first use.
+        let nss_clients = Arc::new(RwLock::new(HashMap::new()));
         let rpc_client_rss = RpcClientRss::new_from_addresses(
             config.rss_addrs.clone(),
             config.rpc_connection_timeout(),
@@ -88,8 +93,7 @@ impl AppState {
 
         Self {
             config,
-            rpc_client_nss,
-            nss_address,
+            nss_clients,
             rpc_client_rss,
             blob_client: OnceCell::new(),
             blob_deletion_tx: tx,
@@ -103,91 +107,141 @@ impl AppState {
         }
     }
 
-    /// Returns a read guard to the NSS client, or ServiceUnavailable error if not initialized
-    pub async fn get_nss_rpc_client(&self) -> Result<RwLockReadGuard<'_, RpcClientNss>, S3Error> {
-        let guard = self.rpc_client_nss.read().await;
-        RwLockReadGuard::try_map(guard, |opt| opt.as_ref()).map_err(|_| S3Error::ServiceUnavailable)
+    /// Returns a read guard to the NSS client for the given routing_key,
+    /// or ServiceUnavailable if no client is cached for that key.
+    pub async fn get_nss_rpc_client(
+        &self,
+        routing_key: &RoutingKey,
+    ) -> Result<RwLockReadGuard<'_, RpcClientNss>, S3Error> {
+        let guard = self.nss_clients.read().await;
+        RwLockReadGuard::try_map(guard, |map| map.get(routing_key).map(|e| &e.client))
+            .map_err(|_| S3Error::ServiceUnavailable)
     }
 
-    pub async fn update_nss_address(&self, new_address: String) {
-        tracing::info!("Updating NSS address to: {}", new_address);
+    pub async fn update_nss_address(&self, routing_key: RoutingKey, new_address: String) {
+        tracing::info!(
+            "Updating NSS address for routing_key {} to: {}",
+            routing_key,
+            new_address
+        );
         let new_client = RpcClientNss::new_from_address(
             new_address.clone(),
             self.config.rpc_connection_timeout(),
         );
-        *self.nss_address.write().await = Some(new_address);
-        *self.rpc_client_nss.write().await = Some(new_client);
+        self.nss_clients.write().await.insert(
+            routing_key,
+            NssEntry {
+                address: new_address,
+                client: new_client,
+            },
+        );
         tracing::info!("NSS client updated successfully");
     }
 
-    /// Get the current NSS address (for comparison during refresh)
-    pub async fn get_nss_address(&self) -> Option<String> {
-        self.nss_address.read().await.clone()
+    /// Get the cached NSS address for a routing_key (for comparison during refresh).
+    pub async fn get_nss_address(&self, routing_key: &RoutingKey) -> Option<String> {
+        self.nss_clients
+            .read()
+            .await
+            .get(routing_key)
+            .map(|e| e.address.clone())
     }
 
-    /// Try to refresh NSS address from RSS when connection fails.
+    /// Try to refresh NSS address from RSS for the given routing_key.
     /// Returns true if address was refreshed and caller should retry the operation.
-    /// TODO: handle multi-NSS routing with per-bucket routing_key
-    pub async fn try_refresh_nss_address(&self, trace_id: &TraceId) -> bool {
-        let current_addr = self.get_nss_address().await;
+    pub async fn try_refresh_nss_address(
+        &self,
+        routing_key: &RoutingKey,
+        trace_id: &TraceId,
+    ) -> bool {
+        let current_addr = self.get_nss_address(routing_key).await;
 
-        // Fetch latest NSS address from RSS (empty routing_key = default journal)
         let rss_client = self.get_rss_rpc_client();
         match rss_rpc_retry!(
             rss_client,
-            get_active_nss_address(&[], Some(self.config.rss_rpc_timeout()), trace_id)
+            get_active_nss_address(
+                routing_key.as_bytes(),
+                Some(self.config.rss_rpc_timeout()),
+                trace_id
+            )
         )
         .await
         {
             Ok(new_addr) => {
                 if current_addr.as_deref() != Some(&new_addr) {
                     tracing::info!(
-                        "NSS address changed during refresh: {:?} -> {}",
+                        "NSS address changed during refresh for routing_key {}: {:?} -> {}",
+                        routing_key,
                         current_addr,
                         new_addr
                     );
-                    self.update_nss_address(new_addr).await;
+                    self.update_nss_address(*routing_key, new_addr).await;
                     true
                 } else {
-                    tracing::debug!("NSS address unchanged during refresh: {:?}", current_addr);
+                    tracing::debug!(
+                        "NSS address unchanged during refresh for routing_key {}: {:?}",
+                        routing_key,
+                        current_addr
+                    );
                     false
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to fetch NSS address from RSS during refresh: {}", e);
+                tracing::warn!(
+                    "Failed to fetch NSS address from RSS during refresh for routing_key {}: {}",
+                    routing_key,
+                    e
+                );
                 false
             }
         }
     }
 
-    /// Ensures NSS client is initialized by fetching address from RSS if needed.
-    /// TODO: handle multi-NSS routing with per-bucket routing_key
-    pub async fn ensure_nss_client_initialized(&self, trace_id: &TraceId) -> bool {
-        // Fast path: check if already initialized
-        if self.get_nss_rpc_client().await.is_ok() {
+    /// Ensures NSS client is initialized for the given routing_key by fetching
+    /// address from RSS if needed.
+    pub async fn ensure_nss_client_initialized(
+        &self,
+        routing_key: &RoutingKey,
+        trace_id: &TraceId,
+    ) -> bool {
+        // Fast path: check if already cached for this routing_key
+        if self.get_nss_rpc_client(routing_key).await.is_ok() {
             return true;
         }
 
-        // Fetch NSS address from RSS (empty routing_key = default journal)
-        tracing::info!("NSS client not initialized, fetching address from RSS");
+        tracing::info!(
+            "NSS client not initialized for routing_key {}, fetching address from RSS",
+            routing_key
+        );
         let rss_client = self.get_rss_rpc_client();
         match rss_rpc_retry!(
             rss_client,
-            get_active_nss_address(&[], Some(self.config.rss_rpc_timeout()), trace_id)
+            get_active_nss_address(
+                routing_key.as_bytes(),
+                Some(self.config.rss_rpc_timeout()),
+                trace_id
+            )
         )
         .await
         {
             Ok(addr) => {
                 if !addr.is_empty() {
-                    self.update_nss_address(addr).await;
+                    self.update_nss_address(*routing_key, addr).await;
                     true
                 } else {
-                    tracing::warn!("RSS returned empty NSS address");
+                    tracing::warn!(
+                        "RSS returned empty NSS address for routing_key {}",
+                        routing_key
+                    );
                     false
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to fetch NSS address from RSS: {}", e);
+                tracing::warn!(
+                    "Failed to fetch NSS address from RSS for routing_key {}: {}",
+                    routing_key,
+                    e
+                );
                 false
             }
         }
@@ -197,7 +251,10 @@ impl AppState {
         &self.rpc_client_rss
     }
 
-    pub async fn get_blob_client(&self) -> Result<Arc<BlobClient>, String> {
+    pub async fn get_blob_client(
+        &self,
+        routing_key: &RoutingKey,
+    ) -> Result<Arc<BlobClient>, String> {
         self.blob_client
             .get_or_try_init(|| async {
                 debug!("Creating per-worker BlobClient on-demand");
@@ -237,7 +294,7 @@ impl AppState {
                         .cloned()
                         .unwrap_or_else(|| "localhost:8086".to_string());
                     let nss_address = self
-                        .get_nss_address()
+                        .get_nss_address(routing_key)
                         .await
                         .unwrap_or_else(|| "localhost:8087".to_string());
                     let tracker = Arc::new(DataBlobTracker::with_endpoints_and_timeout(

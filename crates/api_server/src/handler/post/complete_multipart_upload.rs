@@ -168,6 +168,7 @@ pub async fn complete_multipart_upload_handler(
     upload_id: String,
 ) -> Result<actix_web::HttpResponse, S3Error> {
     let bucket = ctx.resolve_bucket().await?;
+    let routing_key = &bucket.routing_key;
     let _headers = extract_metadata_headers(ctx.request.headers())?;
     let _expected_checksum = ctx.checksum_value;
 
@@ -180,8 +181,14 @@ pub async fn complete_multipart_upload_handler(
     let mut valid_part_numbers: HashSet<u32> =
         req_body.part.iter().map(|part| part.part_number).collect();
 
-    let mut object =
-        get_raw_object(&ctx.app, &bucket.root_blob_name, &ctx.key, &ctx.trace_id).await?;
+    let mut object = get_raw_object(
+        &ctx.app,
+        routing_key,
+        &bucket.root_blob_name,
+        &ctx.key,
+        &ctx.trace_id,
+    )
+    .await?;
     if object.version_id.simple().to_string() != upload_id {
         return Err(S3Error::NoSuchVersion);
     }
@@ -193,6 +200,7 @@ pub async fn complete_multipart_upload_handler(
     let mpu_prefix = mpu_get_part_prefix(ctx.key.clone(), 0);
     let mpu_objs = list_raw_objects(
         &ctx.app,
+        routing_key,
         &bucket.root_blob_name,
         max_parts,
         &mpu_prefix,
@@ -276,7 +284,7 @@ pub async fn complete_multipart_upload_handler(
         checksum: expected_checksum,
     }));
     let new_object_bytes: Bytes = to_bytes_in::<_, Error>(&object, Vec::new())?.into();
-    let nss_client = ctx.app.get_nss_rpc_client().await?;
+    let nss_client = ctx.app.get_nss_rpc_client(routing_key).await?;
     let resp = nss_rpc_retry!(
         nss_client,
         put_inode(
@@ -287,6 +295,7 @@ pub async fn complete_multipart_upload_handler(
             &ctx.trace_id
         ),
         ctx.app,
+        routing_key,
         &ctx.trace_id
     )
     .await?;
