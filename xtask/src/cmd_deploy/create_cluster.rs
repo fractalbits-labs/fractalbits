@@ -247,9 +247,9 @@ impl InputClusterConfig {
         // Generate a shared journal UUID for NSS nodes
         let shared_journal_uuid = Uuid::new_v4().to_string();
 
-        // Extract NSS node IDs based on role for resources config
+        // Extract the journal-owner NSS id (the "active" node, or first declared)
         let nss_nodes = self.nodes.get("nss_server");
-        let nss_a_id = nss_nodes
+        let nss_id = nss_nodes
             .and_then(|nodes| {
                 nodes
                     .iter()
@@ -257,20 +257,9 @@ impl InputClusterConfig {
                     .or_else(|| nodes.first())
             })
             .map(|n| n.hostname.clone().unwrap_or_else(|| n.ip.clone()));
-        let nss_b_id = nss_nodes.and_then(|nodes| {
-            nodes
-                .iter()
-                .find(|n| n.role.as_deref() == Some("standby"))
-                .map(|n| n.hostname.clone().unwrap_or_else(|| n.ip.clone()))
-        });
 
         // Build resources config if we have NSS nodes
-        let resources = nss_a_id.map(|nss_a| ClusterResourcesConfig {
-            nss_a_id: nss_a,
-            nss_b_id,
-            volume_a_id: None,
-            volume_b_id: None,
-        });
+        let resources = nss_id.map(|id| ClusterResourcesConfig { nss_id: id });
 
         // Convert input nodes to output format (already grouped by service_type)
         let nodes: HashMap<String, Vec<NodeEntry>> = self

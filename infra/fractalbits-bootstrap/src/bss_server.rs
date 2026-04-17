@@ -28,6 +28,16 @@ impl BssConfiguredStage {
     }
 }
 
+struct BssReadyStage;
+
+impl BssReadyStage {
+    const STAGE: VerifiedNodeStage = const { stages::BSS_READY.node_stage() };
+
+    fn complete(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.complete_node_stage(Self::STAGE, None)
+    }
+}
+
 struct EtcdReadyStage;
 
 impl EtcdReadyStage {
@@ -128,8 +138,15 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
         sync;
     }?;
 
-    // Signal that BSS is configured and ready
+    // Signal that format + systemd unit install are done.
     BssConfiguredStage::complete(&barrier)?;
+
+    // bss_server still needs a few seconds to bind its port after systemd
+    // starts it. NSS quorum-writes would race otherwise, so wait for the port
+    // to accept connections before signaling BSS_READY.
+    wait_for_service_ready("bss_server", 8088, 300)?;
+    BssReadyStage::complete(&barrier)?;
+
     CommonServicesReadyStage::complete(&barrier)?;
 
     Ok(())

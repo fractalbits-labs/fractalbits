@@ -62,10 +62,6 @@ pub fn generate_blueprint(config: &BootstrapClusterConfig) -> StageBlueprint {
     let all = num_bss + num_nss + num_rss + num_api + num_bench;
 
     let use_etcd = config.global.rss_backend == RssBackend::Etcd;
-    // In HA mode (2 NSS nodes), only the active node signals journal-ready;
-    // the standby is idle.
-    let has_nss_standby = num_nss > 1;
-    let num_journal_ready = if has_nss_standby { 1 } else { num_nss };
 
     let cluster_id = config
         .global
@@ -79,9 +75,13 @@ pub fn generate_blueprint(config: &BootstrapClusterConfig) -> StageBlueprint {
         (&stages::ETCD_READY, 1, use_etcd),
         (&stages::RSS_INITIALIZED, 1, true),
         (&stages::METADATA_VG_READY, 1, true),
-        (&stages::NSS_FORMATTED, num_nss, true),
-        (&stages::NSS_JOURNAL_READY, num_journal_ready, true),
         (&stages::BSS_CONFIGURED, num_bss, true),
+        (&stages::BSS_READY, num_bss, true),
+        (&stages::NSS_CONFIGURED, num_nss, true),
+        // Global: exactly one NSS (journal owner) formats and signals.
+        (&stages::JOURNAL_FORMATTED, 1, true),
+        // Only the journal owner runs nss_server; idle NSS nodes don't signal.
+        (&stages::NSS_JOURNAL_READY, 1, true),
         (&stages::SERVICES_READY, all, true),
     ];
 
@@ -340,13 +340,7 @@ pub struct ClusterEndpointsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClusterResourcesConfig {
-    pub nss_a_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nss_b_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub volume_a_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub volume_b_id: Option<String>,
+    pub nss_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -31,7 +31,7 @@ resource "google_compute_instance" "rss_a" {
     rss-backend   = var.rss_backend
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
-      role_args  = "--role root_server --rss-role leader --nss-a-ip ${google_compute_instance.nss_a.network_interface[0].network_ip} --nss-a-id nss-0-${var.cluster_id}"
+      role_args  = "--role root_server --rss-role leader --nss-ip ${google_compute_instance.nss_a.network_interface[0].network_ip} --nss-id nss-0-${var.cluster_id}"
     })
   }
 
@@ -78,7 +78,7 @@ resource "google_compute_instance" "rss_b" {
     rss-backend   = var.rss_backend
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
-      role_args  = "--role root_server --rss-role follower --nss-a-ip ${google_compute_instance.nss_a.network_interface[0].network_ip}"
+      role_args  = "--role root_server --rss-role follower --nss-ip ${google_compute_instance.nss_a.network_interface[0].network_ip}"
     })
   }
 
