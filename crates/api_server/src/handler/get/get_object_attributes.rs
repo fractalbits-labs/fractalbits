@@ -188,7 +188,14 @@ pub async fn get_object_attributes_handler(
 
     // Parse object attributes from headers
     let header_opts = HeaderOpts::from_headers(ctx.request.headers())?;
-    let obj = get_raw_object(&ctx.app, &bucket.root_blob_name, &ctx.key, &ctx.trace_id).await?;
+    let obj = get_raw_object(
+        &ctx.app,
+        &bucket.routing_key,
+        &bucket.root_blob_name,
+        &ctx.key,
+        &ctx.trace_id,
+    )
+    .await?;
     let last_modified = time::format_http_date(obj.timestamp);
 
     let mut resp = GetObjectAttributesOutput::default();

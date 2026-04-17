@@ -24,9 +24,10 @@ pub async fn abort_multipart_upload_handler(
     }
 
     let bucket = ctx.resolve_bucket().await?;
+    let routing_key = &bucket.routing_key;
     let blob_deletion = ctx.app.get_blob_deletion();
     let rpc_timeout = ctx.app.config.rpc_request_timeout();
-    let nss_client = ctx.app.get_nss_rpc_client().await?;
+    let nss_client = ctx.app.get_nss_rpc_client(routing_key).await?;
 
     // Verify the upload exists and the upload_id matches
     let resp = nss_rpc_retry!(
@@ -38,6 +39,7 @@ pub async fn abort_multipart_upload_handler(
             &ctx.trace_id
         ),
         ctx.app,
+        routing_key,
         &ctx.trace_id
     )
     .await?;
@@ -55,6 +57,7 @@ pub async fn abort_multipart_upload_handler(
     let mpu_prefix = mpu_get_part_prefix(ctx.key.clone(), 0);
     let parts = list_raw_objects(
         &ctx.app,
+        routing_key,
         &bucket.root_blob_name,
         10000,
         &mpu_prefix,
@@ -74,6 +77,7 @@ pub async fn abort_multipart_upload_handler(
                 &ctx.trace_id
             ),
             ctx.app,
+            routing_key,
             &ctx.trace_id
         )
         .await?;
@@ -95,6 +99,7 @@ pub async fn abort_multipart_upload_handler(
             &ctx.trace_id
         ),
         ctx.app,
+        routing_key,
         &ctx.trace_id
     )
     .await?;

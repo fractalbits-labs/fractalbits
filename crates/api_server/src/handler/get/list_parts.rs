@@ -99,7 +99,14 @@ pub async fn list_parts_handler(
         .into_inner();
 
     let max_parts = query_opts.max_parts.unwrap_or(1000);
-    let object = get_raw_object(&ctx.app, &bucket.root_blob_name, &ctx.key, &ctx.trace_id).await?;
+    let object = get_raw_object(
+        &ctx.app,
+        &bucket.routing_key,
+        &bucket.root_blob_name,
+        &ctx.key,
+        &ctx.trace_id,
+    )
+    .await?;
     if object.version_id.simple().to_string() != query_opts.upload_id {
         return Err(S3Error::NoSuchUpload);
     }
@@ -147,6 +154,7 @@ async fn fetch_mpu_parts(
     let mpu_prefix = mpu_get_part_prefix(key.clone(), 0);
     let mpus = list_raw_objects(
         &app,
+        &bucket.routing_key,
         &bucket.root_blob_name,
         10000, // TODO: use max_parts and retry if there are not enough valid
         &mpu_prefix,

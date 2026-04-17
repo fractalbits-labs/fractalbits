@@ -44,6 +44,7 @@ pub async fn create_multipart_upload_handler(
     ctx: ObjectRequestContext,
 ) -> Result<actix_web::HttpResponse, S3Error> {
     let bucket = ctx.resolve_bucket().await?;
+    let routing_key = &bucket.routing_key;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -56,7 +57,7 @@ pub async fn create_multipart_upload_handler(
         state: ObjectState::Mpu(MpuState::Uploading),
     };
     let object_layout_bytes: Bytes = to_bytes_in::<_, Error>(&object_layout, Vec::new())?.into();
-    let nss_client = ctx.app.get_nss_rpc_client().await?;
+    let nss_client = ctx.app.get_nss_rpc_client(routing_key).await?;
     let _resp = nss_rpc_retry!(
         nss_client,
         put_inode(
@@ -67,6 +68,7 @@ pub async fn create_multipart_upload_handler(
             &ctx.trace_id
         ),
         ctx.app,
+        routing_key,
         &ctx.trace_id
     )
     .await?;

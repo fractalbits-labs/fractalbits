@@ -27,7 +27,8 @@ pub async fn rename_folder_handler(ctx: ObjectRequestContext) -> Result<HttpResp
         ctx.bucket_name
     );
 
-    let nss_client = ctx.app.get_nss_rpc_client().await?;
+    let routing_key = &bucket.routing_key;
+    let nss_client = ctx.app.get_nss_rpc_client(routing_key).await?;
     nss_rpc_retry!(
         nss_client,
         rename_folder(
@@ -38,6 +39,7 @@ pub async fn rename_folder_handler(ctx: ObjectRequestContext) -> Result<HttpResp
             &ctx.trace_id
         ),
         ctx.app,
+        routing_key,
         &ctx.trace_id
     )
     .await
