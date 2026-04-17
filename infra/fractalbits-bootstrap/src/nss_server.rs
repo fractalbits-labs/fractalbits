@@ -4,17 +4,20 @@ use crate::stage_helpers::{CommonServicesReadyStage, InstancesReadyStage};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use cmd_lib::*;
 use std::io::Error;
-use xtask_common::stages::{VerifiedGlobalDep, VerifiedNodeStage};
+use xtask_common::stages::{
+    VerifiedGlobalDep, VerifiedGlobalStage, VerifiedNodeDep, VerifiedNodeStage,
+};
 
 const BLOB_DRAM_MEM_PERCENT: f64 = 0.8;
 
-struct NssFormattedStage;
+struct NssConfiguredStage;
 
-impl NssFormattedStage {
-    const STAGE: VerifiedNodeStage = const { stages::NSS_FORMATTED.node_stage() };
-    const ETCD_READY: VerifiedGlobalDep = const { stages::NSS_FORMATTED.global_dep("etcd-ready") };
+impl NssConfiguredStage {
+    const STAGE: VerifiedNodeStage = const { stages::NSS_CONFIGURED.node_stage() };
+    const ETCD_READY: VerifiedGlobalDep =
+        const { stages::NSS_CONFIGURED.global_dep("etcd-ready") };
     const RSS_INITIALIZED: VerifiedGlobalDep =
-        const { stages::NSS_FORMATTED.global_dep("rss-initialized") };
+        const { stages::NSS_CONFIGURED.global_dep("rss-initialized") };
 
     fn wait_for_etcd_ready(barrier: &WorkflowBarrier) -> CmdResult {
         barrier.wait_for_global(Self::ETCD_READY)
@@ -29,15 +32,45 @@ impl NssFormattedStage {
     }
 }
 
+struct JournalFormattedStage;
+
+impl JournalFormattedStage {
+    const STAGE: VerifiedGlobalStage = const { stages::JOURNAL_FORMATTED.global_stage() };
+    const METADATA_VG_READY: VerifiedGlobalDep =
+        const { stages::JOURNAL_FORMATTED.global_dep("metadata-vg-ready") };
+    const BSS_CONFIGURED: VerifiedNodeDep =
+        const { stages::JOURNAL_FORMATTED.node_dep("bss-configured") };
+    const BSS_READY: VerifiedNodeDep =
+        const { stages::JOURNAL_FORMATTED.node_dep("bss-ready") };
+
+    fn wait_for_metadata_vg_ready(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.wait_for_global(Self::METADATA_VG_READY)
+    }
+
+    fn wait_for_bss_configured(barrier: &WorkflowBarrier, expected: usize) -> CmdResult {
+        barrier.wait_for_nodes(Self::BSS_CONFIGURED, expected)?;
+        Ok(())
+    }
+
+    fn wait_for_bss_ready(barrier: &WorkflowBarrier, expected: usize) -> CmdResult {
+        barrier.wait_for_nodes(Self::BSS_READY, expected)?;
+        Ok(())
+    }
+
+    fn complete(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.complete_global_stage(Self::STAGE, None)
+    }
+}
+
 struct NssJournalReadyStage;
 
 impl NssJournalReadyStage {
     const STAGE: VerifiedNodeStage = const { stages::NSS_JOURNAL_READY.node_stage() };
-    const METADATA_VG_READY: VerifiedGlobalDep =
-        const { stages::NSS_JOURNAL_READY.global_dep("metadata-vg-ready") };
+    const JOURNAL_FORMATTED: VerifiedGlobalDep =
+        const { stages::NSS_JOURNAL_READY.global_dep("journal-formatted") };
 
-    fn wait_for_metadata_vg_ready(barrier: &WorkflowBarrier) -> CmdResult {
-        barrier.wait_for_global(Self::METADATA_VG_READY)
+    fn wait_for_journal_formatted(barrier: &WorkflowBarrier) -> CmdResult {
+        barrier.wait_for_global(Self::JOURNAL_FORMATTED)
     }
 
     fn complete(barrier: &WorkflowBarrier, metadata: serde_json::Value) -> CmdResult {
@@ -48,7 +81,6 @@ impl NssJournalReadyStage {
 pub fn bootstrap(
     config: &BootstrapConfig,
     journal_uuid: Option<&str>,
-    is_standby: bool,
     for_bench: bool,
 ) -> CmdResult {
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Nss)?;
@@ -67,10 +99,9 @@ pub fn bootstrap(
 
     // Get private IP for stage completion metadata (used by RSS to discover NSS IP)
     let private_ip = crate::common::get_private_ip(config.global.deploy_target).unwrap_or_default();
-    let nss_role = if is_standby { "standby" } else { "primary" };
     let instances_ready_meta = serde_json::json!({
         "private_ip": private_ip,
-        "role": nss_role,
+        "role": "primary",
     });
 
     // Complete instances-ready stage
@@ -89,7 +120,7 @@ pub fn bootstrap(
     // When using etcd backend, wait for etcd cluster to be ready first
     if config.is_etcd_backend() {
         info!("Waiting for etcd cluster to be ready...");
-        NssFormattedStage::wait_for_etcd_ready(&barrier)?;
+        NssConfiguredStage::wait_for_etcd_ready(&barrier)?;
         info!("etcd cluster is ready");
     }
 
@@ -97,77 +128,86 @@ pub fn bootstrap(
         // Wait for RSS to initialize - RSS will have registered with service discovery by then
         // This must happen before setup_configs because create_nss_role_agent_config needs RSS IPs
         info!("Waiting for RSS to initialize...");
-        NssFormattedStage::wait_for_rss_initialized(&barrier)?;
+        NssConfiguredStage::wait_for_rss_initialized(&barrier)?;
     } else {
         info!("Meta-stack testing mode: skipping RSS wait");
     }
 
-    // Determine HA mode: if this node is the standby, we're definitely in HA mode.
-    // For the primary node, check resources (TOML path) to see if a standby exists.
-    let is_ha_mode = if is_standby {
-        true
-    } else {
-        config.get_resources().nss_b_id.is_some()
-    };
     setup_configs(config, journal_uuid, "nss")?;
+    prepare_local_dirs()?;
 
-    if is_standby {
-        // HA standby: skip format/mount entirely, start role_agent idle
-        info!("Starting as HA standby NSS (idle)");
-
-        // Create local directories needed when standby becomes active
-        prepare_local_dirs()?;
-
-        // Signal formatting complete (standby has nothing to format)
-        NssFormattedStage::complete(&barrier)?;
-
-        // Start role_agent in standby mode (it will be idle)
-        run_cmd!(systemctl start nss_role_agent.service)?;
-
-        // Complete services-ready stage
-        CommonServicesReadyStage::complete(&barrier)?;
-        return Ok(());
-    }
+    // Signal NSS is configured (configs written, local dirs prepared)
+    NssConfiguredStage::complete(&barrier)?;
 
     // Wait for metadata VG configuration before format, since nss_server format
     // needs BSS addresses to initialize the buffer_manager state.
     if !meta_stack_testing {
         info!("Waiting for metadata VG configuration...");
-        NssJournalReadyStage::wait_for_metadata_vg_ready(&barrier)?;
+        JournalFormattedStage::wait_for_metadata_vg_ready(&barrier)?;
     }
-    let metadata_vg_config = get_service_discovery_value(config, BSS_METADATA_VG_CONFIG_KEY)?;
-    let journal_vg_config = get_service_discovery_value(config, BSS_JOURNAL_VG_CONFIG_KEY)?;
+
+    // Read journal-configs to discover the journal owner (running_nss_id). In
+    // a multi-NSS deployment only the owner formats the journal and runs
+    // nss_server; the rest stay idle (role_agent fetches its role from RSS).
+    // Concurrent formats from multiple NSS nodes would corrupt the journal.
     let journal_configs_json = get_service_discovery_value(config, "journal-configs")?;
-    // Extract the first journal config from the list for this NSS
     let journal_configs: Vec<serde_json::Value> = serde_json::from_str(&journal_configs_json)
         .map_err(|e| Error::other(format!("Failed to parse journal-configs: {e}")))?;
     let journal_config = journal_configs
         .first()
-        .ok_or_else(|| Error::other("journal-configs list is empty"))?
-        .to_string();
-    info!("Fetched metadata VG, journal VG, and journal configs from service discovery");
+        .ok_or_else(|| Error::other("journal-configs list is empty"))?;
+    let running_nss_id = journal_config
+        .get("running_nss_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::other("journal-configs entry missing running_nss_id"))?;
+    let my_instance_id = get_instance_id(config.global.deploy_target)?;
+    let is_journal_owner = my_instance_id == running_nss_id;
 
-    // Format journal via quorum journal (BSS storage)
-    format_journal(&metadata_vg_config, &journal_vg_config, &journal_config)?;
+    if is_journal_owner {
+        info!("This NSS ({my_instance_id}) owns the journal; will format");
+        let metadata_vg_config = get_service_discovery_value(config, BSS_METADATA_VG_CONFIG_KEY)?;
+        let journal_vg_config = get_service_discovery_value(config, BSS_JOURNAL_VG_CONFIG_KEY)?;
+        let journal_config_str = journal_config.to_string();
 
-    // Signal that formatting is complete
-    NssFormattedStage::complete(&barrier)?;
+        // Format issues quorum writes to BSS. Wait first for every BSS node
+        // to finish its (slow, zero-write) format — that's the BSS_CONFIGURED
+        // wait and uses BSS_CONFIGURED's long timeout. Then wait for each BSS
+        // to actually bind its port (BSS_READY, short timeout). Otherwise
+        // MultiBssObjectWriter quorum fails with NotEnoughReplicas.
+        let total_bss_nodes = config.global.num_bss_nodes.ok_or_else(|| {
+            Error::other("global.num_bss_nodes is required for NSS bootstrap")
+        })?;
+        info!("Waiting for {total_bss_nodes} BSS node(s) to complete format...");
+        JournalFormattedStage::wait_for_bss_configured(&barrier, total_bss_nodes)?;
+        info!("All BSS nodes have completed format");
+        info!("Waiting for {total_bss_nodes} BSS node(s) to be serving...");
+        JournalFormattedStage::wait_for_bss_ready(&barrier, total_bss_nodes)?;
+        info!("All BSS nodes are serving");
 
-    // Active or solo path
-    let nss_mode = if is_ha_mode { "HA active" } else { "solo" };
-    info!("Starting as {nss_mode} NSS");
+        format_journal(&metadata_vg_config, &journal_vg_config, &journal_config_str)?;
+        JournalFormattedStage::complete(&barrier)?;
+    } else {
+        info!(
+            "This NSS ({my_instance_id}) is idle (owner is {running_nss_id}); \
+             waiting for journal format to complete"
+        );
+        NssJournalReadyStage::wait_for_journal_formatted(&barrier)?;
+    }
 
+    info!("Starting nss_role_agent");
     run_cmd!(systemctl start nss_role_agent.service)?;
 
-    // Wait for nss_server to be ready before signaling
-    wait_for_service_ready("nss_server", 8088, 360)?;
-
-    // Signal that journal is ready and nss_server is accepting connections
-    let journal_ready_meta = serde_json::json!({
-        "private_ip": private_ip,
-        "role": nss_role,
-    });
-    NssJournalReadyStage::complete(&barrier, journal_ready_meta)?;
+    if is_journal_owner {
+        // Journal owner: nss_server is brought up by role_agent. Wait for it
+        // and signal that the journal is ready and nss_server is accepting
+        // connections. Idle nodes skip this — their role_agent stays idle.
+        wait_for_service_ready("nss_server", 8088, 360)?;
+        let journal_ready_meta = serde_json::json!({
+            "private_ip": private_ip,
+            "role": "primary",
+        });
+        NssJournalReadyStage::complete(&barrier, journal_ready_meta)?;
+    }
 
     // Complete services-ready stage
     CommonServicesReadyStage::complete(&barrier)?;
@@ -233,8 +273,6 @@ log_level = "info"
     Ok(())
 }
 
-/// Prepare local directories for nss_server (stats).
-/// This is called for both active and standby nodes.
 fn prepare_local_dirs() -> CmdResult {
     run_cmd! {
         info "Creating local directories for nss_server";
@@ -249,7 +287,7 @@ fn prepare_local_dirs() -> CmdResult {
     Ok(())
 }
 
-/// Prepare local directories and run nss_server format.
+/// Run nss_server format against the quorum journal.
 /// `metadata_vg_config` provides BSS addresses for buffer_manager initialization.
 /// `journal_config` provides journal UUID, device ID, size, and fence token.
 fn format_journal(
@@ -257,8 +295,6 @@ fn format_journal(
     journal_vg_config: &str,
     journal_config: &str,
 ) -> CmdResult {
-    prepare_local_dirs()?;
-
     run_cmd! {
         info "Running format for nss_server";
         METADATA_VG_CONFIG=$metadata_vg_config JOURNAL_VG_CONFIG=$journal_vg_config JOURNAL_CONFIG=$journal_config

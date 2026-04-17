@@ -12,7 +12,6 @@ pub enum ServiceType {
     },
     NssServer {
         journal_uuid: Option<String>,
-        is_standby: bool,
     },
     ApiServer,
     BssServer,
@@ -43,18 +42,14 @@ pub struct CliArgs {
     #[clap(long)]
     pub nss_role: Option<String>,
 
-    /// NSS-A instance ID (for root_server leader — used to initialize observer state)
+    /// NSS instance ID (for root_server leader — used to initialize observer state)
     #[clap(long)]
-    pub nss_a_id: Option<String>,
+    pub nss_id: Option<String>,
 
-    /// NSS-B instance ID (for root_server leader — used to initialize observer state)
-    #[clap(long)]
-    pub nss_b_id: Option<String>,
-
-    /// NSS-A private IP (for root_server leader — injected via UserData so RSS config
+    /// NSS private IP (for root_server leader — injected via UserData so RSS config
     /// has the correct nss_addr from the start, without needing a post-start update)
     #[clap(long)]
-    pub nss_a_ip: Option<String>,
+    pub nss_ip: Option<String>,
 
     /// API server NLB endpoint (for bench_server — injected via UserData)
     #[clap(long)]
@@ -72,11 +67,9 @@ pub fn discover_from_args(args: &CliArgs) -> Result<ServiceType, Error> {
             Ok(ServiceType::RootServer { is_leader })
         }
         "nss_server" => {
-            let is_standby = args.nss_role.as_deref().unwrap_or("primary") == "standby";
             // journal_uuid is no longer per-node; it comes from config.global.journal_uuid
             Ok(ServiceType::NssServer {
                 journal_uuid: None, // read from config.global.journal_uuid at bootstrap time
-                is_standby,
             })
         }
         "api_server" => Ok(ServiceType::ApiServer),
@@ -101,7 +94,7 @@ pub fn discover_service_type(config: &BootstrapConfig) -> Result<ServiceType, Er
             "Found instance config in TOML: {:?}",
             instance_config.service_type
         );
-        return parse_instance_config(config, &instance_config);
+        return parse_instance_config(&instance_config);
     }
 
     // Instance must be in TOML config for all deploy targets
@@ -110,10 +103,7 @@ pub fn discover_service_type(config: &BootstrapConfig) -> Result<ServiceType, Er
     )))
 }
 
-fn parse_instance_config(
-    config: &BootstrapConfig,
-    instance_config: &InstanceConfig,
-) -> Result<ServiceType, Error> {
+fn parse_instance_config(instance_config: &InstanceConfig) -> Result<ServiceType, Error> {
     match instance_config.service_type.as_str() {
         "root_server" => {
             let role = instance_config.role.as_deref().unwrap_or("leader");
@@ -125,17 +115,7 @@ fn parse_instance_config(
             if journal_uuid.is_none() {
                 return Err(Error::other("NSS server config missing journal_uuid"));
             }
-            // Determine if this is the standby NSS node via resources (TOML path)
-            let resources = config.get_resources();
-            let is_standby = resources
-                .nss_b_id
-                .as_deref()
-                .map(|b| b == instance_config.id)
-                .unwrap_or(false);
-            Ok(ServiceType::NssServer {
-                journal_uuid,
-                is_standby,
-            })
+            Ok(ServiceType::NssServer { journal_uuid })
         }
         "api_server" => Ok(ServiceType::ApiServer),
         "bss_server" => Ok(ServiceType::BssServer),
