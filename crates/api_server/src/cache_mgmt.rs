@@ -2,6 +2,7 @@ use actix_web::{
     HttpResponse, Result,
     web::{Data, Json, Path},
 };
+use data_types::RoutingKey;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -23,6 +24,8 @@ pub struct AzStatusUpdateRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NssAddressUpdateRequest {
     pub address: String,
+    /// UUID-formatted routing key identifying which NSS endpoint changed.
+    pub routing_key: String,
 }
 
 /// Invalidate a specific bucket from the cache
@@ -123,35 +126,43 @@ pub async fn update_nss_address(
     app: Data<Arc<AppState>>,
     request: Json<NssAddressUpdateRequest>,
 ) -> Result<HttpResponse> {
-    info!("Received NSS address update request: {}", request.address);
+    info!(
+        "Received NSS address update request for routing_key {}: {}",
+        request.routing_key, request.address
+    );
 
-    app.update_nss_address(request.address.clone()).await;
+    let routing_key = match RoutingKey::from_uuid_str(&request.routing_key) {
+        Ok(k) => k,
+        Err(e) => {
+            warn!("Invalid routing_key in NSS update: {}", e);
+            let response = CacheInvalidationResponse {
+                status: "error".to_string(),
+                message: format!("invalid routing_key: {e}"),
+            };
+            return Ok(HttpResponse::BadRequest().json(response));
+        }
+    };
+
+    app.update_nss_address(routing_key, request.address.clone())
+        .await;
 
     let response = CacheInvalidationResponse {
         status: "success".to_string(),
-        message: format!("NSS address updated to '{}'", request.address),
+        message: format!(
+            "NSS address for routing_key {} updated to '{}'",
+            request.routing_key, request.address
+        ),
     };
 
     Ok(HttpResponse::Ok().json(response))
 }
 
-/// Health check endpoint for management API
-pub async fn mgmt_health(app: Data<Arc<AppState>>) -> Result<HttpResponse> {
-    let trace_id = data_types::TraceId::new();
-    let nss_ready = app.ensure_nss_client_initialized(&trace_id).await;
-
-    if nss_ready {
-        Ok(HttpResponse::Ok().json(serde_json::json!({
-            "status": "healthy",
-            "service": "api_server",
-            "nss_connected": true
-        })))
-    } else {
-        Ok(HttpResponse::ServiceUnavailable().json(serde_json::json!({
-            "status": "unhealthy",
-            "service": "api_server",
-            "nss_connected": false,
-            "message": "NSS client not initialized"
-        })))
-    }
+/// Health check endpoint for management API.
+/// Reports only api_server liveness; NSS health is a property of each NSS
+/// instance and not exposed here.
+pub async fn mgmt_health(_app: Data<Arc<AppState>>) -> Result<HttpResponse> {
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "status": "healthy",
+        "service": "api_server"
+    })))
 }

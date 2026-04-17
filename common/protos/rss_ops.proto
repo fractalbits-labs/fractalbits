@@ -229,7 +229,7 @@ message GetJournalConfigResponse {
 
 // GetActiveNssAddress - Query the NSS network address for a given routing key
 message GetActiveNssAddressRequest {
-  bytes routing_key = 1;  // 16-byte routing key; empty means use default journal
+  bytes routing_key = 1;  // 16-byte opaque routing key; required
 }
 
 message GetActiveNssAddressResponse {

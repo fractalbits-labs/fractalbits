@@ -9,8 +9,8 @@ pub mod xheader;
 
 use crate::AppState;
 use actix_web::http::header::{self, HeaderMap};
-use data_types::TraceId;
 use data_types::object_layout::{HeaderList, ObjectLayout};
+use data_types::{RoutingKey, TraceId};
 pub use file_ops::mpu_get_part_prefix;
 use file_ops::{parse_get_inode, parse_list_inodes};
 use futures::StreamExt;
@@ -61,11 +61,12 @@ pub fn merge_chunks(chunks: Vec<actix_web::web::Bytes>) -> actix_web::web::Bytes
 
 pub async fn get_raw_object(
     app: &AppState,
+    routing_key: &RoutingKey,
     root_blob_name: &str,
     key: &str,
     trace_id: &TraceId,
 ) -> Result<ObjectLayout, S3Error> {
-    let nss_client = app.get_nss_rpc_client().await?;
+    let nss_client = app.get_nss_rpc_client(routing_key).await?;
     let resp = nss_rpc_retry!(
         nss_client,
         get_inode(
@@ -75,6 +76,7 @@ pub async fn get_raw_object(
             trace_id
         ),
         app,
+        routing_key,
         trace_id
     )
     .await?;
@@ -85,6 +87,7 @@ pub async fn get_raw_object(
 #[allow(clippy::too_many_arguments)]
 pub async fn list_raw_objects(
     app: &AppState,
+    routing_key: &RoutingKey,
     root_blob_name: &str,
     max_parts: u32,
     prefix: &str,
@@ -93,7 +96,7 @@ pub async fn list_raw_objects(
     skip_mpu_parts: bool,
     trace_id: &TraceId,
 ) -> Result<Vec<(String, ObjectLayout)>, S3Error> {
-    let nss_client = app.get_nss_rpc_client().await?;
+    let nss_client = app.get_nss_rpc_client(routing_key).await?;
     let resp = nss_rpc_retry!(
         nss_client,
         list_inodes(
@@ -107,6 +110,7 @@ pub async fn list_raw_objects(
             trace_id
         ),
         app,
+        routing_key,
         trace_id
     )
     .await?;

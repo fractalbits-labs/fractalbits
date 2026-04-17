@@ -1,7 +1,7 @@
 #![allow(clippy::await_holding_refcell_ref)]
 
 use bytes::Bytes;
-use data_types::{Bucket, DataBlobGuid, DataVgInfo, TraceId};
+use data_types::{Bucket, DataBlobGuid, DataVgInfo, RoutingKey, TraceId};
 use file_ops::{
     ListEntry, blob_blocks_to_delete, create_dir_marker_layout, mpu_get_part_prefix,
     parse_delete_inode, parse_get_inode, parse_list_inodes, parse_mpu_parts, parse_put_inode,
@@ -21,11 +21,12 @@ pub struct BackendConfig {
     pub nss_address: String,
     pub data_vg_info: DataVgInfo,
     pub root_blob_name: String,
+    pub routing_key: RoutingKey,
     pub config: Config,
 }
 
 impl BackendConfig {
-    /// Perform one-time initialization: discover NSS address, DataVgInfo, bucket info from RSS.
+    /// Perform one-time initialization: discover bucket info, NSS address, DataVgInfo from RSS.
     /// This runs on a compio runtime and creates temporary RPC connections.
     pub async fn discover(config: &Config) -> Result<Self, String> {
         let trace_id = TraceId::new();
@@ -36,21 +37,9 @@ impl BackendConfig {
             config.rpc_connection_timeout(),
         );
 
-        // 2. Get active NSS address from RSS
-        let nss_addr = rss_client
-            .get_active_nss_address(&[], Some(config.rss_rpc_timeout()), &trace_id, 0)
-            .await
-            .map_err(|e| format!("Failed to get NSS address from RSS: {e}"))?;
-        tracing::info!("Got NSS address: {nss_addr}");
-
-        // 3. Get DataVgInfo from RSS
-        let data_vg_info = rss_client
-            .get_data_vg_info(Some(config.rss_rpc_timeout()), &trace_id)
-            .await
-            .map_err(|e| format!("Failed to get DataVgInfo from RSS: {e}"))?;
-        tracing::info!("Got DataVgInfo with {} volumes", data_vg_info.volumes.len());
-
-        // 4. Resolve bucket -> root_blob_name
+        // 2. Resolve bucket -> root_blob_name, routing_key. We fetch the
+        //    bucket first so the NSS address lookup below can use the bucket's
+        //    routing_key.
         let bucket_key = format!("bucket:{}", config.bucket_name);
         let (_version, bucket_json) = rss_client
             .get(&bucket_key, Some(config.rss_rpc_timeout()), &trace_id, 0)
@@ -60,15 +49,36 @@ impl BackendConfig {
         let bucket: Bucket = serde_json::from_str(&bucket_json)
             .map_err(|e| format!("Failed to parse bucket JSON: {e}"))?;
         tracing::info!(
-            "Resolved bucket '{}' -> root_blob_name '{}'",
+            "Resolved bucket '{}' -> root_blob_name '{}' routing_key {}",
             config.bucket_name,
-            bucket.root_blob_name
+            bucket.root_blob_name,
+            bucket.routing_key
         );
+
+        // 3. Get active NSS address from RSS for this bucket's routing_key
+        let nss_addr = rss_client
+            .get_active_nss_address(
+                bucket.routing_key.as_bytes(),
+                Some(config.rss_rpc_timeout()),
+                &trace_id,
+                0,
+            )
+            .await
+            .map_err(|e| format!("Failed to get NSS address from RSS: {e}"))?;
+        tracing::info!("Got NSS address: {nss_addr}");
+
+        // 4. Get DataVgInfo from RSS
+        let data_vg_info = rss_client
+            .get_data_vg_info(Some(config.rss_rpc_timeout()), &trace_id)
+            .await
+            .map_err(|e| format!("Failed to get DataVgInfo from RSS: {e}"))?;
+        tracing::info!("Got DataVgInfo with {} volumes", data_vg_info.volumes.len());
 
         Ok(Self {
             nss_address: nss_addr,
             data_vg_info,
             root_blob_name: bucket.root_blob_name,
+            routing_key: bucket.routing_key,
             config: config.clone(),
         })
     }
@@ -83,6 +93,7 @@ pub struct StorageBackend {
     nss_address: RefCell<String>,
     data_vg_proxy: DataVgProxy,
     root_blob_name: String,
+    routing_key: RoutingKey,
     config: Config,
 }
 
@@ -107,11 +118,12 @@ impl StorageBackend {
             nss_address: RefCell::new(backend_config.nss_address.clone()),
             data_vg_proxy,
             root_blob_name: backend_config.root_blob_name.clone(),
+            routing_key: backend_config.routing_key,
             config: backend_config.config.clone(),
         })
     }
 
-    /// Returns a borrow of the NSS client (for nss_rpc_retry! macro compatibility).
+    /// Returns a borrow of the NSS client.
     pub async fn get_nss_rpc_client(&self) -> Result<std::cell::Ref<'_, RpcClientNss>, FsError> {
         Ok(self.nss_client.borrow())
     }
@@ -122,7 +134,12 @@ impl StorageBackend {
 
         match self
             .rss_client
-            .get_active_nss_address(&[], Some(self.config.rss_rpc_timeout()), trace_id, 0)
+            .get_active_nss_address(
+                self.routing_key.as_bytes(),
+                Some(self.config.rss_rpc_timeout()),
+                trace_id,
+                0,
+            )
             .await
         {
             Ok(new_addr) => {

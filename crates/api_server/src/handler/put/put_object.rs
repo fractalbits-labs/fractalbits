@@ -81,10 +81,14 @@ pub async fn put_object_handler(ctx: ObjectRequestContext) -> Result<HttpRespons
         tracing::debug!("  {}: {:?}", name, value);
     }
 
+    // Resolve bucket once up front; pass through to the sub-handler so they
+    // don't re-resolve (avoids an extra JSON deserialize on the hot path).
+    let bucket = ctx.resolve_bucket().await?;
+
     // Create blob GUID once for this object upload
     let blob_client = ctx
         .app
-        .get_blob_client()
+        .get_blob_client(&bucket.routing_key)
         .await
         .map_err(|_| S3Error::InternalError)?;
     let content_len_hint = ctx
@@ -98,10 +102,10 @@ pub async fn put_object_handler(ctx: ObjectRequestContext) -> Result<HttpRespons
     // Decide whether to use streaming based on request characteristics
     if should_use_streaming(&ctx.request) {
         tracing::debug!("Using streaming path for PUT object");
-        put_object_streaming_internal(ctx, blob_guid).await
+        put_object_streaming_internal(ctx, bucket, blob_guid).await
     } else {
         tracing::debug!("Using buffered path for PUT object");
-        put_object_with_no_trailer(ctx, blob_guid).await
+        put_object_with_no_trailer(ctx, bucket, blob_guid).await
     }
 }
 
@@ -312,6 +316,7 @@ fn should_use_streaming(request: &actix_web::HttpRequest) -> bool {
 // Internal streaming handler that processes chunks as they arrive
 async fn put_object_streaming_internal(
     ctx: ObjectRequestContext,
+    bucket_obj: data_types::Bucket,
     mut blob_guid: DataBlobGuid,
 ) -> Result<HttpResponse, S3Error> {
     let start = Instant::now();
@@ -322,8 +327,7 @@ async fn put_object_streaming_internal(
         ctx.key,
     );
 
-    // Resolve bucket to get bucket details
-    let bucket_obj = ctx.resolve_bucket().await?;
+    let routing_key = bucket_obj.routing_key;
     let tracking_root_blob_name = bucket_obj.tracking_root_blob_name.clone();
 
     // Extract metadata headers
@@ -349,7 +353,7 @@ async fn put_object_streaming_internal(
     // Use the blob GUID passed from the main handler
     let blob_client = ctx
         .app
-        .get_blob_client()
+        .get_blob_client(&routing_key)
         .await
         .map_err(|_| S3Error::InternalError)?;
 
@@ -460,7 +464,7 @@ async fn put_object_streaming_internal(
         .into();
 
     // Store object metadata in NSS
-    let nss_client = ctx.app.get_nss_rpc_client().await?;
+    let nss_client = ctx.app.get_nss_rpc_client(&routing_key).await?;
     let resp = nss_rpc_retry!(
         nss_client,
         put_inode(
@@ -471,6 +475,7 @@ async fn put_object_streaming_internal(
             &ctx.trace_id
         ),
         ctx.app,
+        &routing_key,
         &ctx.trace_id
     )
     .await
@@ -553,9 +558,10 @@ async fn put_object_streaming_internal(
 // Helper function for buffered upload with pre-resolved bucket
 async fn put_object_with_no_trailer(
     ctx: ObjectRequestContext,
+    bucket: data_types::Bucket,
     blob_guid: DataBlobGuid,
 ) -> Result<HttpResponse, S3Error> {
-    let bucket = ctx.resolve_bucket().await?;
+    let routing_key = bucket.routing_key;
     let expected_size = ctx
         .request
         .headers()
@@ -594,7 +600,7 @@ async fn put_object_with_no_trailer(
     // Store data in chunks
     let blob_client = ctx
         .app
-        .get_blob_client()
+        .get_blob_client(&routing_key)
         .await
         .map_err(|_| S3Error::InternalError)?;
     let size = total_size as u64;
@@ -674,7 +680,7 @@ async fn put_object_with_no_trailer(
         .into();
 
     // Store object metadata in NSS using the resolved bucket
-    let nss_client = ctx.app.get_nss_rpc_client().await?;
+    let nss_client = ctx.app.get_nss_rpc_client(&routing_key).await?;
     let resp = nss_rpc_retry!(
         nss_client,
         put_inode(
@@ -685,6 +691,7 @@ async fn put_object_with_no_trailer(
             &ctx.trace_id
         ),
         ctx.app,
+        &routing_key,
         &ctx.trace_id
     )
     .await

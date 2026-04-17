@@ -267,8 +267,18 @@ async fn get_copy_source_object(
     }
 
     let source_bucket = bucket::resolve_bucket(&app, &source_bucket_name, &trace_id).await?;
-    let source_obj =
-        get_raw_object(&app, &source_bucket.root_blob_name, &source_key, &trace_id).await?;
+    // Source may resolve to a different routing_key than the current request;
+    // make sure the corresponding NSS client is cached before issuing NSS RPCs.
+    app.ensure_nss_client_initialized(&source_bucket.routing_key, &trace_id)
+        .await;
+    let source_obj = get_raw_object(
+        &app,
+        &source_bucket.routing_key,
+        &source_bucket.root_blob_name,
+        &source_key,
+        &trace_id,
+    )
+    .await?;
     let (source_obj_content, _) = get_object_content_as_bytes(
         app,
         &source_bucket,

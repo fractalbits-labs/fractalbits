@@ -297,7 +297,8 @@ pub async fn list_objects(
         start_after
     );
 
-    let nss_client = app.get_nss_rpc_client().await?;
+    let routing_key = &bucket.routing_key;
+    let nss_client = app.get_nss_rpc_client(routing_key).await?;
     let resp = nss_rpc_retry!(
         nss_client,
         list_inodes(
@@ -311,6 +312,7 @@ pub async fn list_objects(
             &trace_id
         ),
         app,
+        routing_key,
         &trace_id
     )
     .await?;
