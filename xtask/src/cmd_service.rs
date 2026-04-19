@@ -283,6 +283,9 @@ pub fn init_service(
 
         // Stop services after initialization
         stop_service(ServiceName::Rss)?;
+        // Reset observer-leader-fence to 0 so the next RSS start sees a first-boot
+        // and uses the extended grace period (prevents premature NSS reassignment).
+        reset_observer_leader_fence(init_config.rss_backend)?;
         match init_config.rss_backend {
             RssBackend::Ddb => stop_service(ServiceName::DdbLocal)?,
             RssBackend::Etcd => stop_service(ServiceName::Etcd)?,
@@ -673,7 +676,7 @@ pub fn start_nss_role_agent_instance(id: u32) -> CmdResult {
     // Today's 2-instance active/standby topology: instance 0 supervises the
     // active NSS (port 8087); instance 1 sits as an idle standby.
     if id == 0 {
-        wait_for_port_ready(8087, 30)?;
+        wait_for_port_ready(8087, 120)?;
     } else {
         // Idle standby (or future scaled instances): no managed service port.
         // Fall back to systemd's is-active check.
@@ -1637,6 +1640,41 @@ fn register_local_api_server() -> CmdResult {
     }
 
     info!("Local api_server registered in service discovery");
+    Ok(())
+}
+
+/// Reset observer-leader-fence to 0 so the next RSS start sees a first-boot
+/// and uses the extended grace period. This prevents the observer from
+/// prematurely reassigning journals during service startup.
+fn reset_observer_leader_fence(backend: RssBackend) -> CmdResult {
+    match backend {
+        RssBackend::Etcd => {
+            let etcdctl = resolve_etcd_bin("etcdctl");
+            run_cmd! {
+                $etcdctl put /fractalbits-service-discovery/observer-leader-fence 0 >/dev/null;
+            }?;
+        }
+        RssBackend::Ddb => {
+            let table = "fractalbits-service-discovery";
+            let observer_fence_item =
+                r#"{"service_id":{"S":"observer-leader-fence"},"value":{"N":"0"}}"#;
+            run_cmd! {
+                $[LOCAL_DDB_ENVS]
+                aws dynamodb put-item
+                    --table-name $table
+                    --item $observer_fence_item >/dev/null;
+            }?;
+        }
+        RssBackend::Firestore => {
+            let url = "http://localhost:8282/v1/projects/test-project/databases/fractalbits/documents/fractalbits-service-discovery/observer-leader-fence";
+            let fields = r#"{"fields":{"value":{"integerValue":"0"}}}"#;
+            run_cmd!(
+                curl -sf -X PATCH $url
+                    -H "Content-Type: application/json"
+                    -d $fields >/dev/null
+            )?;
+        }
+    }
     Ok(())
 }
 

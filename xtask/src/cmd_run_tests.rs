@@ -149,10 +149,12 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
             test_fs_server(run_fuse, run_nfs, disk_cache_only).await
         }
         TestType::All => {
-            test_leader_election()?;
+            test_fs_server(true, true, false).await?;
+            test_bss_node_failure().await?;
             test_bss_repair().await?;
-            multi_az::run_multi_az_tests(MultiAzTestType::All).await?;
-            test_fs_server(true, true, false).await
+            test_nss_failover(RssBackend::Etcd).await?;
+            test_leader_election()?;
+            multi_az::run_multi_az_tests(MultiAzTestType::All).await
         }
     }
 }
