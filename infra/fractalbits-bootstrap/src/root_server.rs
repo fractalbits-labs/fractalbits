@@ -85,56 +85,51 @@ impl MetadataVgReadyStage {
     }
 }
 
-pub fn bootstrap(
-    config: &BootstrapConfig,
-    is_leader: bool,
-    for_bench: bool,
-    cli_nss_id: Option<&str>,
-    cli_nss_ip: Option<&str>,
-) -> CmdResult {
-    // CLI-provided IP takes precedence (injected via UserData on cloud deployments
-    // where the instance IP is known at CDK/Terraform synthesis time but not in
-    // the bootstrap config, which is generated before instances are created).
-    let nss_endpoint = cli_nss_ip
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            config
-                .endpoints
-                .as_ref()
-                .and_then(|e| e.nss_endpoint.as_deref())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or("");
-    let resources = config.get_resources();
-    // CLI-provided IDs take precedence (AWS cloud path); fall back to TOML resources (on-prem path)
-    let nss_id_owned;
-    let nss_id = if let Some(id) = cli_nss_id {
-        id
-    } else {
-        nss_id_owned = resources.nss_id.clone();
-        &nss_id_owned
-    };
+pub fn bootstrap(config: &BootstrapConfig, is_leader: bool, for_bench: bool) -> CmdResult {
     let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     let num_bss_nodes = config.global.num_bss_nodes;
     let ha_enabled = config.global.rss_ha_enabled;
 
     if is_leader {
-        bootstrap_leader(
-            config,
-            nss_endpoint,
-            nss_id,
-            remote_az,
-            num_bss_nodes,
-            ha_enabled,
-            for_bench,
-        )?;
+        bootstrap_leader(config, remote_az, num_bss_nodes, ha_enabled, for_bench)?;
         Ok(())
     } else {
-        bootstrap_follower(config, nss_endpoint, ha_enabled)
+        bootstrap_follower(config, ha_enabled)
     }
 }
 
-fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: bool) -> CmdResult {
+/// Resolve the NSS instance_id and IP this RSS should point at. NSS now
+/// self-registers to the service discovery backend (DDB on AWS, Firestore on
+/// GCP, etcd on on-prem), so RSS waits for that registry entry rather than
+/// relying on UserData/startup-script injection. Falls back to TOML on-prem
+/// resources for deployments that don't bring up a service discovery backend.
+fn resolve_nss(config: &BootstrapConfig) -> Result<(String, String), Error> {
+    if config.is_etcd_backend() || config.is_firestore_backend() || config.aws.is_some() {
+        let instances = get_service_instances_with_backend(config, "nss-server", 1);
+        let (id, ip) = instances
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::other("no NSS instance registered in service discovery"))?;
+        return Ok((id, ip));
+    }
+
+    // On-prem TOML fallback
+    let resources = config.get_resources();
+    let nss_id = resources.nss_id.clone();
+    let nss_ip = config
+        .endpoints
+        .as_ref()
+        .and_then(|e| e.nss_endpoint.clone())
+        .unwrap_or_default();
+    if nss_id.is_empty() {
+        return Err(Error::other(
+            "NSS not registered in service discovery and no TOML resources.nss_id",
+        ));
+    }
+    Ok((nss_id, nss_ip))
+}
+
+fn bootstrap_follower(config: &BootstrapConfig, ha_enabled: bool) -> CmdResult {
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Rss)?;
 
     // Complete instances-ready stage
@@ -150,7 +145,10 @@ fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: 
     info!("Follower waiting for RSS leader to initialize...");
     ServicesReadyStage::wait_for_rss_initialized(&barrier)?;
 
-    create_rss_config(config, nss_endpoint, ha_enabled)?;
+    // NSS is registered by the time RSS leader signals RSS_INITIALIZED.
+    let (_nss_id, nss_endpoint) = resolve_nss(config)?;
+
+    create_rss_config(config, &nss_endpoint, ha_enabled)?;
     create_rss_bootstrap_env()?;
     create_systemd_unit_file("rss", true)?; // Start immediately
     register_service(config, "root-server")?;
@@ -164,11 +162,8 @@ fn bootstrap_follower(config: &BootstrapConfig, nss_endpoint: &str, ha_enabled: 
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn bootstrap_leader(
     config: &BootstrapConfig,
-    nss_endpoint: &str,
-    nss_id: &str,
     remote_az: Option<&str>,
     num_bss_nodes: Option<usize>,
     ha_enabled: bool,
@@ -197,11 +192,18 @@ fn bootstrap_leader(
         initialize_az_status(config, remote_az)?;
     }
 
+    // Wait for NSS to self-register before initializing observer state. NSS
+    // runs in an ASG/MIG and registers to service discovery on boot; the
+    // entry persists across NSS restarts so RSS just polls for it.
+    info!("Waiting for NSS to register in service discovery...");
+    let (nss_id, nss_endpoint) = resolve_nss(config)?;
+    info!("Discovered NSS: id={nss_id} ip={nss_endpoint}");
+
     // Initialize NSS role states in service discovery BEFORE starting RSS
     // This ensures the observer state exists when RSS starts
-    initialize_observer_state(config, nss_id, nss_endpoint)?;
+    initialize_observer_state(config, &nss_id, &nss_endpoint)?;
 
-    create_rss_config(config, nss_endpoint, ha_enabled)?;
+    create_rss_config(config, &nss_endpoint, ha_enabled)?;
     create_rss_bootstrap_env()?;
     create_systemd_unit_file("rss", true)?;
     register_service(config, "root-server")?;

@@ -209,17 +209,46 @@ fn clear_firestore_stale_data(project_id: &str) -> CmdResult {
     let database_id = "fractalbits";
     let token = run_fun!(gcloud auth print-access-token)?;
 
-    for collection in [
-        "fractalbits-service-discovery",
-        "fractalbits-api-keys-and-buckets",
-    ] {
-        let list_url = format!(
+    // Discover every top-level collection instead of hard-coding names. Each
+    // service self-registers into its own collection
+    // (`fractalbits-service-discovery-<service>`), so a per-service node from a
+    // prior cluster that didn't deregister cleanly will otherwise leak into
+    // `resolve_nss`/`resolve_rss` lookups and break `running_nss_id` in
+    // `journal-configs`. Wiping every fractalbits collection at deploy start
+    // guarantees a clean slate.
+    let list_url = format!(
+        "https://firestore.googleapis.com/v1/projects/{project_id}/databases/{database_id}/documents:listCollectionIds"
+    );
+    let list_result = run_fun!(
+        curl -sf -X POST $list_url
+            -H "Authorization: Bearer $token"
+            -H "Content-Type: application/json"
+            -d "{}"
+    );
+    let collections: Vec<String> = list_result
+        .ok()
+        .and_then(|json_str| serde_json::from_str::<serde_json::Value>(&json_str).ok())
+        .and_then(|parsed| {
+            parsed
+                .get("collectionIds")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .filter(|name| name.starts_with("fractalbits-"))
+                        .collect()
+                })
+        })
+        .unwrap_or_default();
+
+    for collection in collections {
+        let docs_url = format!(
             "https://firestore.googleapis.com/v1/projects/{project_id}/databases/{database_id}/documents/{collection}"
         );
-        let list_result = run_fun!(
-            curl -sf $list_url -H "Authorization: Bearer $token"
+        let docs_result = run_fun!(
+            curl -sf $docs_url -H "Authorization: Bearer $token"
         );
-        if let Ok(json_str) = list_result
+        if let Ok(json_str) = docs_result
             && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str)
             && let Some(docs) = parsed.get("documents").and_then(|d| d.as_array())
         {

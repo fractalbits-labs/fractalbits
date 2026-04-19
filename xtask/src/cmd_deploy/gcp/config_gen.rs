@@ -58,7 +58,7 @@ pub fn generate_bootstrap_config(
             rss_ha_enabled: params.rss_ha_enabled,
             rss_backend: params.rss_backend,
             journal_type: xtask_common::JournalType::Remote,
-            num_nss_nodes: Some(1), // Terraform creates nss-0 only
+            num_nss_nodes: Some(1), // NSS MIG runs as managed singleton (target_size=1)
             num_bss_nodes: Some(params.num_bss_nodes),
             num_api_servers: Some(params.num_api_servers),
             num_bench_clients: if params.with_bench {

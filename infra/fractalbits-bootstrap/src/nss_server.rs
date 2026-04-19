@@ -14,8 +14,7 @@ struct NssConfiguredStage;
 
 impl NssConfiguredStage {
     const STAGE: VerifiedNodeStage = const { stages::NSS_CONFIGURED.node_stage() };
-    const ETCD_READY: VerifiedGlobalDep =
-        const { stages::NSS_CONFIGURED.global_dep("etcd-ready") };
+    const ETCD_READY: VerifiedGlobalDep = const { stages::NSS_CONFIGURED.global_dep("etcd-ready") };
     const RSS_INITIALIZED: VerifiedGlobalDep =
         const { stages::NSS_CONFIGURED.global_dep("rss-initialized") };
 
@@ -40,8 +39,7 @@ impl JournalFormattedStage {
         const { stages::JOURNAL_FORMATTED.global_dep("metadata-vg-ready") };
     const BSS_CONFIGURED: VerifiedNodeDep =
         const { stages::JOURNAL_FORMATTED.node_dep("bss-configured") };
-    const BSS_READY: VerifiedNodeDep =
-        const { stages::JOURNAL_FORMATTED.node_dep("bss-ready") };
+    const BSS_READY: VerifiedNodeDep = const { stages::JOURNAL_FORMATTED.node_dep("bss-ready") };
 
     fn wait_for_metadata_vg_ready(barrier: &WorkflowBarrier) -> CmdResult {
         barrier.wait_for_global(Self::METADATA_VG_READY)
@@ -124,6 +122,12 @@ pub fn bootstrap(
         info!("etcd cluster is ready");
     }
 
+    // Register NSS in service discovery before waiting for RSS. With NSS
+    // running in an ASG/MIG, instance IDs/IPs are not known at synthesis
+    // time, so RSS leader discovers the NSS endpoint by polling this
+    // registry entry rather than via injected CLI args.
+    register_service(config, "nss-server")?;
+
     if !meta_stack_testing {
         // Wait for RSS to initialize - RSS will have registered with service discovery by then
         // This must happen before setup_configs because create_nss_role_agent_config needs RSS IPs
@@ -174,9 +178,10 @@ pub fn bootstrap(
         // wait and uses BSS_CONFIGURED's long timeout. Then wait for each BSS
         // to actually bind its port (BSS_READY, short timeout). Otherwise
         // MultiBssObjectWriter quorum fails with NotEnoughReplicas.
-        let total_bss_nodes = config.global.num_bss_nodes.ok_or_else(|| {
-            Error::other("global.num_bss_nodes is required for NSS bootstrap")
-        })?;
+        let total_bss_nodes = config
+            .global
+            .num_bss_nodes
+            .ok_or_else(|| Error::other("global.num_bss_nodes is required for NSS bootstrap"))?;
         info!("Waiting for {total_bss_nodes} BSS node(s) to complete format...");
         JournalFormattedStage::wait_for_bss_configured(&barrier, total_bss_nodes)?;
         info!("All BSS nodes have completed format");

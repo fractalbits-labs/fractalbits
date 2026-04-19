@@ -7,18 +7,12 @@ use crate::config::{BootstrapConfig, InstanceConfig};
 
 #[derive(Debug, Clone)]
 pub enum ServiceType {
-    RootServer {
-        is_leader: bool,
-    },
-    NssServer {
-        journal_uuid: Option<String>,
-    },
+    RootServer { is_leader: bool },
+    NssServer { journal_uuid: Option<String> },
     ApiServer,
     BssServer,
     GuiServer,
-    BenchServer {
-        bench_client_num: usize,
-    },
+    BenchServer { bench_client_num: usize },
     BenchClient,
 }
 
@@ -41,15 +35,6 @@ pub struct CliArgs {
     /// NSS sub-role: primary or standby (for nss_server)
     #[clap(long)]
     pub nss_role: Option<String>,
-
-    /// NSS instance ID (for root_server leader — used to initialize observer state)
-    #[clap(long)]
-    pub nss_id: Option<String>,
-
-    /// NSS private IP (for root_server leader — injected via UserData so RSS config
-    /// has the correct nss_addr from the start, without needing a post-start update)
-    #[clap(long)]
-    pub nss_ip: Option<String>,
 
     /// API server NLB endpoint (for bench_server — injected via UserData)
     #[clap(long)]
