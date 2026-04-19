@@ -21,7 +21,6 @@ provider "google" {
 locals {
   rss_a_name = "rss-a"
   rss_b_name = "rss-b"
-  nss_a_name = "nss-0"
 
   # Mini template: single NSS, single BSS, single API server
   # Standard template: single NSS, multiple BSS/API

@@ -13,14 +13,9 @@ output "rss_b_ip" {
   description = "RSS-B private IP (HA only)"
 }
 
-output "nss_0_ip" {
-  value       = google_compute_instance.nss_a.network_interface[0].network_ip
-  description = "NSS-0 private IP"
-}
-
-output "nss_0_name" {
-  value       = google_compute_instance.nss_a.name
-  description = "NSS-0 instance name"
+output "nss_instance_group" {
+  value       = google_compute_instance_group_manager.nss_server.instance_group
+  description = "NSS server instance group URL (managed singleton)"
 }
 
 output "api_lb_ip" {

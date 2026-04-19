@@ -206,6 +206,17 @@ pub(crate) fn get_service_ips_firestore(
     service_id: &str,
     expected_min_count: usize,
 ) -> Vec<String> {
+    get_service_instances_firestore(config, service_id, expected_min_count)
+        .into_iter()
+        .map(|(_id, ip)| ip)
+        .collect()
+}
+
+pub(crate) fn get_service_instances_firestore(
+    config: &BootstrapConfig,
+    service_id: &str,
+    expected_min_count: usize,
+) -> Vec<(String, String)> {
     info!("Waiting for {expected_min_count} {service_id} service(s) via Firestore");
     let gcp = config
         .gcp
@@ -237,26 +248,28 @@ pub(crate) fn get_service_ips_firestore(
             if let Ok(output) = res
                 && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output)
             {
-                let ips: Vec<String> = parsed["documents"]
+                // Doc name format: projects/.../databases/.../documents/<collection>/<instance_id>
+                let pairs: Vec<(String, String)> = parsed["documents"]
                     .as_array()
                     .map(|docs| {
                         docs.iter()
                             .filter_map(|doc| {
-                                doc["fields"]["ip"]["stringValue"]
-                                    .as_str()
-                                    .map(|s| s.to_string())
+                                let name = doc["name"].as_str()?;
+                                let instance_id = name.rsplit('/').next()?.to_string();
+                                let ip = doc["fields"]["ip"]["stringValue"].as_str()?.to_string();
+                                Some((instance_id, ip))
                             })
                             .collect()
                     })
                     .unwrap_or_default();
 
-                if ips.len() >= expected_min_count {
-                    info!("Found a list of {service_id} services via Firestore: {ips:?}");
-                    return ips;
+                if pairs.len() >= expected_min_count {
+                    info!("Found a list of {service_id} services via Firestore: {pairs:?}");
+                    return pairs;
                 }
                 info!(
                     "Found {} of {} {service_id} services, waiting...",
-                    ips.len(),
+                    pairs.len(),
                     expected_min_count
                 );
             }

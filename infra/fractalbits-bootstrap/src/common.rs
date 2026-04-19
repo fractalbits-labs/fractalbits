@@ -512,6 +512,24 @@ pub fn get_service_ips_with_backend(
     }
 }
 
+/// Same as `get_service_ips_with_backend` but returns (instance_id, ip) pairs.
+/// Used when the caller needs the registering instance's identity (e.g., RSS
+/// initializing observer state with the NSS instance ID as the node key).
+pub fn get_service_instances_with_backend(
+    config: &BootstrapConfig,
+    service_id: &str,
+    expected_count: usize,
+) -> Vec<(String, String)> {
+    if config.is_etcd_backend() {
+        let endpoints = crate::etcd::get_etcd_endpoints(config).expect("etcd endpoints required");
+        crate::etcd::get_service_instances_etcd(&endpoints, service_id, expected_count)
+    } else if config.is_firestore_backend() {
+        crate::gcp::get_service_instances_firestore(config, service_id, expected_count)
+    } else {
+        crate::aws::get_service_instances(service_id, expected_count)
+    }
+}
+
 /// Fetch a single string value from service discovery by key.
 /// Returns the raw value string (e.g. the VG config JSON).
 pub fn get_service_discovery_value(

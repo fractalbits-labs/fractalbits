@@ -89,9 +89,7 @@ fn generic_bootstrap_with_args(cli_args: CliArgs) -> CmdResult {
 
     let service_name = match service_type {
         ServiceType::RootServer { is_leader } => {
-            let nss_id = cli_args.nss_id.as_deref();
-            let nss_ip = cli_args.nss_ip.as_deref();
-            root_server::bootstrap(&config, is_leader, for_bench, nss_id, nss_ip)?;
+            root_server::bootstrap(&config, is_leader, for_bench)?;
             "root_server"
         }
         ServiceType::NssServer { journal_uuid } => {

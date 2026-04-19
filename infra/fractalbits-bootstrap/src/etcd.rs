@@ -186,6 +186,17 @@ pub(crate) fn get_service_ips_etcd(
     service_id: &str,
     expected_min_count: usize,
 ) -> Vec<String> {
+    get_service_instances_etcd(endpoints, service_id, expected_min_count)
+        .into_iter()
+        .map(|(_id, ip)| ip)
+        .collect()
+}
+
+pub(crate) fn get_service_instances_etcd(
+    endpoints: &str,
+    service_id: &str,
+    expected_min_count: usize,
+) -> Vec<(String, String)> {
     info!("Waiting for {expected_min_count} {service_id} service(s) via etcd");
     let start_time = Instant::now();
     let timeout = Duration::from_secs(300);
@@ -197,26 +208,32 @@ pub(crate) fn get_service_ips_etcd(
             cmd_die!("Timeout waiting for ${service_id} service(s) via etcd");
         }
 
+        // Without --print-value-only we get alternating key/value lines.
         let res: Result<String, _> = run_fun! {
-            $etcdctl --endpoints=$endpoints get $etcd_prefix --prefix --print-value-only 2>/dev/null
+            $etcdctl --endpoints=$endpoints get $etcd_prefix --prefix 2>/dev/null
         };
 
         match res {
             Ok(ref output) if !output.trim().is_empty() => {
-                // Each line is an IP address
-                let ips: Vec<String> = output
-                    .lines()
-                    .filter(|line| !line.is_empty())
-                    .map(|s| s.to_string())
-                    .collect();
+                let lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
+                let mut pairs = Vec::new();
+                let mut i = 0;
+                while i + 1 < lines.len() {
+                    let key = lines[i];
+                    let val = lines[i + 1];
+                    if let Some(instance_id) = key.strip_prefix(&etcd_prefix) {
+                        pairs.push((instance_id.to_string(), val.to_string()));
+                    }
+                    i += 2;
+                }
 
-                if ips.len() >= expected_min_count {
-                    info!("Found a list of {service_id} services via etcd: {ips:?}");
-                    return ips;
+                if pairs.len() >= expected_min_count {
+                    info!("Found a list of {service_id} services via etcd: {pairs:?}");
+                    return pairs;
                 }
                 info!(
                     "Found {} of {} {service_id} services, waiting...",
-                    ips.len(),
+                    pairs.len(),
                     expected_min_count
                 );
             }
