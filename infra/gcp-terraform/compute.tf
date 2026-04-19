@@ -31,7 +31,7 @@ resource "google_compute_instance" "rss_a" {
     rss-backend   = var.rss_backend
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
-      role_args  = "--role root_server --rss-role leader --nss-ip ${google_compute_instance.nss_a.network_interface[0].network_ip} --nss-id nss-0-${var.cluster_id}"
+      role_args  = "--role root_server --rss-role leader"
     })
   }
 
@@ -78,7 +78,7 @@ resource "google_compute_instance" "rss_b" {
     rss-backend   = var.rss_backend
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
-      role_args  = "--role root_server --rss-role follower --nss-ip ${google_compute_instance.nss_a.network_interface[0].network_ip}"
+      role_args  = "--role root_server --rss-role follower"
     })
   }
 
@@ -100,37 +100,21 @@ resource "google_compute_instance" "rss_b" {
   ]
 }
 
-# NSS-0 (Namespace Server)
-resource "google_compute_instance" "nss_a" {
-  name         = "nss-0-${var.cluster_id}"
+# NSS instance template — stateless, no journal disk (NSS uses BSS quorum
+# journal VG). Provisioned via MIG below as a managed singleton (target_size=1)
+# so a failed instance is replaced and re-registers in Firestore service
+# discovery; RSS picks up the new endpoint on next leader-init poll.
+resource "google_compute_instance_template" "nss_server" {
+  name_prefix  = "nss-${var.cluster_id}-"
   machine_type = var.nss_machine_type
-  zone         = var.zone_a
+  region       = var.region
 
-  boot_disk {
-    initialize_params {
-      image = var.os_image
-      size  = var.boot_disk_size_gb
-    }
-  }
-
-  # Local SSDs for NVMe journal (if using local_ssd journal type)
-  dynamic "scratch_disk" {
-    for_each = var.journal_type == "local_ssd" ? [1] : []
-    content {
-      interface = "NVME"
-    }
-  }
-
-  # Attach shared PD journal disk (if using pd_ssd journal type)
-  dynamic "attached_disk" {
-    for_each = var.journal_type == "pd_ssd" ? [1] : []
-    content {
-      source      = google_compute_disk.nss_journal[0].id
-      device_name = "nss-journal"
-      # Multi-writer is set on the disk itself (access_mode=READ_WRITE_MANY).
-      # The attached_disk mode must be READ_WRITE (not READ_WRITE_MANY).
-      mode        = "READ_WRITE"
-    }
+  disk {
+    source_image = var.os_image
+    auto_delete  = true
+    boot         = true
+    disk_size_gb = var.boot_disk_size_gb
+    disk_type    = "pd-ssd"
   }
 
   network_interface {
@@ -154,7 +138,9 @@ resource "google_compute_instance" "nss_a" {
 
   tags = ["fractalbits-private", "nss"]
 
-  allow_stopping_for_update = true
+  lifecycle {
+    create_before_destroy = true
+  }
 
   depends_on = [
     google_project_iam_member.firestore,
@@ -163,6 +149,19 @@ resource "google_compute_instance" "nss_a" {
     google_project_iam_member.logging,
     google_project_iam_member.monitoring,
   ]
+}
+
+# NSS managed singleton — target_size=1 preserves the current single-NSS
+# topology while using MIG so the instance is auto-replaced on failure.
+resource "google_compute_instance_group_manager" "nss_server" {
+  name               = "nss-server-${var.cluster_id}"
+  base_instance_name = "nss-${var.cluster_id}"
+  zone               = var.zone_a
+  target_size        = 1
+
+  version {
+    instance_template = google_compute_instance_template.nss_server.id
+  }
 }
 
 # Bench clients (optional, one per index)

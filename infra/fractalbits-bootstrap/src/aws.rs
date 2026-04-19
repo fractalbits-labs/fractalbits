@@ -362,6 +362,16 @@ echo "Done" >&2
 }
 
 pub(crate) fn get_service_ips(service_id: &str, expected_min_count: usize) -> Vec<String> {
+    get_service_instances(service_id, expected_min_count)
+        .into_iter()
+        .map(|(_id, ip)| ip)
+        .collect()
+}
+
+pub(crate) fn get_service_instances(
+    service_id: &str,
+    expected_min_count: usize,
+) -> Vec<(String, String)> {
     info!("Waiting for {expected_min_count} {service_id} service(s)");
     let start_time = Instant::now();
     let timeout = Duration::from_secs(300);
@@ -382,19 +392,19 @@ pub(crate) fn get_service_ips(service_id: &str, expected_min_count: usize) -> Ve
             Ok(output) if !output.is_empty() && output != "None" && output != "null" => {
                 let instances: serde_json::Value =
                     serde_json::from_str(&output).unwrap_or(serde_json::json!({}));
-                let mut ips = Vec::new();
+                let mut pairs = Vec::new();
                 if let Some(obj) = instances.as_object() {
-                    for (_instance_id, value) in obj {
+                    for (instance_id, value) in obj {
                         if let Some(ip_obj) = value.get("S")
                             && let Some(ip) = ip_obj.as_str()
                         {
-                            ips.push(ip.to_string());
+                            pairs.push((instance_id.clone(), ip.to_string()));
                         }
                     }
                 }
-                if ips.len() >= expected_min_count {
-                    info!("Found a list of {service_id} services: {ips:?}");
-                    return ips;
+                if pairs.len() >= expected_min_count {
+                    info!("Found a list of {service_id} services: {pairs:?}");
+                    return pairs;
                 }
             }
             _ => std::thread::sleep(std::time::Duration::from_secs(1)),

@@ -11,7 +11,6 @@ import {
   createDynamoDbTable,
   createEc2Role,
   createVpcEndpoints,
-  createPrivateLinkNlb,
   addAsgDynamoDbDeregistrationLifecycleHook,
   getAzNameFromIdAtBuildTime,
   createUserData,
@@ -213,7 +212,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
     );
 
     // Define instance metadata, and create instances
-    const nssInstanceType = new ec2.InstanceType(props.nssInstanceType);
     const rssInstanceType = new ec2.InstanceType("c7g.xlarge");
     const benchInstanceType = new ec2.InstanceType("c7g.large");
 
@@ -243,12 +241,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
         specificSubnet: subnet1,
         sg: privateSg,
         rootVolumeSize: 30,
-      },
-      {
-        id: "nss-0",
-        instanceType: nssInstanceType,
-        specificSubnet: subnet1,
-        sg: privateSg,
       },
     ];
 
@@ -298,18 +290,19 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
-    // Per-service UserData: each instance gets --role (and optional sub-args) appended
+    // Per-service UserData: each instance gets --role (and optional sub-args) appended.
+    // RSS no longer needs --nss-id/--nss-ip — NSS self-registers in DynamoDB
+    // service discovery on boot, and RSS leader polls that entry.
     const perServiceUserData: Record<string, ec2.UserData> = {
-      // rss-A is set below after NSS instances are created (needs their instanceIds)
+      "rss-A": createUserData(
+        this,
+        deployOS,
+        "--role root_server --rss-role leader",
+      ),
       "rss-B": createUserData(
         this,
         deployOS,
         "--role root_server --rss-role follower",
-      ),
-      "nss-0": createUserData(
-        this,
-        deployOS,
-        "--role nss_server --nss-role primary",
       ),
       gui_server: createUserData(this, deployOS, "--role gui_server"),
       // bench_server UserData is set after NLB creation so we can embed the NLB DNS name
@@ -317,10 +310,10 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     const instances: Record<string, ec2.Instance> = {};
 
-    // First pass: create NSS instances so their instanceIds (CDK tokens) are
-    // available for the RSS leader UserData below.
+    // Create non-NSS, non-bench_server instances. bench_server is deferred to
+    // after NLB creation so its UserData can include the NLB DNS.
     instanceConfigs
-      .filter(({ id }) => id.startsWith("nss-"))
+      .filter(({ id }) => id !== "bench_server")
       .forEach(({ id, instanceType, sg, specificSubnet, rootVolumeSize }) => {
         const userData =
           perServiceUserData[id] ?? createUserData(this, deployOS);
@@ -338,36 +331,30 @@ export class FractalbitsVpcStack extends cdk.Stack {
         );
       });
 
-    // Build RSS leader UserData with the NSS instance ID embedded so the
-    // RSS bootstrap can initialize journal config with the real ID.
-    const nssInstanceId = instances["nss-0"].instanceId;
-    const nssPrivateIp = instances["nss-0"].instancePrivateIp;
-    perServiceUserData["rss-A"] = createUserData(
+    // NSS as a managed-singleton ASG (min=max=1). NSS is stateless — its
+    // journal lives on the BSS quorum VG — so a replacement instance can
+    // recover by re-registering and rejoining the journal.
+    const nssAsg = createEc2Asg(
       this,
+      "NssAsg",
+      this.vpc,
+      subnet1,
+      privateSg,
+      ec2Role,
+      [props.nssInstanceType],
+      1,
+      1,
+      "nss_server",
       deployOS,
-      `--role root_server --rss-role leader --nss-id ${nssInstanceId} --nss-ip ${nssPrivateIp}`,
+      createUserData(this, deployOS, "--role nss_server --nss-role primary"),
     );
-
-    // Second pass: create all remaining (non-NSS, non-bench_server) instances.
-    // bench_server is deferred to after NLB creation so its UserData can include the NLB DNS.
-    instanceConfigs
-      .filter(({ id }) => !id.startsWith("nss-") && id !== "bench_server")
-      .forEach(({ id, instanceType, sg, specificSubnet, rootVolumeSize }) => {
-        const userData =
-          perServiceUserData[id] ?? createUserData(this, deployOS);
-        instances[id] = createInstance(
-          this,
-          this.vpc,
-          id,
-          specificSubnet,
-          instanceType,
-          sg,
-          ec2Role,
-          deployOS,
-          rootVolumeSize,
-          userData,
-        );
-      });
+    addAsgDynamoDbDeregistrationLifecycleHook(
+      this,
+      "Nss",
+      nssAsg,
+      "nss-server",
+      "fractalbits-service-discovery",
+    );
 
     // Create BSS nodes in ASG (dynamic cluster discovery via S3)
     let bssAsg: autoscaling.AutoScalingGroup | undefined;
@@ -385,24 +372,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
         "bss_server",
         deployOS,
         createUserData(this, deployOS, "--role bss_server"),
-      );
-    }
-
-    // Create PrivateLink setup for NSS and RSS services
-    const servicePort = 8088;
-
-    // NSS PrivateLink - only for multiAz mode
-    // For single-AZ, use direct instance IP to avoid VPC endpoint latency
-    let nssPrivateLink: any;
-    if (multiAz) {
-      const nssTargets = [instances["nss-0"], instances["nss-1"]];
-      nssPrivateLink = createPrivateLinkNlb(
-        this,
-        "Nss",
-        this.vpc,
-        nssTargets,
-        servicePort,
-        privateSubnets,
       );
     }
 
@@ -542,6 +511,11 @@ export class FractalbitsVpcStack extends cdk.Stack {
         description: `BSS Auto Scaling Group Name`,
       });
     }
+
+    new cdk.CfnOutput(this, "nssAsgName", {
+      value: nssAsg.autoScalingGroupName,
+      description: `NSS Auto Scaling Group Name`,
+    });
 
     if (props.browserIp) {
       new cdk.CfnOutput(this, "GuiServerPublicIp", {
