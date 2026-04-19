@@ -56,7 +56,7 @@ pub struct AppState {
     pub data_blob_tracker: OnceCell<Arc<DataBlobTracker>>,
 }
 
-struct NssEntry {
+pub struct NssEntry {
     address: String,
     client: RpcClientNss,
 }
@@ -68,6 +68,10 @@ impl AppState {
         config: Arc<Config>,
         cache_coordinator: Arc<CacheCoordinator<Versioned<String>>>,
         az_status_coordinator: Arc<CacheCoordinator<String>>,
+        // Shared across all per-core AppStates (including the mgmt-only one)
+        // so update_nss_address notifications reach every worker and the S3
+        // path doesn't redundantly refresh per-core on failover.
+        nss_clients: Arc<RwLock<HashMap<RoutingKey, NssEntry>>>,
         worker_id: u16,
     ) -> Self {
         debug!("Initializing per-core AppState with lazy RPC client connections");
@@ -84,8 +88,6 @@ impl AppState {
 
         debug!("Per-core AppState initialized with lazy BlobClient initialization");
 
-        // NSS clients start empty - populated per-routing-key on first use.
-        let nss_clients = Arc::new(RwLock::new(HashMap::new()));
         let rpc_client_rss = RpcClientRss::new_from_addresses(
             config.rss_addrs.clone(),
             config.rpc_connection_timeout(),
@@ -105,6 +107,13 @@ impl AppState {
             worker_id,
             data_blob_tracker: OnceCell::new(),
         }
+    }
+
+    /// Shared-map constructor for the shared NSS-client table used by
+    /// `new_per_core_sync`. Call once at process startup and pass the same
+    /// `Arc` into every per-core AppState (and the mgmt AppState).
+    pub fn new_shared_nss_clients() -> Arc<RwLock<HashMap<RoutingKey, NssEntry>>> {
+        Arc::new(RwLock::new(HashMap::new()))
     }
 
     /// Returns a read guard to the NSS client for the given routing_key,

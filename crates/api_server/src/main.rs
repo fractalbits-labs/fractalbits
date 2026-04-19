@@ -151,6 +151,9 @@ fn main() -> std::io::Result<()> {
     let cache_coordinator: Arc<CacheCoordinator<Versioned<String>>> =
         Arc::new(CacheCoordinator::new());
     let az_status_coordinator: Arc<CacheCoordinator<String>> = Arc::new(CacheCoordinator::new());
+    // Shared across all per-core AppStates so a single /mgmt/nss/update_address
+    // notification updates the NSS client map for every S3 worker.
+    let nss_clients = AppState::new_shared_nss_clients();
 
     let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     let mgmt_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), mgmt_port);
@@ -205,12 +208,12 @@ fn main() -> std::io::Result<()> {
 
     for (worker_idx, core_id) in worker_cores.into_iter().enumerate() {
         let http_listener = make_reuseport_listener(http_addr)?;
-        let mgmt_listener = make_reuseport_listener(mgmt_addr)?;
         let https_listener = https_addr.map(make_reuseport_listener).transpose()?;
 
         let config = config.clone();
         let cache_coordinator = cache_coordinator.clone();
         let az_status_coordinator = az_status_coordinator.clone();
+        let nss_clients = nss_clients.clone();
         let web_root = gui_web_root.clone();
         let https_config = https_config.clone();
         let handle_tx = handle_tx.clone();
@@ -232,6 +235,7 @@ fn main() -> std::io::Result<()> {
                         config.clone(),
                         cache_coordinator,
                         az_status_coordinator,
+                        nss_clients,
                         worker_idx as u16,
                     ));
 
@@ -240,41 +244,17 @@ fn main() -> std::io::Result<()> {
                             core_affinity::set_for_current(core_id);
                         }
 
+                        // Admin routes (/mgmt, /api_keys) live on the mgmt
+                        // HttpServer on its own port. This keeps them off the
+                        // S3 workers (so cache-invalidation POSTs can't queue
+                        // behind stuck S3 requests) and also frees up "mgmt"
+                        // and "api_keys" as valid S3 bucket names on the main
+                        // port.
                         let app_state = app_state.clone();
                         let mut app = App::new()
                             .app_data(web::Data::new(app_state))
                             .app_data(web::PayloadConfig::default().limit(5_368_709_120))
-                            .wrap(Logger::default())
-                            .service(
-                                web::scope("/mgmt")
-                                    .route("/health", web::get().to(cache_mgmt::mgmt_health))
-                                    .route(
-                                        "/cache/invalidate/bucket/{name}",
-                                        web::post().to(cache_mgmt::invalidate_bucket),
-                                    )
-                                    .route(
-                                        "/cache/invalidate/api_key/{id}",
-                                        web::post().to(cache_mgmt::invalidate_api_key),
-                                    )
-                                    .route(
-                                        "/cache/update/az_status/{id}",
-                                        web::post().to(cache_mgmt::update_az_status),
-                                    )
-                                    .route("/cache/clear", web::post().to(cache_mgmt::clear_cache))
-                                    .route(
-                                        "/nss/update_address",
-                                        web::post().to(cache_mgmt::update_nss_address),
-                                    ),
-                            )
-                            .service(
-                                web::scope("/api_keys")
-                                    .route("/", web::post().to(api_key_routes::create_api_key))
-                                    .route("/", web::get().to(api_key_routes::list_api_keys))
-                                    .route(
-                                        "/{key_id}",
-                                        web::delete().to(api_key_routes::delete_api_key),
-                                    ),
-                            );
+                            .wrap(Logger::default());
 
                         if let Some(ref web_root) = web_root {
                             let static_dir = web_root.clone();
@@ -293,7 +273,6 @@ fn main() -> std::io::Result<()> {
                         .disable_signals();
 
                     server = server.listen(http_listener).unwrap();
-                    server = server.listen(mgmt_listener).unwrap();
 
                     if let Some(https_listener) = https_listener {
                         let key_path = PathBuf::from(&https_config.key_file);
@@ -352,6 +331,80 @@ fn main() -> std::io::Result<()> {
         handles.push(handle);
     }
 
+    // Dedicated mgmt HttpServer: serves on mgmt_addr using a shared AppState.
+    // Having this on its own thread means cache-invalidation POSTs from RSS
+    // can be handled even when the S3 workers are all stuck waiting on RSS/NSS,
+    // avoiding the circular stall that trips the observer's stale-health detector.
+    let mgmt_server_handle = {
+        let config = config.clone();
+        let cache_coordinator = cache_coordinator.clone();
+        let az_status_coordinator = az_status_coordinator.clone();
+        let nss_clients = nss_clients.clone();
+        let (mgmt_tx, mgmt_rx) = std::sync::mpsc::channel();
+        let mgmt_handle = thread::Builder::new()
+            .name("actix-mgmt".to_string())
+            .spawn(move || {
+                System::new().block_on(async move {
+                    let app_state = Arc::new(AppState::new_per_core_sync(
+                        config.clone(),
+                        cache_coordinator,
+                        az_status_coordinator,
+                        nss_clients,
+                        u16::MAX, // mgmt worker id (distinct from S3 workers)
+                    ));
+
+                    let server = HttpServer::new(move || {
+                        let app_state = app_state.clone();
+                        App::new()
+                            .app_data(web::Data::new(app_state))
+                            .wrap(Logger::default())
+                            .service(
+                                web::scope("/mgmt")
+                                    .route("/health", web::get().to(cache_mgmt::mgmt_health))
+                                    .route(
+                                        "/cache/invalidate/bucket/{name}",
+                                        web::post().to(cache_mgmt::invalidate_bucket),
+                                    )
+                                    .route(
+                                        "/cache/invalidate/api_key/{id}",
+                                        web::post().to(cache_mgmt::invalidate_api_key),
+                                    )
+                                    .route(
+                                        "/cache/update/az_status/{id}",
+                                        web::post().to(cache_mgmt::update_az_status),
+                                    )
+                                    .route("/cache/clear", web::post().to(cache_mgmt::clear_cache))
+                                    .route(
+                                        "/nss/update_address",
+                                        web::post().to(cache_mgmt::update_nss_address),
+                                    ),
+                            )
+                            .service(
+                                web::scope("/api_keys")
+                                    .route("/", web::post().to(api_key_routes::create_api_key))
+                                    .route("/", web::get().to(api_key_routes::list_api_keys))
+                                    .route(
+                                        "/{key_id}",
+                                        web::delete().to(api_key_routes::delete_api_key),
+                                    ),
+                            )
+                    })
+                    .workers(1)
+                    .disable_signals()
+                    .bind(mgmt_addr)
+                    .expect("Failed to bind mgmt HttpServer");
+
+                    let server = server.run();
+                    let _ = mgmt_tx.send(server.handle());
+                    drop(mgmt_tx);
+                    server.await
+                })
+            })?;
+        let handle = mgmt_rx.recv().expect("mgmt HttpServer failed to start");
+        server_handles.push(handle);
+        mgmt_handle
+    };
+
     drop(handle_tx);
 
     for server_handle in handle_rx {
@@ -404,6 +457,10 @@ fn main() -> std::io::Result<()> {
         if let Err(e) = handle.join() {
             error!("Worker thread {idx} panicked: {e:?}");
         }
+    }
+
+    if let Err(e) = mgmt_server_handle.join() {
+        error!("mgmt server thread panicked: {e:?}");
     }
 
     if let Err(e) = signal_handle.join() {
