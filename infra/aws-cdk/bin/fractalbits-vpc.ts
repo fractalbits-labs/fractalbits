@@ -14,7 +14,9 @@ const env = {
   region: process.env.CDK_DEFAULT_REGION,
 };
 
-// Meta-stack: deploy a standalone BSS or NSS node for testing
+// Meta-stack: deploy a standalone BSS node for testing.
+// Only serviceName="bss" is supported; standalone NSS bootstrap now requires
+// RSS and BSS and is no longer a meaningful meta-stack target.
 // Usage: npx cdk deploy --context metaStack=bss --context bssInstanceTypes=i8g.2xlarge FractalbitsMetaStack
 const metaStackContext = app.node.tryGetContext("metaStack") ?? null;
 if (metaStackContext) {
@@ -28,7 +30,6 @@ if (metaStackContext) {
     env: env,
     serviceName: metaStackContext,
     availabilityZone: resolvedAz,
-    nssInstanceType: app.node.tryGetContext("nssInstanceType") ?? undefined,
     bssInstanceTypes: app.node.tryGetContext("bssInstanceTypes") ?? undefined,
   });
 } else {
