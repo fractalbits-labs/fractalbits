@@ -82,7 +82,6 @@ pub fn bootstrap(
     for_bench: bool,
 ) -> CmdResult {
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Nss)?;
-    let meta_stack_testing = config.global.meta_stack_testing;
 
     // Resolve journal_uuid: prefer CLI/NodeEntry value, fall back to global config
     let global_journal_uuid;
@@ -105,7 +104,7 @@ pub fn bootstrap(
     // Complete instances-ready stage
     InstancesReadyStage::complete_with_metadata(&barrier, instances_ready_meta)?;
 
-    if meta_stack_testing || for_bench {
+    if for_bench {
         let _ = download_binaries(config, &["rewrk_rpc"]);
     }
 
@@ -128,14 +127,10 @@ pub fn bootstrap(
     // registry entry rather than via injected CLI args.
     register_service(config, "nss-server")?;
 
-    if !meta_stack_testing {
-        // Wait for RSS to initialize - RSS will have registered with service discovery by then
-        // This must happen before setup_configs because create_nss_role_agent_config needs RSS IPs
-        info!("Waiting for RSS to initialize...");
-        NssConfiguredStage::wait_for_rss_initialized(&barrier)?;
-    } else {
-        info!("Meta-stack testing mode: skipping RSS wait");
-    }
+    // Wait for RSS to initialize - RSS will have registered with service discovery by then
+    // This must happen before setup_configs because create_nss_role_agent_config needs RSS IPs
+    info!("Waiting for RSS to initialize...");
+    NssConfiguredStage::wait_for_rss_initialized(&barrier)?;
 
     setup_configs(config, journal_uuid, "nss")?;
     prepare_local_dirs()?;
@@ -145,10 +140,8 @@ pub fn bootstrap(
 
     // Wait for metadata VG configuration before format, since nss_server format
     // needs BSS addresses to initialize the buffer_manager state.
-    if !meta_stack_testing {
-        info!("Waiting for metadata VG configuration...");
-        JournalFormattedStage::wait_for_metadata_vg_ready(&barrier)?;
-    }
+    info!("Waiting for metadata VG configuration...");
+    JournalFormattedStage::wait_for_metadata_vg_ready(&barrier)?;
 
     // Read journal-configs to discover the journal owner (running_nss_id). In
     // a multi-NSS deployment only the owner formats the journal and runs
@@ -224,9 +217,7 @@ fn setup_configs(config: &BootstrapConfig, journal_uuid: &str, service_name: &st
 
     // Common configs
     create_coredump_config()?;
-    if !config.global.meta_stack_testing {
-        create_nss_role_agent_config(config)?;
-    }
+    create_nss_role_agent_config(config)?;
     create_systemd_unit_file("nss_role_agent", false)?;
     create_systemd_unit_file(service_name, false)?;
 

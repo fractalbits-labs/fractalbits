@@ -6,7 +6,6 @@ import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import * as TOML from "@iarna/toml";
 import {
   createEc2Asg,
-  createInstance,
   createUserData,
   createDynamoDbTable,
   createEc2Role,
@@ -16,7 +15,6 @@ import {
 interface FractalbitsMetaStackProps extends cdk.StackProps {
   serviceName: string;
   availabilityZone?: string;
-  nssInstanceType?: string;
   bssInstanceTypes?: string;
 }
 
@@ -65,7 +63,14 @@ export class FractalbitsMetaStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    let targetIdOutput: cdk.CfnOutput;
+    if (props.serviceName !== "bss") {
+      console.error(
+        `Error: meta-stack only supports serviceName="bss" (got "${props.serviceName}"). ` +
+          "NSS meta-stack is no longer supported because standalone NSS bootstrap " +
+          "now requires RSS and BSS.",
+      );
+      process.exit(1);
+    }
 
     const buildMetaStackConfig = (nodeEntries: string[]): string => {
       const rootConfig: TOML.JsonMap = {
@@ -104,82 +109,40 @@ export class FractalbitsMetaStack extends cdk.Stack {
       bucketName,
     );
 
-    if (props.serviceName == "nss") {
-      const nssInstanceType = new ec2.InstanceType(
-        props.nssInstanceType ?? "m7gd.2xlarge",
+    if (!props.bssInstanceTypes) {
+      console.error(
+        "Error: bssInstanceTypes must be provided for the 'bss' service type in the meta stack. Please specify it via --context bssInstanceTypes='type1,type2'",
       );
-      const nssUserData = createUserData(this);
-      const instance = createInstance(
-        this,
-        this.vpc,
-        `${props.serviceName}_bench`,
-        this.vpc.isolatedSubnets[0],
-        nssInstanceType,
-        sg,
-        ec2Role,
-        "al2023",
-        undefined,
-        nssUserData,
-      );
-      const nodeEntries = [
-        "[[nodes.nss_server]]",
-        cdk.Fn.join("", ['id = "', instance.instanceId, '"']),
-        "",
-      ];
-
-      const configContent = buildMetaStackConfig(nodeEntries);
-      new s3deploy.BucketDeployment(this, "ConfigDeployment", {
-        sources: [
-          s3deploy.Source.data("bootstrap_cluster.toml", configContent),
-        ],
-        destinationBucket: buildsBucket,
-        prune: false,
-      });
-
-      targetIdOutput = new cdk.CfnOutput(this, "instanceId", {
-        value: instance.instanceId,
-        description: "EC2 instance ID",
-      });
-    } else {
-      if (!props.bssInstanceTypes) {
-        console.error(
-          "Error: bssInstanceTypes must be provided for the 'bss' service type in the meta stack. Please specify it via --context bssInstanceTypes='type1,type2'",
-        );
-        process.exit(1);
-      }
-      const bssInstanceTypes = props.bssInstanceTypes.split(",");
-
-      const configContent = buildMetaStackConfig([]);
-      new s3deploy.BucketDeployment(this, "ConfigDeployment", {
-        sources: [
-          s3deploy.Source.data("bootstrap_cluster.toml", configContent),
-        ],
-        destinationBucket: buildsBucket,
-        prune: false,
-      });
-
-      const bssUserData = createUserData(this, "al2023", "--role bss_server");
-      const bssAsg = createEc2Asg(
-        this,
-        "BssAsg",
-        this.vpc,
-        this.vpc.isolatedSubnets[0],
-        sg,
-        ec2Role,
-        bssInstanceTypes,
-        1,
-        1,
-        "bss_server",
-        "al2023",
-        bssUserData,
-      );
-
-      targetIdOutput = new cdk.CfnOutput(this, "bssAsgName", {
-        value: bssAsg.autoScalingGroupName,
-        description: "Bss Auto Scaling Group Name",
-      });
+      process.exit(1);
     }
+    const bssInstanceTypes = props.bssInstanceTypes.split(",");
 
-    targetIdOutput;
+    const configContent = buildMetaStackConfig([]);
+    new s3deploy.BucketDeployment(this, "ConfigDeployment", {
+      sources: [s3deploy.Source.data("bootstrap_cluster.toml", configContent)],
+      destinationBucket: buildsBucket,
+      prune: false,
+    });
+
+    const bssUserData = createUserData(this, "al2023", "--role bss_server");
+    const bssAsg = createEc2Asg(
+      this,
+      "BssAsg",
+      this.vpc,
+      this.vpc.isolatedSubnets[0],
+      sg,
+      ec2Role,
+      bssInstanceTypes,
+      1,
+      1,
+      "bss_server",
+      "al2023",
+      bssUserData,
+    );
+
+    new cdk.CfnOutput(this, "bssAsgName", {
+      value: bssAsg.autoScalingGroupName,
+      description: "Bss Auto Scaling Group Name",
+    });
   }
 }
