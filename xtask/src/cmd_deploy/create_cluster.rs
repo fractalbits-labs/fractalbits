@@ -10,8 +10,8 @@ use std::time::Duration;
 use uuid::Uuid;
 use xtask_common::{
     BOOTSTRAP_CLUSTER_CONFIG, BootstrapClusterConfig, ClusterEndpointsConfig, ClusterEtcdConfig,
-    ClusterGlobalConfig, ClusterResourcesConfig, DataBlobStorage, DeployTarget, JournalType,
-    NodeEntry, RssBackend,
+    ClusterGlobalConfig, ClusterResourcesConfig, DataBlobStorage, DeployTarget, NodeEntry,
+    RssBackend,
 };
 
 const SSH_TUNNEL_LOCAL_PORT: u16 = 8080;
@@ -193,7 +193,6 @@ impl InputClusterConfig {
             data_blob_storage: DataBlobStorage::AllInBssSingleAz,
             rss_ha_enabled: self.global.rss_ha_enabled,
             rss_backend: RssBackend::Etcd,
-            journal_type: JournalType::Remote,
             num_nss_nodes: None, // derived from populated nodes map at blueprint time
             num_bss_nodes: Some(self.global.num_bss_nodes),
             num_api_servers: self.global.num_api_servers,

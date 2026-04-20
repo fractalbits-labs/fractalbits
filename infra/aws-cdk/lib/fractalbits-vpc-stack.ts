@@ -36,7 +36,6 @@ export interface FractalbitsVpcStackProps extends cdk.StackProps {
   dataBlobStorage: DataBlobStorage;
   rootServerHa: boolean;
   rssBackend: "etcd" | "ddb";
-  journalType: "remote";
   deployOS?: DeployOS;
 }
 

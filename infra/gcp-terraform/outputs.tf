@@ -68,11 +68,6 @@ output "rss_backend" {
   description = "RSS backend type"
 }
 
-output "journal_type" {
-  value       = var.journal_type
-  description = "NSS journal type"
-}
-
 output "bench_server_name" {
   value       = var.with_bench ? google_compute_instance.bench[0].name : ""
   description = "Bench server instance name"

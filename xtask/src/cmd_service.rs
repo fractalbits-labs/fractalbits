@@ -1287,7 +1287,6 @@ Environment="RUST_LOG=warn""##
             if init_config.nss_disable_restart_limit {
                 env_settings += "\nEnvironment=\"NSS_DISABLE_RESTART_LIMIT=1\"";
             }
-            env_settings += "\nEnvironment=\"APP_JOURNAL_TYPE=remote\"";
             resolve_binary_path("nss_role_agent", build_mode)
         }
         ServiceName::Rss => {

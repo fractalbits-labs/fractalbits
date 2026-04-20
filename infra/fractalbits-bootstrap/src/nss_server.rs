@@ -322,7 +322,6 @@ fn create_nss_role_agent_config(config: &BootstrapConfig) -> CmdResult {
 rss_addrs = [{rss_addrs_toml}]
 instance_id = "{instance_id}"
 network_address = "{private_ip}:{nss_port}"
-journal_type = "remote"
 "##
     );
 

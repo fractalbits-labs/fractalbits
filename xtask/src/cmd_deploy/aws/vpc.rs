@@ -146,8 +146,6 @@ fn build_cdk_context(config: &VpcConfig) -> Vec<String> {
         "benchClientInstanceType",
         config.bench_client_instance_type.clone(),
     );
-    add("ebsVolumeSize", config.ebs_volume_size.to_string());
-    add("ebsVolumeIops", config.ebs_volume_iops.to_string());
     if config.with_bench {
         add("benchType", "external".to_string());
     }
@@ -158,7 +156,6 @@ fn build_cdk_context(config: &VpcConfig) -> Vec<String> {
         add("rootServerHa", "true".to_string());
     }
     add("rssBackend", config.rss_backend.as_ref().to_string());
-    add("journalType", config.journal_type.as_ref().to_string());
     if config.use_generic_binaries {
         add("useGenericBinaries", "true".to_string());
     }
@@ -177,8 +174,6 @@ fn apply_template_defaults(config: &mut VpcConfig) {
         Some(VpcTemplate::Mini) => {
             config.nss_instance_type = "r7g.xlarge".to_string();
             config.bss_instance_type = "i8g.xlarge".to_string();
-            config.ebs_volume_size = 5;
-            config.ebs_volume_iops = 1000;
             config.root_server_ha = false;
             config.num_api_servers = 1;
             config.num_bss_nodes = 1;
@@ -186,8 +181,6 @@ fn apply_template_defaults(config: &mut VpcConfig) {
         }
         Some(VpcTemplate::PerfDemo) => {
             config.nss_instance_type = "r7g.4xlarge".to_string();
-            config.ebs_volume_size = 20;
-            config.ebs_volume_iops = 10000;
             config.root_server_ha = true;
             config.num_api_servers = 14;
             config.num_bss_nodes = 6;
