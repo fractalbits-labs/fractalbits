@@ -71,15 +71,6 @@ variable "rss_backend" {
   }
 }
 
-variable "journal_type" {
-  type    = string
-  default = "pd_ssd"
-  validation {
-    condition     = contains(["local_ssd", "pd_ssd"], var.journal_type)
-    error_message = "journal_type must be 'local_ssd' or 'pd_ssd'"
-  }
-}
-
 variable "data_blob_storage" {
   type    = string
   default = "all_in_bss_single_az"
@@ -113,14 +104,4 @@ variable "os_image" {
 variable "boot_disk_size_gb" {
   type    = number
   default = 30
-}
-
-variable "journal_disk_size_gb" {
-  type    = number
-  default = 20
-}
-
-variable "journal_disk_iops" {
-  type    = number
-  default = 10000
 }

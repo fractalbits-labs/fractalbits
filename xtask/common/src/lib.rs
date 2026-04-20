@@ -284,8 +284,6 @@ pub struct ClusterGlobalConfig {
     pub rss_ha_enabled: bool,
     #[serde(default)]
     pub rss_backend: RssBackend,
-    #[serde(default)]
-    pub journal_type: JournalType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_nss_nodes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

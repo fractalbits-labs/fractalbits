@@ -325,15 +325,6 @@ pub enum DeployCommand {
         )]
         rss_backend: RssBackend,
 
-        #[clap(long, value_enum, long_help = "Journal type", default_value = "remote")]
-        journal_type: JournalType,
-
-        #[clap(long, long_help = "EBS volume size in GiB", default_value = "20")]
-        ebs_volume_size: u32,
-
-        #[clap(long, long_help = "EBS volume IOPS", default_value = "10000")]
-        ebs_volume_iops: u32,
-
         #[clap(long, long_help = "Watch bootstrap progress inline after VPC creation")]
         watch_bootstrap: bool,
 
@@ -534,7 +525,6 @@ pub struct InitConfig {
     pub bss_count: u32,
     pub nss_disable_restart_limit: bool,
     pub rss_backend: RssBackend,
-    pub journal_type: JournalType,
     pub fs_server: FsServerConfig,
 }
 
@@ -558,7 +548,6 @@ impl Default for InitConfig {
             bss_count: 1,
             nss_disable_restart_limit: false,
             rss_backend: RssBackend::Etcd,
-            journal_type: Default::default(),
             fs_server: Default::default(),
         }
     }
@@ -595,10 +584,6 @@ pub enum ServiceCommand {
 
         #[clap(long, value_enum, default_value = "etcd")]
         rss_backend: RssBackend,
-
-        #[clap(long, value_enum, long_help = "journal type (ebs or nvme)")]
-        #[arg(default_value_t)]
-        journal_type: JournalType,
     },
     Stop {
         #[clap(default_value = "all", value_enum)]
@@ -810,7 +795,6 @@ async fn main() -> CmdResult {
                 bss_count,
                 nss_disable_restart_limit,
                 rss_backend,
-                journal_type,
             } => {
                 if bss_count != 1 && bss_count != 6 {
                     cmd_die!("bss_count must be either 1 or 6, got $bss_count");
@@ -822,7 +806,6 @@ async fn main() -> CmdResult {
                     bss_count,
                     nss_disable_restart_limit,
                     rss_backend,
-                    journal_type,
                     fs_server: Default::default(),
                 };
                 cmd_service::init_service(service, cmd_build::build_mode(release), &init_config)?;
@@ -864,9 +847,6 @@ async fn main() -> CmdResult {
                 az,
                 root_server_ha,
                 rss_backend,
-                journal_type,
-                ebs_volume_size,
-                ebs_volume_iops,
                 watch_bootstrap,
                 skip_upload,
                 use_generic_binaries,
@@ -888,9 +868,6 @@ async fn main() -> CmdResult {
                     az,
                     root_server_ha,
                     rss_backend,
-                    journal_type,
-                    ebs_volume_size,
-                    ebs_volume_iops,
                     watch_bootstrap,
                     skip_upload,
                     use_generic_binaries,

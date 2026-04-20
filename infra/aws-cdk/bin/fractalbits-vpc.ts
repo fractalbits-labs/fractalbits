@@ -51,7 +51,6 @@ const benchClientInstanceType =
 const dataBlobStorage =
   app.node.tryGetContext("dataBlobStorage") ?? "all_in_bss_single_az";
 const rssBackend = app.node.tryGetContext("rssBackend") ?? "ddb";
-const journalType = app.node.tryGetContext("journalType") ?? "remote";
 const browserIp = app.node.tryGetContext("browserIp") ?? null;
 // Note: Context values from CLI are always strings, so convert to numbers
 const numApiServers = Number(app.node.tryGetContext("numApiServers")) || 1;
@@ -89,7 +88,6 @@ const vpcStack = new FractalbitsVpcStack(app, "FractalbitsVpcStack", {
   nssInstanceType: nssInstanceType,
   dataBlobStorage: dataBlobStorage,
   rssBackend: rssBackend,
-  journalType: journalType,
   rootServerHa: rootServerHa,
   deployOS: deployOS,
 });
