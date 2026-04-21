@@ -321,18 +321,15 @@ pub fn format_local_nvme_disks(support_storage_twp: bool) -> CmdResult {
             "ext4" => {
                 run_cmd! {
                     info "Creating ext4 on local nvme disks: ${nvme_disks:?}";
-                    mkfs.ext4 -F -I 128 -m 0 -i 8192 -J size=4096
+                    mkfs.ext4 -F -m 0 -T largefile4
                         -E lazy_itable_init=0,lazy_journal_init=0
-                        -O dir_index,extent,flex_bg,fast_commit $[nvme_disks] &>/dev/null;
+                        -O extent,flex_bg $[nvme_disks] &>/dev/null;
                 }?;
             }
             "xfs" => {
                 run_cmd! {
-                    info "Creating XFS on local nvme disks: ${nvme_disks:?} with metadata optimizations";
-                    mkfs.xfs -f -q -b size=8192 -d agcount=64
-                        -i size=512,sparse=1
-                        -l size=1024m,lazy-count=1
-                        -n size=8192 $[nvme_disks];
+                    info "Creating XFS on local nvme disks: ${nvme_disks:?}";
+                    mkfs.xfs -f -q -b size=8192 $[nvme_disks];
                 }?;
             }
             _ => {
@@ -378,18 +375,15 @@ pub fn format_local_nvme_disks(support_storage_twp: bool) -> CmdResult {
             let stripe_width = num_nvme_disks * 128;
             run_cmd! {
                 info "Creating ext4 on /dev/md0";
-                mkfs.ext4 -F -I 128 -m 0 -i 8192 -J size=4096
+                mkfs.ext4 -F -m 0 -T largefile4
                     -E lazy_itable_init=0,lazy_journal_init=0,stride=128,stripe_width=${stripe_width}
-                    -O dir_index,extent,flex_bg,fast_commit /dev/md0 &>/dev/null;
+                    -O extent,flex_bg /dev/md0 &>/dev/null;
             }?;
         }
         "xfs" => {
             run_cmd! {
-                info "Creating XFS on /dev/md0 with metadata optimizations";
-                mkfs.xfs -q -b size=8192 -d agcount=64,su=1m,sw=1
-                    -i size=512,sparse=1
-                    -l size=1024m,lazy-count=1
-                    -n size=8192 /dev/md0;
+                info "Creating XFS on /dev/md0";
+                mkfs.xfs -q -b size=8192 -d su=1m,sw=1 /dev/md0;
             }?;
         }
         _ => {
