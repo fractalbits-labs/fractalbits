@@ -130,7 +130,10 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     }
 
     create_bss_config()?;
-    format_bss(&config.global.bss_storage_alloc_mode)?;
+    format_bss(
+        config.global.bss_storage_alloc_mode,
+        config.global.bss_storage_write_zero_pct,
+    )?;
     create_systemd_unit_file("bss", true)?;
 
     run_cmd! {
@@ -196,11 +199,11 @@ fn generate_initial_cluster(ips: &[String]) -> String {
         .join(",")
 }
 
-fn format_bss(alloc_mode: &xtask_common::BssStorageAllocMode) -> CmdResult {
+fn format_bss(alloc_mode: xtask_common::BssStorageAllocMode, write_zero_pct: u8) -> CmdResult {
     let mode = alloc_mode.as_ref();
     run_cmd! {
-        info "Running format for bss_server (storage_alloc_mode=${mode})";
-        ${BIN_PATH}bss_server format -c ${ETC_PATH}${BSS_SERVER_CONFIG} --storage-alloc-mode $mode;
+        info "Running format for bss_server (storage_alloc_mode=${mode}, write_zero_pct=${write_zero_pct})";
+        ${BIN_PATH}bss_server format -c ${ETC_PATH}${BSS_SERVER_CONFIG} --storage-alloc-mode $mode --storage-write-zero-pct $write_zero_pct;
     }?;
 
     Ok(())
