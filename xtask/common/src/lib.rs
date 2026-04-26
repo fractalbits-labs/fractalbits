@@ -304,6 +304,12 @@ pub struct ClusterGlobalConfig {
     pub journal_uuid: Option<String>,
     #[serde(default)]
     pub bss_storage_alloc_mode: BssStorageAllocMode,
+    #[serde(default = "default_bss_storage_write_zero_pct")]
+    pub bss_storage_write_zero_pct: u8,
+}
+
+fn default_bss_storage_write_zero_pct() -> u8 {
+    100
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
