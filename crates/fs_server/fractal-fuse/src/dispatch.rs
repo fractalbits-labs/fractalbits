@@ -384,6 +384,18 @@ async fn dispatch_with_reply<F: Filesystem>(
             fs.destroy().await;
             DispatchResult::Empty
         }
+        FUSE_STATX => {
+            let arg: &fuse_statx_in = entry.header().op_in_as();
+            let fh = if arg.getattr_flags & FUSE_GETATTR_FH != 0 {
+                Some(arg.fh)
+            } else {
+                None
+            };
+            match fs.statx(req, nodeid, fh, arg.sx_flags, arg.sx_mask).await {
+                Ok(reply) => DispatchResult::Statx(reply),
+                Err(e) => DispatchResult::Error(e),
+            }
+        }
         _ => {
             warn!("unsupported FUSE opcode: {}", opcode);
             DispatchResult::Error(ENOSYS)
@@ -396,6 +408,7 @@ enum DispatchResult {
     Error(Errno),
     Entry(ReplyEntry),
     Attr(ReplyAttr),
+    Statx(ReplyStatx),
     Open(ReplyOpen),
     /// Data already written directly into the payload buffer by read.
     /// The usize is the number of valid bytes in the payload.
@@ -451,6 +464,20 @@ fn serialize_response(entry: &mut RingEntry, unique: u64, _opcode: u32, result: 
                 attr_valid_nsec: reply.ttl.subsec_nanos(),
                 dummy: 0,
                 attr: reply.attr.to_fuse_attr(),
+            };
+            write_payload_struct(entry, unique, &out);
+        }
+        DispatchResult::Statx(reply) => {
+            debug!(
+                "STATX reply: ino={} size={} mode=0o{:o}",
+                reply.stat.ino, reply.stat.size, reply.stat.mode
+            );
+            let out = fuse_statx_out {
+                attr_valid: reply.ttl.as_secs(),
+                attr_valid_nsec: reply.ttl.subsec_nanos(),
+                flags: reply.flags,
+                stat: reply.stat.into(),
+                ..Default::default()
             };
             write_payload_struct(entry, unique, &out);
         }

@@ -192,6 +192,50 @@ pub struct fuse_attr {
     pub flags: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct fuse_statx {
+    pub mask: u32,
+    pub blksize: u32,
+    pub attributes: u64,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u16,
+    pub spare0: [u16; 1],
+    pub ino: u64,
+    pub size: u64,
+    pub blocks: u64,
+    pub attributes_mask: u64,
+    pub atime: fuse_sx_time,
+    pub btime: fuse_sx_time,
+    pub ctime: fuse_sx_time,
+    pub mtime: fuse_sx_time,
+    pub rdev_major: u32,
+    pub rdev_minor: u32,
+    pub dev_major: u32,
+    pub dev_minor: u32,
+    pub spare2: [u64; 14],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct fuse_sx_time {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    pub reserved: i32,
+}
+
+impl From<crate::types::Timestamp> for fuse_sx_time {
+    fn from(value: crate::types::Timestamp) -> Self {
+        Self {
+            tv_sec: value.sec as i64,
+            tv_nsec: value.nsec,
+            reserved: 0,
+        }
+    }
+}
+
 // ---------- Request structures ----------
 
 #[repr(C)]
@@ -230,6 +274,16 @@ pub struct fuse_getattr_in {
     pub getattr_flags: u32,
     pub dummy: u32,
     pub fh: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct fuse_statx_in {
+    pub getattr_flags: u32,
+    pub reserved: u32,
+    pub fh: u64,
+    pub sx_flags: u32,
+    pub sx_mask: u32,
 }
 
 #[repr(C)]
@@ -443,6 +497,16 @@ pub struct fuse_attr_out {
     pub attr_valid_nsec: u32,
     pub dummy: u32,
     pub attr: fuse_attr,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct fuse_statx_out {
+    pub attr_valid: u64,
+    pub attr_valid_nsec: u32,
+    pub flags: u32,
+    pub spare: [u64; 2],
+    pub stat: fuse_statx,
 }
 
 #[repr(C)]

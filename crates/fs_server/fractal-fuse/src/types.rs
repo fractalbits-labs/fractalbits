@@ -118,6 +118,54 @@ impl FileAttr {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+pub struct FileStatx {
+    pub mask: u32,
+    pub blksize: u32,
+    pub attributes: u64,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u16,
+    pub ino: u64,
+    pub size: u64,
+    pub blocks: u64,
+    pub attributes_mask: u64,
+    pub atime: Timestamp,
+    pub mtime: Timestamp,
+    pub ctime: Timestamp,
+    pub btime: Timestamp,
+    pub rdev: (u32, u32),
+    pub dev: (u32, u32),
+}
+
+impl From<FileStatx> for abi::fuse_statx {
+    fn from(value: FileStatx) -> Self {
+        abi::fuse_statx {
+            mask: value.mask,
+            blksize: value.blksize,
+            attributes: value.attributes,
+            nlink: value.nlink,
+            uid: value.uid,
+            gid: value.gid,
+            mode: value.mode,
+            ino: value.ino,
+            size: value.size,
+            blocks: value.blocks,
+            attributes_mask: value.attributes_mask,
+            atime: value.atime.into(),
+            btime: value.btime.into(),
+            ctime: value.ctime.into(),
+            mtime: value.mtime.into(),
+            rdev_major: value.rdev.0,
+            rdev_minor: value.rdev.1,
+            dev_major: value.dev.0,
+            dev_minor: value.dev.1,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SetAttr {
     pub mode: Option<u32>,
     pub uid: Option<u32>,
@@ -281,6 +329,13 @@ pub struct DirectoryEntryPlus {
     pub entry_ttl: Duration,
     pub attr: FileAttr,
     pub generation: u64,
+}
+
+#[derive(Debug)]
+pub struct ReplyStatx {
+    pub ttl: Duration,
+    pub flags: u32,
+    pub stat: FileStatx,
 }
 
 #[derive(Debug)]

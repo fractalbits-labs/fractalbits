@@ -86,6 +86,23 @@ pub trait Filesystem: Send + Sync + 'static {
         async { Err(ENOSYS) }
     }
 
+    /// Get extended file attributes via statx(2).
+    ///
+    /// Similar to `getattr`, but returns additional fields like birth time
+    /// and file attributes. The `flags` parameter contains statx flags
+    /// (e.g., `AT_NO_AUTOMOUNT`), and `mask` specifies which attributes
+    /// to retrieve. Returns [`ReplyStatx`] with extended attributes.
+    fn statx(
+        &self,
+        req: Request,
+        inode: Inode,
+        fh: Option<u64>,
+        flags: u32,
+        mask: u32,
+    ) -> impl std::future::Future<Output = FsResult<ReplyStatx>> {
+        let _ = (req, inode, fh, flags, mask);
+        async { Err(ENOSYS) }
+    }
     /// Set file attributes.
     ///
     /// The [`SetAttr`] struct indicates which fields to change (size, mode,
