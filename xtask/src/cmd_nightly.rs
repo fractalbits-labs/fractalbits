@@ -23,7 +23,7 @@ fn setup_python_venv() -> CmdResult {
     }
 }
 
-fn run_crash_recovery_test(multi_bss: bool, initial_run: bool) -> CmdResult {
+fn run_crash_recovery_test_nss(multi_bss: bool, initial_run: bool, log_dir: &str) -> CmdResult {
     // Kill leftover test processes
     run_cmd! {
         ignore pkill -f test_async_fractal_art &>/dev/null;
@@ -48,18 +48,7 @@ fn run_crash_recovery_test(multi_bss: bool, initial_run: bool) -> CmdResult {
         setup_python_venv()?;
     }
 
-    // Check for leftover core dumps from a previous run
-    crate::cmd_precheckin::check_for_core_dumps()?;
-
-    // Create timestamp-based log directory
-    let log_dir = format!("data/logs/nightly/{}", Local::now().format("%Y%m%d_%H%M%S"));
-    run_cmd! {
-        mkdir -p $log_dir;
-        rm -rf data/coredumps;
-        mkdir -p data/coredumps;
-    }?;
-
-    let nightly_log = format!("{}/crash_recovery.log", log_dir);
+    let nightly_log = format!("{}/crash_recovery_nss.log", log_dir);
     let venv_python = "./core/crash_recovery_test/.venv/bin/python3";
 
     // Export VG configs and journal config so nss_server format and
@@ -72,9 +61,9 @@ fn run_crash_recovery_test(multi_bss: bool, initial_run: bool) -> CmdResult {
     let journal_vg_config = generate_bss_journal_vg_config(init_config.bss_count);
     let journal_config = generate_initial_journal_config(&journal_uuid, "nss-0");
 
-    // Run crash recovery test
+    // Run NSS crash recovery test
     let result = run_cmd! {
-        info "Running crash_recovery_test with log $nightly_log ...";
+        info "Running NSS crash_recovery_test with log $nightly_log ...";
         METADATA_VG_CONFIG=$metadata_vg_config JOURNAL_VG_CONFIG=$journal_vg_config JOURNAL_CONFIG=$journal_config SHARED_DIR=$shared_dir
             $venv_python ./core/crash_recovery_test/main.py --mode nss --build-mode release &>$nightly_log;
     }
@@ -93,7 +82,57 @@ fn run_crash_recovery_test(multi_bss: bool, initial_run: bool) -> CmdResult {
     core_dump_result
 }
 
+fn run_crash_recovery_test_bss(log_dir: &str) -> CmdResult {
+    // Kill leftover test processes
+    run_cmd! {
+        ignore pkill -f test_bss_storage_engine &>/dev/null;
+    }?;
+
+    let nightly_log = format!("{}/crash_recovery_bss.log", log_dir);
+    let venv_python = "./core/crash_recovery_test/.venv/bin/python3";
+
+    // Run BSS crash recovery test
+    let result = run_cmd! {
+        info "Running BSS crash_recovery_test with log $nightly_log ...";
+        $venv_python ./core/crash_recovery_test/main.py --mode bss --build-mode release &>$nightly_log;
+    }
+    .inspect_err(|_| {
+        run_cmd! { ignore tail $nightly_log; }.ok();
+    });
+
+    // Check for core dumps regardless of test result
+    let core_dump_result = crate::cmd_precheckin::check_for_core_dumps();
+
+    // Report test failure first, then core dump failure
+    result?;
+    core_dump_result
+}
+
 pub fn run_cmd_nightly(multi_bss: bool) -> CmdResult {
-    info!("Running nightly crash recovery test (NSS mode, release build)");
-    run_crash_recovery_test(multi_bss, true)
+    info!("Running nightly crash recovery tests (NSS + BSS modes, release build)");
+
+    // Check for leftover core dumps from a previous run
+    crate::cmd_precheckin::check_for_core_dumps()?;
+
+    // Create timestamp-based log directory
+    let log_dir = format!("data/logs/nightly/{}", Local::now().format("%Y%m%d_%H%M%S"));
+    run_cmd! {
+        mkdir -p $log_dir;
+        rm -rf data/coredumps;
+        mkdir -p data/coredumps;
+    }?;
+
+    // Run NSS test first
+    info!("Starting NSS crash recovery test...");
+    if let Err(e) = run_crash_recovery_test_nss(multi_bss, true, &log_dir) {
+        error!("NSS crash recovery test failed. Logs and coredumps preserved in {}", log_dir);
+        return Err(e);
+    }
+
+    // Run BSS test after NSS
+    info!("Starting BSS crash recovery test...");
+    run_crash_recovery_test_bss(&log_dir)?;
+
+    info!("Nightly crash recovery tests completed successfully");
+    Ok(())
 }
