@@ -1076,7 +1076,12 @@ impl VfsCore {
         let blob_guid = self.backend().create_blob_guid();
         let block_size_usize = block_size as usize;
 
-        // Write data blocks
+        // Write data blocks. Every block is zero-padded to a full
+        // block_size on disk so readers can request block_size and
+        // truncate locally to the file_size known from NSS / BSS parent;
+        // the last block is the only one that needs padding in
+        // practice. Storage overhead is up to (block_size - 1) bytes
+        // per file (tail block).
         let num_blocks = if data.is_empty() {
             0
         } else {
@@ -1086,8 +1091,16 @@ impl VfsCore {
             let start = block_i * block_size_usize;
             let end = std::cmp::min(start + block_size_usize, data.len());
             let chunk = data.slice(start..end);
+            let padded = if chunk.len() < block_size_usize {
+                let mut buf = BytesMut::with_capacity(block_size_usize);
+                buf.extend_from_slice(&chunk);
+                buf.resize(block_size_usize, 0);
+                buf.freeze()
+            } else {
+                chunk
+            };
             self.backend()
-                .write_block(blob_guid, block_i as u32, chunk, 1, &trace_id)
+                .write_block(blob_guid, block_i as u32, padded, 1, &trace_id)
                 .await?;
         }
 

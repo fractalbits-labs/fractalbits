@@ -283,9 +283,18 @@ impl RpcClient {
         check_response_errno(&resp_frame.header)?;
         let version = resp_frame.header.version;
         *body = resp_frame.body;
-        if content_len != body.len() {
+        // The caller can pass content_len = 0 to opt into "give me
+        // whatever you have" semantics. With block-size padding the
+        // body length is always block_size, but readers that know the
+        // logical content length still want to clamp to it locally;
+        // strict equality here would force every padded block to
+        // round-trip through the caller's logical-length field, which
+        // isn't what the design wants. A non-zero content_len that is
+        // strictly larger than the response is still an error -- that
+        // means BSS lost bytes and the caller would silently underread.
+        if content_len != 0 && body.len() < content_len {
             return Err(RpcError::InternalResponseError(format!(
-                "BSS returned body length {} but client expected {}",
+                "BSS returned body length {} but client expected at least {}",
                 body.len(),
                 content_len
             )));
