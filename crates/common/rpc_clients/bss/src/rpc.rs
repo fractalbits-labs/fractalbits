@@ -241,6 +241,10 @@ impl RpcClient {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Issue a GetDataBlob RPC and return the BSS-reported `version` of the
+    /// returned block alongside the body. Callers that need read-side
+    /// version arbitration (see `DataVgProxy::get_blob`) compare this
+    /// against an expected version to detect lagging-replica reads.
     pub async fn get_data_blob(
         &self,
         blob_guid: DataBlobGuid,
@@ -250,7 +254,7 @@ impl RpcClient {
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
-    ) -> Result<(), RpcError> {
+    ) -> Result<u64, RpcError> {
         let _guard = InflightRpcGuard::new("bss", "get_data_blob");
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
@@ -275,6 +279,7 @@ impl RpcClient {
                 e
             })?;
         check_response_errno(&resp_frame.header)?;
+        let version = resp_frame.header.version;
         *body = resp_frame.body;
         if content_len != body.len() {
             return Err(RpcError::InternalResponseError(format!(
@@ -283,7 +288,7 @@ impl RpcClient {
                 content_len
             )));
         }
-        Ok(())
+        Ok(version)
     }
 
     pub async fn delete_data_blob(

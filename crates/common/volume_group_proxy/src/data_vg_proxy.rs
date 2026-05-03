@@ -406,16 +406,17 @@ impl DataVgProxy {
         content_len: usize,
         trace_id: &TraceId,
         fast_path: bool,
-    ) -> Result<Bytes, RpcError> {
+    ) -> Result<(Bytes, u64), RpcError> {
         tracing::debug!(%blob_guid, bss_address=%bss_node.address, block_number, content_len, fast_path, "get_blob_from_node_instance calling BSS");
 
         let bss_client = bss_node.get_client();
 
         let mut body = Bytes::new();
+        let version: u64;
 
         if fast_path {
             // Fast path: single attempt, no retries
-            bss_client
+            version = bss_client
                 .get_data_blob(
                     blob_guid,
                     block_number,
@@ -445,7 +446,10 @@ impl DataVgProxy {
                     )
                     .await
                 {
-                    Ok(()) => break,
+                    Ok(v) => {
+                        version = v;
+                        break;
+                    }
                     Err(e) if e.retryable() && retries > 0 => {
                         retries -= 1;
                         retry_count += 1;
@@ -457,9 +461,9 @@ impl DataVgProxy {
             }
         }
 
-        tracing::debug!(%blob_guid, bss_address=%bss_node.address, block_number, data_size=body.len(), "get_blob_from_node_instance result");
+        tracing::debug!(%blob_guid, bss_address=%bss_node.address, block_number, data_size=body.len(), version, "get_blob_from_node_instance result");
 
-        Ok(body)
+        Ok((body, version))
     }
 
     async fn delete_blob_from_node(
@@ -895,6 +899,32 @@ impl DataVgProxy {
         body: &mut Bytes,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
+        self.get_blob_with_version(blob_guid, block_number, content_len, None, body, trace_id)
+            .await
+    }
+
+    /// Variant of `get_blob` that enforces a read-side version check.
+    ///
+    /// When `expected_version = Some(v)`, the returned block's BSS-stamped
+    /// version must equal `v`. Replicas that return a different version
+    /// (typically a lagging replica that hasn't received the latest write
+    /// quorum yet) are skipped, and the read falls through to the next
+    /// replica. If every reachable replica returns a mismatched version,
+    /// `DataVgError::StaleVersion` is returned so the caller can retry or
+    /// surface the staleness to the writer's flush sequence.
+    ///
+    /// When `expected_version = None`, behaviour matches `get_blob`: the
+    /// first successful read is returned regardless of its version (no
+    /// behavioural change for callers that don't care).
+    pub async fn get_blob_with_version(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        content_len: usize,
+        expected_version: Option<u64>,
+        body: &mut Bytes,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
         let volume_id = blob_guid.volume_id;
         let volume = self.find_volume(volume_id).ok_or_else(|| {
             tracing::error!(volume_id, available_volumes=?self.volumes.iter().map(|v| v.volume_id).collect::<Vec<_>>(), "Volume not found in DataVgProxy for get_blob");
@@ -911,7 +941,7 @@ impl DataVgProxy {
 
         let blob_id = blob_guid.blob_id;
 
-        tracing::debug!(%blob_id, volume_id, available_volumes=?self.volumes.iter().map(|v| v.volume_id).collect::<Vec<_>>(), "get_blob looking for volume");
+        tracing::debug!(%blob_id, volume_id, ?expected_version, available_volumes=?self.volumes.iter().map(|v| v.volume_id).collect::<Vec<_>>(), "get_blob looking for volume");
 
         // Filter available nodes for fast path (only try nodes with closed circuit)
         let available_nodes: Vec<_> = volume
@@ -927,7 +957,10 @@ impl DataVgProxy {
             })
             .collect();
 
-        // Fast path: try reading from a randomly selected available node
+        // Fast path: try reading from a randomly selected available node.
+        // A version mismatch is treated like a transient failure on this
+        // replica so the fallback loop can try another node.
+        let mut saw_stale_version = false;
         if !available_nodes.is_empty() {
             let selected_node = *available_nodes.choose(&mut rand::rng()).unwrap();
             debug!(
@@ -945,12 +978,24 @@ impl DataVgProxy {
                 )
                 .await
             {
-                Ok(blob_data) => {
-                    selected_node.record_success();
-                    histogram!("datavg_get_blob_nanos", "result" => "fast_path_success")
-                        .record(start.elapsed().as_nanos() as f64);
-                    *body = blob_data;
-                    return Ok(());
+                Ok((blob_data, returned_version)) => {
+                    if let Some(expected) = expected_version
+                        && returned_version != expected
+                    {
+                        // Don't penalise the node — it answered correctly,
+                        // just hasn't received the latest version yet.
+                        warn!(
+                            "Fast path read from {} returned version {} but expected {}, falling back",
+                            selected_node.address, returned_version, expected
+                        );
+                        saw_stale_version = true;
+                    } else {
+                        selected_node.record_success();
+                        histogram!("datavg_get_blob_nanos", "result" => "fast_path_success")
+                            .record(start.elapsed().as_nanos() as f64);
+                        *body = blob_data;
+                        return Ok(());
+                    }
                 }
                 Err(e) => {
                     selected_node.record_failure();
@@ -1018,10 +1063,23 @@ impl DataVgProxy {
         let mut successful_reads = 0;
         let mut successful_blob_data = None;
 
-        // Wait until we get a successful read (quorum of 1) or all fail
+        // Wait until we get a successful read (quorum of 1) or all fail.
+        // A response with a mismatched version is treated like a transient
+        // failure on this replica: the node is not penalised (its data is
+        // intact, just lagging) but we keep polling other replicas.
         while let Some((node, result)) = read_futures.next().await {
             match result {
-                Ok(blob_data) => {
+                Ok((blob_data, returned_version)) => {
+                    if let Some(expected) = expected_version
+                        && returned_version != expected
+                    {
+                        warn!(
+                            "Read from BSS node {} returned version {} but expected {}, trying other replicas",
+                            node.address, returned_version, expected
+                        );
+                        saw_stale_version = true;
+                        continue;
+                    }
                     node.record_success();
                     successful_reads += 1;
                     debug!("Successful read from BSS node: {}", node.address);
@@ -1053,6 +1111,20 @@ impl DataVgProxy {
             );
             *body = blob_data;
             return Ok(());
+        }
+
+        // No replica returned the expected version. Distinguish stale-quorum
+        // from outright failure so the caller can react accordingly (e.g. a
+        // writer's flush sequence may want to wait for replication catchup
+        // and retry, while an outright failure should propagate as today).
+        if saw_stale_version && let Some(expected) = expected_version {
+            histogram!("datavg_get_blob_nanos", "result" => "stale_version")
+                .record(start.elapsed().as_nanos() as f64);
+            warn!(
+                "All reachable replicas returned a version older than expected {} for blob {}:{}",
+                expected, blob_id, block_number
+            );
+            return Err(DataVgError::StaleVersion { expected });
         }
 
         // All reads failed
@@ -1419,7 +1491,7 @@ impl DataVgProxy {
 
         while let Some((shard_idx, node_idx, result)) = fetch_futures.next().await {
             match result {
-                Ok(data) => {
+                Ok((data, _version)) => {
                     ec_vol.bss_nodes[node_idx].record_success();
                     shard_results[shard_idx] = Some(data.to_vec());
                     data_shards_received += 1;
@@ -1488,7 +1560,7 @@ impl DataVgProxy {
 
         while let Some((shard_idx, node_idx, result)) = parity_futures.next().await {
             match result {
-                Ok(data) => {
+                Ok((data, _version)) => {
                     ec_vol.bss_nodes[node_idx].record_success();
                     shard_results[shard_idx] = Some(data.to_vec());
                 }

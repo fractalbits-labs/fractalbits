@@ -15,6 +15,9 @@ pub enum DataVgError {
     #[error("Quorum failure: {0}")]
     QuorumFailure(String),
 
+    #[error("Stale version: expected {expected}, all reachable replicas returned older versions")]
+    StaleVersion { expected: u64 },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
