@@ -241,27 +241,23 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     run_test!("Fsync Persistence", test_fsync_persistence);
     run_test!("Truncate to Non-Zero Size", test_truncate_nonzero);
 
-    // V1 sparse-override regression tests (design doc 09 sec 7i).
-    // Cover the user-visible behaviors that the sparse WriteBuffer +
-    // single-writer enforcement guarantee on the fs_server side, even
-    // before the override flush (PutInodeCas / DeleteBlocks /
-    // BSS-parent-as-size-authority) lands.
+    // Sparse WriteBuffer + single-writer regression tests.
+    run_test!("Sparse: Large Truncate", test_sparse_truncate_large);
     run_test!(
-        "V1: O(1) Truncate Past Memory Pressure",
-        test_v1_truncate_large
-    );
-    run_test!("V1: Partial-Block Overwrite", test_v1_partial_overwrite);
-    run_test!(
-        "V1: Dirty-Handle Read After Write",
-        test_v1_dirty_read_after_write
+        "Sparse: Partial-Block Overwrite",
+        test_sparse_partial_overwrite
     );
     run_test!(
-        "V1: Single-Writer EBUSY Enforcement",
-        test_v1_single_writer_ebusy
+        "Sparse: Dirty-Handle Read After Write",
+        test_sparse_dirty_read_after_write
     );
     run_test!(
-        "V1: Truncate-Then-Extend Reads Zeros",
-        test_v1_truncate_then_extend
+        "Sparse: Single-Writer EBUSY",
+        test_sparse_single_writer_ebusy
+    );
+    run_test!(
+        "Sparse: Truncate-Then-Extend Reads Zeros",
+        test_sparse_truncate_then_extend
     );
 
     // Cache staleness tests: verify FUSE sees external S3 mutations after TTL
@@ -1985,21 +1981,18 @@ async fn test_truncate_nonzero(disk_cache: bool) -> CmdResult {
     Ok(())
 }
 
-// V1 sec 4.7 / 5.2: an open + write handle's WriteBuffer is sparse, so
-// a truncate that grows the file by hundreds of MB must NOT allocate
-// that many bytes. Pre-V1 the flat BytesMut::resize allocated the
-// entire range, OOM-ing the process for moderately large extends. The
-// test stops well before fs_server's flush would try to upload the
-// (still-existing) holes; the V1 sparse buffer makes the in-memory
-// growth O(1).
-async fn test_v1_truncate_large(disk_cache: bool) -> CmdResult {
+// An open + write handle's WriteBuffer is sparse, so a truncate that
+// grows the file by hundreds of MB must NOT allocate that many bytes.
+// Previously the flat BytesMut::resize allocated the entire range,
+// OOM-ing the process for moderately large extends.
+async fn test_sparse_truncate_large(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
     mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create a small file");
-    let file_path = format!("{}/v1-trunc-large.bin", MOUNT_POINT);
+    let file_path = format!("{}/sparse-trunc-large.bin", MOUNT_POINT);
     std::fs::write(&file_path, b"hello").expect("Failed to write seed file");
 
     println!("  Step 3: ftruncate up to 256MB (sparse extend)");
@@ -2043,20 +2036,22 @@ async fn test_v1_truncate_large(disk_cache: bool) -> CmdResult {
     );
 
     unmount_fuse()?;
-    println!("{}", "SUCCESS: V1 O(1) truncate large test passed".green());
+    println!(
+        "{}",
+        "SUCCESS: Sparse O(1) truncate large test passed".green()
+    );
     Ok(())
 }
 
-// V1 sec 5.3: the sparse buffer lazy-loads only the touched blocks on
-// a partial-block edit. A small write at a high offset must not
-// disturb surrounding bytes; previously the flat buffer's resize
-// would zero-fill the gap before the application's data lands.
-async fn test_v1_partial_overwrite(disk_cache: bool) -> CmdResult {
+// The sparse buffer lazy-loads only the touched blocks on a partial-
+// block edit. A small write at a high offset must not disturb the
+// surrounding bytes.
+async fn test_sparse_partial_overwrite(disk_cache: bool) -> CmdResult {
     use aws_sdk_s3::primitives::ByteStream;
     let (ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Upload an existing 64KB file via S3");
-    let key = "v1-partial.bin";
+    let key = "sparse-partial.bin";
     let original = generate_test_data(key, 64 * 1024);
     ctx.client
         .put_object()
@@ -2108,20 +2103,20 @@ async fn test_v1_partial_overwrite(disk_cache: bool) -> CmdResult {
     cleanup_objects(&ctx, &bucket, &[key]).await;
     println!(
         "{}",
-        "SUCCESS: V1 partial-block overwrite test passed".green()
+        "SUCCESS: Sparse partial-block overwrite test passed".green()
     );
     Ok(())
 }
 
-// V1 sec 5.6.1: a same-handle read after write must observe the just-
-// written bytes via the per-block merge, including reads that span the
-// transition between buffered and unbuffered blocks.
-async fn test_v1_dirty_read_after_write(disk_cache: bool) -> CmdResult {
+// A same-handle read after write must observe the just-written bytes
+// via the per-block merge, including reads that span the transition
+// between buffered and unbuffered blocks.
+async fn test_sparse_dirty_read_after_write(disk_cache: bool) -> CmdResult {
     use aws_sdk_s3::primitives::ByteStream;
     let (ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Upload a 32KB seed file via S3");
-    let key = "v1-dirty-read.bin";
+    let key = "sparse-dirty-read.bin";
     let original = generate_test_data(key, 32 * 1024);
     ctx.client
         .put_object()
@@ -2179,30 +2174,31 @@ async fn test_v1_dirty_read_after_write(disk_cache: bool) -> CmdResult {
     cleanup_objects(&ctx, &bucket, &[key]).await;
     println!(
         "{}",
-        "SUCCESS: V1 dirty-handle read-after-write test passed".green()
+        "SUCCESS: Sparse dirty-handle read-after-write test passed".green()
     );
     Ok(())
 }
 
-// V1 sec 4.8: VfsCore's inode-scoped write lock must reject a second
-// open(O_WRONLY) on the same inode while the first is live. Read-only
-// opens are unaffected.
-async fn test_v1_single_writer_ebusy(disk_cache: bool) -> CmdResult {
+// The inode-scoped write lock must reject a second open(O_WRONLY) on
+// the same inode while the first is live. Read-only opens are
+// unaffected.
+async fn test_sparse_single_writer_ebusy(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
     mount_fuse_rw(&bucket, disk_cache)?;
 
-    println!("  Step 2: Create a file and hold a write handle open");
-    let file_path = format!("{}/v1-busy.bin", MOUNT_POINT);
+    println!("  Step 2: Create + flush a file so it exists in NSS");
+    let file_path = format!("{}/sparse-busy.bin", MOUNT_POINT);
+    std::fs::write(&file_path, b"seed").expect("seed write failed");
+
+    println!("  Step 3: Open the file for write and hold the handle");
     let f1 = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
         .open(&file_path)
         .expect("Failed to open first writer");
 
-    println!("  Step 3: Second writer open must fail with EBUSY");
+    println!("  Step 4: Second writer open must fail with EBUSY");
     let err = std::fs::OpenOptions::new()
         .write(true)
         .open(&file_path)
@@ -2217,14 +2213,14 @@ async fn test_v1_single_writer_ebusy(disk_cache: bool) -> CmdResult {
     );
     println!("    Got EBUSY as expected");
 
-    println!("  Step 4: A reader open on the same inode is unaffected");
+    println!("  Step 5: A reader open on the same inode is unaffected");
     let reader = std::fs::OpenOptions::new()
         .read(true)
         .open(&file_path)
         .expect("Read open should succeed alongside the writer");
     drop(reader);
 
-    println!("  Step 5: Closing the first writer releases the lock");
+    println!("  Step 6: Closing the first writer releases the lock");
     drop(f1);
     let f2 = std::fs::OpenOptions::new()
         .write(true)
@@ -2233,22 +2229,25 @@ async fn test_v1_single_writer_ebusy(disk_cache: bool) -> CmdResult {
     drop(f2);
 
     unmount_fuse()?;
-    println!("{}", "SUCCESS: V1 single-writer EBUSY test passed".green());
+    println!(
+        "{}",
+        "SUCCESS: Sparse single-writer EBUSY test passed".green()
+    );
     Ok(())
 }
 
-// V1 sec 5.2: shrink + grow inside one buffer session. A read of the
-// regrown region must return zeros, not pre-shrink committed data.
-// This exercises the wb.file_size logic and the shrink-clamp on
-// per-block intents inside vfs_setattr_size.
-async fn test_v1_truncate_then_extend(disk_cache: bool) -> CmdResult {
+// Shrink + grow inside one buffer session. A read of the regrown
+// region must return zeros, not pre-shrink committed data. Exercises
+// the wb.file_size logic and the shrink-clamp on per-block intents
+// inside vfs_setattr_size.
+async fn test_sparse_truncate_then_extend(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
     mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Write a small file, then ftruncate up");
-    let file_path = format!("{}/v1-shrink-grow.bin", MOUNT_POINT);
+    let file_path = format!("{}/sparse-shrink-grow.bin", MOUNT_POINT);
     std::fs::write(&file_path, b"abcdefghij").expect("seed write failed");
     let f = std::fs::OpenOptions::new()
         .write(true)
@@ -2274,6 +2273,9 @@ async fn test_v1_truncate_then_extend(disk_cache: bool) -> CmdResult {
     drop(f);
 
     unmount_fuse()?;
-    println!("{}", "SUCCESS: V1 truncate-then-extend test passed".green());
+    println!(
+        "{}",
+        "SUCCESS: Sparse truncate-then-extend test passed".green()
+    );
     Ok(())
 }

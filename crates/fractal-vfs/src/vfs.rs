@@ -69,18 +69,14 @@ thread_local! {
     static THREAD_BACKEND: Cell<Option<&'static StorageBackend>> = const { Cell::new(None) };
 }
 
-/// Per-block content intent for the V1 sparse WriteBuffer (sec 4.7).
+/// Per-block content intent for the sparse WriteBuffer.
 ///
 /// Blocks NOT in the map are implicitly "Keep": no buffered work, BSS is
-/// authoritative.
-///
-/// Note: in this V1 implementation, override-style flush (PutInodeCas /
-/// DeleteBlocks) is not yet wired through, so flush still goes through
-/// the existing replace-on-flush path. The sparse buffer's role today is
-/// to keep in-memory operations O(1) (truncate, partial writes), avoid
-/// the whole-file preload on open, and serve dirty-handle reads per
-/// block. The override flush wires up later once the BSS / NSS protocol
-/// changes (PutInodeCas, DeleteBlocks, ParentInodeMeta, padding) land.
+/// authoritative. Flush still goes through the legacy replace-on-flush
+/// path -- the sparse buffer's role today is to keep in-memory ops O(1),
+/// avoid whole-file preload on open, and serve dirty-handle reads
+/// per-block. Override flush wires up once the BSS/NSS protocol changes
+/// land.
 #[derive(Debug, Clone)]
 enum BlockState {
     /// Bytes lazily loaded from BSS for read or partial-block edit.
@@ -164,10 +160,10 @@ pub struct VfsCore {
     // Tracks blob data for unlinked files that still have open handles.
     // Cleanup is deferred until the last handle is released.
     deferred_blob_cleanup: DashMap<u64, Bytes>,
-    // Inode-scoped write lock. At most one write-mode handle per inode is
-    // allowed. Map value is the owning fh so a stale lock for a closed fh
-    // can be reclaimed by the next opener (V1 sec 4.8). Reads do not touch
-    // this lock.
+    // Inode-scoped write lock. At most one write-mode handle per inode
+    // is allowed. The map value is the owning fh, so a stale lock from
+    // a handle that disappeared without going through release can be
+    // reclaimed by the next opener. Reads do not touch this lock.
     inode_write_owner: DashMap<u64, u64>,
 }
 
@@ -280,7 +276,7 @@ impl VfsCore {
     /// Reclaim rule: if the recorded owner fh has been released (no entry in
     /// `file_handles`), the lock is stale and we take it. This recovers from
     /// any path that removes a handle without first calling
-    /// `release_write_lock` (e.g. lookup races during shutdown). V1 sec 4.8.
+    /// `release_write_lock` (e.g. lookup races during shutdown).
     fn acquire_write_lock(&self, inode: u64, fh: u64) -> Result<(), FsError> {
         use dashmap::mapref::entry::Entry;
         match self.inode_write_owner.entry(inode) {
@@ -832,11 +828,10 @@ impl VfsCore {
     pub async fn vfs_read(&self, fh: u64, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
 
-        // V1 sec 5.6.1: dirty-handle read merge. The flat-buffer shortcut
-        // is gone; reads through a dirty handle use a per-block merge
-        // that mirrors flush-time semantics. Read len is clamped to
-        // wb.file_size so a buffered truncate / write-into-EOF is
-        // visible to same-handle reads.
+        // Dirty-handle read merge: a per-block path that mirrors
+        // flush-time semantics. Read len is clamped to wb.file_size so
+        // a buffered truncate / write-into-EOF is visible to
+        // same-handle reads.
         if let Some(ref wb) = handle.write_buf
             && wb.dirty
         {
@@ -883,7 +878,7 @@ impl VfsCore {
     /// or Cached blocks return those bytes; an absent block falls through
     /// to lazy-load from BSS, treating BlockNotFound as a hole. The total
     /// read length is clamped to `file_size` so a buffered truncate /
-    /// extend is observable. (V1 sec 5.6.1.)
+    /// extend is observable.
     async fn read_dirty_handle(
         &self,
         file_size: u64,
@@ -922,11 +917,14 @@ impl VfsCore {
             let block_bytes: Bytes = match blocks.get(&b) {
                 Some(BlockState::Rewrite(b2)) | Some(BlockState::Cached(b2)) => b2.clone(),
                 None => {
+                    // Read against the buffered file_size: blocks past it
+                    // shouldn't be reachable from this loop (we clamp on
+                    // entry), so the committed length matches block_content_len.
                     self.lazy_load_block_for_flush(
                         existing_blob_guid,
                         b,
-                        block_size as usize,
-                        file_size,
+                        block_content_len,
+                        block_content_len,
                         &trace_id,
                     )
                     .await?
@@ -951,19 +949,22 @@ impl VfsCore {
 
     // ── Write helpers ──
 
-    /// Build the contiguous byte stream that the current replace-on-flush
-    /// path needs out of the sparse WriteBuffer. Lazy-loads any block that
-    /// is reachable (within file_size) but not buffered.
+    /// Build the contiguous byte stream that the existing replace-on-flush
+    /// path needs out of the sparse WriteBuffer. Lazy-loads any block
+    /// that is within the new file_size but not buffered.
     ///
-    /// In the V1 final design these blocks would not be re-uploaded at
-    /// all (override flush only writes Rewrite intents), but until the
-    /// BSS / NSS protocol changes (PutInodeCas, DeleteBlocks, padding,
-    /// ParentInodeMeta) land, the existing replace-on-flush still demands
-    /// a full file body.
+    /// `committed_size` is the size BSS currently has under
+    /// `existing_blob_guid`; it disambiguates a block that lives in BSS
+    /// at its original length from a block that the buffer has shrunk
+    /// or never written. The BSS read path enforces a strict
+    /// content_len match, so a lazy-load for a block that the buffer is
+    /// shrinking must request the original (committed) content length
+    /// and truncate the result locally.
     async fn materialize_for_flush(
         &self,
         existing_blob_guid: Option<data_types::DataBlobGuid>,
         file_size: u64,
+        committed_size: u64,
         block_size: u32,
         blocks: &std::collections::BTreeMap<u32, BlockState>,
         trace_id: &TraceId,
@@ -976,54 +977,60 @@ impl VfsCore {
         let mut out = BytesMut::with_capacity(file_size as usize);
         for b in 0..block_count {
             let block_start = b as u64 * bsz;
-            let content_len = std::cmp::min(bsz, file_size - block_start) as usize;
+            let new_content_len = std::cmp::min(bsz, file_size - block_start) as usize;
             let block_bytes = match blocks.get(&b) {
                 Some(BlockState::Rewrite(bytes)) | Some(BlockState::Cached(bytes)) => bytes.clone(),
                 None => {
+                    let committed_content_len = if block_start < committed_size {
+                        std::cmp::min(bsz, committed_size - block_start) as usize
+                    } else {
+                        // Hole (block past the committed EOF -- pure grow).
+                        0
+                    };
                     self.lazy_load_block_for_flush(
                         existing_blob_guid,
                         b,
-                        content_len,
-                        file_size,
+                        committed_content_len,
+                        new_content_len,
                         trace_id,
                     )
                     .await?
                 }
             };
-            let take = std::cmp::min(content_len, block_bytes.len());
+            let take = std::cmp::min(new_content_len, block_bytes.len());
             out.extend_from_slice(&block_bytes[..take]);
-            if take < content_len {
-                out.resize(out.len() + (content_len - take), 0);
+            if take < new_content_len {
+                out.resize(out.len() + (new_content_len - take), 0);
             }
         }
         Ok(out.freeze())
     }
 
     /// Lazy-load a single block from BSS at flush time. Returns zeros if
-    /// no existing blob or the block is missing (hole).
+    /// no existing blob, the block was past committed EOF (hole), or
+    /// the read fails (treated as a hole for now -- once the
+    /// BlockNotFound error variant lands, only that maps to zeros).
     async fn lazy_load_block_for_flush(
         &self,
         existing_blob_guid: Option<data_types::DataBlobGuid>,
         block_num: u32,
-        content_len: usize,
-        file_size: u64,
+        committed_content_len: usize,
+        fallback_content_len: usize,
         trace_id: &TraceId,
     ) -> Result<Bytes, FsError> {
         let Some(guid) = existing_blob_guid else {
-            return Ok(Bytes::from(vec![0u8; content_len]));
+            return Ok(Bytes::from(vec![0u8; fallback_content_len]));
         };
+        if committed_content_len == 0 {
+            return Ok(Bytes::from(vec![0u8; fallback_content_len]));
+        }
         match self
             .backend()
-            .read_block(guid, block_num, content_len, trace_id)
+            .read_block(guid, block_num, committed_content_len, trace_id)
             .await
         {
             Ok((data, _)) => Ok(data),
-            // V1 sec 5.6: BlockNotFound -> zeros. The current backend maps
-            // a missing block to a quorum-not-found error today; treat it
-            // as a hole (zeros). Once the BlockNotFound error variant
-            // lands we will match it specifically.
-            Err(_) if file_size > 0 => Ok(Bytes::from(vec![0u8; content_len])),
-            Err(e) => Err(e),
+            Err(_) => Ok(Bytes::from(vec![0u8; fallback_content_len])),
         }
     }
 
@@ -1031,12 +1038,15 @@ impl VfsCore {
         // Snapshot the WriteBuffer and detach its block map so we can
         // run async work outside the DashMap guard. If anything fails
         // after this point the handle is left with `dirty=false` and an
-        // empty intent map -- callers retry by writing again. (V1 sec 5.5
-        // forward-retry lands later; today we keep the current semantics
-        // of "flush is best-effort, error returned to caller".)
-        let (s3_key, file_size, existing_blob_guid, block_size, blocks) = {
+        // empty intent map; the caller retries by writing again.
+        let (s3_key, file_size, committed_size, existing_blob_guid, block_size, blocks) = {
             let mut handle = self.file_handles.get_mut(&fh_id).ok_or(FsError::BadFd)?;
             let s3_key = handle.s3_key.clone();
+            let committed_size = handle
+                .layout
+                .as_ref()
+                .and_then(|l| l.size().ok())
+                .unwrap_or(0);
             let wb = match &mut handle.write_buf {
                 Some(wb) if wb.dirty => wb,
                 _ => return Ok(()),
@@ -1045,6 +1055,7 @@ impl VfsCore {
             (
                 s3_key,
                 wb.file_size,
+                committed_size,
                 wb.existing_blob_guid,
                 wb.block_size,
                 blocks,
@@ -1056,6 +1067,7 @@ impl VfsCore {
             .materialize_for_flush(
                 existing_blob_guid,
                 file_size,
+                committed_size,
                 block_size,
                 &blocks,
                 &trace_id,
@@ -1340,8 +1352,8 @@ impl VfsCore {
             return Ok(self.make_dir_attr(ROOT_INODE));
         }
 
-        // V1 sec 5.6.1: dirty-handle stat reports wb.file_size whenever the
-        // handle has buffered any size change (bare truncate or write-into-EOF).
+        // Dirty-handle stat reports wb.file_size whenever the handle
+        // has buffered any size change (bare truncate or write-into-EOF).
         // Otherwise fall through to the committed layout.
         if let Some(fh_id) = fh
             && let Some(handle) = self.file_handles.get(&fh_id)
@@ -1375,9 +1387,9 @@ impl VfsCore {
 
     /// Handle size changes via setattr (truncate, extend, or truncate-to-zero).
     ///
-    /// V1 sec 5.2: this is buffered locally and is O(1) regardless of
-    /// `new_size`. `BytesMut::resize` is gone -- a 100GB truncate now
-    /// updates a couple of fields and drops out-of-range block intents.
+    /// Buffered locally and O(1) regardless of `new_size`. The flat-buffer
+    /// `BytesMut::resize` is gone -- a 100GB truncate updates a couple of
+    /// fields and drops out-of-range block intents.
     pub async fn vfs_setattr_size(
         &self,
         inode: u64,
@@ -1433,10 +1445,10 @@ impl VfsCore {
         let layout = entry.layout.clone();
         drop(entry);
 
-        // V1 sec 4.8: enforce single-writer per inode. The first writer
-        // wins and subsequent write-mode opens fail with EBUSY. The lock
-        // is process-local in-memory state and dies with the process on
-        // crash, so the next open reacquires.
+        // Single-writer per inode. First writer wins; subsequent
+        // write-mode opens fail with EBUSY. The lock is process-local
+        // in-memory state and dies with the process on crash, so the
+        // next open reacquires.
         let fh = self.alloc_fh();
         if is_write {
             self.acquire_write_lock(inode, fh)?;
@@ -1455,7 +1467,7 @@ impl VfsCore {
             }
         };
 
-        // V1 sec 5.3: no preload. Existing files seed the WriteBuffer with
+        // No preload. Existing files seed the WriteBuffer with the
         // committed file_size + blob_guid; partial writes lazy-load the
         // touched blocks at write time. O_TRUNC is honored by setting
         // file_size = 0.
@@ -1505,8 +1517,8 @@ impl VfsCore {
     async fn vfs_read_bytes(&self, fh: u64, offset: u64, size: u32) -> Result<Bytes, FsError> {
         let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
 
-        // V1 sec 5.6.1: dirty-handle read merge. Materialize into a Vec<u8>
-        // and freeze for callers that need owned bytes.
+        // Dirty-handle read merge: materialize into a Vec<u8> and freeze
+        // for callers that need owned bytes.
         if let Some(ref wb) = handle.write_buf
             && wb.dirty
         {
@@ -1547,8 +1559,8 @@ impl VfsCore {
         }
     }
 
-    /// V1 sec 5.3: sparse write path. Lazy-loads only the affected blocks
-    /// (no whole-file preload), inserts a `Rewrite` intent for each, and
+    /// Sparse write path: lazy-loads only the affected blocks (no
+    /// whole-file preload), inserts a `Rewrite` intent for each, and
     /// grows the logical EOF if the write extends past it.
     pub async fn vfs_write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, FsError> {
         // POSIX: zero-byte writes are a no-op and must NOT extend the
@@ -1562,7 +1574,7 @@ impl VfsCore {
         // blob_guid for lazy-loading, current intents) without holding
         // the DashMap guard across awaits. Initialize the buffer in
         // place if missing.
-        let (block_size, existing_blob_guid, blocks_to_load) = {
+        let (block_size, existing_blob_guid, committed_size, blocks_to_load) = {
             let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
             let bsize = handle
                 .layout
@@ -1596,24 +1608,31 @@ impl VfsCore {
                     to_load.push(b);
                 }
             }
-            (wb.block_size, wb.existing_blob_guid, to_load)
+            (
+                wb.block_size,
+                wb.existing_blob_guid,
+                committed_size,
+                to_load,
+            )
         };
 
         // Phase 2: lazy-load missing blocks (outside the guard).
         let trace_id = TraceId::new();
         let mut loaded: std::collections::BTreeMap<u32, Bytes> = std::collections::BTreeMap::new();
+        let bsz_u64 = block_size as u64;
         for b in blocks_to_load {
-            let block_start = b as u64 * block_size as u64;
+            let block_start = b as u64 * bsz_u64;
+            let committed_content_len = if block_start < committed_size {
+                std::cmp::min(bsz_u64, committed_size - block_start) as usize
+            } else {
+                0
+            };
             let bytes = self
                 .lazy_load_block_for_flush(
                     existing_blob_guid,
                     b,
-                    // Read up to block_size; if we're past committed EOF
-                    // the helper returns zeros.
+                    committed_content_len,
                     block_size as usize,
-                    // Pass file_size as 0 sentinel for hole tolerance --
-                    // the helper currently ignores file_size for fall-back.
-                    block_start.saturating_add(1),
                     &trace_id,
                 )
                 .await?;
@@ -1700,8 +1719,8 @@ impl VfsCore {
         let ino = self.file_handles.get(&fh).map(|h| h.ino);
         self.file_handles.remove(&fh);
 
-        // Release the inode-scoped write lock if this handle held it
-        // (V1 sec 4.8). Read-only handles never acquired it.
+        // Release the inode-scoped write lock if this handle held it.
+        // Read-only handles never acquired it.
         if was_writer && let Some(ino) = ino {
             self.release_write_lock(ino, fh);
         }
@@ -1738,8 +1757,8 @@ impl VfsCore {
         let (ino, _) = self.inodes.lookup_or_insert(&key, EntryType::File, None);
 
         let fh = self.alloc_fh();
-        // V1 sec 4.8: vfs_create implicitly opens the new file for writing,
-        // so it must obey the inode-scoped write lock. A re-create on an
+        // vfs_create implicitly opens the new file for writing, so it
+        // must obey the inode-scoped write lock. A re-create on an
         // inode that already has a live write handle returns EBUSY.
         self.acquire_write_lock(ino, fh)?;
         // size_changed=true so a subsequent close-without-write still
