@@ -450,6 +450,7 @@ async fn put_object_streaming_internal(
         version_id,
         block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
         timestamp,
+        blob_version: 1,
         state: ObjectState::Normal(ObjectMetaData {
             blob_guid,
             core_meta_data: ObjectCoreMetaData {
@@ -666,6 +667,7 @@ async fn put_object_with_no_trailer(
         version_id,
         block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
         timestamp,
+        blob_version: 1,
         state: ObjectState::Normal(ObjectMetaData {
             blob_guid,
             core_meta_data: ObjectCoreMetaData {
