@@ -24,6 +24,10 @@ pub struct ObjectLayout {
     pub timestamp: u64,
     pub version_id: Uuid, // v4
     pub block_size: u32,
+    /// Monotonic version for in-place block override (V1 sparse + override).
+    /// Incremented by `PutInodeCas` on every flush that has pending work.
+    /// `0` is reserved for legacy / pre-V1 layouts; new flushes start at `1`.
+    pub blob_version: u64,
     pub state: ObjectState,
 }
 

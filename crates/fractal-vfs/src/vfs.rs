@@ -824,6 +824,7 @@ impl VfsCore {
             version_id: ObjectLayout::gen_version_id(),
             block_size: DEFAULT_BLOCK_SIZE,
             timestamp,
+            blob_version: 1,
             state: ObjectState::Normal(ObjectMetaData {
                 blob_guid,
                 core_meta_data: ObjectCoreMetaData {
