@@ -1015,6 +1015,16 @@ impl DataVgProxy {
                         return Ok(());
                     }
                 }
+                Err(RpcError::NotFound) => {
+                    // Hole on this replica. Don't penalise the node;
+                    // fall through to the fallback path which polls
+                    // every replica and either finds a copy somewhere
+                    // or concludes BlockNotFound for the whole quorum.
+                    debug!(
+                        "Fast path: BSS node {} reports BlockNotFound, falling back",
+                        selected_node.address
+                    );
+                }
                 Err(e) => {
                     selected_node.record_failure();
                     warn!(
@@ -1080,6 +1090,12 @@ impl DataVgProxy {
 
         let mut successful_reads = 0;
         let mut successful_blob_data = None;
+        // Track whether every responding replica reported NotFound, so a
+        // sparse-file hole (block legitimately missing on every replica)
+        // can be surfaced as DataVgError::BlockNotFound rather than a
+        // generic quorum failure.
+        let mut not_found_count: usize = 0;
+        let mut other_error_count: usize = 0;
 
         // Wait until we get a successful read (quorum of 1) or all fail.
         // A response with a mismatched version is treated like a transient
@@ -1107,8 +1123,16 @@ impl DataVgProxy {
                         break;
                     }
                 }
+                Err(RpcError::NotFound) => {
+                    // Hole semantics: this replica agrees the block does
+                    // not exist. Don't penalise the node -- it answered
+                    // promptly and correctly.
+                    not_found_count += 1;
+                    debug!("BSS node {} reports BlockNotFound", node.address);
+                }
                 Err(rpc_error) => {
                     node.record_failure();
+                    other_error_count += 1;
                     warn!(
                         "RPC error reading from BSS node {}: {}",
                         node.address, rpc_error
@@ -1143,6 +1167,15 @@ impl DataVgProxy {
                 expected, blob_id, block_number
             );
             return Err(DataVgError::StaleVersion { expected });
+        }
+
+        // Sparse-file hole: every responding replica agrees the block
+        // does not exist. The caller (fs_server's read path) maps this
+        // to zeros within the file's logical EOF.
+        if not_found_count > 0 && other_error_count == 0 {
+            histogram!("datavg_get_blob_nanos", "result" => "block_not_found")
+                .record(start.elapsed().as_nanos() as f64);
+            return Err(DataVgError::BlockNotFound);
         }
 
         // All reads failed
@@ -1489,6 +1522,8 @@ impl DataVgProxy {
         // Fetch the k data shards (indices 0..k) from their rotated nodes
         let mut shard_results: Vec<Option<Vec<u8>>> = vec![None; total];
         let mut data_shards_received = 0;
+        let mut data_shards_not_found = 0usize;
+        let mut data_shards_other_err = 0usize;
         let mut fetch_futures = FuturesUnordered::new();
         for shard_idx in 0..k {
             let node_idx = (shard_idx + rotation) % total;
@@ -1520,14 +1555,36 @@ impl DataVgProxy {
                     shard_results[shard_idx] = Some(data.to_vec());
                     data_shards_received += 1;
                 }
+                Err(RpcError::NotFound) => {
+                    // Hole on this shard. Don't penalise the node.
+                    data_shards_not_found += 1;
+                    debug!(
+                        "EC data shard {} reports BlockNotFound from {}",
+                        shard_idx, ec_vol.bss_nodes[node_idx].address
+                    );
+                }
                 Err(e) => {
                     ec_vol.bss_nodes[node_idx].record_failure();
+                    data_shards_other_err += 1;
                     warn!(
                         "EC data shard {} fetch failed from {}: {}",
                         shard_idx, ec_vol.bss_nodes[node_idx].address, e
                     );
                 }
             }
+        }
+
+        // If every data-shard fetch came back as BlockNotFound (and
+        // no transient errors), the block legitimately doesn't exist
+        // on the EC volume either. Surface as BlockNotFound so the
+        // fs_server read path maps it to zeros.
+        if data_shards_received == 0
+            && data_shards_other_err == 0
+            && data_shards_not_found > 0
+        {
+            histogram!("datavg_get_blob_nanos", "result" => "ec_block_not_found")
+                .record(start.elapsed().as_nanos() as f64);
+            return Err(DataVgError::BlockNotFound);
         }
 
         if data_shards_received == k {
@@ -1582,14 +1639,24 @@ impl DataVgProxy {
             });
         }
 
+        let mut parity_shards_not_found = 0usize;
+        let mut parity_shards_other_err = 0usize;
         while let Some((shard_idx, node_idx, result)) = parity_futures.next().await {
             match result {
                 Ok((data, _version)) => {
                     ec_vol.bss_nodes[node_idx].record_success();
                     shard_results[shard_idx] = Some(data.to_vec());
                 }
+                Err(RpcError::NotFound) => {
+                    parity_shards_not_found += 1;
+                    debug!(
+                        "EC parity shard {} reports BlockNotFound from {}",
+                        shard_idx, ec_vol.bss_nodes[node_idx].address
+                    );
+                }
                 Err(e) => {
                     ec_vol.bss_nodes[node_idx].record_failure();
+                    parity_shards_other_err += 1;
                     warn!(
                         "EC parity shard {} fetch failed from {}: {}",
                         shard_idx, ec_vol.bss_nodes[node_idx].address, e
@@ -1600,6 +1667,19 @@ impl DataVgProxy {
 
         let total_shards_received = shard_results.iter().filter(|s| s.is_some()).count();
         if total_shards_received < k {
+            // If the unrecoverable read is because every reachable
+            // shard agreed the block doesn't exist (no transient
+            // errors at all), surface BlockNotFound so the fs_server
+            // read path can map to zeros for sparse files.
+            if total_shards_received == 0
+                && data_shards_other_err == 0
+                && parity_shards_other_err == 0
+                && (data_shards_not_found > 0 || parity_shards_not_found > 0)
+            {
+                histogram!("datavg_get_blob_nanos", "result" => "ec_block_not_found")
+                    .record(start.elapsed().as_nanos() as f64);
+                return Err(DataVgError::BlockNotFound);
+            }
             histogram!("datavg_get_blob_nanos", "result" => "ec_quorum_failure")
                 .record(start.elapsed().as_nanos() as f64);
             return Err(DataVgError::QuorumFailure(format!(

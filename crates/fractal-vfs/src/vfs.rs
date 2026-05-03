@@ -479,6 +479,12 @@ impl VfsCore {
 
     /// Read a block, checking disk cache first. On miss, fetches from backend
     /// and populates disk cache.
+    ///
+    /// A sparse-file hole (block legitimately missing on every replica)
+    /// is surfaced as a synthetic zero-filled block of `block_content_len`.
+    /// The disk cache is intentionally NOT populated for holes -- there's
+    /// no checksum to validate against and a future override-flush could
+    /// fill the hole with real data.
     async fn read_block_cached(
         &self,
         blob_guid: data_types::DataBlobGuid,
@@ -497,10 +503,18 @@ impl VfsCore {
         }
 
         // Cache miss: fetch from backend
-        let (data, checksum) = self
+        let (data, checksum) = match self
             .backend()
             .read_block(blob_guid, block_num, block_content_len, trace_id)
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(FsError::DataVg(volume_group_proxy::DataVgError::BlockNotFound))
+            | Err(FsError::Rpc(rpc_client_common::RpcError::NotFound)) => {
+                return Ok(Bytes::from(vec![0u8; block_content_len]));
+            }
+            Err(e) => return Err(e),
+        };
 
         // Populate disk cache
         if let Some(dc) = &self.disk_cache {
@@ -1006,10 +1020,132 @@ impl VfsCore {
         Ok(out.freeze())
     }
 
-    /// Lazy-load a single block from BSS at flush time. Returns zeros if
-    /// no existing blob, the block was past committed EOF (hole), or
-    /// the read fails (treated as a hole for now -- once the
-    /// BlockNotFound error variant lands, only that maps to zeros).
+    /// Override-style flush: write only the Rewrite intents to the
+    /// existing blob_guid at `new_version`, then delete blocks past the
+    /// new EOF if the file shrunk. Shrunk blocks are deleted at
+    /// `new_version` so bssEraseCheck accepts them and a later
+    /// re-extend reads zeros (POSIX shrink-destroys semantics).
+    #[allow(clippy::too_many_arguments)]
+    async fn override_flush_blocks(
+        &self,
+        blob_guid: data_types::DataBlobGuid,
+        new_version: u64,
+        block_size: u32,
+        file_size: u64,
+        committed_size: u64,
+        blocks: &std::collections::BTreeMap<u32, BlockState>,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        let block_size_usize = block_size as usize;
+        let bsz_u64 = block_size as u64;
+
+        // Identify the surviving last block of a non-aligned shrink so
+        // its tail can be zeroed (POSIX shrink-destroys: bytes between
+        // new EOF and the next block boundary must not resurface on a
+        // later re-extend).
+        let needs_tail_zero =
+            file_size > 0 && file_size < committed_size && file_size % bsz_u64 != 0;
+        let tail_block = if needs_tail_zero {
+            Some((file_size / bsz_u64) as u32)
+        } else {
+            None
+        };
+        let kept = (file_size % bsz_u64) as usize;
+
+        // Step 1: write Rewrite intents at new_version. Cached and
+        // implicit (absent) blocks are not re-uploaded -- they stay at
+        // their previously-stored version on disk and remain reachable
+        // through the new layout because BSS keys are versioned.
+        // When the Rewrite covers the surviving last block of a
+        // non-aligned shrink, the tail beyond `kept` is zeroed before
+        // upload so the buffered user write doesn't preserve bytes
+        // past the new EOF.
+        let mut wrote_tail_block = false;
+        for (block_num, state) in blocks {
+            if let BlockState::Rewrite(bytes) = state {
+                let mut block_bytes = BytesMut::with_capacity(block_size_usize);
+                block_bytes.extend_from_slice(bytes);
+                if block_bytes.len() < block_size_usize {
+                    block_bytes.resize(block_size_usize, 0);
+                }
+                if Some(*block_num) == tail_block {
+                    for byte in &mut block_bytes[kept..] {
+                        *byte = 0;
+                    }
+                    wrote_tail_block = true;
+                }
+                self.backend()
+                    .write_block(
+                        blob_guid,
+                        *block_num,
+                        block_bytes.freeze(),
+                        new_version,
+                        trace_id,
+                    )
+                    .await?;
+            }
+        }
+
+        // Step 2: shrink-trim. Delete any committed blocks that fall
+        // past the new EOF. The trim runs at new_version so a stale
+        // re-extend can't resurrect pre-shrink data: any concurrent
+        // write at the old version would lose to the V+1 erase.
+        let new_block_count = file_size.div_ceil(bsz_u64) as u32;
+        let committed_block_count = committed_size.div_ceil(bsz_u64) as u32;
+        if new_block_count < committed_block_count {
+            for block_num in new_block_count..committed_block_count {
+                if let Err(e) = self
+                    .backend()
+                    .delete_block(blob_guid, block_num, new_version, trace_id)
+                    .await
+                {
+                    tracing::warn!(
+                        %blob_guid,
+                        block_num,
+                        new_version,
+                        error = %e,
+                        "Failed to delete shrunken block"
+                    );
+                }
+            }
+        }
+
+        // Step 3: synthesised tail-zero for shrink with no buffered
+        // Rewrite for the last block. Lazy-load the committed block,
+        // zero everything after `kept`, write at new_version.
+        if let Some(last_block) = tail_block
+            && !wrote_tail_block
+        {
+            let committed_block_start = last_block as u64 * bsz_u64;
+            let committed_content_len = if committed_block_start < committed_size {
+                std::cmp::min(bsz_u64, committed_size - committed_block_start) as usize
+            } else {
+                0
+            };
+            let existing = self
+                .lazy_load_block_for_flush(
+                    Some(blob_guid),
+                    last_block,
+                    committed_content_len,
+                    block_size_usize,
+                    trace_id,
+                )
+                .await?;
+            let mut buf = BytesMut::with_capacity(block_size_usize);
+            let prefix_len = std::cmp::min(kept, existing.len());
+            buf.extend_from_slice(&existing[..prefix_len]);
+            buf.resize(block_size_usize, 0);
+            self.backend()
+                .write_block(blob_guid, last_block, buf.freeze(), new_version, trace_id)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Lazy-load a single block from BSS at flush time. Returns zeros
+    /// when the block doesn't exist (sparse-file hole) or when no
+    /// existing blob is known. Other failures propagate.
     async fn lazy_load_block_for_flush(
         &self,
         existing_blob_guid: Option<data_types::DataBlobGuid>,
@@ -1030,7 +1166,13 @@ impl VfsCore {
             .await
         {
             Ok((data, _)) => Ok(data),
-            Err(_) => Ok(Bytes::from(vec![0u8; fallback_content_len])),
+            Err(FsError::DataVg(volume_group_proxy::DataVgError::BlockNotFound)) => {
+                Ok(Bytes::from(vec![0u8; fallback_content_len]))
+            }
+            Err(FsError::Rpc(rpc_client_common::RpcError::NotFound)) => {
+                Ok(Bytes::from(vec![0u8; fallback_content_len]))
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -1039,7 +1181,15 @@ impl VfsCore {
         // run async work outside the DashMap guard. If anything fails
         // after this point the handle is left with `dirty=false` and an
         // empty intent map; the caller retries by writing again.
-        let (s3_key, file_size, committed_size, existing_blob_guid, block_size, blocks) = {
+        let (
+            s3_key,
+            file_size,
+            committed_size,
+            committed_blob_version,
+            existing_blob_guid,
+            block_size,
+            blocks,
+        ) = {
             let mut handle = self.file_handles.get_mut(&fh_id).ok_or(FsError::BadFd)?;
             let s3_key = handle.s3_key.clone();
             let committed_size = handle
@@ -1047,6 +1197,8 @@ impl VfsCore {
                 .as_ref()
                 .and_then(|l| l.size().ok())
                 .unwrap_or(0);
+            let committed_blob_version =
+                handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
             let wb = match &mut handle.write_buf {
                 Some(wb) if wb.dirty => wb,
                 _ => return Ok(()),
@@ -1056,6 +1208,7 @@ impl VfsCore {
                 s3_key,
                 wb.file_size,
                 committed_size,
+                committed_blob_version,
                 wb.existing_blob_guid,
                 wb.block_size,
                 blocks,
@@ -1063,46 +1216,72 @@ impl VfsCore {
         };
 
         let trace_id = TraceId::new();
-        let data = self
-            .materialize_for_flush(
-                existing_blob_guid,
-                file_size,
-                committed_size,
-                block_size,
-                &blocks,
-                &trace_id,
-            )
-            .await?;
-        let blob_guid = self.backend().create_blob_guid();
         let block_size_usize = block_size as usize;
 
-        // Write data blocks. Every block is zero-padded to a full
-        // block_size on disk so readers can request block_size and
-        // truncate locally to the file_size known from NSS / BSS parent;
-        // the last block is the only one that needs padding in
-        // practice. Storage overhead is up to (block_size - 1) bytes
-        // per file (tail block).
-        let num_blocks = if data.is_empty() {
-            0
-        } else {
-            data.len().div_ceil(block_size_usize)
-        };
-        for block_i in 0..num_blocks {
-            let start = block_i * block_size_usize;
-            let end = std::cmp::min(start + block_size_usize, data.len());
-            let chunk = data.slice(start..end);
-            let padded = if chunk.len() < block_size_usize {
-                let mut buf = BytesMut::with_capacity(block_size_usize);
-                buf.extend_from_slice(&chunk);
-                buf.resize(block_size_usize, 0);
-                buf.freeze()
-            } else {
-                chunk
-            };
-            self.backend()
-                .write_block(blob_guid, block_i as u32, padded, 1, &trace_id)
+        // Override-flush vs replace-flush dispatch.
+        //
+        // Override flush: keep the existing blob_guid, bump blob_version
+        // V -> V+1, write only the per-block Rewrite intents (other
+        // blocks stay at V on disk and remain reachable through the
+        // V+1 layout because BSS returns the latest stored version per
+        // key). This is what makes a 1-block edit of a 100-block file
+        // cost 1 block-write instead of a 100-block re-upload + delete
+        // dance. Shrink-past-EOF blocks are deleted at V+1 so a later
+        // re-extend reads zeros (POSIX semantics).
+        //
+        // Replace flush: brand-new file. Allocate a fresh blob_guid,
+        // materialize the whole buffer, write all blocks at version=1.
+        // If NSS happens to have a stale entry under the same key, its
+        // old blob's blocks get cleaned up via the existing
+        // delete_blob_blocks fire-and-forget path.
+        let (final_blob_guid, final_blob_version, is_override) =
+            if let Some(guid) = existing_blob_guid {
+                // Bump to V+1, but guarantee at least 2 even when the
+                // committed layout is a legacy / pre-V1 record with
+                // blob_version=0: those records' BSS blocks are stored
+                // at version=1 (the previously-hardcoded default), so
+                // overwriting at version=1 would hit bssOverwriteCheck's
+                // idempotency branch and panic on different content.
+                let new_version = committed_blob_version.saturating_add(1).max(2);
+                self.override_flush_blocks(
+                    guid,
+                    new_version,
+                    block_size,
+                    file_size,
+                    committed_size,
+                    &blocks,
+                    &trace_id,
+                )
                 .await?;
-        }
+                (guid, new_version, true)
+            } else {
+                let data = self
+                    .materialize_for_flush(
+                        None,
+                        file_size,
+                        0,
+                        block_size,
+                        &blocks,
+                        &trace_id,
+                    )
+                    .await?;
+                let blob_guid = self.backend().create_blob_guid();
+                let num_blocks = if data.is_empty() {
+                    0
+                } else {
+                    data.len().div_ceil(block_size_usize)
+                };
+                for block_i in 0..num_blocks {
+                    let start = block_i * block_size_usize;
+                    let end = std::cmp::min(start + block_size_usize, data.len());
+                    let chunk = data.slice(start..end);
+                    let padded = pad_to_block_size(chunk, block_size_usize);
+                    self.backend()
+                        .write_block(blob_guid, block_i as u32, padded, 1, &trace_id)
+                        .await?;
+                }
+                (blob_guid, 1, false)
+            };
 
         // Build ObjectLayout
         let timestamp = SystemTime::now()
@@ -1113,12 +1292,12 @@ impl VfsCore {
             version_id: ObjectLayout::gen_version_id(),
             block_size,
             timestamp,
-            blob_version: 1,
+            blob_version: final_blob_version,
             state: ObjectState::Normal(ObjectMetaData {
-                blob_guid,
+                blob_guid: final_blob_guid,
                 core_meta_data: ObjectCoreMetaData {
                     size: file_size,
-                    etag: blob_guid.blob_id.simple().to_string(),
+                    etag: final_blob_guid.blob_id.simple().to_string(),
                     headers: vec![],
                     checksum: None,
                 },
@@ -1136,10 +1315,16 @@ impl VfsCore {
             .put_inode(&s3_key, layout_bytes, &trace_id)
             .await?;
 
-        // Delete old blob blocks if there was a previous version
-        if !old_bytes.is_empty()
+        // Replace flush only: clean up the old blob's blocks if NSS had
+        // a stale entry under the same key. Override flush kept the
+        // same blob_guid so its old_bytes refer to the SAME blob -- the
+        // shrunken blocks were already handled inline above and any
+        // blocks past new EOF were deleted at V+1.
+        if !is_override
+            && !old_bytes.is_empty()
             && let Ok(old_layout) =
                 rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
+            && old_layout.blob_guid().ok() != Some(final_blob_guid)
         {
             self.backend()
                 .delete_blob_blocks(&old_layout, &trace_id)
@@ -1155,7 +1340,7 @@ impl VfsCore {
             if let Some(ref mut wb) = handle.write_buf {
                 wb.dirty = false;
                 wb.size_changed = false;
-                wb.existing_blob_guid = Some(blob_guid);
+                wb.existing_blob_guid = Some(final_blob_guid);
                 wb.block_size = block_size;
                 // wb.blocks already drained when we took it out above.
             }
@@ -2117,6 +2302,21 @@ impl VfsCore {
 
 /// Extract the parent prefix from an s3_key.
 /// e.g. "/foo/bar" -> "/foo/", "/top" -> "/"
+/// Zero-pad `bytes` up to `block_size_usize`, returning the original
+/// (cheap clone) if it's already at least that large. Used by the
+/// override flush + replace flush write paths so every block lands on
+/// disk at full block_size.
+fn pad_to_block_size(bytes: Bytes, block_size_usize: usize) -> Bytes {
+    if bytes.len() >= block_size_usize {
+        bytes
+    } else {
+        let mut buf = BytesMut::with_capacity(block_size_usize);
+        buf.extend_from_slice(&bytes);
+        buf.resize(block_size_usize, 0);
+        buf.freeze()
+    }
+}
+
 fn parent_prefix_of(key: &str) -> String {
     let trimmed = key.trim_end_matches('/');
     match trimmed.rfind('/') {

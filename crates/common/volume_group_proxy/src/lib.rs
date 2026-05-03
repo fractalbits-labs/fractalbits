@@ -18,6 +18,12 @@ pub enum DataVgError {
     #[error("Stale version: expected {expected}, all reachable replicas returned older versions")]
     StaleVersion { expected: u64 },
 
+    /// All responding replicas agreed the block does not exist. The
+    /// caller can treat this as a sparse-file hole and substitute
+    /// zeros, rather than treating it as a quorum failure.
+    #[error("Block not found on any replica")]
+    BlockNotFound,
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
