@@ -630,21 +630,40 @@ impl DataVgProxy {
 
             // Check if we've achieved write quorum
             if successful_writes >= write_quorum {
-                // Spawn remaining writes as background task for eventual consistency
-                spawn_background(async move {
-                    while let Some((bg_node, addr, res)) = write_futures.next().await {
-                        match res {
+                // Override-style writes (version > 1) must land on every
+                // available replica before we return so an immediate
+                // read can't pick a lagging replica that still serves
+                // the older content.
+                if version > 1 {
+                    while let Some((node, address, result)) = write_futures.next().await {
+                        match result {
                             Ok(()) | Err(RpcError::VersionSkipped) => {
-                                bg_node.record_success();
-                                debug!("Background write to {} completed", addr);
+                                node.record_success();
+                                debug!("Override write to {} completed", address);
                             }
                             Err(e) => {
-                                bg_node.record_failure();
-                                warn!("Background write to {} failed: {}", addr, e);
+                                node.record_failure();
+                                warn!("Override write to {} failed: {}", address, e);
                             }
                         }
                     }
-                });
+                } else {
+                    // Spawn remaining writes as background task for eventual consistency
+                    spawn_background(async move {
+                        while let Some((bg_node, addr, res)) = write_futures.next().await {
+                            match res {
+                                Ok(()) | Err(RpcError::VersionSkipped) => {
+                                    bg_node.record_success();
+                                    debug!("Background write to {} completed", addr);
+                                }
+                                Err(e) => {
+                                    bg_node.record_failure();
+                                    warn!("Background write to {} failed: {}", addr, e);
+                                }
+                            }
+                        }
+                    });
+                }
 
                 histogram!("datavg_put_blob_nanos", "result" => "success")
                     .record(start.elapsed().as_nanos() as f64);
@@ -792,20 +811,35 @@ impl DataVgProxy {
             }
 
             if successful_writes >= write_quorum {
-                spawn_background(async move {
-                    while let Some((bg_node, addr, res)) = write_futures.next().await {
-                        match res {
+                if version > 1 {
+                    while let Some((node, address, result)) = write_futures.next().await {
+                        match result {
                             Ok(()) | Err(RpcError::VersionSkipped) => {
-                                bg_node.record_success();
-                                debug!("Background vectored write to {} completed", addr);
+                                node.record_success();
+                                debug!("Override vectored write to {} completed", address);
                             }
                             Err(e) => {
-                                bg_node.record_failure();
-                                warn!("Background vectored write to {} failed: {}", addr, e);
+                                node.record_failure();
+                                warn!("Override vectored write to {} failed: {}", address, e);
                             }
                         }
                     }
-                });
+                } else {
+                    spawn_background(async move {
+                        while let Some((bg_node, addr, res)) = write_futures.next().await {
+                            match res {
+                                Ok(()) | Err(RpcError::VersionSkipped) => {
+                                    bg_node.record_success();
+                                    debug!("Background vectored write to {} completed", addr);
+                                }
+                                Err(e) => {
+                                    bg_node.record_failure();
+                                    warn!("Background vectored write to {} failed: {}", addr, e);
+                                }
+                            }
+                        }
+                    });
+                }
 
                 histogram!("datavg_put_blob_nanos", "result" => "success")
                     .record(start.elapsed().as_nanos() as f64);
@@ -1441,21 +1475,43 @@ impl DataVgProxy {
             }
 
             if successful_writes >= write_quorum {
-                // Background remaining writes
-                spawn_background(async move {
-                    while let Some((bg_node, addr, res)) = write_futures.next().await {
-                        match res {
+                // For override-style writes (version > 1), all shards must
+                // be at the new version before we return: an immediate
+                // reader assembles the file from k data shards, and a
+                // mix of old/new shards yields a corrupted result. The
+                // quorum-then-background optimisation is only safe for
+                // brand-new objects (version == 1), where there's no
+                // older content to mix with.
+                if version > 1 {
+                    while let Some((node, address, result)) = write_futures.next().await {
+                        match result {
                             Ok(()) | Err(RpcError::VersionSkipped) => {
-                                bg_node.record_success();
-                                debug!("EC background write to {} completed", addr);
+                                node.record_success();
+                                debug!("EC override write to {} completed", address);
                             }
                             Err(e) => {
-                                bg_node.record_failure();
-                                warn!("EC background write to {} failed: {}", addr, e);
+                                node.record_failure();
+                                warn!("EC override write to {} failed: {}", address, e);
                             }
                         }
                     }
-                });
+                } else {
+                    // Background remaining writes for initial create.
+                    spawn_background(async move {
+                        while let Some((bg_node, addr, res)) = write_futures.next().await {
+                            match res {
+                                Ok(()) | Err(RpcError::VersionSkipped) => {
+                                    bg_node.record_success();
+                                    debug!("EC background write to {} completed", addr);
+                                }
+                                Err(e) => {
+                                    bg_node.record_failure();
+                                    warn!("EC background write to {} failed: {}", addr, e);
+                                }
+                            }
+                        }
+                    });
+                }
 
                 histogram!("datavg_put_blob_nanos", "result" => "ec_success")
                     .record(start.elapsed().as_nanos() as f64);
