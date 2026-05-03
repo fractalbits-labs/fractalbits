@@ -61,12 +61,14 @@ impl S3HybridSingleAzStorage {
 }
 
 impl S3HybridSingleAzStorage {
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_blob(
         &self,
         blob_id: Uuid,
         volume_id: u16,
         block_number: u32,
         body: Bytes,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         histogram!("blob_size", "operation" => "put").record(body.len() as f64);
@@ -79,7 +81,7 @@ impl S3HybridSingleAzStorage {
             // Small blob or EC-routed blob - store in DataVgProxy
             let blob_guid = DataBlobGuid { blob_id, volume_id };
             self.data_vg_proxy
-                .put_blob(blob_guid, block_number, body, trace_id)
+                .put_blob(blob_guid, block_number, body, version, trace_id)
                 .await?;
         } else {
             // Large blob - store in S3 (volume_id doesn't matter for S3 storage, but we'll use S3_VOLUME for metadata consistency)
@@ -100,12 +102,14 @@ impl S3HybridSingleAzStorage {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_blob_vectored(
         &self,
         blob_id: Uuid,
         volume_id: u16,
         block_number: u32,
         chunks: Vec<actix_web::web::Bytes>,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         let total_size: usize = chunks.iter().map(|c| c.len()).sum();
@@ -117,7 +121,7 @@ impl S3HybridSingleAzStorage {
         if is_small || Volume::is_ec_volume_id(volume_id) {
             let blob_guid = DataBlobGuid { blob_id, volume_id };
             self.data_vg_proxy
-                .put_blob_vectored(blob_guid, block_number, chunks, trace_id)
+                .put_blob_vectored(blob_guid, block_number, chunks, version, trace_id)
                 .await?;
         } else {
             let s3_key = blob_key(blob_id, block_number);
@@ -200,6 +204,7 @@ impl S3HybridSingleAzStorage {
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         location: BlobLocation,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
@@ -207,7 +212,7 @@ impl S3HybridSingleAzStorage {
             BlobLocation::DataVgProxy => {
                 // Small blob - delete from DataVgProxy
                 self.data_vg_proxy
-                    .delete_blob(blob_guid, block_number, trace_id)
+                    .delete_blob(blob_guid, block_number, version, trace_id)
                     .await?;
             }
             BlobLocation::S3 => {

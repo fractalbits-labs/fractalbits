@@ -261,16 +261,19 @@ impl StorageBackend {
         self.data_vg_proxy.create_data_blob_guid()
     }
 
-    /// Write a single block to a data blob via DataVgProxy.
+    /// Write a single block to a data blob via DataVgProxy at a specific
+    /// version. Override-style flush passes the bumped `blob_version`;
+    /// initial-create passes `1`.
     pub async fn write_block(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
         body: Bytes,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
         self.data_vg_proxy
-            .put_blob(blob_guid, block_number, body, trace_id)
+            .put_blob(blob_guid, block_number, body, version, trace_id)
             .await?;
         Ok(())
     }
@@ -388,7 +391,7 @@ impl StorageBackend {
         for (blob_guid, block_number) in blob_blocks_to_delete(layout) {
             if let Err(e) = self
                 .data_vg_proxy
-                .delete_blob(blob_guid, block_number, trace_id)
+                .delete_blob(blob_guid, block_number, layout.blob_version, trace_id)
                 .await
             {
                 tracing::warn!(
@@ -399,6 +402,21 @@ impl StorageBackend {
                 );
             }
         }
+    }
+
+    /// Delete a specific (blob_guid, block_number) at a given version.
+    /// Used by override flush to drop blocks past the new EOF.
+    pub async fn delete_block(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        version: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        self.data_vg_proxy
+            .delete_blob(blob_guid, block_number, version, trace_id)
+            .await?;
+        Ok(())
     }
 
     /// Create a directory marker in NSS.

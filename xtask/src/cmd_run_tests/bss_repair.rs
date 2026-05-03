@@ -513,6 +513,7 @@ async fn delete_blob_from_node(
         .delete_data_blob(
             blob_guid,
             block_number,
+            1,
             Some(Duration::from_secs(5)),
             &TraceId::new(),
             0,
@@ -666,6 +667,7 @@ async fn put_blob(
             block_number,
             body,
             checksum,
+            1,
             Some(Duration::from_secs(5)),
             &TraceId::new(),
             0,

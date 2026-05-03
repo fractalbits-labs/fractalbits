@@ -37,30 +37,34 @@ impl AllInBssSingleAzStorage {
 }
 
 impl AllInBssSingleAzStorage {
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_blob(
         &self,
         blob_id: uuid::Uuid,
         volume_id: u16,
         block_number: u32,
         body: Bytes,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         histogram!("blob_size", "operation" => "put").record(body.len() as f64);
 
         let blob_guid = DataBlobGuid { blob_id, volume_id };
         self.data_vg_proxy
-            .put_blob(blob_guid, block_number, body, trace_id)
+            .put_blob(blob_guid, block_number, body, version, trace_id)
             .await?;
 
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_blob_vectored(
         &self,
         blob_id: uuid::Uuid,
         volume_id: u16,
         block_number: u32,
         chunks: Vec<actix_web::web::Bytes>,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         let total_size: usize = chunks.iter().map(|c| c.len()).sum();
@@ -68,7 +72,7 @@ impl AllInBssSingleAzStorage {
 
         let blob_guid = DataBlobGuid { blob_id, volume_id };
         self.data_vg_proxy
-            .put_blob_vectored(blob_guid, block_number, chunks, trace_id)
+            .put_blob_vectored(blob_guid, block_number, chunks, version, trace_id)
             .await?;
 
         Ok(())
@@ -94,10 +98,11 @@ impl AllInBssSingleAzStorage {
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         self.data_vg_proxy
-            .delete_blob(blob_guid, block_number, trace_id)
+            .delete_blob(blob_guid, block_number, version, trace_id)
             .await?;
 
         Ok(())

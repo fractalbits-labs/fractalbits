@@ -166,6 +166,7 @@ impl RpcClient {
         block_number: u32,
         body: Bytes,
         body_checksum: u64,
+        version: u64,
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
@@ -183,7 +184,7 @@ impl RpcClient {
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
         header.checksum_body = body_checksum;
-        header.version = 1;
+        header.version = version;
 
         let msg_frame = MessageFrame::new(header, body);
         let resp_frame = self
@@ -206,6 +207,7 @@ impl RpcClient {
         block_number: u32,
         chunks: Vec<Bytes>,
         body_checksum: u64,
+        version: u64,
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
@@ -224,7 +226,7 @@ impl RpcClient {
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
         header.checksum_body = body_checksum;
-        header.version = 1;
+        header.version = version;
 
         let msg_frame = MessageFrame::new(header, chunks);
         let resp_frame = self
@@ -291,10 +293,12 @@ impl RpcClient {
         Ok(version)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn delete_data_blob(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
@@ -310,7 +314,7 @@ impl RpcClient {
         header.size = size_of::<MessageHeader>() as u32;
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
-        header.version = 1;
+        header.version = version;
 
         let msg_frame = MessageFrame::new(header, Bytes::new());
         let resp_frame = self

@@ -183,6 +183,7 @@ pub async fn delete_blob(
             tracking_root_blob_name: tracking_root_blob_name.clone(),
             blob_guid,
             block_number: block_number as u32,
+            version: object.blob_version,
             location: blob_location,
         };
 

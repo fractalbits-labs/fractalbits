@@ -18,6 +18,7 @@ pub struct BlobDeletionRequest {
     pub tracking_root_blob_name: Option<String>,
     pub blob_guid: DataBlobGuid,
     pub block_number: u32,
+    pub version: u64,
     pub location: BlobLocation,
 }
 
@@ -161,6 +162,7 @@ impl BlobClient {
                     request.tracking_root_blob_name.as_deref(),
                     request.blob_guid,
                     request.block_number,
+                    request.version,
                     request.location,
                     &TraceId::new(),
                 )
@@ -201,12 +203,14 @@ impl BlobClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_blob(
         &self,
         tracking_root_blob_name: Option<&str>,
         blob_guid: DataBlobGuid,
         block_number: u32,
         body: Bytes,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         self.storage
@@ -216,17 +220,20 @@ impl BlobClient {
                 blob_guid.volume_id,
                 block_number,
                 body,
+                version,
                 trace_id,
             )
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_blob_vectored(
         &self,
         tracking_root_blob_name: Option<&str>,
         blob_guid: DataBlobGuid,
         block_number: u32,
         chunks: Vec<actix_web::web::Bytes>,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         self.storage
@@ -236,6 +243,7 @@ impl BlobClient {
                 blob_guid.volume_id,
                 block_number,
                 chunks,
+                version,
                 trace_id,
             )
             .await
@@ -262,11 +270,13 @@ impl BlobClient {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn delete_blob(
         &self,
         tracking_root_blob_name: Option<&str>,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         location: BlobLocation,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
@@ -275,6 +285,7 @@ impl BlobClient {
                 tracking_root_blob_name,
                 blob_guid,
                 block_number,
+                version,
                 location,
                 trace_id,
             )

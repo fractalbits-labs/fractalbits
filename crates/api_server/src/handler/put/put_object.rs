@@ -386,6 +386,7 @@ async fn put_object_streaming_internal(
                         blob_guid,
                         i as u32,
                         chunks,
+                        1,
                         &ctx.trace_id,
                     )
                     .await;
@@ -530,6 +531,7 @@ async fn put_object_streaming_internal(
                     tracking_root_blob_name: bucket_obj.tracking_root_blob_name.clone(),
                     blob_guid: old_blob_guid,
                     block_number: block_number as u32,
+                    version: old_object.blob_version,
                     location: blob_location,
                 };
 
@@ -617,7 +619,14 @@ async fn put_object_with_no_trailer(
     // If total size fits in one block, use vectored API to avoid copying
     if total_size <= block_size {
         blob_client
-            .put_blob_vectored(tracking_root_blob_name, blob_guid, 0, chunks, &ctx.trace_id)
+            .put_blob_vectored(
+                tracking_root_blob_name,
+                blob_guid,
+                0,
+                chunks,
+                1,
+                &ctx.trace_id,
+            )
             .await
             .map_err(|e| {
                 tracing::error!("Failed to store blob: {e}");
@@ -637,6 +646,7 @@ async fn put_object_with_no_trailer(
                         blob_guid,
                         block_num as u32,
                         block_chunks,
+                        1,
                         &ctx.trace_id,
                     )
                     .await
@@ -746,6 +756,7 @@ async fn put_object_with_no_trailer(
                     tracking_root_blob_name: bucket.tracking_root_blob_name.clone(),
                     blob_guid: old_blob_guid,
                     block_number: block_number as u32,
+                    version: old_object.blob_version,
                     location: blob_location,
                 };
 

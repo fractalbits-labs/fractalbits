@@ -337,6 +337,7 @@ impl From<SdkError<DeleteObjectError>> for BlobStorageError {
 }
 
 impl BlobStorageImpl {
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_blob(
         &self,
         tracking_root_blob_name: Option<&str>,
@@ -344,12 +345,13 @@ impl BlobStorageImpl {
         volume_id: u16,
         block_number: u32,
         body: Bytes,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         match self {
             BlobStorageImpl::HybridSingleAz(storage) => {
                 storage
-                    .put_blob(blob_id, volume_id, block_number, body, trace_id)
+                    .put_blob(blob_id, volume_id, block_number, body, version, trace_id)
                     .await
             }
             BlobStorageImpl::S3ExpressMultiAz(storage) => {
@@ -359,12 +361,13 @@ impl BlobStorageImpl {
             }
             BlobStorageImpl::AllInBssSingleAz(storage) => {
                 storage
-                    .put_blob(blob_id, volume_id, block_number, body, trace_id)
+                    .put_blob(blob_id, volume_id, block_number, body, version, trace_id)
                     .await
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_blob_vectored(
         &self,
         tracking_root_blob_name: Option<&str>,
@@ -372,12 +375,13 @@ impl BlobStorageImpl {
         volume_id: u16,
         block_number: u32,
         chunks: Vec<actix_web::web::Bytes>,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         match self {
             BlobStorageImpl::HybridSingleAz(storage) => {
                 storage
-                    .put_blob_vectored(blob_id, volume_id, block_number, chunks, trace_id)
+                    .put_blob_vectored(blob_id, volume_id, block_number, chunks, version, trace_id)
                     .await
             }
             BlobStorageImpl::S3ExpressMultiAz(storage) => {
@@ -387,7 +391,7 @@ impl BlobStorageImpl {
             }
             BlobStorageImpl::AllInBssSingleAz(storage) => {
                 storage
-                    .put_blob_vectored(blob_id, volume_id, block_number, chunks, trace_id)
+                    .put_blob_vectored(blob_id, volume_id, block_number, chunks, version, trace_id)
                     .await
             }
         }
@@ -426,18 +430,20 @@ impl BlobStorageImpl {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn delete_blob(
         &self,
         tracking_root_blob_name: Option<&str>,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         location: BlobLocation,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         match self {
             BlobStorageImpl::HybridSingleAz(storage) => {
                 storage
-                    .delete_blob(blob_guid, block_number, location, trace_id)
+                    .delete_blob(blob_guid, block_number, version, location, trace_id)
                     .await
             }
             BlobStorageImpl::S3ExpressMultiAz(storage) => {
@@ -446,7 +452,9 @@ impl BlobStorageImpl {
                     .await
             }
             BlobStorageImpl::AllInBssSingleAz(storage) => {
-                storage.delete_blob(blob_guid, block_number, trace_id).await
+                storage
+                    .delete_blob(blob_guid, block_number, version, trace_id)
+                    .await
             }
         }
     }

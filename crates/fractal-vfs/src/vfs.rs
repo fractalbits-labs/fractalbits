@@ -1087,7 +1087,7 @@ impl VfsCore {
             let end = std::cmp::min(start + block_size_usize, data.len());
             let chunk = data.slice(start..end);
             self.backend()
-                .write_block(blob_guid, block_i as u32, chunk, &trace_id)
+                .write_block(blob_guid, block_i as u32, chunk, 1, &trace_id)
                 .await?;
         }
 
