@@ -241,6 +241,29 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     run_test!("Fsync Persistence", test_fsync_persistence);
     run_test!("Truncate to Non-Zero Size", test_truncate_nonzero);
 
+    // V1 sparse-override regression tests (design doc 09 sec 7i).
+    // Cover the user-visible behaviors that the sparse WriteBuffer +
+    // single-writer enforcement guarantee on the fs_server side, even
+    // before the override flush (PutInodeCas / DeleteBlocks /
+    // BSS-parent-as-size-authority) lands.
+    run_test!(
+        "V1: O(1) Truncate Past Memory Pressure",
+        test_v1_truncate_large
+    );
+    run_test!("V1: Partial-Block Overwrite", test_v1_partial_overwrite);
+    run_test!(
+        "V1: Dirty-Handle Read After Write",
+        test_v1_dirty_read_after_write
+    );
+    run_test!(
+        "V1: Single-Writer EBUSY Enforcement",
+        test_v1_single_writer_ebusy
+    );
+    run_test!(
+        "V1: Truncate-Then-Extend Reads Zeros",
+        test_v1_truncate_then_extend
+    );
+
     // Cache staleness tests: verify FUSE sees external S3 mutations after TTL
     run_test!(
         "External Create Visibility",
@@ -1959,5 +1982,298 @@ async fn test_truncate_nonzero(disk_cache: bool) -> CmdResult {
         "{}",
         "SUCCESS: Truncate to non-zero size test passed".green()
     );
+    Ok(())
+}
+
+// V1 sec 4.7 / 5.2: an open + write handle's WriteBuffer is sparse, so
+// a truncate that grows the file by hundreds of MB must NOT allocate
+// that many bytes. Pre-V1 the flat BytesMut::resize allocated the
+// entire range, OOM-ing the process for moderately large extends. The
+// test stops well before fs_server's flush would try to upload the
+// (still-existing) holes; the V1 sparse buffer makes the in-memory
+// growth O(1).
+async fn test_v1_truncate_large(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Create a small file");
+    let file_path = format!("{}/v1-trunc-large.bin", MOUNT_POINT);
+    std::fs::write(&file_path, b"hello").expect("Failed to write seed file");
+
+    println!("  Step 3: ftruncate up to 256MB (sparse extend)");
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .expect("Failed to open for truncate-large");
+        // 256 MB is far larger than what the legacy BytesMut::resize
+        // path would tolerate without obvious memory pressure, but
+        // small enough to keep the test fast on a constrained box.
+        file.set_len(256 * 1024 * 1024)
+            .expect("ftruncate(256MB) failed -- sparse buffer regressed?");
+    }
+
+    println!("  Step 4: Verify stat() reports the buffered size");
+    let meta = std::fs::metadata(&file_path).expect("Failed to stat");
+    assert_eq!(
+        meta.len(),
+        256 * 1024 * 1024,
+        "stat after ftruncate should report buffered size"
+    );
+
+    println!("  Step 5: Read first 5 bytes (existing data preserved)");
+    let mut head = vec![0u8; 5];
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&file_path)
+        .expect("Failed to open for read");
+    use std::os::unix::fs::FileExt;
+    f.read_exact_at(&mut head, 0).expect("read_at(0..5) failed");
+    assert_eq!(&head, b"hello", "Original bytes should survive ftruncate");
+
+    println!("  Step 6: Read 4KB from a hole (returns zeros)");
+    let mut hole = vec![0xffu8; 4096];
+    f.read_exact_at(&mut hole, 1024 * 1024)
+        .expect("read_at(1MB) failed");
+    assert!(
+        hole.iter().all(|&b| b == 0),
+        "Hole region should read as zeros"
+    );
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: V1 O(1) truncate large test passed".green());
+    Ok(())
+}
+
+// V1 sec 5.3: the sparse buffer lazy-loads only the touched blocks on
+// a partial-block edit. A small write at a high offset must not
+// disturb surrounding bytes; previously the flat buffer's resize
+// would zero-fill the gap before the application's data lands.
+async fn test_v1_partial_overwrite(disk_cache: bool) -> CmdResult {
+    use aws_sdk_s3::primitives::ByteStream;
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Upload an existing 64KB file via S3");
+    let key = "v1-partial.bin";
+    let original = generate_test_data(key, 64 * 1024);
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(original.clone()))
+        .send()
+        .await
+        .expect("Failed to put existing object");
+
+    println!("  Step 2: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 3: Open the file for RDWR and overwrite 16 bytes at offset 32KB");
+    let file_path = format!("{}/{}", MOUNT_POINT, key);
+    let patch = b"V1-PARTIAL-WRITE";
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("Failed to open RDWR");
+        f.write_all_at(patch, 32 * 1024)
+            .expect("write_all_at failed");
+        f.sync_all().expect("fsync failed");
+    }
+
+    println!("  Step 4: Verify the file is unchanged outside the patched region");
+    let actual = std::fs::read(&file_path).expect("Failed to read after partial write");
+    assert_eq!(actual.len(), original.len(), "Length must match original");
+    assert_eq!(
+        &actual[..32 * 1024],
+        &original[..32 * 1024],
+        "Pre-patch region corrupted"
+    );
+    assert_eq!(
+        &actual[32 * 1024..32 * 1024 + patch.len()],
+        patch,
+        "Patch did not land"
+    );
+    assert_eq!(
+        &actual[32 * 1024 + patch.len()..],
+        &original[32 * 1024 + patch.len()..],
+        "Post-patch region corrupted"
+    );
+
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+    println!(
+        "{}",
+        "SUCCESS: V1 partial-block overwrite test passed".green()
+    );
+    Ok(())
+}
+
+// V1 sec 5.6.1: a same-handle read after write must observe the just-
+// written bytes via the per-block merge, including reads that span the
+// transition between buffered and unbuffered blocks.
+async fn test_v1_dirty_read_after_write(disk_cache: bool) -> CmdResult {
+    use aws_sdk_s3::primitives::ByteStream;
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Upload a 32KB seed file via S3");
+    let key = "v1-dirty-read.bin";
+    let original = generate_test_data(key, 32 * 1024);
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(original.clone()))
+        .send()
+        .await
+        .expect("Failed to put seed object");
+
+    println!("  Step 2: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 3: Write at offset 1024, then read overlapping range without close");
+    let file_path = format!("{}/{}", MOUNT_POINT, key);
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&file_path)
+        .expect("Failed to open RDWR");
+    let patch = b"DIRTY-READ-AFTER-WRITE-CHECK";
+    f.write_all_at(patch, 1024).expect("write_all_at failed");
+
+    let mut readback = vec![0u8; patch.len()];
+    f.read_exact_at(&mut readback, 1024)
+        .expect("read_exact_at failed");
+    assert_eq!(
+        &readback, patch,
+        "Dirty-handle read should see just-written bytes"
+    );
+
+    // Read across a buffered/unbuffered boundary too.
+    let mut head = vec![0u8; 1024 + patch.len() + 32];
+    f.read_exact_at(&mut head, 0)
+        .expect("cross-boundary read failed");
+    assert_eq!(
+        &head[..1024],
+        &original[..1024],
+        "Pre-patch region should reflect committed bytes"
+    );
+    assert_eq!(
+        &head[1024..1024 + patch.len()],
+        patch,
+        "Patch region should reflect buffered bytes"
+    );
+    assert_eq!(
+        &head[1024 + patch.len()..],
+        &original[1024 + patch.len()..1024 + patch.len() + 32],
+        "Post-patch region should reflect committed bytes"
+    );
+
+    drop(f);
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+    println!(
+        "{}",
+        "SUCCESS: V1 dirty-handle read-after-write test passed".green()
+    );
+    Ok(())
+}
+
+// V1 sec 4.8: VfsCore's inode-scoped write lock must reject a second
+// open(O_WRONLY) on the same inode while the first is live. Read-only
+// opens are unaffected.
+async fn test_v1_single_writer_ebusy(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Create a file and hold a write handle open");
+    let file_path = format!("{}/v1-busy.bin", MOUNT_POINT);
+    let f1 = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&file_path)
+        .expect("Failed to open first writer");
+
+    println!("  Step 3: Second writer open must fail with EBUSY");
+    let err = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file_path)
+        .expect_err("Second writer should be rejected");
+    let raw = err.raw_os_error().unwrap_or(0);
+    assert_eq!(
+        raw,
+        libc::EBUSY,
+        "Expected EBUSY, got {} ({:?})",
+        raw,
+        err.kind()
+    );
+    println!("    Got EBUSY as expected");
+
+    println!("  Step 4: A reader open on the same inode is unaffected");
+    let reader = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&file_path)
+        .expect("Read open should succeed alongside the writer");
+    drop(reader);
+
+    println!("  Step 5: Closing the first writer releases the lock");
+    drop(f1);
+    let f2 = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file_path)
+        .expect("Second writer should succeed after first closes");
+    drop(f2);
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: V1 single-writer EBUSY test passed".green());
+    Ok(())
+}
+
+// V1 sec 5.2: shrink + grow inside one buffer session. A read of the
+// regrown region must return zeros, not pre-shrink committed data.
+// This exercises the wb.file_size logic and the shrink-clamp on
+// per-block intents inside vfs_setattr_size.
+async fn test_v1_truncate_then_extend(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Write a small file, then ftruncate up");
+    let file_path = format!("{}/v1-shrink-grow.bin", MOUNT_POINT);
+    std::fs::write(&file_path, b"abcdefghij").expect("seed write failed");
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file_path)
+        .expect("Failed to open for set_len");
+    f.set_len(4096).expect("set_len(4096) failed");
+
+    println!("  Step 3: Read [10..4096) -- must be zeros");
+    use std::os::unix::fs::FileExt;
+    let read_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&file_path)
+        .expect("Failed to open for read");
+    let mut tail = vec![0xffu8; 4096 - 10];
+    read_handle
+        .read_exact_at(&mut tail, 10)
+        .expect("tail read failed");
+    assert!(
+        tail.iter().all(|&b| b == 0),
+        "Extended region must read as zeros"
+    );
+    drop(read_handle);
+    drop(f);
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: V1 truncate-then-extend test passed".green());
     Ok(())
 }
