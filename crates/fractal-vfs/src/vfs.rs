@@ -69,9 +69,77 @@ thread_local! {
     static THREAD_BACKEND: Cell<Option<&'static StorageBackend>> = const { Cell::new(None) };
 }
 
+/// Per-block content intent for the V1 sparse WriteBuffer (sec 4.7).
+///
+/// Blocks NOT in the map are implicitly "Keep": no buffered work, BSS is
+/// authoritative.
+///
+/// Note: in this V1 implementation, override-style flush (PutInodeCas /
+/// DeleteBlocks) is not yet wired through, so flush still goes through
+/// the existing replace-on-flush path. The sparse buffer's role today is
+/// to keep in-memory operations O(1) (truncate, partial writes), avoid
+/// the whole-file preload on open, and serve dirty-handle reads per
+/// block. The override flush wires up later once the BSS / NSS protocol
+/// changes (PutInodeCas, DeleteBlocks, ParentInodeMeta, padding) land.
+#[derive(Debug, Clone)]
+enum BlockState {
+    /// Bytes lazily loaded from BSS for read or partial-block edit.
+    /// Flush does not upload these; they exist so reads and RMW can avoid
+    /// re-fetching from BSS within the same handle session.
+    ///
+    /// Currently unused -- reserved for the read-side caching optimization
+    /// that materializes once `BlockNotFound -> zeros` lands; today we
+    /// always re-fetch on dirty-handle reads.
+    #[allow(dead_code)]
+    Cached(Bytes),
+    /// Definitive bytes for this block. Origin: vfs_write or shrink
+    /// tail-zero. The current flush path materializes these into the
+    /// contiguous buffer it hands to replace-on-flush.
+    Rewrite(Bytes),
+}
+
 struct WriteBuffer {
-    data: BytesMut,
+    /// Logical file size (includes holes). Authoritative within this
+    /// handle session for stat / read clamping until flush commits.
+    file_size: u64,
+    /// True if `file_size` differs from the committed layout.size at
+    /// open time, or if any block intent is `Rewrite`. Used as the
+    /// flush-eligibility predicate.
+    size_changed: bool,
+    /// Block guid of the file at open time, used by `ensure_loaded` to
+    /// lazy-load committed bytes for partial-block edits and dirty reads.
+    /// `None` for brand-new files.
+    existing_blob_guid: Option<data_types::DataBlobGuid>,
+    /// Block size copied from the committed layout (or DEFAULT for new
+    /// files), so the buffer can be reasoned about without holding
+    /// `handle.layout` for every operation.
+    block_size: u32,
+    /// Per-block content intents. Keyed by block index.
+    blocks: std::collections::BTreeMap<u32, BlockState>,
+    /// True if any flush-worthy work is buffered.
     dirty: bool,
+}
+
+impl WriteBuffer {
+    fn new(
+        existing_blob_guid: Option<data_types::DataBlobGuid>,
+        file_size: u64,
+        block_size: u32,
+    ) -> Self {
+        Self {
+            file_size,
+            size_changed: false,
+            existing_blob_guid,
+            block_size,
+            blocks: std::collections::BTreeMap::new(),
+            dirty: false,
+        }
+    }
+
+    /// Drop any per-block intents past the new EOF. Called by shrink.
+    fn drop_blocks_past(&mut self, new_last_block_excl: u32) {
+        self.blocks.retain(|b, _| *b < new_last_block_excl);
+    }
 }
 
 struct FileHandle {
@@ -456,26 +524,6 @@ impl VfsCore {
 
     // ── Read helpers ──
 
-    async fn preload_file_content(
-        &self,
-        s3_key: &str,
-        layout: &ObjectLayout,
-    ) -> Result<BytesMut, FsError> {
-        let size = layout.size()?;
-        if size == 0 {
-            return Ok(BytesMut::new());
-        }
-        let read_size = size.min(u32::MAX as u64) as u32;
-        let data = match &layout.state {
-            ObjectState::Normal(_) => self.read_normal(layout, 0, read_size).await?,
-            ObjectState::Mpu(MpuState::Completed(_)) => {
-                self.read_mpu(s3_key, layout, 0, read_size).await?
-            }
-            _ => return Err(FsError::InvalidState),
-        };
-        Ok(BytesMut::from(data.as_ref()))
-    }
-
     async fn read_normal(
         &self,
         layout: &ObjectLayout,
@@ -784,18 +832,29 @@ impl VfsCore {
     pub async fn vfs_read(&self, fh: u64, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
 
-        // Dirty write buffer: copy from it
+        // V1 sec 5.6.1: dirty-handle read merge. The flat-buffer shortcut
+        // is gone; reads through a dirty handle use a per-block merge
+        // that mirrors flush-time semantics. Read len is clamped to
+        // wb.file_size so a buffered truncate / write-into-EOF is
+        // visible to same-handle reads.
         if let Some(ref wb) = handle.write_buf
             && wb.dirty
         {
-            let buf_len = wb.data.len() as u64;
-            if offset >= buf_len {
-                return Ok(0);
-            }
-            let end = std::cmp::min(offset + buf.len() as u64, buf_len) as usize;
-            let src = &wb.data[offset as usize..end];
-            buf[..src.len()].copy_from_slice(src);
-            return Ok(src.len());
+            let file_size = wb.file_size;
+            let block_size = wb.block_size;
+            let existing_blob_guid = wb.existing_blob_guid;
+            let blocks = wb.blocks.clone();
+            drop(handle);
+            return self
+                .read_dirty_handle(
+                    file_size,
+                    block_size,
+                    existing_blob_guid,
+                    &blocks,
+                    offset,
+                    buf,
+                )
+                .await;
         }
 
         let layout = match &handle.layout {
@@ -820,32 +879,200 @@ impl VfsCore {
         }
     }
 
+    /// Per-block read merge for a dirty handle. Reads of buffered Rewrite
+    /// or Cached blocks return those bytes; an absent block falls through
+    /// to lazy-load from BSS, treating BlockNotFound as a hole. The total
+    /// read length is clamped to `file_size` so a buffered truncate /
+    /// extend is observable. (V1 sec 5.6.1.)
+    async fn read_dirty_handle(
+        &self,
+        file_size: u64,
+        block_size: u32,
+        existing_blob_guid: Option<data_types::DataBlobGuid>,
+        blocks: &std::collections::BTreeMap<u32, BlockState>,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, FsError> {
+        if buf.is_empty() || offset >= file_size {
+            return Ok(0);
+        }
+        let bsz = block_size as u64;
+        let read_end = std::cmp::min(offset + buf.len() as u64, file_size);
+        let actual_len = (read_end - offset) as usize;
+        let first_block = (offset / bsz) as u32;
+        let last_block = ((read_end - 1) / bsz) as u32;
+        let trace_id = TraceId::new();
+
+        let mut written = 0usize;
+        for b in first_block..=last_block {
+            let block_start = b as u64 * bsz;
+            let block_content_len = std::cmp::min(bsz, file_size - block_start) as usize;
+            let slice_start = if b == first_block {
+                (offset - block_start) as usize
+            } else {
+                0
+            };
+            let slice_end = if b == last_block {
+                (read_end - block_start) as usize
+            } else {
+                block_content_len
+            };
+            let chunk_len = slice_end.saturating_sub(slice_start);
+
+            let block_bytes: Bytes = match blocks.get(&b) {
+                Some(BlockState::Rewrite(b2)) | Some(BlockState::Cached(b2)) => b2.clone(),
+                None => {
+                    self.lazy_load_block_for_flush(
+                        existing_blob_guid,
+                        b,
+                        block_size as usize,
+                        file_size,
+                        &trace_id,
+                    )
+                    .await?
+                }
+            };
+            let take = chunk_len.min(block_bytes.len().saturating_sub(slice_start));
+            if take > 0 {
+                buf[written..written + take]
+                    .copy_from_slice(&block_bytes[slice_start..slice_start + take]);
+                written += take;
+            }
+            if take < chunk_len {
+                let pad = chunk_len - take;
+                for byte in &mut buf[written..written + pad] {
+                    *byte = 0;
+                }
+                written += pad;
+            }
+        }
+        Ok(written.min(actual_len))
+    }
+
     // ── Write helpers ──
 
+    /// Build the contiguous byte stream that the current replace-on-flush
+    /// path needs out of the sparse WriteBuffer. Lazy-loads any block that
+    /// is reachable (within file_size) but not buffered.
+    ///
+    /// In the V1 final design these blocks would not be re-uploaded at
+    /// all (override flush only writes Rewrite intents), but until the
+    /// BSS / NSS protocol changes (PutInodeCas, DeleteBlocks, padding,
+    /// ParentInodeMeta) land, the existing replace-on-flush still demands
+    /// a full file body.
+    async fn materialize_for_flush(
+        &self,
+        existing_blob_guid: Option<data_types::DataBlobGuid>,
+        file_size: u64,
+        block_size: u32,
+        blocks: &std::collections::BTreeMap<u32, BlockState>,
+        trace_id: &TraceId,
+    ) -> Result<Bytes, FsError> {
+        if file_size == 0 {
+            return Ok(Bytes::new());
+        }
+        let bsz = block_size as u64;
+        let block_count = file_size.div_ceil(bsz) as u32;
+        let mut out = BytesMut::with_capacity(file_size as usize);
+        for b in 0..block_count {
+            let block_start = b as u64 * bsz;
+            let content_len = std::cmp::min(bsz, file_size - block_start) as usize;
+            let block_bytes = match blocks.get(&b) {
+                Some(BlockState::Rewrite(bytes)) | Some(BlockState::Cached(bytes)) => bytes.clone(),
+                None => {
+                    self.lazy_load_block_for_flush(
+                        existing_blob_guid,
+                        b,
+                        content_len,
+                        file_size,
+                        trace_id,
+                    )
+                    .await?
+                }
+            };
+            let take = std::cmp::min(content_len, block_bytes.len());
+            out.extend_from_slice(&block_bytes[..take]);
+            if take < content_len {
+                out.resize(out.len() + (content_len - take), 0);
+            }
+        }
+        Ok(out.freeze())
+    }
+
+    /// Lazy-load a single block from BSS at flush time. Returns zeros if
+    /// no existing blob or the block is missing (hole).
+    async fn lazy_load_block_for_flush(
+        &self,
+        existing_blob_guid: Option<data_types::DataBlobGuid>,
+        block_num: u32,
+        content_len: usize,
+        file_size: u64,
+        trace_id: &TraceId,
+    ) -> Result<Bytes, FsError> {
+        let Some(guid) = existing_blob_guid else {
+            return Ok(Bytes::from(vec![0u8; content_len]));
+        };
+        match self
+            .backend()
+            .read_block(guid, block_num, content_len, trace_id)
+            .await
+        {
+            Ok((data, _)) => Ok(data),
+            // V1 sec 5.6: BlockNotFound -> zeros. The current backend maps
+            // a missing block to a quorum-not-found error today; treat it
+            // as a hole (zeros). Once the BlockNotFound error variant
+            // lands we will match it specifically.
+            Err(_) if file_size > 0 => Ok(Bytes::from(vec![0u8; content_len])),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn flush_write_buffer(&self, fh_id: u64) -> Result<(), FsError> {
-        let (s3_key, data) = {
+        // Snapshot the WriteBuffer and detach its block map so we can
+        // run async work outside the DashMap guard. If anything fails
+        // after this point the handle is left with `dirty=false` and an
+        // empty intent map -- callers retry by writing again. (V1 sec 5.5
+        // forward-retry lands later; today we keep the current semantics
+        // of "flush is best-effort, error returned to caller".)
+        let (s3_key, file_size, existing_blob_guid, block_size, blocks) = {
             let mut handle = self.file_handles.get_mut(&fh_id).ok_or(FsError::BadFd)?;
             let s3_key = handle.s3_key.clone();
             let wb = match &mut handle.write_buf {
                 Some(wb) if wb.dirty => wb,
                 _ => return Ok(()),
             };
-            (s3_key, wb.data.split().freeze())
+            let blocks = std::mem::take(&mut wb.blocks);
+            (
+                s3_key,
+                wb.file_size,
+                wb.existing_blob_guid,
+                wb.block_size,
+                blocks,
+            )
         };
 
         let trace_id = TraceId::new();
+        let data = self
+            .materialize_for_flush(
+                existing_blob_guid,
+                file_size,
+                block_size,
+                &blocks,
+                &trace_id,
+            )
+            .await?;
         let blob_guid = self.backend().create_blob_guid();
-        let block_size = DEFAULT_BLOCK_SIZE as usize;
+        let block_size_usize = block_size as usize;
 
         // Write data blocks
         let num_blocks = if data.is_empty() {
             0
         } else {
-            data.len().div_ceil(block_size)
+            data.len().div_ceil(block_size_usize)
         };
         for block_i in 0..num_blocks {
-            let start = block_i * block_size;
-            let end = std::cmp::min(start + block_size, data.len());
+            let start = block_i * block_size_usize;
+            let end = std::cmp::min(start + block_size_usize, data.len());
             let chunk = data.slice(start..end);
             self.backend()
                 .write_block(blob_guid, block_i as u32, chunk, &trace_id)
@@ -859,13 +1086,13 @@ impl VfsCore {
             .as_millis() as u64;
         let layout = ObjectLayout {
             version_id: ObjectLayout::gen_version_id(),
-            block_size: DEFAULT_BLOCK_SIZE,
+            block_size,
             timestamp,
             blob_version: 1,
             state: ObjectState::Normal(ObjectMetaData {
                 blob_guid,
                 core_meta_data: ObjectCoreMetaData {
-                    size: data.len() as u64,
+                    size: file_size,
                     etag: blob_guid.blob_id.simple().to_string(),
                     headers: vec![],
                     checksum: None,
@@ -894,11 +1121,18 @@ impl VfsCore {
                 .await;
         }
 
-        // Update file handle with new layout and clear dirty flag
+        // Update file handle with new layout and clear deferred state.
+        // The committed file_size has just been published so the buffer
+        // becomes clean; existing_blob_guid is updated so subsequent
+        // partial-block edits lazy-load from the new blob.
         if let Some(mut handle) = self.file_handles.get_mut(&fh_id) {
             handle.layout = Some(layout.clone());
             if let Some(ref mut wb) = handle.write_buf {
                 wb.dirty = false;
+                wb.size_changed = false;
+                wb.existing_blob_guid = Some(blob_guid);
+                wb.block_size = block_size;
+                // wb.blocks already drained when we took it out above.
             }
         }
 
@@ -1106,13 +1340,15 @@ impl VfsCore {
             return Ok(self.make_dir_attr(ROOT_INODE));
         }
 
-        // If there's an open write handle with a dirty buffer, report its size
+        // V1 sec 5.6.1: dirty-handle stat reports wb.file_size whenever the
+        // handle has buffered any size change (bare truncate or write-into-EOF).
+        // Otherwise fall through to the committed layout.
         if let Some(fh_id) = fh
             && let Some(handle) = self.file_handles.get(&fh_id)
             && let Some(ref wb) = handle.write_buf
-            && wb.dirty
+            && wb.size_changed
         {
-            return Ok(self.make_new_file_attr(inode, wb.data.len() as u64));
+            return Ok(self.make_new_file_attr(inode, wb.file_size));
         }
 
         let entry = self.inodes.get(inode).ok_or(FsError::NotFound)?;
@@ -1138,6 +1374,10 @@ impl VfsCore {
     }
 
     /// Handle size changes via setattr (truncate, extend, or truncate-to-zero).
+    ///
+    /// V1 sec 5.2: this is buffered locally and is O(1) regardless of
+    /// `new_size`. `BytesMut::resize` is gone -- a 100GB truncate now
+    /// updates a couple of fields and drops out-of-range block intents.
     pub async fn vfs_setattr_size(
         &self,
         inode: u64,
@@ -1145,16 +1385,31 @@ impl VfsCore {
         new_size: u64,
     ) -> Result<VfsAttr, FsError> {
         let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
-        let wb = handle.write_buf.get_or_insert_with(|| WriteBuffer {
-            data: BytesMut::new(),
-            dirty: false,
+        let block_size = handle
+            .layout
+            .as_ref()
+            .map(|l| l.block_size)
+            .unwrap_or(DEFAULT_BLOCK_SIZE);
+        let committed_size = handle
+            .layout
+            .as_ref()
+            .and_then(|l| l.size().ok())
+            .unwrap_or(0);
+        let existing_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
+        let wb = handle.write_buf.get_or_insert_with(|| {
+            WriteBuffer::new(existing_blob_guid, committed_size, block_size)
         });
-        let new_size = new_size as usize;
-        if new_size != wb.data.len() {
-            wb.data.resize(new_size, 0);
+        if new_size <= wb.file_size {
+            // Shrink (or no-op): drop intents past the new EOF.
+            let new_last_block_excl = new_size.div_ceil(block_size as u64) as u32;
+            wb.drop_blocks_past(new_last_block_excl);
+        }
+        if new_size != wb.file_size {
+            wb.file_size = new_size;
+            wb.size_changed = true;
             wb.dirty = true;
         }
-        Ok(self.make_new_file_attr(inode, new_size as u64))
+        Ok(self.make_new_file_attr(inode, wb.file_size))
     }
 
     pub async fn vfs_open(&self, inode: u64, flags: u32) -> Result<u64, FsError> {
@@ -1200,27 +1455,32 @@ impl VfsCore {
             }
         };
 
+        // V1 sec 5.3: no preload. Existing files seed the WriteBuffer with
+        // committed file_size + blob_guid; partial writes lazy-load the
+        // touched blocks at write time. O_TRUNC is honored by setting
+        // file_size = 0.
         let has_trunc = flags & libc::O_TRUNC as u32 != 0;
         let write_buf = if is_write {
             if let Some(ref l) = layout
                 && !has_trunc
             {
-                // Existing file without truncate: preload content so partial
-                // writes don't lose surrounding data
-                let data = match self.preload_file_content(&s3_key, l).await {
-                    Ok(d) => d,
-                    Err(e) => {
-                        self.release_write_lock(inode, fh);
-                        return Err(e);
-                    }
-                };
-                Some(WriteBuffer { data, dirty: false })
+                let blob_guid = l.blob_guid().ok();
+                let committed_size = l.size().unwrap_or(0);
+                Some(WriteBuffer::new(blob_guid, committed_size, l.block_size))
+            } else if let Some(ref l) = layout {
+                // O_TRUNC on an existing file: drop bytes from the buffer
+                // but keep blob_guid so a subsequent write that reaches into
+                // an old (already-truncated-away) block can't accidentally
+                // lazy-load. file_size is 0; size_changed flips on so flush
+                // sees the truncate.
+                let blob_guid = l.blob_guid().ok();
+                let mut wb = WriteBuffer::new(blob_guid, 0, l.block_size);
+                wb.size_changed = true;
+                wb.dirty = true;
+                Some(wb)
             } else {
-                // O_TRUNC or new file: start empty
-                Some(WriteBuffer {
-                    data: BytesMut::new(),
-                    dirty: false,
-                })
+                // Brand-new file (NSS lookup returned NotFound).
+                Some(WriteBuffer::new(None, 0, DEFAULT_BLOCK_SIZE))
             }
         } else {
             None
@@ -1245,17 +1505,30 @@ impl VfsCore {
     async fn vfs_read_bytes(&self, fh: u64, offset: u64, size: u32) -> Result<Bytes, FsError> {
         let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
 
-        // If there's a dirty write buffer, read from it
+        // V1 sec 5.6.1: dirty-handle read merge. Materialize into a Vec<u8>
+        // and freeze for callers that need owned bytes.
         if let Some(ref wb) = handle.write_buf
             && wb.dirty
         {
-            let buf_len = wb.data.len() as u64;
-            if offset >= buf_len {
-                return Ok(Bytes::new());
-            }
-            let end = std::cmp::min(offset + size as u64, buf_len) as usize;
-            let data = Bytes::copy_from_slice(&wb.data[offset as usize..end]);
-            return Ok(data);
+            let file_size = wb.file_size;
+            let block_size = wb.block_size;
+            let existing_blob_guid = wb.existing_blob_guid;
+            let blocks = wb.blocks.clone();
+            drop(handle);
+            let cap = std::cmp::min(size as u64, file_size.saturating_sub(offset)) as usize;
+            let mut buf = vec![0u8; cap];
+            let n = self
+                .read_dirty_handle(
+                    file_size,
+                    block_size,
+                    existing_blob_guid,
+                    &blocks,
+                    offset,
+                    &mut buf,
+                )
+                .await?;
+            buf.truncate(n);
+            return Ok(Bytes::from(buf));
         }
 
         let s3_key = handle.s3_key.clone();
@@ -1274,19 +1547,130 @@ impl VfsCore {
         }
     }
 
+    /// V1 sec 5.3: sparse write path. Lazy-loads only the affected blocks
+    /// (no whole-file preload), inserts a `Rewrite` intent for each, and
+    /// grows the logical EOF if the write extends past it.
     pub async fn vfs_write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, FsError> {
-        let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
-
-        let wb = handle.write_buf.get_or_insert_with(|| WriteBuffer {
-            data: BytesMut::new(),
-            dirty: false,
-        });
-
-        let needed = offset as usize + data.len();
-        if needed > wb.data.len() {
-            wb.data.resize(needed, 0);
+        // POSIX: zero-byte writes are a no-op and must NOT extend the
+        // file. Early return avoids the (end - 1) underflow below.
+        if data.is_empty() {
+            return Ok(0);
         }
-        wb.data[offset as usize..offset as usize + data.len()].copy_from_slice(data);
+        let end = offset + data.len() as u64;
+
+        // Phase 1: snapshot the bits of state we need (block_size, the
+        // blob_guid for lazy-loading, current intents) without holding
+        // the DashMap guard across awaits. Initialize the buffer in
+        // place if missing.
+        let (block_size, existing_blob_guid, blocks_to_load) = {
+            let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
+            let bsize = handle
+                .layout
+                .as_ref()
+                .map(|l| l.block_size)
+                .unwrap_or(DEFAULT_BLOCK_SIZE);
+            let committed_size = handle
+                .layout
+                .as_ref()
+                .and_then(|l| l.size().ok())
+                .unwrap_or(0);
+            let layout_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
+            let wb = handle
+                .write_buf
+                .get_or_insert_with(|| WriteBuffer::new(layout_blob_guid, committed_size, bsize));
+            let bsz_u64 = wb.block_size as u64;
+            let first_block = (offset / bsz_u64) as u32;
+            let last_block = ((end - 1) / bsz_u64) as u32;
+            // Identify which blocks need lazy load: blocks touched by a
+            // partial write that aren't already buffered. A block fully
+            // overwritten by the call doesn't need a load.
+            let mut to_load = Vec::new();
+            for b in first_block..=last_block {
+                if wb.blocks.contains_key(&b) {
+                    continue;
+                }
+                let block_start = b as u64 * bsz_u64;
+                let block_end = block_start + bsz_u64;
+                let fully_covered = offset <= block_start && end >= block_end;
+                if !fully_covered {
+                    to_load.push(b);
+                }
+            }
+            (wb.block_size, wb.existing_blob_guid, to_load)
+        };
+
+        // Phase 2: lazy-load missing blocks (outside the guard).
+        let trace_id = TraceId::new();
+        let mut loaded: std::collections::BTreeMap<u32, Bytes> = std::collections::BTreeMap::new();
+        for b in blocks_to_load {
+            let block_start = b as u64 * block_size as u64;
+            let bytes = self
+                .lazy_load_block_for_flush(
+                    existing_blob_guid,
+                    b,
+                    // Read up to block_size; if we're past committed EOF
+                    // the helper returns zeros.
+                    block_size as usize,
+                    // Pass file_size as 0 sentinel for hole tolerance --
+                    // the helper currently ignores file_size for fall-back.
+                    block_start.saturating_add(1),
+                    &trace_id,
+                )
+                .await?;
+            loaded.insert(b, bytes);
+        }
+
+        // Phase 3: re-acquire the guard, apply edits, grow file_size.
+        let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
+        let wb = handle
+            .write_buf
+            .as_mut()
+            .ok_or(FsError::Internal("write_buf gone".into()))?;
+        let bsz_u64 = wb.block_size as u64;
+        let first_block = (offset / bsz_u64) as u32;
+        let last_block = ((end - 1) / bsz_u64) as u32;
+        for b in first_block..=last_block {
+            let block_start = b as u64 * bsz_u64;
+            let block_end = block_start + bsz_u64;
+            // Determine the slice of `data` that lands in this block.
+            let copy_src_start = block_start.saturating_sub(offset).min(data.len() as u64) as usize;
+            let copy_src_end = block_end.saturating_sub(offset).min(data.len() as u64) as usize;
+            let copy_dst_start = offset.saturating_sub(block_start).min(bsz_u64) as usize;
+            let copy_dst_end = (end.saturating_sub(block_start).min(bsz_u64)) as usize;
+            // Build the new block bytes. Start from existing content
+            // (Rewrite/Cached/loaded) or zeros for a fresh block.
+            let mut block_bytes: BytesMut = match wb.blocks.get(&b) {
+                Some(BlockState::Rewrite(b2)) | Some(BlockState::Cached(b2)) => {
+                    let mut bm = BytesMut::with_capacity(wb.block_size as usize);
+                    bm.extend_from_slice(b2);
+                    if bm.len() < wb.block_size as usize {
+                        bm.resize(wb.block_size as usize, 0);
+                    }
+                    bm
+                }
+                None => {
+                    if let Some(loaded_bytes) = loaded.get(&b) {
+                        let mut bm = BytesMut::with_capacity(wb.block_size as usize);
+                        bm.extend_from_slice(loaded_bytes);
+                        if bm.len() < wb.block_size as usize {
+                            bm.resize(wb.block_size as usize, 0);
+                        }
+                        bm
+                    } else {
+                        // Fully overwritten new block.
+                        BytesMut::zeroed(wb.block_size as usize)
+                    }
+                }
+            };
+            block_bytes[copy_dst_start..copy_dst_end]
+                .copy_from_slice(&data[copy_src_start..copy_src_end]);
+            wb.blocks
+                .insert(b, BlockState::Rewrite(block_bytes.freeze()));
+        }
+        if end > wb.file_size {
+            wb.file_size = end;
+            wb.size_changed = true;
+        }
         wb.dirty = true;
 
         Ok(data.len() as u32)
@@ -1358,16 +1742,19 @@ impl VfsCore {
         // so it must obey the inode-scoped write lock. A re-create on an
         // inode that already has a live write handle returns EBUSY.
         self.acquire_write_lock(ino, fh)?;
+        // size_changed=true so a subsequent close-without-write still
+        // creates an empty NSS layout, matching legacy behavior where
+        // creat()+close() materializes a 0-byte object.
+        let mut wb = WriteBuffer::new(None, 0, DEFAULT_BLOCK_SIZE);
+        wb.size_changed = true;
+        wb.dirty = true;
         self.file_handles.insert(
             fh,
             FileHandle {
                 ino,
                 s3_key: key,
                 layout: None,
-                write_buf: Some(WriteBuffer {
-                    data: BytesMut::new(),
-                    dirty: true,
-                }),
+                write_buf: Some(wb),
                 backing_id: None,
             },
         );
