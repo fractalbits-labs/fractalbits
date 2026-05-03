@@ -96,6 +96,11 @@ pub struct VfsCore {
     // Tracks blob data for unlinked files that still have open handles.
     // Cleanup is deferred until the last handle is released.
     deferred_blob_cleanup: DashMap<u64, Bytes>,
+    // Inode-scoped write lock. At most one write-mode handle per inode is
+    // allowed. Map value is the owning fh so a stale lock for a closed fh
+    // can be reclaimed by the next opener (V1 sec 4.8). Reads do not touch
+    // this lock.
+    inode_write_owner: DashMap<u64, u64>,
 }
 
 impl VfsCore {
@@ -146,6 +151,7 @@ impl VfsCore {
             passthrough_max_object_size,
             fuse_dev_fd: None,
             deferred_blob_cleanup: DashMap::new(),
+            inode_write_owner: DashMap::new(),
         }
     }
 
@@ -198,6 +204,37 @@ impl VfsCore {
         self.file_handles.iter().any(|entry| {
             entry.value().ino == ino && exclude_fh.is_none_or(|excl| *entry.key() != excl)
         })
+    }
+
+    /// Acquire the inode-scoped write lock for `fh`. Returns `Busy` if another
+    /// write-mode handle currently owns it.
+    ///
+    /// Reclaim rule: if the recorded owner fh has been released (no entry in
+    /// `file_handles`), the lock is stale and we take it. This recovers from
+    /// any path that removes a handle without first calling
+    /// `release_write_lock` (e.g. lookup races during shutdown). V1 sec 4.8.
+    fn acquire_write_lock(&self, inode: u64, fh: u64) -> Result<(), FsError> {
+        use dashmap::mapref::entry::Entry;
+        match self.inode_write_owner.entry(inode) {
+            Entry::Vacant(slot) => {
+                slot.insert(fh);
+                Ok(())
+            }
+            Entry::Occupied(mut slot) => {
+                let owner = *slot.get();
+                if !self.file_handles.contains_key(&owner) {
+                    slot.insert(fh);
+                    Ok(())
+                } else {
+                    Err(FsError::Busy)
+                }
+            }
+        }
+    }
+
+    fn release_write_lock(&self, inode: u64, fh: u64) {
+        self.inode_write_owner
+            .remove_if(&inode, |_, owner| *owner == fh);
     }
 
     fn file_perm(&self) -> u16 {
@@ -1141,6 +1178,15 @@ impl VfsCore {
         let layout = entry.layout.clone();
         drop(entry);
 
+        // V1 sec 4.8: enforce single-writer per inode. The first writer
+        // wins and subsequent write-mode opens fail with EBUSY. The lock
+        // is process-local in-memory state and dies with the process on
+        // crash, so the next open reacquires.
+        let fh = self.alloc_fh();
+        if is_write {
+            self.acquire_write_lock(inode, fh)?;
+        }
+
         // Resolve layout if not cached
         let layout = match layout {
             Some(l) => Some(l),
@@ -1161,7 +1207,13 @@ impl VfsCore {
             {
                 // Existing file without truncate: preload content so partial
                 // writes don't lose surrounding data
-                let data = self.preload_file_content(&s3_key, l).await?;
+                let data = match self.preload_file_content(&s3_key, l).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.release_write_lock(inode, fh);
+                        return Err(e);
+                    }
+                };
                 Some(WriteBuffer { data, dirty: false })
             } else {
                 // O_TRUNC or new file: start empty
@@ -1174,7 +1226,6 @@ impl VfsCore {
             None
         };
 
-        let fh = self.alloc_fh();
         self.file_handles.insert(
             fh,
             FileHandle {
@@ -1247,11 +1298,15 @@ impl VfsCore {
 
     pub async fn vfs_release(&self, fh: u64) -> Result<(), FsError> {
         // Flush any dirty write buffer before releasing
-        let has_dirty = self
+        let (has_dirty, was_writer) = self
             .file_handles
             .get(&fh)
-            .map(|h| h.write_buf.as_ref().map(|wb| wb.dirty).unwrap_or(false))
-            .unwrap_or(false);
+            .map(|h| {
+                let dirty = h.write_buf.as_ref().map(|wb| wb.dirty).unwrap_or(false);
+                let writer = h.write_buf.is_some();
+                (dirty, writer)
+            })
+            .unwrap_or((false, false));
 
         if has_dirty {
             self.flush_write_buffer(fh).await?;
@@ -1260,6 +1315,12 @@ impl VfsCore {
         // Get the inode before removing the handle
         let ino = self.file_handles.get(&fh).map(|h| h.ino);
         self.file_handles.remove(&fh);
+
+        // Release the inode-scoped write lock if this handle held it
+        // (V1 sec 4.8). Read-only handles never acquired it.
+        if was_writer && let Some(ino) = ino {
+            self.release_write_lock(ino, fh);
+        }
 
         // Handle deferred blob cleanup for unlinked files
         if let Some(ino) = ino
@@ -1293,6 +1354,10 @@ impl VfsCore {
         let (ino, _) = self.inodes.lookup_or_insert(&key, EntryType::File, None);
 
         let fh = self.alloc_fh();
+        // V1 sec 4.8: vfs_create implicitly opens the new file for writing,
+        // so it must obey the inode-scoped write lock. A re-create on an
+        // inode that already has a live write handle returns EBUSY.
+        self.acquire_write_lock(ino, fh)?;
         self.file_handles.insert(
             fh,
             FileHandle {

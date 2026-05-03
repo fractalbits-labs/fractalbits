@@ -25,6 +25,9 @@ pub enum FsError {
     #[error("bad file descriptor")]
     BadFd,
 
+    #[error("file is busy: another writer holds the inode-scoped write lock")]
+    Busy,
+
     #[error("RPC error: {0}")]
     Rpc(#[from] RpcError),
 
@@ -51,6 +54,7 @@ impl From<FsError> for io::Error {
             FsError::NotDir => io::Error::from_raw_os_error(libc::ENOTDIR),
             FsError::ReadOnly => io::Error::from_raw_os_error(libc::EROFS),
             FsError::BadFd => io::Error::from_raw_os_error(libc::EBADF),
+            FsError::Busy => io::Error::from_raw_os_error(libc::EBUSY),
             FsError::Rpc(ref e) => {
                 if e.retryable() {
                     io::Error::from_raw_os_error(libc::EAGAIN)
