@@ -2,7 +2,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client::RpcClient;
-use bss_codec::{Command, ListBlobsRequest, ListBlobsResponse, MessageHeader, list_blobs_response};
+use bss_codec::{
+    Command, ListBlobBlocksRequest, ListBlobBlocksResponse, ListBlobsRequest, ListBlobsResponse,
+    MessageHeader, ReserveBlocksRequest, ReserveBlocksResponse, list_blob_blocks_response,
+    list_blobs_response, reserve_blocks_response,
+};
 use bytes::Bytes;
 use data_types::{DataBlobGuid, TraceId};
 use prost::Message as PbMessage;
@@ -337,6 +341,127 @@ impl RpcClient {
             })?;
         check_response_errno(&resp_frame.header)?;
         Ok(())
+    }
+
+    /// Reserve a single block under `blob_guid` at `expected_version`.
+    ///
+    /// Spec carries a `block_count` field in the request body for
+    /// future multi-block batching, but the server currently treats
+    /// the call as scoped to `block_number` only -- callers that need
+    /// a range simply iterate. The version-guard semantics mirror
+    /// `put_data_blob`: VersionSkipped on a newer existing entry,
+    /// idempotent on equal/older versions.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reserve_blocks(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        block_size: u32,
+        expected_version: u64,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<(), RpcError> {
+        let _guard = InflightRpcGuard::new("bss", "reserve_blocks");
+        let body = ReserveBlocksRequest {
+            block_count: 1,
+            block_size,
+        };
+        let body_bytes = encode_protobuf(body, trace_id)?;
+
+        let mut header = MessageHeader::default();
+        let request_id = self.gen_request_id();
+        header.id = request_id;
+        header.blob_id = blob_guid.blob_id.into_bytes();
+        header.volume_id = blob_guid.volume_id;
+        header.block_number = block_number;
+        header.command = Command::ReserveBlocks;
+        header.size = (size_of::<MessageHeader>() + body_bytes.len()) as u32;
+        header.retry_count = retry_count as u8;
+        header.trace_id = trace_id.0;
+        header.version = expected_version;
+        header.set_body_checksum(&body_bytes);
+
+        let msg_frame = MessageFrame::new(header, body_bytes);
+        let resp_frame = self
+            .send_request(msg_frame, timeout, Some(crate::OperationType::PutData))
+            .await
+            .map_err(|e| {
+                if !e.retryable() {
+                    error!(rpc=%"reserve_blocks", %request_id, %blob_guid, %block_number, error=?e, "bss rpc failed");
+                }
+                e
+            })?;
+        check_response_errno(&resp_frame.header)?;
+        // Body is a ReserveBlocksResponse with stats; we don't propagate
+        // the breakdown today since the client iterates one block at a
+        // time, but decoding it here keeps a future telemetry hook
+        // cheap to add and validates the response shape.
+        if !resp_frame.body.is_empty()
+            && let Ok(resp) = <ReserveBlocksResponse as PbMessage>::decode(resp_frame.body.clone())
+            && let Some(reserve_blocks_response::Result::Err(err)) = resp.result
+        {
+            return Err(RpcError::InternalResponseError(err));
+        }
+        Ok(())
+    }
+
+    /// Enumerate the BSS-side block entries for a single blob over the
+    /// range `[first_block, first_block + block_count)`. Each result
+    /// row is `(block_number, entry_type, version)` -- absent indices
+    /// are holes. Returns an empty list when nothing in the range is
+    /// stored on this BSS instance (every block is a hole).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_blob_blocks(
+        &self,
+        blob_guid: DataBlobGuid,
+        first_block: u32,
+        block_count: u32,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<Vec<list_blob_blocks_response::BlobBlockEntry>, RpcError> {
+        let _guard = InflightRpcGuard::new("bss", "list_blob_blocks");
+        let body = ListBlobBlocksRequest {
+            first_block,
+            block_count,
+        };
+        let body_bytes = encode_protobuf(body, trace_id)?;
+
+        let mut header = MessageHeader::default();
+        let request_id = self.gen_request_id();
+        header.id = request_id;
+        header.blob_id = blob_guid.blob_id.into_bytes();
+        header.volume_id = blob_guid.volume_id;
+        header.command = Command::ListBlobBlocks;
+        header.size = (size_of::<MessageHeader>() + body_bytes.len()) as u32;
+        header.retry_count = retry_count as u8;
+        header.trace_id = trace_id.0;
+        header.set_body_checksum(&body_bytes);
+
+        let msg_frame = MessageFrame::new(header, body_bytes);
+        let resp_frame = self
+            .send_request(msg_frame, timeout, None)
+            .await
+            .map_err(|e| {
+                if !e.retryable() {
+                    error!(rpc=%"list_blob_blocks", %request_id, %blob_guid, %first_block, %block_count, error=?e, "bss rpc failed");
+                }
+                e
+            })?;
+        check_response_errno(&resp_frame.header)?;
+
+        let resp: ListBlobBlocksResponse =
+            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        match resp.result {
+            Some(list_blob_blocks_response::Result::Ok(blocks)) => Ok(blocks.blocks),
+            Some(list_blob_blocks_response::Result::Err(err)) => {
+                Err(RpcError::InternalResponseError(err))
+            }
+            None => Err(RpcError::InternalResponseError(
+                "BSS ListBlobBlocks response missing result".to_string(),
+            )),
+        }
     }
 
     pub async fn get_metadata_blob(

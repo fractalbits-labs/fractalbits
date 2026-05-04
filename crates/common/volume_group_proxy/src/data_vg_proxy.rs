@@ -1962,6 +1962,164 @@ impl DataVgProxy {
             errors.join("; ")
         )))
     }
+
+    /// Reserve a single block on every replica of `blob_guid` at
+    /// `expected_version`. Replicated only -- EC volumes treat
+    /// ReserveBlocks as a no-op for now (the EC stripe layout means a
+    /// reservation has nothing to claim until real data lands; this
+    /// matches the spec's "best-effort" framing).
+    pub async fn reserve_blob(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        block_size: u32,
+        expected_version: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        let volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
+            DataVgError::InitializationError(format!("Volume {} not found", blob_guid.volume_id))
+        })?;
+        if let VolumeMode::ErasureCoded { .. } = &volume.mode {
+            return Ok(());
+        }
+
+        let trace_id = *trace_id;
+        let rpc_timeout = self.rpc_timeout;
+        let write_quorum = match &volume.mode {
+            VolumeMode::Replicated { w, .. } => *w as usize,
+            VolumeMode::ErasureCoded { .. } => unreachable!(),
+        };
+
+        let available_nodes: Vec<_> = volume
+            .bss_nodes
+            .iter()
+            .filter(|node| node.is_available())
+            .cloned()
+            .collect();
+
+        if available_nodes.len() < write_quorum {
+            return Err(DataVgError::QuorumFailure(format!(
+                "Insufficient available nodes ({}/{}) for reserve quorum ({})",
+                available_nodes.len(),
+                volume.bss_nodes.len(),
+                write_quorum
+            )));
+        }
+
+        let mut futures = FuturesUnordered::new();
+        for bss_node in &available_nodes {
+            let node = bss_node.clone();
+            let trace_id = trace_id;
+            futures.push(async move {
+                let address = node.address.clone();
+                let result = node
+                    .get_client()
+                    .reserve_blocks(
+                        blob_guid,
+                        block_number,
+                        block_size,
+                        expected_version,
+                        Some(rpc_timeout),
+                        &trace_id,
+                        0,
+                    )
+                    .await;
+                (node, address, result)
+            });
+        }
+
+        let mut successes = 0usize;
+        let mut errors = Vec::new();
+        while let Some((node, address, result)) = futures.next().await {
+            match result {
+                Ok(()) | Err(RpcError::VersionSkipped) => {
+                    node.record_success();
+                    successes += 1;
+                }
+                Err(e) => {
+                    node.record_failure();
+                    errors.push(format!("{}: {}", address, e));
+                }
+            }
+            if successes >= write_quorum {
+                return Ok(());
+            }
+        }
+
+        Err(DataVgError::QuorumFailure(format!(
+            "Reserve quorum failed ({}/{}): {}",
+            successes,
+            write_quorum,
+            errors.join("; ")
+        )))
+    }
+
+    /// Enumerate the BSS-side block-level entries for `blob_guid`
+    /// over `[first_block, first_block + block_count)`. Tries
+    /// available replicas in random order and returns the first
+    /// successful response. The result intentionally is whatever a
+    /// single replica saw -- callers that need a coherent view (scan
+    /// & repair) should query each replica directly.
+    pub async fn list_blob_blocks(
+        &self,
+        blob_guid: DataBlobGuid,
+        first_block: u32,
+        block_count: u32,
+        trace_id: &TraceId,
+    ) -> Result<Vec<bss_codec::list_blob_blocks_response::BlobBlockEntry>, DataVgError> {
+        let volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
+            DataVgError::InitializationError(format!("Volume {} not found", blob_guid.volume_id))
+        })?;
+        if let VolumeMode::ErasureCoded { .. } = &volume.mode {
+            // EC: every parity / data shard sees the same key space; the
+            // first available node responds.
+        }
+
+        let mut available_nodes: Vec<_> = volume
+            .bss_nodes
+            .iter()
+            .filter(|node| node.is_available())
+            .cloned()
+            .collect();
+        available_nodes.shuffle(&mut rand::rng());
+
+        if available_nodes.is_empty() {
+            return Err(DataVgError::QuorumFailure(
+                "No available BSS nodes for list_blob_blocks".to_string(),
+            ));
+        }
+
+        let trace_id = *trace_id;
+        let rpc_timeout = self.rpc_timeout;
+        let mut last_err: Option<String> = None;
+        for node in &available_nodes {
+            let result = node
+                .get_client()
+                .list_blob_blocks(
+                    blob_guid,
+                    first_block,
+                    block_count,
+                    Some(rpc_timeout),
+                    &trace_id,
+                    0,
+                )
+                .await;
+            match result {
+                Ok(entries) => {
+                    node.record_success();
+                    return Ok(entries);
+                }
+                Err(e) => {
+                    node.record_failure();
+                    last_err = Some(format!("{}: {}", node.address, e));
+                }
+            }
+        }
+        Err(DataVgError::QuorumFailure(format!(
+            "list_blob_blocks: every replica failed ({})",
+            last_err.unwrap_or_default()
+        )))
+    }
 }
 
 #[cfg(test)]
