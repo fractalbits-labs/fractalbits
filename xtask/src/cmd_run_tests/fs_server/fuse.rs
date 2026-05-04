@@ -267,6 +267,10 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         "Sparse: Truncate-Then-Extend Reads Zeros",
         test_sparse_truncate_then_extend
     );
+    run_test!(
+        "Sparse: Shrink-Then-Grow Destroys Pre-Shrink Bytes",
+        test_sparse_shrink_then_grow_destroys
+    );
 
     // Cache staleness tests: verify FUSE sees external S3 mutations after TTL
     run_test!(
@@ -2248,6 +2252,84 @@ async fn test_sparse_single_writer_ebusy(disk_cache: bool) -> CmdResult {
 // region must return zeros, not pre-shrink committed data. Exercises
 // the wb.file_size logic and the shrink-clamp on per-block intents
 // inside vfs_setattr_size.
+// Shrink-then-grow within the SAME handle, same session. Seeds a
+// 256KB file with a recognizable pattern, shrinks to 4KB, then writes
+// past the old EOF (re-grows past the originally committed size).
+// POSIX: bytes between the new EOF and the re-extended position must
+// read as zeros, NOT the pre-shrink data. Without the
+// `eof_low_watermark` guard, the lazy-load on the re-extended write
+// would resurface the pre-shrink BSS bytes and the read would see the
+// original pattern instead of zeros.
+async fn test_sparse_shrink_then_grow_destroys(disk_cache: bool) -> CmdResult {
+    use aws_sdk_s3::primitives::ByteStream;
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Seed a 256KB file via S3 with a recognizable pattern");
+    let key = "shrink-grow-destroys.bin";
+    let pattern: Vec<u8> = (0..256 * 1024).map(|i| (i % 251 + 1) as u8).collect();
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(pattern.clone()))
+        .send()
+        .await
+        .expect("seed put failed");
+
+    println!("  Step 2: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/{}", MOUNT_POINT, key);
+
+    println!(
+        "  Step 3: Open RDWR, shrink to 4KB, then write at offset 200KB, all on the same handle"
+    );
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        f.set_len(4096).expect("set_len(4096) failed");
+        let marker = b"MARKER-AT-200K";
+        f.write_all_at(marker, 200 * 1024)
+            .expect("write past old EOF failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Re-open and read [4096..200KB) -- must be zeros, NOT the seed pattern");
+    let read_handle = std::fs::File::open(&file_path).expect("open for read");
+    use std::os::unix::fs::FileExt;
+    let mut span = vec![0xffu8; 200 * 1024 - 4096];
+    read_handle
+        .read_exact_at(&mut span, 4096)
+        .expect("span read failed");
+    assert!(
+        span.iter().all(|&b| b == 0),
+        "destroyed-by-shrink range must read as zeros (POSIX shrink-destroys), \
+         got first non-zero at offset {} (value {})",
+        span.iter().position(|&b| b != 0).unwrap_or(usize::MAX),
+        span.iter().find(|&&b| b != 0).copied().unwrap_or(0)
+    );
+
+    println!("  Step 5: Verify the marker at 200KB is intact");
+    let mut marker_back = [0u8; 14];
+    read_handle
+        .read_exact_at(&mut marker_back, 200 * 1024)
+        .expect("marker read failed");
+    assert_eq!(&marker_back, b"MARKER-AT-200K");
+    drop(read_handle);
+
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+    println!(
+        "{}",
+        "SUCCESS: Sparse shrink-then-grow destroys pre-shrink bytes test passed".green()
+    );
+    Ok(())
+}
+
 async fn test_sparse_truncate_then_extend(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 

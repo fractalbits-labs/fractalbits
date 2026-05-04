@@ -114,6 +114,24 @@ struct WriteBuffer {
     blocks: std::collections::BTreeMap<u32, BlockState>,
     /// True if any flush-worthy work is buffered.
     dirty: bool,
+    /// Smallest `ceil(new_size / block_size)` reached by any shrink in
+    /// this buffer session. Blocks at index `>= eof_low_watermark` had
+    /// their committed BSS data logically destroyed by the shrink and
+    /// must read as zeros until the flush trim deletes them, even if a
+    /// later grow brings the index back into the file. Reset to `None`
+    /// only on a successful flush. Without this guard a
+    /// `truncate(small); write(past old EOF)` would lazy-load the
+    /// pre-shrink BSS bytes and merge user data on top, resurrecting
+    /// bytes POSIX requires to be zero.
+    eof_low_watermark: Option<u32>,
+    /// `committed_block_count` pinned at the FIRST shrink in this
+    /// buffer session. Pairs with `eof_low_watermark` to bound the
+    /// EOF-trim range across post-CAS-failure retries: step 5a of the
+    /// flush promotes `handle.layout.size` to the smaller new size, so
+    /// recomputing the upper bound from `handle.layout` on retry would
+    /// lose the original committed bound. Reset to `None` only on a
+    /// successful flush.
+    trim_upper: Option<u32>,
 }
 
 impl WriteBuffer {
@@ -129,12 +147,24 @@ impl WriteBuffer {
             block_size,
             blocks: std::collections::BTreeMap::new(),
             dirty: false,
+            eof_low_watermark: None,
+            trim_upper: None,
         }
     }
 
     /// Drop any per-block intents past the new EOF. Called by shrink.
     fn drop_blocks_past(&mut self, new_last_block_excl: u32) {
         self.blocks.retain(|b, _| *b < new_last_block_excl);
+    }
+
+    /// Returns true when block index `b` sits in a range whose committed
+    /// BSS bytes were destroyed by a shrink earlier in this buffer
+    /// session. Lazy-load and dirty-read paths must return zeros for
+    /// such blocks instead of consulting BSS, otherwise
+    /// `truncate(small); write_at(re-extended block)` would resurrect
+    /// pre-shrink bytes.
+    fn block_destroyed_by_shrink(&self, b: u32) -> bool {
+        self.eof_low_watermark.is_some_and(|low| b >= low)
     }
 }
 
@@ -861,6 +891,7 @@ impl VfsCore {
             let block_size = wb.block_size;
             let existing_blob_guid = wb.existing_blob_guid;
             let blocks = wb.blocks.clone();
+            let eof_low_watermark = wb.eof_low_watermark;
             drop(handle);
             return self
                 .read_dirty_handle(
@@ -868,6 +899,7 @@ impl VfsCore {
                     block_size,
                     existing_blob_guid,
                     &blocks,
+                    eof_low_watermark,
                     offset,
                     buf,
                 )
@@ -901,12 +933,14 @@ impl VfsCore {
     /// to lazy-load from BSS, treating BlockNotFound as a hole. The total
     /// read length is clamped to `file_size` so a buffered truncate /
     /// extend is observable.
+    #[allow(clippy::too_many_arguments)]
     async fn read_dirty_handle(
         &self,
         file_size: u64,
         block_size: u32,
         existing_blob_guid: Option<data_types::DataBlobGuid>,
         blocks: &std::collections::BTreeMap<u32, BlockState>,
+        eof_low_watermark: Option<u32>,
         offset: u64,
         buf: &mut [u8],
     ) -> Result<usize, FsError> {
@@ -939,17 +973,25 @@ impl VfsCore {
             let block_bytes: Bytes = match blocks.get(&b) {
                 Some(BlockState::Rewrite(b2)) | Some(BlockState::Cached(b2)) => b2.clone(),
                 None => {
-                    // Read against the buffered file_size: blocks past it
-                    // shouldn't be reachable from this loop (we clamp on
-                    // entry), so the committed length matches block_content_len.
-                    self.lazy_load_block_for_flush(
-                        existing_blob_guid,
-                        b,
-                        block_content_len,
-                        block_content_len,
-                        &trace_id,
-                    )
-                    .await?
+                    // Block destroyed by an earlier shrink in this
+                    // session: POSIX requires zeros, so don't consult
+                    // BSS even though re-extension brought the index
+                    // back into the file.
+                    if eof_low_watermark.is_some_and(|low| b >= low) {
+                        Bytes::from(vec![0u8; block_content_len])
+                    } else {
+                        // Read against the buffered file_size: blocks past it
+                        // shouldn't be reachable from this loop (we clamp on
+                        // entry), so the committed length matches block_content_len.
+                        self.lazy_load_block_for_flush(
+                            existing_blob_guid,
+                            b,
+                            block_content_len,
+                            block_content_len,
+                            &trace_id,
+                        )
+                        .await?
+                    }
                 }
             };
             let take = chunk_len.min(block_bytes.len().saturating_sub(slice_start));
@@ -1033,6 +1075,17 @@ impl VfsCore {
     /// new EOF if the file shrunk. Shrunk blocks are deleted at
     /// `new_version` so bssEraseCheck accepts them and a later
     /// re-extend reads zeros (POSIX shrink-destroys semantics).
+    ///
+    /// `trim_lower` / `trim_upper` extend the EOF-trim across a
+    /// shrink-then-grow within a single buffer session: after a
+    /// shrink the watermark is pinned at the lowest reached
+    /// `block_count` and the originally-committed `block_count`, and
+    /// every committed block in that range is deleted at
+    /// `new_version` regardless of whether `file_size` later grew
+    /// back. Without this, a `truncate(small); truncate(committed)`
+    /// pair would leave the originally-committed blocks intact and a
+    /// reader of the regrown range would see pre-shrink bytes,
+    /// violating POSIX shrink-destroys.
     #[allow(clippy::too_many_arguments)]
     async fn override_flush_blocks(
         &self,
@@ -1042,6 +1095,8 @@ impl VfsCore {
         file_size: u64,
         committed_size: u64,
         blocks: &std::collections::BTreeMap<u32, BlockState>,
+        trim_lower: Option<u32>,
+        trim_upper: Option<u32>,
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
         let block_size_usize = block_size as usize;
@@ -1094,14 +1149,34 @@ impl VfsCore {
             }
         }
 
-        // Step 2: shrink-trim. Delete any committed blocks that fall
-        // past the new EOF. The trim runs at new_version so a stale
-        // re-extend can't resurrect pre-shrink data: any concurrent
-        // write at the old version would lose to the V+1 erase.
+        // Step 2: EOF-trim. Delete the committed-and-now-destroyed
+        // block range at new_version. Two contributors:
+        //
+        //   - Plain shrink with file_size < committed_size:
+        //     [new_block_count, committed_block_count).
+        //   - Shrink-then-grow within the same buffer session:
+        //     [trim_lower, trim_upper). The watermark was pinned at
+        //     the FIRST shrink so a later regrow doesn't lose the
+        //     committed bound; without this the regrown range would
+        //     resurface pre-shrink bytes on read.
+        //
+        // The two ranges are unioned and the ones we are about to
+        // overwrite via a buffered Rewrite are skipped (the upload at
+        // new_version handles the version bump on its own; deleting
+        // first would just be a wasted RPC).
         let new_block_count = file_size.div_ceil(bsz_u64) as u32;
         let committed_block_count = committed_size.div_ceil(bsz_u64) as u32;
-        if new_block_count < committed_block_count {
-            for block_num in new_block_count..committed_block_count {
+        let plain_lower = new_block_count;
+        let plain_upper = committed_block_count;
+        let watermark_lower = trim_lower.unwrap_or(u32::MAX);
+        let watermark_upper = trim_upper.unwrap_or(0);
+        let lower = std::cmp::min(plain_lower, watermark_lower);
+        let upper = std::cmp::max(plain_upper, watermark_upper);
+        if lower < upper {
+            for block_num in lower..upper {
+                if matches!(blocks.get(&block_num), Some(BlockState::Rewrite(_))) {
+                    continue;
+                }
                 if let Err(e) = self
                     .backend()
                     .delete_block(blob_guid, block_num, new_version, trace_id)
@@ -1201,6 +1276,8 @@ impl VfsCore {
             block_size,
             blocks,
             expected_layout_bytes,
+            eof_low_watermark,
+            trim_upper,
         ) = {
             let mut handle = self.file_handles.get_mut(&fh_id).ok_or(FsError::BadFd)?;
             let s3_key = handle.s3_key.clone();
@@ -1226,6 +1303,8 @@ impl VfsCore {
                 wb.block_size,
                 blocks,
                 expected_layout_bytes,
+                wb.eof_low_watermark,
+                wb.trim_upper,
             )
         };
 
@@ -1244,6 +1323,8 @@ impl VfsCore {
                 block_size,
                 &blocks,
                 expected_layout_bytes,
+                eof_low_watermark,
+                trim_upper,
                 &trace_id,
             )
             .await;
@@ -1291,6 +1372,13 @@ impl VfsCore {
                 wb.size_changed = false;
                 wb.existing_blob_guid = layout.blob_guid().ok();
                 wb.block_size = block_size;
+                // The shrink-destroys watermark and pinned trim bound
+                // are session-scoped: once the trim has landed via the
+                // override flush, a later shrink-then-grow within the
+                // SAME handle starts a fresh session and re-pins from
+                // the new committed state.
+                wb.eof_low_watermark = None;
+                wb.trim_upper = None;
                 // wb.blocks already drained when we took it out above.
             }
         }
@@ -1336,6 +1424,8 @@ impl VfsCore {
         block_size: u32,
         blocks: &std::collections::BTreeMap<u32, BlockState>,
         expected_layout_bytes: Option<Bytes>,
+        trim_lower: Option<u32>,
+        trim_upper: Option<u32>,
         trace_id: &TraceId,
     ) -> Result<(ObjectLayout, Bytes), FsError> {
         let block_size_usize = block_size as usize;
@@ -1373,6 +1463,8 @@ impl VfsCore {
                     file_size,
                     committed_size,
                     blocks,
+                    trim_lower,
+                    trim_upper,
                     trace_id,
                 )
                 .await?;
@@ -1724,32 +1816,133 @@ impl VfsCore {
         fh: u64,
         new_size: u64,
     ) -> Result<VfsAttr, FsError> {
-        let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
-        let block_size = handle
-            .layout
-            .as_ref()
-            .map(|l| l.block_size)
-            .unwrap_or(DEFAULT_BLOCK_SIZE);
-        let committed_size = handle
-            .layout
-            .as_ref()
-            .and_then(|l| l.size().ok())
-            .unwrap_or(0);
-        let existing_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
-        let wb = handle.write_buf.get_or_insert_with(|| {
-            WriteBuffer::new(existing_blob_guid, committed_size, block_size)
-        });
-        if new_size <= wb.file_size {
-            // Shrink (or no-op): drop intents past the new EOF.
-            let new_last_block_excl = new_size.div_ceil(block_size as u64) as u32;
-            wb.drop_blocks_past(new_last_block_excl);
+        // Phase 1: snapshot, drop intents past new EOF, lower the
+        // shrink-destroys watermark, and decide whether the surviving
+        // last block of a non-block-aligned shrink needs a synthesized
+        // tail-zero `Rewrite`. Releases the DashMap guard before any
+        // await; the lazy-load (if any) happens in phase 2.
+        let (block_size, committed_size, existing_blob_guid, tail_zero_target) = {
+            let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
+            let block_size = handle
+                .layout
+                .as_ref()
+                .map(|l| l.block_size)
+                .unwrap_or(DEFAULT_BLOCK_SIZE);
+            let committed_size = handle
+                .layout
+                .as_ref()
+                .and_then(|l| l.size().ok())
+                .unwrap_or(0);
+            let existing_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
+            let wb = handle.write_buf.get_or_insert_with(|| {
+                WriteBuffer::new(existing_blob_guid, committed_size, block_size)
+            });
+            let bsz_u64 = block_size as u64;
+            let mut tail_zero_target: Option<(u32, usize, Option<Bytes>)> = None;
+            if new_size < wb.file_size {
+                let new_last_block_excl = new_size.div_ceil(bsz_u64) as u32;
+                wb.drop_blocks_past(new_last_block_excl);
+                wb.eof_low_watermark = Some(
+                    wb.eof_low_watermark
+                        .map(|low| low.min(new_last_block_excl))
+                        .unwrap_or(new_last_block_excl),
+                );
+                // Pin trim_upper at the FIRST shrink. Step 5a of flush
+                // promotes handle.layout.size to the smaller new size,
+                // so recomputing the bound from handle.layout on retry
+                // would lose the committed bound.
+                if wb.trim_upper.is_none() {
+                    let committed_block_count = committed_size.div_ceil(bsz_u64) as u32;
+                    if committed_block_count > new_last_block_excl {
+                        wb.trim_upper = Some(committed_block_count);
+                    }
+                }
+                // Non-block-aligned shrink: the surviving last block
+                // contains [0..kept) of the original content and
+                // [kept..block_size) of POSIX-destroyed bytes. The
+                // override-flush tail-zero only inspects file_size AT
+                // flush time; if a re-grow lifts file_size past the
+                // shrink point before flush, that synthesis would
+                // tail-zero the WRONG block. Synthesize the Rewrite
+                // here so the destroyed tail is captured even across
+                // shrink-then-grow within the same session.
+                if new_size > 0 && new_size % bsz_u64 != 0 {
+                    let last = (new_size / bsz_u64) as u32;
+                    let kept = (new_size % bsz_u64) as usize;
+                    let block_was_committed = (last as u64) * bsz_u64 < committed_size;
+                    let buffered_prefix: Option<Bytes> = match wb.blocks.get(&last) {
+                        Some(BlockState::Rewrite(b)) | Some(BlockState::Cached(b)) => {
+                            Some(b.clone())
+                        }
+                        _ => None,
+                    };
+                    if block_was_committed || buffered_prefix.is_some() {
+                        tail_zero_target = Some((last, kept, buffered_prefix));
+                    }
+                }
+            }
+            if new_size != wb.file_size {
+                wb.file_size = new_size;
+                wb.size_changed = true;
+                wb.dirty = true;
+            }
+            (
+                block_size,
+                committed_size,
+                existing_blob_guid,
+                tail_zero_target,
+            )
+        };
+
+        // Phase 2: lazy-load the surviving last block from BSS (if not
+        // already buffered) outside the DashMap guard, then insert the
+        // synthesized Rewrite. A subsequent re-grow that writes into
+        // an offset > kept on the same block sees this Rewrite and
+        // merges over the zeros; a write strictly inside [0..kept)
+        // also merges, preserving the zeros in [kept..block_size).
+        if let Some((last, kept, buffered_prefix)) = tail_zero_target {
+            let bsz_usize = block_size as usize;
+            let prefix_bytes = match buffered_prefix {
+                Some(b) => b,
+                None => {
+                    let trace_id = TraceId::new();
+                    let block_start = (last as u64) * (block_size as u64);
+                    let committed_content_len = if block_start < committed_size {
+                        std::cmp::min(block_size as u64, committed_size - block_start) as usize
+                    } else {
+                        0
+                    };
+                    self.lazy_load_block_for_flush(
+                        existing_blob_guid,
+                        last,
+                        committed_content_len,
+                        bsz_usize,
+                        &trace_id,
+                    )
+                    .await?
+                }
+            };
+            let mut buf = BytesMut::with_capacity(bsz_usize);
+            let prefix_len = std::cmp::min(kept, prefix_bytes.len());
+            buf.extend_from_slice(&prefix_bytes[..prefix_len]);
+            buf.resize(bsz_usize, 0);
+            if let Some(mut handle) = self.file_handles.get_mut(&fh)
+                && let Some(ref mut wb) = handle.write_buf
+            {
+                wb.blocks.insert(last, BlockState::Rewrite(buf.freeze()));
+                wb.dirty = true;
+            }
         }
-        if new_size != wb.file_size {
-            wb.file_size = new_size;
-            wb.size_changed = true;
-            wb.dirty = true;
-        }
-        Ok(self.make_new_file_attr(inode, wb.file_size))
+
+        let new_attr_size = self
+            .file_handles
+            .get(&fh)
+            .ok_or(FsError::BadFd)?
+            .write_buf
+            .as_ref()
+            .map(|wb| wb.file_size)
+            .unwrap_or(new_size);
+        Ok(self.make_new_file_attr(inode, new_attr_size))
     }
 
     pub async fn vfs_open(&self, inode: u64, flags: u32) -> Result<u64, FsError> {
@@ -1905,6 +2098,7 @@ impl VfsCore {
             let block_size = wb.block_size;
             let existing_blob_guid = wb.existing_blob_guid;
             let blocks = wb.blocks.clone();
+            let eof_low_watermark = wb.eof_low_watermark;
             drop(handle);
             let cap = std::cmp::min(size as u64, file_size.saturating_sub(offset)) as usize;
             let mut buf = vec![0u8; cap];
@@ -1914,6 +2108,7 @@ impl VfsCore {
                     block_size,
                     existing_blob_guid,
                     &blocks,
+                    eof_low_watermark,
                     offset,
                     &mut buf,
                 )
@@ -1973,8 +2168,14 @@ impl VfsCore {
             let first_block = (offset / bsz_u64) as u32;
             let last_block = ((end - 1) / bsz_u64) as u32;
             // Identify which blocks need lazy load: blocks touched by a
-            // partial write that aren't already buffered. A block fully
-            // overwritten by the call doesn't need a load.
+            // partial write that aren't already buffered AND not fully
+            // overwritten by this call. Blocks whose committed bytes
+            // were destroyed by an earlier shrink in this buffer
+            // session are explicitly skipped from the load list -- they
+            // read as zeros per POSIX, and Phase 3's `None` arm builds
+            // a zeroed buffer when neither `wb.blocks` nor `loaded`
+            // carries content. Without this guard the lazy-load would
+            // resurrect pre-shrink BSS bytes under user data.
             let mut to_load = Vec::new();
             for b in first_block..=last_block {
                 if wb.blocks.contains_key(&b) {
@@ -1983,9 +2184,13 @@ impl VfsCore {
                 let block_start = b as u64 * bsz_u64;
                 let block_end = block_start + bsz_u64;
                 let fully_covered = offset <= block_start && end >= block_end;
-                if !fully_covered {
-                    to_load.push(b);
+                if fully_covered {
+                    continue;
                 }
+                if wb.block_destroyed_by_shrink(b) {
+                    continue;
+                }
+                to_load.push(b);
             }
             (
                 wb.block_size,
