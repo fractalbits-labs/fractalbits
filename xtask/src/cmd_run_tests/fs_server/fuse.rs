@@ -294,6 +294,10 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         "Writeback default mode (symlink commit via async worker)",
         test_writeback_default_mode_symlink
     );
+    run_test!(
+        "Writeback default mode (async release of dirty file)",
+        test_writeback_default_mode_async_release
+    );
     run_test!("Rename", test_rename);
     run_test!("Unlink with Open Handle", test_unlink_open_handle);
     run_test!("Overwrite Existing File", test_overwrite_existing);
@@ -955,6 +959,73 @@ async fn test_writeback_default_mode_symlink(disk_cache: bool) -> CmdResult {
     println!(
         "{}",
         "SUCCESS: writeback default mode symlink path passed".green()
+    );
+    Ok(())
+}
+
+/// Default-mode async release: closing a freshly-written file should
+/// return immediately on the kernel side, with the actual flush
+/// happening in the background. The test:
+///   1. Mounts in writeback default mode.
+///   2. Creates + writes a file via FUSE (the write is buffered in
+///      WriteBuffer; nothing has hit NSS yet).
+///   3. close() returns -- in default mode this is fast because the
+///      flush is spawned. We don't measure latency here; correctness
+///      is what matters.
+///   4. Polls the kernel-side dir listing until the new file appears.
+///      Listing the parent directory exercises the FUSE -> vfs_readdir
+///      -> NSS ListInodes path, so an entry being visible proves NSS
+///      received the put_inode_cas from the spawn task.
+///   5. Reads the file back via FUSE and verifies the bytes match.
+async fn test_writeback_default_mode_async_release(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_writeback(&bucket, true, disk_cache)?;
+
+    println!("  Step 2: Create + write + close a file (close returns before NSS commit)");
+    let key = "wb-async-release.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let payload = generate_test_data(key, 32 * 1024);
+    std::fs::write(&fuse_path, &payload).expect("write+close failed");
+
+    println!("  Step 3: Poll until NSS commit visible via dir listing (up to 5s)");
+    let mount_point = MOUNT_POINT;
+    let mut committed = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        let entries: Vec<_> = std::fs::read_dir(mount_point)
+            .expect("readdir failed")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        if entries.iter().any(|n| n == key) {
+            committed = true;
+            break;
+        }
+    }
+    assert!(
+        committed,
+        "async-release flush failed to commit within 5s; default-mode pipeline broken"
+    );
+    println!("    NSS commit observed via dir listing");
+
+    println!("  Step 4: Read the file back; bytes must match");
+    let read_back = std::fs::read(&fuse_path).expect("post-flush read failed");
+    assert_eq!(
+        read_back.len(),
+        payload.len(),
+        "post-flush size mismatch: expected {}, got {}",
+        payload.len(),
+        read_back.len()
+    );
+    assert_eq!(read_back, payload, "post-flush content mismatch");
+
+    let _ = std::fs::remove_file(&fuse_path);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode async release passed".green()
     );
     Ok(())
 }

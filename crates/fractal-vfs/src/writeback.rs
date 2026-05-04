@@ -961,6 +961,23 @@ impl WritebackQueue {
         Ok(())
     }
 
+    /// Move a cycle straight to `Done` regardless of where it
+    /// currently is. Used by the async-flush spawn handler when the
+    /// background flush finishes -- the existing flush body collapses
+    /// Stage A/B/C into one synchronous unit, so the queue records a
+    /// single Pending → InFlight → Done arc rather than per-stage
+    /// transitions.
+    pub fn advance_to_done(&self, inode: u64, generation: Generation) {
+        let mut inner = self.inner.lock().expect("writeback queue poisoned");
+        if let Some(cycle) = inner
+            .file_pipeline
+            .get_mut(&inode)
+            .and_then(|c| c.get_mut(&generation))
+        {
+            cycle.stage = FileCommitStage::Done;
+        }
+    }
+
     /// Capture a fsync barrier: the highest dirty generation for
     /// `inode` at this instant. Returns `None` when no cycle is
     /// dirty (a fsync(fd) on an idle inode is a no-op).

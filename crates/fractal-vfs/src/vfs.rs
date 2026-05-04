@@ -386,6 +386,46 @@ impl VfsCore {
             .remove_if(&inode, |_, owner| *owner == fh);
     }
 
+    /// `true` when the writeback queue is configured for default mode.
+    /// Callers branch on this to enqueue ops vs. running the strict
+    /// synchronous path.
+    pub fn writeback_mode_is_default(&self) -> bool {
+        self.writeback_mode == WritebackMode::Default
+    }
+
+    /// Borrow the writeback queue. Used by external spawn handlers that
+    /// need to seal cycles around an async flush.
+    pub fn writeback_queue(&self) -> &Arc<WritebackQueue> {
+        &self.writeback
+    }
+
+    /// Allocate the next generation for `inode`. Each background flush
+    /// gets a fresh generation so concurrent flushes don't false-
+    /// coalesce in the queue. Generation numbers are monotonic per
+    /// inode across the fs_server lifetime.
+    pub fn allocate_flush_generation(&self, inode: u64) -> crate::writeback::Generation {
+        let cur = self.writeback.active_generation(inode);
+        crate::writeback::Generation(cur.0 + 1)
+    }
+
+    /// Peek at the file-handle state needed by the FuseServer release
+    /// adapter to decide whether to spawn an async flush. Returns
+    /// `(inode, has_dirty, file_size)`, or `None` if the fh is gone.
+    pub fn peek_release_state(&self, fh: u64) -> Option<(u64, bool, u64)> {
+        let handle = self.file_handles.get(&fh)?;
+        let has_dirty = handle
+            .write_buf
+            .as_ref()
+            .map(|wb| wb.dirty)
+            .unwrap_or(false);
+        let file_size = handle
+            .write_buf
+            .as_ref()
+            .map(|wb| wb.file_size)
+            .unwrap_or(0);
+        Some((handle.ino, has_dirty, file_size))
+    }
+
     fn file_perm(&self) -> u16 {
         if self.read_write { 0o644 } else { 0o444 }
     }

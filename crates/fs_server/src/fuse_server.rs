@@ -171,6 +171,53 @@ impl Filesystem for FuseServer {
         _flock_release: bool,
     ) -> FsResult<()> {
         self.vfs.release_passthrough(fh);
+
+        // Default mode: spawn the synchronous release/flush work in
+        // the background and return to the kernel immediately. A
+        // pending-flush cycle is registered in the queue so vfs_fsync
+        // and the FUSE_FSYNC drain path can wait for it.
+        //
+        // We deliberately keep the inode write lock held until the
+        // spawn completes -- a subsequent vfs_open of the same inode
+        // sees EBUSY, which is the correct "still being flushed"
+        // semantic. Crash mid-flush after close means the data is
+        // lost (POSIX legal without fsync); the loss bound is the
+        // worker queue depth + the flush RPC chain.
+        if self.vfs.writeback_mode_is_default()
+            && let Some((ino, has_dirty, file_size)) = self.vfs.peek_release_state(fh)
+            && has_dirty
+        {
+            let queue = self.vfs.writeback_queue().clone();
+            let generation = self.vfs.allocate_flush_generation(ino);
+            queue.open_cycle(ino, generation, file_size, 0);
+            let _ = queue.advance_stage(
+                ino,
+                generation,
+                crate::writeback::FileCommitStage::StageAQueued,
+            );
+            let vfs = self.vfs.clone();
+            compio_runtime::spawn(async move {
+                match vfs.vfs_release(fh).await {
+                    Ok(()) => {
+                        queue.advance_to_done(ino, generation);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            fh,
+                            ino,
+                            generation = generation.0,
+                            error = %e,
+                            "writeback release flush failed; tainting inode"
+                        );
+                        queue.record_failure(ino, generation);
+                        queue.advance_to_done(ino, generation);
+                    }
+                }
+            })
+            .detach();
+            return Ok(());
+        }
+
         self.vfs.vfs_release(fh).await.map_err(fs_err)
     }
 
