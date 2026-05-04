@@ -28,6 +28,11 @@ pub enum FsError {
     #[error("file is busy: another writer holds the inode-scoped write lock")]
     Busy,
 
+    /// CAS guard mismatched on a flush. Surface as ESTALE so userspace
+    /// notices the cross-instance conflict and reopens the file.
+    #[error("flush CAS conflict: another writer published a new version first")]
+    CasConflict,
+
     #[error("RPC error: {0}")]
     Rpc(#[from] RpcError),
 
@@ -55,6 +60,7 @@ impl From<FsError> for io::Error {
             FsError::ReadOnly => io::Error::from_raw_os_error(libc::EROFS),
             FsError::BadFd => io::Error::from_raw_os_error(libc::EBADF),
             FsError::Busy => io::Error::from_raw_os_error(libc::EBUSY),
+            FsError::CasConflict => io::Error::from_raw_os_error(libc::ESTALE),
             FsError::Rpc(ref e) => {
                 if e.retryable() {
                     io::Error::from_raw_os_error(libc::EAGAIN)
@@ -99,6 +105,10 @@ impl From<file_ops::NssError> for FsError {
             file_ops::NssError::AlreadyExists => FsError::AlreadyExists,
             file_ops::NssError::Internal(msg) => FsError::Internal(msg),
             file_ops::NssError::Deserialization(msg) => FsError::Deserialize(msg),
+            // The conflict bytes are dropped on this conversion -- the
+            // override flush path uses the typed CasConflict variant
+            // directly so it can act on the bytes before lowering.
+            file_ops::NssError::CasConflict(_) => FsError::CasConflict,
         }
     }
 }

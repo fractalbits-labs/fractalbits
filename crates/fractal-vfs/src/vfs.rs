@@ -142,6 +142,14 @@ struct FileHandle {
     ino: u64,
     s3_key: String,
     layout: Option<ObjectLayout>,
+    /// Bytes the NSS handed back for this inode at the most recent
+    /// successful read or successful CAS write. Used as
+    /// `expected_old_value` on the next override-flush CAS so a
+    /// concurrent cross-instance writer fails the guard instead of
+    /// silently winning the race. `None` for brand-new files (initial
+    /// create uses unconditional `put_inode`) and for read-only handles
+    /// that never need it.
+    layout_bytes: Option<Bytes>,
     write_buf: Option<WriteBuffer>,
     backing_id: Option<i32>,
 }
@@ -1192,6 +1200,7 @@ impl VfsCore {
             existing_blob_guid,
             block_size,
             blocks,
+            expected_layout_bytes,
         ) = {
             let mut handle = self.file_handles.get_mut(&fh_id).ok_or(FsError::BadFd)?;
             let s3_key = handle.s3_key.clone();
@@ -1202,6 +1211,7 @@ impl VfsCore {
                 .unwrap_or(0);
             let committed_blob_version =
                 handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
+            let expected_layout_bytes = handle.layout_bytes.clone();
             let wb = match &mut handle.write_buf {
                 Some(wb) if wb.dirty => wb,
                 _ => return Ok(()),
@@ -1215,6 +1225,7 @@ impl VfsCore {
                 wb.existing_blob_guid,
                 wb.block_size,
                 blocks,
+                expected_layout_bytes,
             )
         };
 
@@ -1232,19 +1243,26 @@ impl VfsCore {
                 existing_blob_guid,
                 block_size,
                 &blocks,
+                expected_layout_bytes,
                 &trace_id,
             )
             .await;
 
-        let layout = match result {
-            Ok(layout) => layout,
+        let (layout, new_layout_bytes) = match result {
+            Ok(pair) => pair,
             Err(e) => {
                 // Restore blocks for forward-retry. The handle's
                 // single-writer invariant means no concurrent vfs_write
                 // ran during this call, so the slot we took the blocks
                 // out of is still empty and the put-back is a direct
                 // assignment.
-                if let Some(mut handle) = self.file_handles.get_mut(&fh_id)
+                //
+                // CasConflict skips the restoration: the buffer is
+                // proven stale (a cross-instance writer wrote on top
+                // of us), so retrying would just lose. Userspace gets
+                // ESTALE and must close/reopen.
+                if !matches!(e, FsError::CasConflict)
+                    && let Some(mut handle) = self.file_handles.get_mut(&fh_id)
                     && let Some(ref mut wb) = handle.write_buf
                 {
                     if wb.blocks.is_empty() {
@@ -1262,9 +1280,12 @@ impl VfsCore {
         // Update file handle with new layout and clear deferred state.
         // The committed file_size has just been published so the buffer
         // becomes clean; existing_blob_guid is updated so subsequent
-        // partial-block edits lazy-load from the new blob.
+        // partial-block edits lazy-load from the new blob. The freshly
+        // installed layout_bytes become the next CAS guard's
+        // expected_old_value.
         if let Some(mut handle) = self.file_handles.get_mut(&fh_id) {
             handle.layout = Some(layout.clone());
+            handle.layout_bytes = Some(new_layout_bytes);
             if let Some(ref mut wb) = handle.write_buf {
                 wb.dirty = false;
                 wb.size_changed = false;
@@ -1292,8 +1313,17 @@ impl VfsCore {
     }
 
     /// Publish the buffered changes to BSS + NSS. Returns the new
-    /// `ObjectLayout` on success. Failure leaves the caller responsible
-    /// for restoring `wb.blocks` so a subsequent flush can retry.
+    /// `ObjectLayout` plus the on-NSS bytes that were just installed
+    /// (so the caller can refresh `handle.layout_bytes` for the next
+    /// CAS) on success. Failure leaves the caller responsible for
+    /// restoring `wb.blocks` so a subsequent flush can retry.
+    ///
+    /// `expected_layout_bytes` carries the bytes the caller believes
+    /// NSS has stored for this key; when present, the override-flush
+    /// NSS write goes through `put_inode_cas` and a guard mismatch
+    /// surfaces as `FsError::CasConflict`. Pass `None` to skip the
+    /// guard (initial-create flow, where we expect the slot to be new
+    /// or whatever is there is the loser of an earlier crash).
     #[allow(clippy::too_many_arguments)]
     async fn flush_publish(
         &self,
@@ -1305,8 +1335,9 @@ impl VfsCore {
         existing_blob_guid: Option<data_types::DataBlobGuid>,
         block_size: u32,
         blocks: &std::collections::BTreeMap<u32, BlockState>,
+        expected_layout_bytes: Option<Bytes>,
         trace_id: &TraceId,
-    ) -> Result<ObjectLayout, FsError> {
+    ) -> Result<(ObjectLayout, Bytes), FsError> {
         let block_size_usize = block_size as usize;
         let _ = fh_id; // currently unused; reserved for future per-handle context
 
@@ -1425,11 +1456,23 @@ impl VfsCore {
             .map_err(FsError::from)?
             .into();
 
-        // Put inode in NSS, get old object bytes
-        let old_bytes = self
-            .backend()
-            .put_inode(s3_key, layout_bytes, trace_id)
-            .await?;
+        // Override flushes go through the CAS variant when we have a
+        // snapshot of what NSS held at open time. A guard mismatch
+        // means a cross-instance writer published a newer version
+        // first; the in-memory write buffer is provably stale, so we
+        // surface CasConflict (ESTALE) to userspace and let the caller
+        // close + reopen. Non-override (initial-create) and the
+        // missing-bytes fallback (no read at open) keep the original
+        // unconditional put_inode path.
+        let old_bytes = if is_override && let Some(expected) = expected_layout_bytes {
+            self.backend()
+                .put_inode_cas(s3_key, layout_bytes.clone(), expected, trace_id)
+                .await?
+        } else {
+            self.backend()
+                .put_inode(s3_key, layout_bytes.clone(), trace_id)
+                .await?
+        };
 
         // Replace flush only: clean up the old blob's blocks if NSS had
         // a stale entry under the same key. Override flush kept the
@@ -1447,7 +1490,7 @@ impl VfsCore {
                 .await;
         }
 
-        Ok(layout)
+        Ok((layout, layout_bytes))
     }
 
     async fn fetch_dir_entries(
@@ -1739,15 +1782,32 @@ impl VfsCore {
             self.acquire_write_lock(inode, fh)?;
         }
 
-        // Resolve layout if not cached
-        let layout = match layout {
-            Some(l) => Some(l),
-            None => {
-                let trace_id = TraceId::new();
-                match self.backend().get_inode(&s3_key, &trace_id).await {
-                    Ok(l) => Some(l),
-                    Err(FsError::NotFound) if is_write => None,
-                    Err(e) => return Err(e),
+        // Resolve layout. Write-mode opens always fetch fresh from NSS
+        // (even when the inode cache is hot) so the override-flush CAS
+        // has the bytes NSS actually has -- a stale cached layout could
+        // pass a CAS check that the server would reject. Read-only
+        // opens reuse the cached layout when available and never need
+        // bytes.
+        let (layout, layout_bytes) = if is_write {
+            let trace_id = TraceId::new();
+            match self
+                .backend()
+                .get_inode_with_bytes(&s3_key, &trace_id)
+                .await
+            {
+                Ok((l, bytes)) => (Some(l), Some(bytes)),
+                Err(FsError::NotFound) => (None, None),
+                Err(e) => return Err(e),
+            }
+        } else {
+            match layout {
+                Some(l) => (Some(l), None),
+                None => {
+                    let trace_id = TraceId::new();
+                    match self.backend().get_inode(&s3_key, &trace_id).await {
+                        Ok(l) => (Some(l), None),
+                        Err(e) => return Err(e),
+                    }
                 }
             }
         };
@@ -1822,6 +1882,7 @@ impl VfsCore {
                 ino: inode,
                 s3_key,
                 layout,
+                layout_bytes,
                 write_buf,
                 backing_id: None,
             },
@@ -2091,6 +2152,7 @@ impl VfsCore {
                 ino,
                 s3_key: key,
                 layout: None,
+                layout_bytes: None,
                 write_buf: Some(wb),
                 backing_id: None,
             },

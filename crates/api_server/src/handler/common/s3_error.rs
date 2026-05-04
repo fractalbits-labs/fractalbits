@@ -952,6 +952,13 @@ impl From<file_ops::NssError> for S3Error {
                 tracing::error!("NssError::Deserialization: {e}");
                 Self::InternalError
             }
+            // S3 path never issues a CAS put -- if one ever leaks here,
+            // bucket it under InternalError so a stray conflict can't
+            // be silently swallowed.
+            file_ops::NssError::CasConflict(_) => {
+                tracing::error!("NssError::CasConflict reached S3 mapping");
+                Self::InternalError
+            }
         }
     }
 }

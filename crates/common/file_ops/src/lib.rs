@@ -1,8 +1,9 @@
 use bytes::Bytes;
 use data_types::object_layout::ObjectLayout;
 use nss_codec::{
-    DeleteInodeResponse, GetInodeResponse, ListInodesResponse, PutInodeResponse,
-    delete_inode_response, get_inode_response, list_inodes_response, put_inode_response,
+    DeleteInodeResponse, GetInodeResponse, ListInodesResponse, PutInodeCasResponse,
+    PutInodeResponse, delete_inode_response, get_inode_response, list_inodes_response,
+    put_inode_cas_response, put_inode_response,
 };
 
 #[derive(Debug)]
@@ -16,6 +17,11 @@ pub enum NssError {
     NoSuchRootBlob,
     Internal(String),
     Deserialization(String),
+    /// CAS guard mismatched -- the put did not happen. The payload is the
+    /// bytes that NSS actually has stored for the key, so a caller can
+    /// reload its in-memory state from a definitive snapshot of the
+    /// winner instead of guessing.
+    CasConflict(Bytes),
 }
 
 impl std::fmt::Display for NssError {
@@ -26,6 +32,9 @@ impl std::fmt::Display for NssError {
             NssError::NoSuchRootBlob => write!(f, "root blob does not exist"),
             NssError::Internal(e) => write!(f, "internal error: {e}"),
             NssError::Deserialization(e) => write!(f, "deserialization error: {e}"),
+            NssError::CasConflict(b) => {
+                write!(f, "CAS conflict: current value is {} bytes", b.len())
+            }
         }
     }
 }
@@ -43,6 +52,17 @@ pub struct ListInodesResult {
 }
 
 pub fn parse_get_inode(resp: GetInodeResponse) -> Result<ObjectLayout, NssError> {
+    parse_get_inode_with_bytes(resp).map(|(layout, _)| layout)
+}
+
+/// Variant of [`parse_get_inode`] that also returns the raw stored bytes.
+/// Use this when the caller needs the original NSS-side bytes for a
+/// later CAS guard (`put_inode_cas`'s `expected_old_value`); rkyv has
+/// no `to_bytes` round-trip guarantee that produces a byte-identical
+/// reserialisation, so we keep what NSS gave us.
+pub fn parse_get_inode_with_bytes(
+    resp: GetInodeResponse,
+) -> Result<(ObjectLayout, Bytes), NssError> {
     let object_bytes = match resp.result.unwrap() {
         get_inode_response::Result::Ok(res) => res,
         get_inode_response::Result::ErrNotFound(()) => {
@@ -57,8 +77,9 @@ pub fn parse_get_inode(resp: GetInodeResponse) -> Result<ObjectLayout, NssError>
         }
     };
 
-    rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&object_bytes)
-        .map_err(|e| NssError::Deserialization(e.to_string()))
+    let layout = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&object_bytes)
+        .map_err(|e| NssError::Deserialization(e.to_string()))?;
+    Ok((layout, object_bytes))
 }
 
 pub fn parse_list_inodes(resp: ListInodesResponse) -> Result<ListInodesResult, NssError> {
@@ -110,6 +131,25 @@ pub fn parse_put_inode(resp: PutInodeResponse) -> Result<Bytes, NssError> {
         put_inode_response::Result::ErrNoSuchRootBlob(()) => Err(NssError::NoSuchRootBlob),
         put_inode_response::Result::ErrOther(e) => {
             tracing::error!("NSS put_inode error: {e}");
+            Err(NssError::Internal(e))
+        }
+    }
+}
+
+/// Parse a PutInodeCas response.
+///
+/// - `Ok(prev)` -> the put landed; `prev` is the previous stored value
+///   (empty if there was none).
+/// - `Conflict(current)` -> CAS guard failed; `current` is the bytes NSS
+///   actually has so the caller can rebuild its in-memory state from a
+///   definitive winner snapshot rather than guessing.
+/// - `Err(string)` -> server-side internal error.
+pub fn parse_put_inode_cas(resp: PutInodeCasResponse) -> Result<Bytes, NssError> {
+    match resp.result.unwrap() {
+        put_inode_cas_response::Result::Ok(res) => Ok(res),
+        put_inode_cas_response::Result::Conflict(current) => Err(NssError::CasConflict(current)),
+        put_inode_cas_response::Result::Err(e) => {
+            tracing::error!("NSS put_inode_cas error: {e}");
             Err(NssError::Internal(e))
         }
     }

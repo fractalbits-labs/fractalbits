@@ -4,7 +4,8 @@ use bytes::Bytes;
 use data_types::{Bucket, DataBlobGuid, DataVgInfo, RoutingKey, TraceId};
 use file_ops::{
     ListEntry, blob_blocks_to_delete, create_dir_marker_layout, mpu_get_part_prefix,
-    parse_delete_inode, parse_get_inode, parse_list_inodes, parse_mpu_parts, parse_put_inode,
+    parse_delete_inode, parse_get_inode, parse_get_inode_with_bytes, parse_list_inodes,
+    parse_mpu_parts, parse_put_inode, parse_put_inode_cas,
 };
 use rpc_client_common::RpcError;
 use rpc_client_common::nss_rpc_retry;
@@ -183,6 +184,31 @@ impl StorageBackend {
         Ok(parse_get_inode(resp)?)
     }
 
+    /// Variant of [`Self::get_inode`] that also returns the raw stored
+    /// bytes alongside the parsed `ObjectLayout`. The caller can stash
+    /// the bytes for a later `put_inode_cas` guard so the override flush
+    /// has a definitive snapshot to compare against without re-fetching.
+    pub async fn get_inode_with_bytes(
+        &self,
+        key: &str,
+        trace_id: &TraceId,
+    ) -> Result<(ObjectLayout, Bytes), FsError> {
+        let resp = nss_rpc_retry!(
+            self.nss_client.borrow(),
+            get_inode(
+                &self.root_blob_name,
+                key,
+                Some(self.config.rpc_request_timeout()),
+                trace_id
+            ),
+            self,
+            trace_id
+        )
+        .await?;
+
+        Ok(parse_get_inode_with_bytes(resp)?)
+    }
+
     /// List inodes from NSS. Returns (key, Option<ObjectLayout>).
     /// Empty inode data means common prefix (directory).
     pub async fn list_inodes(
@@ -302,6 +328,42 @@ impl StorageBackend {
         .await?;
 
         Ok(parse_put_inode(resp)?)
+    }
+
+    /// Compare-and-swap variant of [`Self::put_inode`].
+    ///
+    /// The put lands only when the bytes currently stored at `key` are
+    /// byte-equal to `expected_old_value`. Pass an empty `Bytes` to
+    /// require the slot to be empty (initial-create semantics under
+    /// CAS, intended for safe replays of a new file). On a guard
+    /// mismatch this returns `FsError::CasConflict` so the caller can
+    /// surface a stale-handle error to userspace; the conflict bytes
+    /// from the server are dropped at this layer because the override
+    /// flush path cannot recover by silently adopting the winner's
+    /// state -- the in-memory write buffer is provably stale.
+    pub async fn put_inode_cas(
+        &self,
+        key: &str,
+        value: Bytes,
+        expected_old_value: Bytes,
+        trace_id: &TraceId,
+    ) -> Result<Bytes, FsError> {
+        let resp = nss_rpc_retry!(
+            self.nss_client.borrow(),
+            put_inode_cas(
+                &self.root_blob_name,
+                key,
+                value.clone(),
+                expected_old_value.clone(),
+                Some(self.config.rpc_request_timeout()),
+                trace_id
+            ),
+            self,
+            trace_id
+        )
+        .await?;
+
+        Ok(parse_put_inode_cas(resp)?)
     }
 
     /// Delete an inode from NSS. Returns the previous object bytes, or None
