@@ -181,25 +181,31 @@ fn stop_second_fuse(mut child: Child) {
 pub async fn run_fuse_tests_with_disk_cache(disk_cache_only: bool) -> CmdResult {
     info!("Running FUSE integration tests...");
 
-    // The override flush keeps blob_guid stable across versions, which
-    // breaks the current disk-cache key (blob_id, vol, block) -- a hit
-    // can serve bytes from a previous version even though the block was
-    // just rewritten. Skip the disk-cache phase until the cache-side
-    // version-stamping + watch-loop invalidation lands.
-    if disk_cache_only {
+    // The disk-cache phase relies on the version-stamped cache_file_path
+    // scheme: each (blob_id, vol, blob_version) is its own on-disk file,
+    // so a writer advancing blob_version makes the older cache file an
+    // unreachable path. Without it, the override flush would keep
+    // blob_guid stable across versions and a cache hit could serve
+    // stale bytes for a block just rewritten at V+1.
+    if !disk_cache_only {
         println!(
             "\n{}",
-            ">>> disk-cache phase skipped (override flush + cache invalidation not implemented) <<<"
-                .bold()
+            ">>> Running FUSE tests WITHOUT disk cache <<<".bold()
         );
-        return Ok(());
+        run_fuse_test_suite(false).await?;
+
+        // Reinit services to clear stale state from the first suite.
+        cmd_service::stop_service(ServiceName::All)?;
+        cmd_service::init_service(
+            ServiceName::All,
+            crate::cmd_build::BuildMode::Debug,
+            &crate::InitConfig::default(),
+        )?;
+        cmd_service::start_service(ServiceName::All)?;
     }
 
-    println!(
-        "\n{}",
-        ">>> Running FUSE tests WITHOUT disk cache <<<".bold()
-    );
-    run_fuse_test_suite(false).await?;
+    println!("\n{}", ">>> Running FUSE tests WITH disk cache <<<".bold());
+    run_fuse_test_suite(true).await?;
 
     println!("\n{}", "=== All FUSE Tests PASSED ===".green().bold());
     Ok(())
@@ -339,6 +345,10 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         run_test!(
             "Disk Cache Cold Start After Remount",
             test_disk_cache_cold_start
+        );
+        run_test!(
+            "Disk Cache Version-Stamped Paths Survive Override",
+            test_disk_cache_version_roll
         );
     }
 
@@ -1916,6 +1926,104 @@ async fn test_disk_cache_cold_start(disk_cache: bool) -> CmdResult {
     println!(
         "{}",
         "SUCCESS: Disk cache cold start after remount test passed".green()
+    );
+    Ok(())
+}
+
+/// Override-flush version-roll regression. The previous skip commit
+/// flagged this as the failing scenario: a write to an already-cached
+/// file rewrote a block at V+1 while the disk cache still held the V
+/// bytes under the same `(blob_id, vol, block)` key, so a subsequent
+/// read returned stale bytes. With version-stamped paths each
+/// blob_version owns its own cache file and the older one becomes
+/// unreachable, so post-override reads must observe the new bytes.
+async fn test_disk_cache_version_roll(disk_cache: bool) -> CmdResult {
+    assert!(disk_cache, "this test requires disk cache");
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    let dc_path = disk_cache_path();
+    let _ = std::fs::remove_dir_all(&dc_path);
+
+    println!("  Step 1: Mount RW and create a file with original bytes");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let key = "dc-versionroll.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let original = generate_test_data(key, 64 * 1024);
+    std::fs::write(&fuse_path, &original).expect("Failed to write original");
+    println!("    Wrote: {} ({} bytes)", key, original.len());
+
+    println!("  Step 2: Read once to populate the disk cache at the original version");
+    let first_read = std::fs::read(&fuse_path).expect("Failed initial read");
+    assert_eq!(first_read, original, "initial read mismatch");
+    let cache_files_v1: Vec<_> = std::fs::read_dir(&dc_path)
+        .expect("Failed to list disk cache dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !cache_files_v1.is_empty(),
+        "cache should have files after the first read"
+    );
+    println!("    Cache files after v1 read: {:?}", cache_files_v1);
+
+    println!("  Step 3: Override-flush: rewrite the file with new bytes at V+1");
+    let updated = {
+        let mut v = original.clone();
+        // Mutate every byte so a stale-cache hit produces a clearly
+        // different result than the new content.
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = b.wrapping_add(((i % 251) + 1) as u8);
+        }
+        v
+    };
+    std::fs::write(&fuse_path, &updated).expect("Failed to overwrite");
+    println!("    Overwrote: {} bytes", updated.len());
+
+    println!("  Step 4: Read after override; the disk cache must serve V+1 bytes");
+    let post_read = std::fs::read(&fuse_path).expect("Failed post-override read");
+    assert_eq!(
+        post_read, updated,
+        "stale-cache regression: read returned previous-version bytes"
+    );
+
+    println!("  Step 5: A new versioned cache entry exists alongside (or in place of) the old");
+    let cache_files_v2: Vec<_> = std::fs::read_dir(&dc_path)
+        .expect("Failed to list disk cache dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !cache_files_v2.is_empty(),
+        "cache should still have files after override"
+    );
+    let new_files: Vec<_> = cache_files_v2
+        .iter()
+        .filter(|n| !cache_files_v1.contains(n))
+        .collect();
+    assert!(
+        !new_files.is_empty(),
+        "expected a new versioned cache file after override; v1={:?} v2={:?}",
+        cache_files_v1,
+        cache_files_v2
+    );
+    // Sanity: every cache file uses the versioned naming
+    // {blob_id}_{vol}_v{N}.
+    for name in &cache_files_v2 {
+        assert!(
+            name.contains("_v"),
+            "cache file {} should carry the _v{{N}} version suffix",
+            name
+        );
+    }
+    println!("    Cache files after v2 write: {:?}", cache_files_v2);
+    println!("    New versioned files: {:?}", new_files);
+
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: Disk cache version-roll regression passed".green()
     );
     Ok(())
 }
