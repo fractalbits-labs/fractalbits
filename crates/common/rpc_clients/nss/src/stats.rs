@@ -30,7 +30,7 @@ impl OperationType {
 
     pub fn from_operation(op: NssOperation) -> Self {
         match op {
-            NssOperation::PutInode => OperationType::PutInode,
+            NssOperation::PutInode | NssOperation::PutInodeCas => OperationType::PutInode,
             NssOperation::GetInode => OperationType::GetInode,
             NssOperation::DeleteInode => OperationType::DeleteInode,
             NssOperation::ListInodes
@@ -45,6 +45,7 @@ impl OperationType {
 #[derive(Debug, Clone, Copy)]
 pub enum NssOperation {
     PutInode,
+    PutInodeCas,
     GetInode,
     ListInodes,
     DeleteInode,

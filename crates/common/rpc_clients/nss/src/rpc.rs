@@ -53,6 +53,57 @@ impl RpcClient {
         Ok(resp)
     }
 
+    /// Compare-and-swap variant of `put_inode`. The server installs `value`
+    /// at `key` only if the currently stored bytes match `expected_old_value`
+    /// exactly; pass an empty `Bytes` to require the slot to be empty.
+    /// On mismatch the response carries the current bytes via `Conflict`,
+    /// letting callers fail forward without guessing the winner's state.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_inode_cas(
+        &self,
+        root_blob_name: &str,
+        key: &str,
+        value: Bytes,
+        expected_old_value: Bytes,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<PutInodeCasResponse, RpcError> {
+        let _guard = InflightRpcGuard::new("nss", "put_inode_cas");
+        let mut nss_key = key.to_string();
+        nss_key.push('\0');
+        let body = PutInodeCasRequest {
+            root_blob_name: root_blob_name.to_string(),
+            key: nss_key,
+            value,
+            expected_old_value,
+        };
+
+        let mut header = MessageHeader::default();
+        let request_id = self.gen_request_id();
+        header.id = request_id;
+        header.command = Command::PutInodeCas;
+        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
+        header.retry_count = retry_count as u8;
+        header.set_trace_id(trace_id);
+
+        let body_bytes = encode_protobuf(body, trace_id)?;
+        header.set_body_checksum(&body_bytes);
+        let frame = MessageFrame::new(header, body_bytes);
+        let resp_frame = self
+            .send_request(frame, timeout, crate::NssOperation::PutInodeCas)
+            .await
+            .map_err(|e| {
+                if !e.retryable() {
+                    error!(rpc=%"put_inode_cas", %request_id, %root_blob_name, %key, error=?e, "nss rpc failed");
+                }
+                e
+            })?;
+        let resp: PutInodeCasResponse =
+            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        Ok(resp)
+    }
+
     pub async fn get_inode(
         &self,
         root_blob_name: &str,
