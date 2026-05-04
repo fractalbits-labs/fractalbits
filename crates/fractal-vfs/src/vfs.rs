@@ -1764,13 +1764,10 @@ impl VfsCore {
         // Default mode routes Stage A through the writeback queue so
         // multiple concurrent flushes coalesce into one InodeBatch
         // RPC instead of N round-trips. Strict mode keeps the
-        // existing direct path. The queue path returns Ok on success
-        // (we drop the would-be old_bytes since the replace-flush
-        // cleanup logic below only runs when !is_override anyway, and
-        // the queue path is best-effort about reporting prev bytes).
+        // existing direct path. The queue path's CAS guard is gated
+        // by `is_override`: only the override path captures the
+        // expected bytes at open time.
         let old_bytes = if self.writeback_mode_is_default() {
-            // Resolve inode from the active fh; we need it for the
-            // per-cycle pipeline state.
             let inode = self.file_handles.get(&fh_id).map(|h| h.ino).unwrap_or(0);
             let parent_key = parent_prefix_of(s3_key);
             let name = s3_key
@@ -3432,6 +3429,28 @@ impl VfsCore {
         let key = format!("{}{}/", prefix, name);
 
         let trace_id = TraceId::new();
+
+        // Default mode: route through the writeback queue so multiple
+        // concurrent mkdir calls (e.g. tar walking the kernel-source
+        // tree) coalesce into one InodeBatch RPC instead of N
+        // synchronous put_inode round-trips. Strict mode keeps the
+        // direct put_dir_marker call.
+        if self.writeback_mode_is_default() {
+            // Build the dir marker layout + bytes locally so we can
+            // enqueue without touching NSS yet.
+            let layout = file_ops::create_dir_marker_layout();
+            let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())
+                .map_err(FsError::from)?
+                .into();
+            let (ino, _) =
+                self.inodes
+                    .lookup_or_insert(&key, EntryType::Directory, Some(layout.clone()));
+            self.put_inode_via_queue(ino, &key, &prefix, name, layout_bytes, None)
+                .await?;
+            self.dir_cache.invalidate(&prefix);
+            return Ok(self.make_dir_attr(ino));
+        }
+
         self.backend().put_dir_marker(&key, &trace_id).await?;
 
         let (ino, _) = self

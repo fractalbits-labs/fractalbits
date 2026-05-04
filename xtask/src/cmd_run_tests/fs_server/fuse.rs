@@ -302,6 +302,10 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         "Writeback default mode (batched 50-symlink burst via InodeBatch)",
         test_writeback_default_mode_batched
     );
+    run_test!(
+        "Writeback default mode (5-level mkdir -p)",
+        test_writeback_default_mode_mkdir
+    );
     run_test!("Rename", test_rename);
     run_test!("Unlink with Open Handle", test_unlink_open_handle);
     run_test!("Overwrite Existing File", test_overwrite_existing);
@@ -1104,6 +1108,75 @@ async fn test_writeback_default_mode_batched(disk_cache: bool) -> CmdResult {
     println!(
         "{}",
         "SUCCESS: writeback default mode batched (50 symlinks) passed".green()
+    );
+    Ok(())
+}
+
+/// Exercise mkdir under default mode. mkdir returns immediately and
+/// the worker drains the dir-marker PutInode via InodeBatch -- no
+/// synchronous round-trip per directory. This test creates a 5-deep
+/// nested tree (mkdir -p) then verifies all 5 dirs are visible to
+/// readdir at each level after the queue drains.
+async fn test_writeback_default_mode_mkdir(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_writeback(&bucket, true, disk_cache)?;
+
+    println!("  Step 2: Create a 5-deep nested directory tree");
+    let path_a = format!("{}/wb-mkdir-a", MOUNT_POINT);
+    let path_b = format!("{}/b", path_a);
+    let path_c = format!("{}/c", path_b);
+    let path_d = format!("{}/d", path_c);
+    let path_e = format!("{}/e", path_d);
+    std::fs::create_dir_all(&path_e).expect("create_dir_all failed");
+    println!("    enqueued nested mkdirs");
+
+    println!("  Step 3: Poll until every level is visible (up to 5s)");
+    let mut all_visible = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        let levels = [&path_a, &path_b, &path_c, &path_d, &path_e];
+        let visible = levels
+            .iter()
+            .filter(|p| std::fs::metadata(p).is_ok())
+            .count();
+        if visible == levels.len() {
+            all_visible = true;
+            break;
+        }
+    }
+    assert!(
+        all_visible,
+        "default-mode mkdir failed to commit all 5 levels within 5s"
+    );
+
+    println!("  Step 4: Drop a regular file in the deepest dir");
+    let leaf_file = format!("{}/leaf.txt", path_e);
+    std::fs::write(&leaf_file, b"hello deep").expect("write leaf failed");
+    let mut leaf_committed = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        if std::fs::metadata(&leaf_file).is_ok() {
+            leaf_committed = true;
+            break;
+        }
+    }
+    assert!(leaf_committed, "leaf file did not commit within 5s");
+    let read_back = std::fs::read(&leaf_file).expect("read leaf failed");
+    assert_eq!(&read_back[..], b"hello deep");
+
+    // Cleanup
+    let _ = std::fs::remove_file(&leaf_file);
+    let _ = std::fs::remove_dir(&path_e);
+    let _ = std::fs::remove_dir(&path_d);
+    let _ = std::fs::remove_dir(&path_c);
+    let _ = std::fs::remove_dir(&path_b);
+    let _ = std::fs::remove_dir(&path_a);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode mkdir (5-level nested) passed".green()
     );
     Ok(())
 }
