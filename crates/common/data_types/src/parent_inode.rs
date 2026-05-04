@@ -154,7 +154,10 @@ mod tests {
     #[test]
     fn from_bytes_rejects_short_buffer() {
         let err = ParentInodeMeta::from_bytes(&[0u8; 16]).expect_err("too short");
-        assert!(matches!(err, ParentInodeError::TooShort { got: 16, want: 24 }));
+        assert!(matches!(
+            err,
+            ParentInodeError::TooShort { got: 16, want: 24 }
+        ));
     }
 
     #[test]

@@ -2288,7 +2288,6 @@ async fn test_sparse_truncate_then_extend(disk_cache: bool) -> CmdResult {
     Ok(())
 }
 
-
 // Override flush preserves the surrounding bytes after a partial write
 // + close + reopen + read. This exercises the path where flush keeps
 // the existing blob_guid, bumps blob_version, and writes only the
@@ -2350,7 +2349,10 @@ async fn test_sparse_override_flush_persists(disk_cache: bool) -> CmdResult {
 
     unmount_fuse()?;
     cleanup_objects(&ctx, &bucket, &[key]).await;
-    println!("{}", "SUCCESS: Sparse override flush persists test passed".green());
+    println!(
+        "{}",
+        "SUCCESS: Sparse override flush persists test passed".green()
+    );
     Ok(())
 }
 
@@ -2417,4 +2419,3 @@ async fn test_sparse_sparse_file_round_trip(disk_cache: bool) -> CmdResult {
     );
     Ok(())
 }
-

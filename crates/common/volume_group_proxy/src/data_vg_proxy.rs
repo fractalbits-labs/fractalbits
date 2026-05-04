@@ -1634,10 +1634,7 @@ impl DataVgProxy {
         // no transient errors), the block legitimately doesn't exist
         // on the EC volume either. Surface as BlockNotFound so the
         // fs_server read path maps it to zeros.
-        if data_shards_received == 0
-            && data_shards_other_err == 0
-            && data_shards_not_found > 0
-        {
+        if data_shards_received == 0 && data_shards_other_err == 0 && data_shards_not_found > 0 {
             histogram!("datavg_get_blob_nanos", "result" => "ec_block_not_found")
                 .record(start.elapsed().as_nanos() as f64);
             return Err(DataVgError::BlockNotFound);
