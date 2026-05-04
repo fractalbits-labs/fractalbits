@@ -1335,6 +1335,7 @@ impl VfsCore {
             expected_layout_bytes,
             eof_low_watermark,
             trim_upper,
+            pending_reservations,
         ) = {
             let mut handle = self.file_handles.get_mut(&fh_id).ok_or(FsError::BadFd)?;
             let s3_key = handle.s3_key.clone();
@@ -1351,6 +1352,7 @@ impl VfsCore {
                 _ => return Ok(()),
             };
             let blocks = std::mem::take(&mut wb.blocks);
+            let pending_reservations = std::mem::take(&mut wb.pending_reservations);
             (
                 s3_key,
                 wb.file_size,
@@ -1362,6 +1364,7 @@ impl VfsCore {
                 expected_layout_bytes,
                 wb.eof_low_watermark,
                 wb.trim_upper,
+                pending_reservations,
             )
         };
 
@@ -1382,6 +1385,7 @@ impl VfsCore {
                 expected_layout_bytes,
                 eof_low_watermark,
                 trim_upper,
+                &pending_reservations,
                 &trace_id,
             )
             .await;
@@ -1409,6 +1413,11 @@ impl VfsCore {
                         for (b, state) in blocks {
                             wb.blocks.entry(b).or_insert(state);
                         }
+                    }
+                    // Restore reservations the same way -- forward-retry
+                    // must replay them at the next bumped version.
+                    for b in pending_reservations {
+                        wb.pending_reservations.insert(b);
                     }
                 }
                 return Err(e);
@@ -1484,6 +1493,7 @@ impl VfsCore {
         expected_layout_bytes: Option<Bytes>,
         trim_lower: Option<u32>,
         trim_upper: Option<u32>,
+        pending_reservations: &std::collections::BTreeSet<u32>,
         trace_id: &TraceId,
     ) -> Result<(ObjectLayout, Bytes), FsError> {
         let block_size_usize = block_size as usize;
@@ -1526,6 +1536,34 @@ impl VfsCore {
                     trace_id,
                 )
                 .await?;
+                // Issue per-block ReserveBlocks for any range fallocate
+                // requested. Skipped on blocks that already have a
+                // Rewrite intent or a Delete intent in this flush --
+                // those entries already supersede the reservation. The
+                // reservation is best-effort: a partial failure is
+                // logged and not fatal to the flush, mirroring the way
+                // the parent inode update itself is best-effort.
+                for &block_num in pending_reservations.iter() {
+                    if matches!(
+                        blocks.get(&block_num),
+                        Some(BlockState::Rewrite(_)) | Some(BlockState::Delete)
+                    ) {
+                        continue;
+                    }
+                    if let Err(e) = self
+                        .backend()
+                        .reserve_block(guid, block_num, block_size, new_version, trace_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            %guid,
+                            block_num,
+                            new_version,
+                            error = %e,
+                            "Failed to reserve block; continuing"
+                        );
+                    }
+                }
                 (guid, new_version, true)
             } else {
                 let data = self
@@ -2701,41 +2739,30 @@ impl VfsCore {
             }
         };
 
-        // BSS-side per-block probe. Without a real ListBlobBlocks RPC
-        // we issue a small `read_block(.., 1)`: a `BlockNotFound`
-        // (hole) is the cheap classification we care about, and a
-        // success means the block has data.
-        async fn block_has_data(
-            backend: &StorageBackend,
-            guid: data_types::DataBlobGuid,
-            block: u32,
-            block_size: u32,
-            file_size: u64,
-            trace_id: &TraceId,
-        ) -> Result<bool, FsError> {
-            let block_start = block as u64 * block_size as u64;
-            let probe_len = std::cmp::min(block_size as u64, file_size - block_start) as usize;
-            if probe_len == 0 {
-                return Ok(false);
+        // BSS-side classification: one ListBlobBlocks call covers the
+        // whole walk range. Reserved entries count as data (Linux
+        // SEEK_DATA convention), Data is data, anything not in the
+        // returned set is a hole.
+        let block_map: std::collections::BTreeSet<u32> = match existing_blob_guid {
+            Some(guid) => {
+                let count = last_block_excl.saturating_sub(first_block);
+                if count == 0 {
+                    std::collections::BTreeSet::new()
+                } else {
+                    let entries = self
+                        .backend()
+                        .list_blob_blocks(guid, first_block, count, &trace_id)
+                        .await?;
+                    entries.into_iter().map(|e| e.block_number).collect()
+                }
             }
-            match backend.read_block(guid, block, probe_len, trace_id).await {
-                Ok(_) => Ok(true),
-                Err(FsError::DataVg(volume_group_proxy::DataVgError::BlockNotFound))
-                | Err(FsError::Rpc(rpc_client_common::RpcError::NotFound)) => Ok(false),
-                Err(e) => Err(e),
-            }
-        }
+            None => std::collections::BTreeSet::new(),
+        };
 
         for b in first_block..last_block_excl {
             let is_data = match buffered_kind(b) {
                 Some(d) => d,
-                None => match existing_blob_guid {
-                    Some(guid) => {
-                        block_has_data(self.backend(), guid, b, block_size, file_size, &trace_id)
-                            .await?
-                    }
-                    None => false,
-                },
+                None => block_map.contains(&b),
             };
             let result_offset = if b == first_block {
                 offset

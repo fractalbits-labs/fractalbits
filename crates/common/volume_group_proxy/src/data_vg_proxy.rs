@@ -1983,7 +1983,6 @@ impl DataVgProxy {
             return Ok(());
         }
 
-        let trace_id = *trace_id;
         let rpc_timeout = self.rpc_timeout;
         let write_quorum = match &volume.mode {
             VolumeMode::Replicated { w, .. } => *w as usize,
@@ -2009,7 +2008,7 @@ impl DataVgProxy {
         let mut futures = FuturesUnordered::new();
         for bss_node in &available_nodes {
             let node = bss_node.clone();
-            let trace_id = trace_id;
+            let trace_id = *trace_id;
             futures.push(async move {
                 let address = node.address.clone();
                 let result = node

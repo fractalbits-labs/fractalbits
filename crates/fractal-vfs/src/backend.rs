@@ -482,6 +482,51 @@ impl StorageBackend {
         Ok(())
     }
 
+    /// Reserve a single block on `blob_guid` at `expected_version`.
+    /// Version-guarded: a stored entry at a higher version skips the
+    /// reserve (mapped to `Ok(())` via the `VersionSkipped` rule in
+    /// `DataVgProxy::reserve_blob`). Failures other than skip are
+    /// surfaced for the caller to log, since reservations are
+    /// best-effort and a flush that fails to reserve still publishes
+    /// the new size via the parent inode update.
+    pub async fn reserve_block(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        block_size: u32,
+        expected_version: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        self.data_vg_proxy
+            .reserve_blob(
+                blob_guid,
+                block_number,
+                block_size,
+                expected_version,
+                trace_id,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Enumerate the BSS-side block entries for `blob_guid` over the
+    /// requested range. Each result is `(block_number, entry_type,
+    /// version)` where `entry_type` is 0=Data, 1=Reserved. Absent
+    /// indices are holes.
+    pub async fn list_blob_blocks(
+        &self,
+        blob_guid: DataBlobGuid,
+        first_block: u32,
+        block_count: u32,
+        trace_id: &TraceId,
+    ) -> Result<Vec<bss_codec::list_blob_blocks_response::BlobBlockEntry>, FsError> {
+        let entries = self
+            .data_vg_proxy
+            .list_blob_blocks(blob_guid, first_block, block_count, trace_id)
+            .await?;
+        Ok(entries)
+    }
+
     /// Write the parent inode meta record for `blob_guid` at the
     /// given version. Goes through the same `put_blob` path as a
     /// regular block write, but addresses the no-suffix key form via
