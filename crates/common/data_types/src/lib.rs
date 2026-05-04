@@ -6,6 +6,7 @@ pub mod ec_utils;
 pub mod hash;
 pub mod object_layout;
 pub mod observer_types;
+pub mod parent_inode;
 mod permission;
 mod routing_key;
 mod trace_id;

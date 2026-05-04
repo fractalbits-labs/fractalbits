@@ -1237,10 +1237,10 @@ impl VfsCore {
         let (final_blob_guid, final_blob_version, is_override) =
             if let Some(guid) = existing_blob_guid {
                 // Bump to V+1, but guarantee at least 2 even when the
-                // committed layout is a legacy / pre-V1 record with
-                // blob_version=0: those records' BSS blocks are stored
-                // at version=1 (the previously-hardcoded default), so
-                // overwriting at version=1 would hit bssOverwriteCheck's
+                // committed layout has blob_version=0 (uninitialised
+                // record): those records' BSS blocks are stored at
+                // version=1 (the previous hardcoded default), so an
+                // overwrite at version=1 would land in bssOverwriteCheck's
                 // idempotency branch and panic on different content.
                 let new_version = committed_blob_version.saturating_add(1).max(2);
                 self.override_flush_blocks(
@@ -1282,6 +1282,37 @@ impl VfsCore {
                 }
                 (blob_guid, 1, false)
             };
+
+        // Write the parent inode meta record after all data block
+        // writes have landed. The parent record carries the new
+        // (total_size, block_count) at this version and is the
+        // single commit point for the file's logical size on data
+        // reads -- a reader who races the flush sees either the old
+        // parent (and reads bytes against the old size) or the new
+        // one, but never a half-applied state.
+        //
+        // Failure here is non-fatal: the data blocks landed, the
+        // logical size is still recoverable from NSS layout.size,
+        // and the next flush re-publishes the parent at a higher
+        // version. We log and proceed.
+        let parent_meta = data_types::parent_inode::ParentInodeMeta::new(
+            final_blob_version,
+            file_size,
+            block_size,
+        );
+        if let Err(e) = self
+            .backend()
+            .write_parent_inode(final_blob_guid, parent_meta, &trace_id)
+            .await
+        {
+            tracing::warn!(
+                %final_blob_guid,
+                final_blob_version,
+                file_size,
+                error = %e,
+                "Failed to publish parent inode; continuing"
+            );
+        }
 
         // Build ObjectLayout
         let timestamp = SystemTime::now()
@@ -1665,6 +1696,39 @@ impl VfsCore {
             }
         };
 
+        // For an existing file opened for write, ask BSS for the
+        // parent inode and prefer its total_size when present. The
+        // parent inode is published as part of the override flush
+        // sequence and is the authoritative source for the file's
+        // logical size; a successful read here picks up the latest
+        // committed size even when the in-memory inode cache is
+        // ahead/behind the BSS state. Failure is tolerated -- older
+        // blobs that pre-date parent-inode support, or a transient
+        // missing-replica situation, return None and we fall back to
+        // layout.size.
+        let parent_size = if is_write {
+            if let Some(ref l) = layout
+                && let Ok(blob_guid) = l.blob_guid()
+            {
+                let trace_id = TraceId::new();
+                match self.backend().read_parent_inode(blob_guid, &trace_id).await {
+                    Ok(Some(meta)) => Some(meta.total_size),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            %blob_guid, error = %e,
+                            "read_parent_inode failed during open; falling back to layout size"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // No preload. Existing files seed the WriteBuffer with the
         // committed file_size + blob_guid; partial writes lazy-load the
         // touched blocks at write time. O_TRUNC is honored by setting
@@ -1675,7 +1739,7 @@ impl VfsCore {
                 && !has_trunc
             {
                 let blob_guid = l.blob_guid().ok();
-                let committed_size = l.size().unwrap_or(0);
+                let committed_size = parent_size.unwrap_or_else(|| l.size().unwrap_or(0));
                 Some(WriteBuffer::new(blob_guid, committed_size, l.block_size))
             } else if let Some(ref l) = layout {
                 // O_TRUNC on an existing file: drop bytes from the buffer

@@ -16,6 +16,7 @@ use volume_group_proxy::DataVgProxy;
 use crate::config::Config;
 use crate::error::FsError;
 use data_types::object_layout::ObjectLayout;
+use data_types::parent_inode::{PARENT_INODE_BLOCK_NUMBER, ParentInodeMeta};
 /// Discovered configuration from RSS (shared across threads).
 pub struct BackendConfig {
     pub nss_address: String,
@@ -417,6 +418,60 @@ impl StorageBackend {
             .delete_blob(blob_guid, block_number, version, trace_id)
             .await?;
         Ok(())
+    }
+
+    /// Write the parent inode meta record for `blob_guid` at the
+    /// given version. Goes through the same `put_blob` path as a
+    /// regular block write, but addresses the no-suffix key form via
+    /// the `PARENT_INODE_BLOCK_NUMBER` sentinel that the BSS server
+    /// recognises.
+    pub async fn write_parent_inode(
+        &self,
+        blob_guid: DataBlobGuid,
+        meta: ParentInodeMeta,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        let body = Bytes::copy_from_slice(&meta.to_bytes());
+        self.data_vg_proxy
+            .put_blob(
+                blob_guid,
+                PARENT_INODE_BLOCK_NUMBER,
+                body,
+                meta.version,
+                trace_id,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Read the parent inode meta record for `blob_guid`. Returns
+    /// `Ok(None)` when the parent inode does not exist (older blobs
+    /// written before parent-inode support, or a transient
+    /// missing-replica situation that the regular hole-tolerant read
+    /// path treats the same way).
+    pub async fn read_parent_inode(
+        &self,
+        blob_guid: DataBlobGuid,
+        trace_id: &TraceId,
+    ) -> Result<Option<ParentInodeMeta>, FsError> {
+        match self
+            .read_block(
+                blob_guid,
+                PARENT_INODE_BLOCK_NUMBER,
+                ParentInodeMeta::WIRE_LEN,
+                trace_id,
+            )
+            .await
+        {
+            Ok((body, _)) => {
+                let meta = ParentInodeMeta::from_bytes(&body)
+                    .map_err(|e| FsError::Internal(format!("invalid ParentInodeMeta: {e}")))?;
+                Ok(Some(meta))
+            }
+            Err(FsError::DataVg(volume_group_proxy::DataVgError::BlockNotFound)) => Ok(None),
+            Err(FsError::Rpc(RpcError::NotFound)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Create a directory marker in NSS.
