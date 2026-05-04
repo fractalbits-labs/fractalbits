@@ -3731,37 +3731,107 @@ fn spawn_writeback_worker(
                 continue;
             }
 
-            for intent in drained {
-                let trace_id = TraceId::new();
-                // Phase 1a only handles `PutInode` and `SetAttr`; the
-                // FUSE op rewires only enqueue these variants today.
-                let result = match &intent.op {
-                    WbInodeOp::PutInode { layout_bytes, .. } => backend
-                        .put_inode(&intent.s3_key, layout_bytes.clone(), &trace_id)
-                        .await
-                        .map(|_old| ()),
+            // Build one batched RPC for the whole drain set. Each
+            // intent maps to one InodeBatchEntry; the worker uses the
+            // unconditional Put path for every entry today (Stage A on
+            // the symlink / vfs_create paths is always the initial
+            // publish, never a CAS). Adding CAS support is one extra
+            // field on the entry once vfs_release flush moves into
+            // the queue.
+            let trace_id = TraceId::new();
+            let mut batch_entries: Vec<nss_codec::InodeBatchEntry> =
+                Vec::with_capacity(drained.len());
+            for intent in &drained {
+                let mut nss_key = intent.s3_key.clone();
+                nss_key.push('\0');
+                match &intent.op {
+                    WbInodeOp::PutInode { layout_bytes, .. } => {
+                        batch_entries.push(nss_codec::InodeBatchEntry {
+                            depends_on_index: vec![],
+                            op: Some(nss_codec::inode_batch_entry::Op::Put(
+                                nss_codec::PutInodeBatchEntry {
+                                    key: nss_key,
+                                    value: layout_bytes.clone(),
+                                    cas_check: false,
+                                    expected_old_value: bytes::Bytes::new(),
+                                },
+                            )),
+                        });
+                    }
                     WbInodeOp::SetAttr { .. } => {
-                        // No SetAttr enqueue path lands in Phase 1a.
-                        // Treat as no-op success; future scope adds the
-                        // PutInodeCas path that applies attr mutations
-                        // to the layout.
-                        Ok(())
+                        // SetAttr enqueue path isn't wired today. The
+                        // worker already coalesces SetAttr into the
+                        // PutInode layout when both target the same
+                        // (key, gen); a SetAttr intent reaching the
+                        // worker means there was no PutInode to merge
+                        // into. We push it as a placeholder so the
+                        // drained-vs-results indices stay aligned;
+                        // the server treats it as an empty Put which
+                        // returns PERMANENT_ERROR.
+                        batch_entries.push(nss_codec::InodeBatchEntry {
+                            depends_on_index: vec![],
+                            op: Some(nss_codec::inode_batch_entry::Op::Setattr(
+                                nss_codec::SetAttrBatchEntry {
+                                    key: nss_key,
+                                    attrs: bytes::Bytes::new(),
+                                    cas_check: false,
+                                    expected_old_value: bytes::Bytes::new(),
+                                },
+                            )),
+                        });
                     }
-                };
+                }
+            }
 
-                let inode = inode_for_intent(&queue, &intent);
-                match result {
-                    Ok(_) => {
-                        queue.mark_stage_a_committed(&intent.s3_key, intent.generation, inode);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            key = %intent.s3_key,
-                            generation = intent.generation.0,
-                            error = %e,
-                            "writeback Stage A failed"
-                        );
+            let batch_result = backend.inode_batch(batch_entries, &trace_id).await;
+
+            match batch_result {
+                Err(e) => {
+                    tracing::warn!(
+                        n_entries = drained.len(),
+                        error = %e,
+                        "writeback InodeBatch RPC failed"
+                    );
+                    for intent in &drained {
+                        let inode = inode_for_intent(&queue, intent);
                         queue.mark_stage_a_failed(&intent.s3_key, intent.generation, inode);
+                    }
+                }
+                Ok(results) if results.len() != drained.len() => {
+                    tracing::warn!(
+                        sent = drained.len(),
+                        got = results.len(),
+                        "writeback InodeBatch result count mismatch"
+                    );
+                    for intent in &drained {
+                        let inode = inode_for_intent(&queue, intent);
+                        queue.mark_stage_a_failed(&intent.s3_key, intent.generation, inode);
+                    }
+                }
+                Ok(results) => {
+                    for (intent, result) in drained.iter().zip(results.iter()) {
+                        let inode = inode_for_intent(&queue, intent);
+                        let status = nss_codec::BatchEntryStatus::try_from(result.status)
+                            .unwrap_or(nss_codec::BatchEntryStatus::StatusUnspecified);
+                        match status {
+                            nss_codec::BatchEntryStatus::StatusOk => {
+                                queue.mark_stage_a_committed(
+                                    &intent.s3_key,
+                                    intent.generation,
+                                    inode,
+                                );
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    key = %intent.s3_key,
+                                    generation = intent.generation.0,
+                                    status = ?status,
+                                    error = %result.error_message,
+                                    "writeback Stage A entry failed"
+                                );
+                                queue.mark_stage_a_failed(&intent.s3_key, intent.generation, inode);
+                            }
+                        }
                     }
                 }
             }

@@ -298,6 +298,10 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         "Writeback default mode (async release of dirty file)",
         test_writeback_default_mode_async_release
     );
+    run_test!(
+        "Writeback default mode (batched 50-symlink burst via InodeBatch)",
+        test_writeback_default_mode_batched
+    );
     run_test!("Rename", test_rename);
     run_test!("Unlink with Open Handle", test_unlink_open_handle);
     run_test!("Overwrite Existing File", test_overwrite_existing);
@@ -1026,6 +1030,80 @@ async fn test_writeback_default_mode_async_release(disk_cache: bool) -> CmdResul
     println!(
         "{}",
         "SUCCESS: writeback default mode async release passed".green()
+    );
+    Ok(())
+}
+
+/// Stress the batched-write path: rapid-fire 50 symlink creates in
+/// default mode and verify they all commit. With Phase 1c-NSS active,
+/// the worker drains them via one (or a small number of) InodeBatch
+/// RPCs instead of 50 PutInode round-trips. The correctness assertion
+/// here is purely the all-50-visible test; an instrumented RPC count
+/// is a separate observability concern.
+async fn test_writeback_default_mode_batched(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_writeback(&bucket, true, disk_cache)?;
+
+    println!("  Step 2: Create 50 symlinks rapid-fire (no fsync between)");
+    let n = 50usize;
+    for i in 0..n {
+        let link_path = format!("{}/wb-batch-{:03}", MOUNT_POINT, i);
+        let target = format!("../etc/wb-batch-target-{}", i);
+        std::os::unix::fs::symlink(&target, &link_path)
+            .unwrap_or_else(|e| panic!("symlink {} failed: {}", i, e));
+    }
+    println!("    enqueued {} symlinks", n);
+
+    println!("  Step 3: Poll until every symlink appears in dir listing (up to 10s)");
+    let mount_point = MOUNT_POINT;
+    let mut all_committed = false;
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(100));
+        let entries: Vec<_> = std::fs::read_dir(mount_point)
+            .expect("readdir failed")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let visible = (0..n)
+            .filter(|i| {
+                entries
+                    .iter()
+                    .any(|name| name == &format!("wb-batch-{:03}", i))
+            })
+            .count();
+        if visible == n {
+            all_committed = true;
+            println!("    {}/{} symlinks committed via NSS", visible, n);
+            break;
+        }
+    }
+    assert!(
+        all_committed,
+        "batched worker failed to commit all {} symlinks within 10s",
+        n
+    );
+
+    println!("  Step 4: Spot-check readlink on a few entries");
+    for i in [0usize, n / 2, n - 1] {
+        let link_path = format!("{}/wb-batch-{:03}", MOUNT_POINT, i);
+        let resolved = std::fs::read_link(&link_path)
+            .unwrap_or_else(|e| panic!("readlink {} failed: {}", i, e));
+        assert_eq!(
+            resolved.to_str().unwrap(),
+            format!("../etc/wb-batch-target-{}", i)
+        );
+    }
+
+    // Cleanup
+    for i in 0..n {
+        let _ = std::fs::remove_file(format!("{}/wb-batch-{:03}", MOUNT_POINT, i));
+    }
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode batched (50 symlinks) passed".green()
     );
     Ok(())
 }

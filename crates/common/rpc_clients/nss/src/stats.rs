@@ -30,7 +30,9 @@ impl OperationType {
 
     pub fn from_operation(op: NssOperation) -> Self {
         match op {
-            NssOperation::PutInode | NssOperation::PutInodeCas => OperationType::PutInode,
+            NssOperation::PutInode | NssOperation::PutInodeCas | NssOperation::InodeBatch => {
+                OperationType::PutInode
+            }
             NssOperation::GetInode => OperationType::GetInode,
             NssOperation::DeleteInode => OperationType::DeleteInode,
             NssOperation::ListInodes
@@ -46,6 +48,9 @@ impl OperationType {
 pub enum NssOperation {
     PutInode,
     PutInodeCas,
+    /// Batched inode mutations -- one RPC carries N entries, server
+    /// returns per-entry results.
+    InodeBatch,
     GetInode,
     ListInodes,
     DeleteInode,

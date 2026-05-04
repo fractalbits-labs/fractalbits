@@ -330,6 +330,30 @@ impl StorageBackend {
         Ok(parse_put_inode(resp)?)
     }
 
+    /// Batched inode mutations -- ship N entries in one RPC. Server
+    /// processes entries in order; per-entry results come back in
+    /// `InodeBatchResponse.results`. Used by the writeback worker to
+    /// drain Stage A as one RPC instead of N round-trips.
+    pub async fn inode_batch(
+        &self,
+        entries: Vec<nss_codec::InodeBatchEntry>,
+        trace_id: &TraceId,
+    ) -> Result<Vec<nss_codec::InodeEntryResult>, FsError> {
+        let resp = nss_rpc_retry!(
+            self.nss_client.borrow(),
+            inode_batch(
+                &self.root_blob_name,
+                entries.clone(),
+                Some(self.config.rpc_request_timeout()),
+                trace_id
+            ),
+            self,
+            trace_id
+        )
+        .await?;
+        Ok(resp.results)
+    }
+
     /// Compare-and-swap variant of [`Self::put_inode`].
     ///
     /// The put lands only when the bytes currently stored at `key` are

@@ -16,6 +16,11 @@ enum Command {
   DeleteRootInode = 21;
   Rename = 22;
   PutInodeCas = 23;
+  // Batched inode mutations: process N entries in one RPC, return per-
+  // entry results. Each entry is either a PutInode (or PutInodeCas) or a
+  // SetAttr op. Cross-batch ordering uses depends_on_index for the
+  // mkdir-then-creat patterns the writeback queue collapses.
+  InodeBatch = 24;
 }
 
 // PutInode
@@ -164,4 +169,72 @@ message RenameResponse {
     google.protobuf.Empty err_no_such_root_blob = 4;
     string err_other = 5;
   }
+}
+
+// InodeBatch: process N inode mutations in one RPC. Entries run in
+// order; each entry's result is reported individually so an isolated
+// CAS conflict on one entry does not roll back the rest.
+//
+// Initial scope only enables PutInodeBatchEntry and SetAttrBatchEntry
+// (matching the Phase 1 writeback-queue intent set). Other op kinds
+// (unlink / rmdir / rename / link / symlink / mknod / commit-claim)
+// can land later without a schema break -- the entry oneof holds
+// reserved tags for them.
+message InodeBatchRequest {
+  string root_blob_name = 1;
+  repeated InodeBatchEntry entries = 2;
+}
+
+message InodeBatchEntry {
+  oneof op {
+    PutInodeBatchEntry put = 1;
+    SetAttrBatchEntry  setattr = 2;
+    // Reserved tags 3..10 for: unlink / rmdir / rename_file /
+    // rename_dir / link / symlink / mknod / commit_claim. Adding any
+    // of these is a backward-compatible schema extension.
+  }
+  // Indices of preceding entries in this batch that must succeed
+  // before this entry runs. Empty for independent entries. The
+  // handler reports DEPENDENCY_FAILED on dependents whose listed
+  // predecessor did not return OK; the writeback retry path
+  // group-requeues the failed predecessor with all its dependents.
+  repeated uint32 depends_on_index = 11;
+}
+
+// Single Put. `cas_check=true` enforces that the bytes currently at
+// `key` match `expected_old_value` (CAS); `cas_check=false` is the
+// unconditional put. Mirrors today's `PutInode` / `PutInodeCas` split
+// inside one entry shape so the writeback worker can pick per-entry.
+message PutInodeBatchEntry {
+  string key = 1;
+  bytes value = 2;
+  bool cas_check = 3;
+  bytes expected_old_value = 4;
+}
+
+message SetAttrBatchEntry {
+  string key = 1;
+  bytes attrs = 2;
+  bool cas_check = 3;
+  bytes expected_old_value = 4;
+}
+
+message InodeBatchResponse {
+  repeated InodeEntryResult results = 1;
+}
+
+message InodeEntryResult {
+  BatchEntryStatus status = 1;
+  // Populated on CAS_CONFLICT: the bytes the server actually has.
+  bytes current_value = 2;
+  string error_message = 3;
+}
+
+enum BatchEntryStatus {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_OK = 1;
+  STATUS_CAS_CONFLICT = 2;
+  STATUS_PERMANENT_ERROR = 3;
+  STATUS_TRANSIENT = 4;
+  STATUS_DEPENDENCY_FAILED = 5;
 }
