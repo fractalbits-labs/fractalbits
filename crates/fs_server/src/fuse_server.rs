@@ -202,6 +202,34 @@ impl Filesystem for FuseServer {
         self.vfs.vfs_unlink(parent, name_str).await.map_err(fs_err)
     }
 
+    async fn symlink(
+        &self,
+        _req: Request,
+        parent: u64,
+        name: &OsStr,
+        link: &OsStr,
+    ) -> FsResult<ReplyEntry> {
+        let name_str = name.to_str().ok_or(libc::EINVAL)?;
+        // The symlink target is uninterpreted bytes -- pass it through
+        // verbatim so non-UTF-8 targets round-trip correctly.
+        let target_bytes = link.as_encoded_bytes();
+        let attr = self
+            .vfs
+            .vfs_symlink(parent, name_str, target_bytes)
+            .await
+            .map_err(fs_err)?;
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr: to_file_attr(&attr),
+            generation: 0,
+        })
+    }
+
+    async fn readlink(&self, _req: Request, inode: u64) -> FsResult<ReplyReadlink> {
+        let data = self.vfs.vfs_readlink(inode).await.map_err(fs_err)?;
+        Ok(ReplyReadlink { data })
+    }
+
     async fn mkdir(
         &self,
         _req: Request,

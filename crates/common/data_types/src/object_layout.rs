@@ -44,8 +44,26 @@ impl ObjectLayout {
     pub fn is_listable(&self) -> bool {
         matches!(
             &self.state,
-            ObjectState::Normal(_) | ObjectState::Mpu(MpuState::Completed(_))
+            ObjectState::Normal(_)
+                | ObjectState::Mpu(MpuState::Completed(_))
+                | ObjectState::Symlink(_)
+                | ObjectState::Indirect(_)
         )
+    }
+
+    /// `true` when this layout describes a symbolic link.
+    #[inline]
+    pub fn is_symlink(&self) -> bool {
+        matches!(&self.state, ObjectState::Symlink(_))
+    }
+
+    /// Borrow the symlink target bytes when this layout is a symlink.
+    #[inline]
+    pub fn symlink_target(&self) -> Option<&[u8]> {
+        match &self.state {
+            ObjectState::Symlink(data) => Some(&data.target),
+            _ => None,
+        }
     }
 
     #[inline]
@@ -71,6 +89,8 @@ impl ObjectLayout {
         match self.state {
             ObjectState::Normal(ref data) => Ok(data.core_meta_data.size),
             ObjectState::Mpu(MpuState::Completed(ref core_meta_data)) => Ok(core_meta_data.size),
+            // POSIX: a symlink's stat size is the length of its target.
+            ObjectState::Symlink(ref data) => Ok(data.target.len() as u64),
             _ => Err(ObjectLayoutError::InvalidState),
         }
     }
@@ -82,13 +102,19 @@ impl ObjectLayout {
             ObjectState::Mpu(MpuState::Completed(ref core_meta_data)) => {
                 Ok(core_meta_data.etag.clone())
             }
+            ObjectState::Symlink(ref data) => Ok(data.core_meta_data.etag.clone()),
             _ => Err(ObjectLayoutError::InvalidState),
         }
     }
 
+    /// Number of data blocks for non-symlink objects. Symlinks have no
+    /// BSS blob and report 0; Indirect entries have no inline state.
     #[inline]
     pub fn num_blocks(&self) -> Result<usize, ObjectLayoutError> {
-        Ok(self.size()?.div_ceil(self.block_size as u64) as usize)
+        match self.state {
+            ObjectState::Symlink(_) => Ok(0),
+            _ => Ok(self.size()?.div_ceil(self.block_size as u64) as usize),
+        }
     }
 
     #[inline]
@@ -98,6 +124,7 @@ impl ObjectLayout {
             ObjectState::Mpu(MpuState::Completed(ref core_meta_data)) => {
                 Ok(core_meta_data.checksum)
             }
+            ObjectState::Symlink(ref data) => Ok(data.core_meta_data.checksum),
             _ => Err(ObjectLayoutError::InvalidState),
         }
     }
@@ -109,6 +136,7 @@ impl ObjectLayout {
             ObjectState::Mpu(MpuState::Completed(ref core_meta_data)) => {
                 Ok(&core_meta_data.headers)
             }
+            ObjectState::Symlink(ref data) => Ok(&data.core_meta_data.headers),
             _ => Err(ObjectLayoutError::InvalidState),
         }
     }
@@ -118,6 +146,15 @@ impl ObjectLayout {
 pub enum ObjectState {
     Normal(ObjectMetaData),
     Mpu(MpuState),
+    /// Symbolic link. The body is the raw target path the kernel
+    /// returns from `readlink(2)`. No BSS blob is allocated.
+    Symlink(SymlinkData),
+    /// Hardlink redirect. The real layout lives at a separate
+    /// inode-keyed entry and must be resolved before any read /
+    /// write op can run. Schema-only today; no VFS handler creates
+    /// or follows these. Reserved as the Phase-1 placeholder for the
+    /// lazy-promotion hardlink design.
+    Indirect(IndirectEntry),
 }
 
 #[derive(Debug, Archive, Deserialize, Serialize, PartialEq, Clone)]
@@ -139,6 +176,25 @@ pub struct ObjectCoreMetaData {
     pub etag: String,
     pub headers: HeaderList,
     pub checksum: Option<ChecksumValue>,
+}
+
+/// Body of an `ObjectState::Symlink` layout. `target` is the raw bytes
+/// the kernel returns from `readlink(2)`. `core_meta_data` carries the
+/// usual stat fields so the symlink itself answers `lstat` correctly.
+#[derive(Debug, Archive, Deserialize, Serialize, PartialEq, Clone)]
+pub struct SymlinkData {
+    pub target: Vec<u8>,
+    pub core_meta_data: ObjectCoreMetaData,
+}
+
+/// Schema-only placeholder for hardlink indirection. A name whose
+/// layout has `state == Indirect(entry)` is a redirect: the real
+/// layout lives at a separate inode-keyed entry. No VFS handler
+/// constructs or follows these today; reserved for a future
+/// lazy-promotion hardlink implementation.
+#[derive(Debug, Archive, Deserialize, Serialize, PartialEq, Clone)]
+pub struct IndirectEntry {
+    pub inode_id: Uuid,
 }
 
 #[derive(
@@ -193,5 +249,115 @@ impl ChecksumValue {
             ChecksumValue::Sha1(bytes) => bytes,
             ChecksumValue::Sha256(bytes) => bytes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn core_meta(size: u64) -> ObjectCoreMetaData {
+        ObjectCoreMetaData {
+            size,
+            etag: "etag".to_string(),
+            headers: vec![],
+            checksum: None,
+        }
+    }
+
+    fn symlink_layout(target: &[u8]) -> ObjectLayout {
+        ObjectLayout {
+            timestamp: 0,
+            version_id: ObjectLayout::gen_version_id(),
+            block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
+            blob_version: 0,
+            state: ObjectState::Symlink(SymlinkData {
+                target: target.to_vec(),
+                core_meta_data: core_meta(target.len() as u64),
+            }),
+        }
+    }
+
+    fn indirect_layout() -> ObjectLayout {
+        ObjectLayout {
+            timestamp: 0,
+            version_id: ObjectLayout::gen_version_id(),
+            block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
+            blob_version: 0,
+            state: ObjectState::Indirect(IndirectEntry {
+                inode_id: Uuid::new_v4(),
+            }),
+        }
+    }
+
+    #[test]
+    fn symlink_size_matches_target_length() {
+        let layout = symlink_layout(b"../etc/hostname");
+        assert_eq!(
+            layout.size().expect("size"),
+            b"../etc/hostname".len() as u64
+        );
+    }
+
+    #[test]
+    fn symlink_is_listable_and_is_symlink() {
+        let layout = symlink_layout(b"a/b/c");
+        assert!(layout.is_listable(), "symlink must be listable");
+        assert!(layout.is_symlink());
+        assert_eq!(layout.symlink_target(), Some(b"a/b/c".as_slice()));
+    }
+
+    #[test]
+    fn symlink_has_no_blob_guid() {
+        let layout = symlink_layout(b"target");
+        assert!(matches!(
+            layout.blob_guid(),
+            Err(ObjectLayoutError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn symlink_reports_zero_blocks() {
+        let layout = symlink_layout(b"abc");
+        assert_eq!(layout.num_blocks().expect("num_blocks"), 0);
+    }
+
+    #[test]
+    fn indirect_is_listable_but_not_a_symlink() {
+        let layout = indirect_layout();
+        assert!(layout.is_listable());
+        assert!(!layout.is_symlink());
+        assert!(layout.symlink_target().is_none());
+    }
+
+    #[test]
+    fn indirect_layout_has_no_inline_state() {
+        let layout = indirect_layout();
+        assert!(matches!(
+            layout.size(),
+            Err(ObjectLayoutError::InvalidState)
+        ));
+        assert!(matches!(
+            layout.blob_guid(),
+            Err(ObjectLayoutError::InvalidState)
+        ));
+        assert!(matches!(
+            layout.etag(),
+            Err(ObjectLayoutError::InvalidState)
+        ));
+        assert!(matches!(
+            layout.checksum(),
+            Err(ObjectLayoutError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn symlink_round_trips_through_rkyv() {
+        let layout = symlink_layout(b"/tmp/target");
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&layout).expect("serialize");
+        let parsed: ObjectLayout =
+            rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&bytes).expect("deserialize");
+        assert_eq!(parsed, layout);
+        assert_eq!(parsed.symlink_target(), Some(b"/tmp/target".as_slice()));
     }
 }

@@ -162,6 +162,11 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
                     }
                 }
             },
+            // Symlinks are an FS-only concept and have no associated
+            // blob to clean up; the namespace-level delete above is
+            // sufficient. Indirect entries are schema-only today and
+            // should never reach this handler.
+            ObjectState::Symlink(_) | ObjectState::Indirect(_) => {}
         }
     }
 
