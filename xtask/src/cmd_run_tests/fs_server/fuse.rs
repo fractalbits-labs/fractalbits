@@ -2851,39 +2851,55 @@ async fn test_lseek_seek_data_hole(disk_cache: bool) -> CmdResult {
     mount_fuse_rw(&bucket, disk_cache)?;
 
     let file_path = format!("{}/lseek-sparse.bin", MOUNT_POINT);
-    println!("  Step 2: Create a sparse file (truncate to 4MB, write near 3MB)");
+
+    // The replace-flush path that handles brand-new files writes every
+    // logical block dense, so a fresh `create + set_len + write_at_3MB`
+    // sequence ends up with no actual holes on disk. To exercise lseek
+    // against real holes we seed the file first (one block becomes
+    // committed), then re-open and let the override-flush path place
+    // only the new tail block at offset 3MB. Everything between the
+    // first block and the tail block stays unallocated in BSS.
+    println!("  Step 2: Seed a tiny file so subsequent flushes use the override path");
+    std::fs::write(&file_path, b"seed-data").expect("seed write failed");
+
+    println!("  Step 3: Re-open, extend to 4MB, write at 3MB; sync");
     {
         use std::os::unix::fs::FileExt;
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
             .open(&file_path)
-            .expect("create failed");
+            .expect("open rdwr failed");
         f.set_len(4 * 1024 * 1024).expect("set_len failed");
         f.write_all_at(b"data!", 3 * 1024 * 1024)
             .expect("data write failed");
         f.sync_all().expect("sync_all failed");
     }
 
-    println!("  Step 3: SEEK_DATA from offset 0 must skip the leading hole");
+    println!("  Step 4: SEEK_DATA from inside the hole must jump to the tail data block");
     use std::os::unix::io::AsRawFd;
     let f = std::fs::File::open(&file_path).expect("open ro failed");
     let fd = f.as_raw_fd();
 
-    let data_off = do_lseek(fd, 0, libc::SEEK_DATA).expect("SEEK_DATA from 0 failed");
+    let data_off = do_lseek(fd, BLOCK_SIZE as i64, libc::SEEK_DATA)
+        .expect("SEEK_DATA from inside hole failed");
     assert!(
-        data_off > 0 && data_off <= 3 * 1024 * 1024,
-        "SEEK_DATA returned {} (expected leading hole jump up to 3MB)",
+        data_off >= BLOCK_SIZE as i64 && data_off <= 3 * 1024 * 1024,
+        "SEEK_DATA returned {} (expected jump to the 3MB data block)",
         data_off
     );
 
-    println!("  Step 4: SEEK_HOLE from offset 0 should return offset 0 (leading hole)");
+    println!(
+        "  Step 5: SEEK_HOLE from offset 0 (block 0 has the seed) should land in the hole region"
+    );
     let hole_off = do_lseek(fd, 0, libc::SEEK_HOLE).expect("SEEK_HOLE from 0 failed");
-    assert_eq!(hole_off, 0, "SEEK_HOLE from start should be 0");
+    assert!(
+        hole_off >= BLOCK_SIZE as i64 && hole_off < 3 * 1024 * 1024,
+        "SEEK_HOLE returned {} (expected first hole offset between block 1 and 3MB)",
+        hole_off
+    );
 
-    println!("  Step 5: SEEK_HOLE from offset 3MB (mid-data) should advance past data");
+    println!("  Step 6: SEEK_HOLE from offset 3MB (mid-data) should advance past the data block");
     let after_data =
         do_lseek(fd, 3 * 1024 * 1024, libc::SEEK_HOLE).expect("SEEK_HOLE from 3MB failed");
     assert!(
@@ -2892,7 +2908,7 @@ async fn test_lseek_seek_data_hole(disk_cache: bool) -> CmdResult {
         after_data
     );
 
-    println!("  Step 6: SEEK_DATA past EOF must return ENXIO");
+    println!("  Step 7: SEEK_DATA past EOF must return ENXIO");
     let err =
         do_lseek(fd, 4 * 1024 * 1024, libc::SEEK_DATA).expect_err("SEEK_DATA past EOF must fail");
     assert_eq!(err, libc::ENXIO, "expected ENXIO past EOF, got {}", err);
