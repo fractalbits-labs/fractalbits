@@ -93,6 +93,12 @@ pub enum InodeOp {
         parent_key: S3Key,
         name: String,
         layout_bytes: Bytes,
+        /// `Some(prev_bytes)` enables CAS: the worker fires the entry
+        /// with `cas_check=true` and the put lands only when the
+        /// server's currently-stored bytes match `prev_bytes`. `None`
+        /// is the unconditional put used for fresh creates and the
+        /// symlink path.
+        expected_old_value: Option<Bytes>,
     },
     SetAttr {
         key: S3Key,
@@ -245,6 +251,10 @@ pub struct CyclePipelineState {
     /// FUSE_RELEASE to seal still-Pending stages and detach error
     /// routing onto the inode.
     pub contributors: BTreeSet<FhId>,
+    /// Final outcome reported by the worker. `InFlight` until the
+    /// cycle reaches `Done`. CAS-aware callers consult this to
+    /// distinguish a Stage-A CAS conflict from a generic failure.
+    pub outcome: CycleOutcome,
 }
 
 impl CyclePipelineState {
@@ -257,6 +267,7 @@ impl CyclePipelineState {
                 block_count,
             },
             contributors: BTreeSet::new(),
+            outcome: CycleOutcome::InFlight,
         }
     }
 
@@ -377,6 +388,21 @@ struct QueueInner {
 pub struct InodeErrorState {
     pub errseq: u32,
     pub tainted: bool,
+}
+
+/// Outcome of a single completed cycle. Surfaced to async-CAS callers
+/// so they can distinguish a CAS-conflict (caller must reopen) from a
+/// generic failure (caller surfaces EIO).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleOutcome {
+    /// Cycle still in flight (Pending or InFlight).
+    InFlight,
+    /// All stages reached `Done` cleanly.
+    Committed,
+    /// CAS conflict on Stage A. Worker reported STATUS_CAS_CONFLICT.
+    CasConflict,
+    /// Any other terminal failure.
+    Failed,
 }
 
 /// Per-fh last-seen errseq counter. Owned by the file-handle table;
@@ -904,14 +930,22 @@ impl WritebackQueue {
             if cycle.stage == FileCommitStage::StageACommitted {
                 cycle.stage = FileCommitStage::Done;
             }
+            cycle.outcome = CycleOutcome::Committed;
         }
     }
 
-    /// Apply a failed Stage A result: mark the inode tainted, bump
-    /// errseq so an open fh's next fsync surfaces EIO, and short-
-    /// circuit the cycle to `Done`. The application is expected to
-    /// close and reopen on the remote winner.
-    pub fn mark_stage_a_failed(&self, key: &str, generation: Generation, inode: u64) {
+    /// Apply a failed Stage A result. `is_cas_conflict` distinguishes
+    /// a CAS conflict (the only failure mode where the caller needs to
+    /// reopen) from generic failure. Either way the cycle short-
+    /// circuits to `Done`, the inode is tainted, and errseq is bumped
+    /// so any open fh's next fsync surfaces EIO.
+    pub fn mark_stage_a_failed(
+        &self,
+        key: &str,
+        generation: Generation,
+        inode: u64,
+        is_cas_conflict: bool,
+    ) {
         let mut inner = self.inner.lock().expect("writeback queue poisoned");
         let removed = inner
             .inode_intents
@@ -932,7 +966,25 @@ impl WritebackQueue {
             .and_then(|c| c.get_mut(&generation))
         {
             cycle.stage = FileCommitStage::Done;
+            cycle.outcome = if is_cas_conflict {
+                CycleOutcome::CasConflict
+            } else {
+                CycleOutcome::Failed
+            };
         }
+    }
+
+    /// Read the cycle's terminal outcome. Used by async-CAS wrappers
+    /// that enqueue + wait + need to surface the right errno
+    /// (CasConflict ⇒ ESTALE, anything else ⇒ EIO).
+    pub fn cycle_outcome(&self, inode: u64, generation: Generation) -> CycleOutcome {
+        let inner = self.inner.lock().expect("writeback queue poisoned");
+        inner
+            .file_pipeline
+            .get(&inode)
+            .and_then(|c| c.get(&generation))
+            .map(|c| c.outcome)
+            .unwrap_or(CycleOutcome::InFlight)
     }
 
     /// Advance a cycle's pipeline stage. The transitions follow the
@@ -1185,12 +1237,14 @@ fn coalesce_inode_pending(existing: &mut InodeOp, new: &InodeOp) -> CoalesceOutc
                 parent_key,
                 name,
                 layout_bytes,
+                expected_old_value,
             },
         ) => {
             *existing = InodeOp::PutInode {
                 parent_key: parent_key.clone(),
                 name: name.clone(),
                 layout_bytes: layout_bytes.clone(),
+                expected_old_value: expected_old_value.clone(),
             };
             CoalesceOutcome::ReplacedInPlace
         }
@@ -1399,6 +1453,7 @@ mod tests {
                 parent_key: "/a".to_string(),
                 name: "b".to_string(),
                 layout_bytes: Bytes::from_static(b"v1"),
+                expected_old_value: None,
             },
             FhId(1),
         );
@@ -1412,6 +1467,7 @@ mod tests {
                 parent_key: "/a".to_string(),
                 name: "b".to_string(),
                 layout_bytes: Bytes::from_static(b"v2"),
+                expected_old_value: None,
             },
             FhId(1),
         );
@@ -1832,6 +1888,7 @@ mod tests {
                 parent_key: "/".to_string(),
                 name: "foo".to_string(),
                 layout_bytes: Bytes::from_static(b"v1"),
+                expected_old_value: None,
             },
             FhId(7),
         );
@@ -1863,6 +1920,7 @@ mod tests {
                 parent_key: "/".to_string(),
                 name: "x".to_string(),
                 layout_bytes: Bytes::from_static(b""),
+                expected_old_value: None,
             },
             FhId(1),
         );
@@ -1889,12 +1947,13 @@ mod tests {
                 parent_key: "/".to_string(),
                 name: "y".to_string(),
                 layout_bytes: Bytes::from_static(b""),
+                expected_old_value: None,
             },
             FhId(2),
         );
         let _ = q.drain_stage_a(8);
 
-        q.mark_stage_a_failed("/y", Generation(0), 9);
+        q.mark_stage_a_failed("/y", Generation(0), 9, false);
 
         assert_eq!(q.depth(), 0);
         assert!(q.is_tainted(9));

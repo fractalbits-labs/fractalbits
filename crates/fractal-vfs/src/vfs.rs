@@ -1761,7 +1761,38 @@ impl VfsCore {
         // close + reopen. Non-override (initial-create) and the
         // missing-bytes fallback (no read at open) keep the original
         // unconditional put_inode path.
-        let old_bytes = if is_override && let Some(expected) = expected_layout_bytes {
+        // Default mode routes Stage A through the writeback queue so
+        // multiple concurrent flushes coalesce into one InodeBatch
+        // RPC instead of N round-trips. Strict mode keeps the
+        // existing direct path. The queue path returns Ok on success
+        // (we drop the would-be old_bytes since the replace-flush
+        // cleanup logic below only runs when !is_override anyway, and
+        // the queue path is best-effort about reporting prev bytes).
+        let old_bytes = if self.writeback_mode_is_default() {
+            // Resolve inode from the active fh; we need it for the
+            // per-cycle pipeline state.
+            let inode = self.file_handles.get(&fh_id).map(|h| h.ino).unwrap_or(0);
+            let parent_key = parent_prefix_of(s3_key);
+            let name = s3_key
+                .rsplit_once('/')
+                .map(|(_, n)| n.to_string())
+                .unwrap_or_else(|| s3_key.to_string());
+            let expected = if is_override {
+                expected_layout_bytes
+            } else {
+                None
+            };
+            self.put_inode_via_queue(
+                inode,
+                s3_key,
+                &parent_key,
+                &name,
+                layout_bytes.clone(),
+                expected,
+            )
+            .await?;
+            Bytes::new()
+        } else if is_override && let Some(expected) = expected_layout_bytes {
             self.backend()
                 .put_inode_cas(s3_key, layout_bytes.clone(), expected, trace_id)
                 .await?
@@ -3010,6 +3041,73 @@ impl VfsCore {
         Ok(())
     }
 
+    /// Queue-aware put_inode that the worker batches across concurrent
+    /// callers. Enqueues an `InodeOp::PutInode` (with optional
+    /// `expected_old_value` for CAS), waits for the cycle to drain,
+    /// and surfaces the right errno on failure:
+    ///   * Ok(()) on success
+    ///   * Err(CasConflict) on STATUS_CAS_CONFLICT (caller must reopen)
+    ///   * Err(Internal) on any other failure
+    ///
+    /// Used by flush_write_buffer in default mode so vfs_release
+    /// flush traffic actually rides the InodeBatch path. Strict mode
+    /// keeps the direct backend.put_inode_cas call.
+    pub async fn put_inode_via_queue(
+        &self,
+        inode: u64,
+        s3_key: &str,
+        parent_key: &str,
+        name: &str,
+        layout_bytes: Bytes,
+        expected_old_value: Option<Bytes>,
+    ) -> Result<(), FsError> {
+        self.ensure_writeback_worker_started();
+
+        use crate::writeback::{CycleOutcome, FhId};
+        let generation = self.allocate_flush_generation(inode);
+        self.writeback
+            .open_cycle(inode, generation, layout_bytes.len() as u64, 0);
+        self.writeback.upsert_inode_intent(
+            s3_key.to_string(),
+            generation,
+            WbInodeOp::PutInode {
+                parent_key: parent_key.to_string(),
+                name: name.to_string(),
+                layout_bytes,
+                expected_old_value,
+            },
+            FhId(0),
+        );
+
+        // Poll until the cycle completes. The worker drains every
+        // poll_ms (~50ms) so a single flush typically waits no more
+        // than that. The drain loop bound matches drain_inode_to_barrier.
+        let poll_dur = Duration::from_millis(5);
+        let timeout_secs = self.backend_config.config.rpc_request_timeout_seconds * 4;
+        let deadline = SystemTime::now() + Duration::from_secs(timeout_secs);
+        loop {
+            let outcome = self.writeback.cycle_outcome(inode, generation);
+            match outcome {
+                CycleOutcome::Committed => return Ok(()),
+                CycleOutcome::CasConflict => return Err(FsError::CasConflict),
+                CycleOutcome::Failed => {
+                    return Err(FsError::Internal("writeback put_inode failed".to_string()));
+                }
+                CycleOutcome::InFlight => {
+                    if SystemTime::now() > deadline {
+                        tracing::warn!(
+                            inode,
+                            generation = generation.0,
+                            "put_inode_via_queue timeout"
+                        );
+                        return Err(FsError::Internal("writeback put_inode timeout".to_string()));
+                    }
+                    compio_runtime::time::sleep(poll_dur).await;
+                }
+            }
+        }
+    }
+
     /// Drain every writeback cycle for `inode` whose generation is
     /// at or below the barrier captured at entry. Returns when every
     /// cycle has reached `Done` (success or short-circuit on failure).
@@ -3214,6 +3312,9 @@ impl VfsCore {
                         parent_key: prefix.clone(),
                         name: name.to_string(),
                         layout_bytes,
+                        // Symlinks are brand-new entries -- no CAS
+                        // guard. Worker uses unconditional put_inode.
+                        expected_old_value: None,
                     },
                     // No fh is allocated for symlinks (the kernel does
                     // not call open() on the link itself); use a
@@ -3745,15 +3846,23 @@ fn spawn_writeback_worker(
                 let mut nss_key = intent.s3_key.clone();
                 nss_key.push('\0');
                 match &intent.op {
-                    WbInodeOp::PutInode { layout_bytes, .. } => {
+                    WbInodeOp::PutInode {
+                        layout_bytes,
+                        expected_old_value,
+                        ..
+                    } => {
+                        let (cas_check, prev) = match expected_old_value {
+                            Some(b) => (true, b.clone()),
+                            None => (false, bytes::Bytes::new()),
+                        };
                         batch_entries.push(nss_codec::InodeBatchEntry {
                             depends_on_index: vec![],
                             op: Some(nss_codec::inode_batch_entry::Op::Put(
                                 nss_codec::PutInodeBatchEntry {
                                     key: nss_key,
                                     value: layout_bytes.clone(),
-                                    cas_check: false,
-                                    expected_old_value: bytes::Bytes::new(),
+                                    cas_check,
+                                    expected_old_value: prev,
                                 },
                             )),
                         });
@@ -3794,7 +3903,7 @@ fn spawn_writeback_worker(
                     );
                     for intent in &drained {
                         let inode = inode_for_intent(&queue, intent);
-                        queue.mark_stage_a_failed(&intent.s3_key, intent.generation, inode);
+                        queue.mark_stage_a_failed(&intent.s3_key, intent.generation, inode, false);
                     }
                 }
                 Ok(results) if results.len() != drained.len() => {
@@ -3805,7 +3914,7 @@ fn spawn_writeback_worker(
                     );
                     for intent in &drained {
                         let inode = inode_for_intent(&queue, intent);
-                        queue.mark_stage_a_failed(&intent.s3_key, intent.generation, inode);
+                        queue.mark_stage_a_failed(&intent.s3_key, intent.generation, inode, false);
                     }
                 }
                 Ok(results) => {
@@ -3821,6 +3930,19 @@ fn spawn_writeback_worker(
                                     inode,
                                 );
                             }
+                            nss_codec::BatchEntryStatus::StatusCasConflict => {
+                                tracing::warn!(
+                                    key = %intent.s3_key,
+                                    generation = intent.generation.0,
+                                    "writeback Stage A CAS conflict"
+                                );
+                                queue.mark_stage_a_failed(
+                                    &intent.s3_key,
+                                    intent.generation,
+                                    inode,
+                                    true,
+                                );
+                            }
                             _ => {
                                 tracing::warn!(
                                     key = %intent.s3_key,
@@ -3829,7 +3951,12 @@ fn spawn_writeback_worker(
                                     error = %result.error_message,
                                     "writeback Stage A entry failed"
                                 );
-                                queue.mark_stage_a_failed(&intent.s3_key, intent.generation, inode);
+                                queue.mark_stage_a_failed(
+                                    &intent.s3_key,
+                                    intent.generation,
+                                    inode,
+                                    false,
+                                );
                             }
                         }
                     }
