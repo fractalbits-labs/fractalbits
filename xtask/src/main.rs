@@ -528,6 +528,10 @@ pub struct FsServerConfig {
     pub disk_cache_enabled: bool,
     pub disk_cache_path: String,
     pub disk_cache_size_gb: u64,
+    /// Writeback durability mode passed through to fs_server via the
+    /// `FS_SERVER_WRITEBACK_MODE` env var. Empty string = use the
+    /// fs_server config default (`strict`).
+    pub writeback_mode: String,
 }
 
 impl Default for InitConfig {

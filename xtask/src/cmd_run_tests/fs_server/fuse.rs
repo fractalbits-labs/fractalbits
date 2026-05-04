@@ -33,6 +33,57 @@ fn fs_server_config(bucket: &str, read_write: bool, disk_cache: bool) -> FsServe
     cfg
 }
 
+/// Same as `mount_fuse_with_opts` but sets `writeback_mode = "default"`
+/// so the writeback queue / worker are active for this mount.
+fn mount_fuse_writeback(bucket: &str, read_write: bool, disk_cache: bool) -> CmdResult {
+    let mount_point = MOUNT_POINT;
+
+    run_cmd! {
+        ignore fusermount3 -u $mount_point 2>/dev/null;
+        ignore fusermount -u $mount_point 2>/dev/null;
+    }?;
+    run_cmd!(mkdir -p $mount_point)?;
+    if disk_cache {
+        let dc_path = disk_cache_path();
+        run_cmd!(mkdir -p $dc_path)?;
+    }
+    let mut fs_cfg = fs_server_config(bucket, read_write, disk_cache);
+    fs_cfg.writeback_mode = "default".to_string();
+    let init_config = InitConfig {
+        fs_server: fs_cfg,
+        ..Default::default()
+    };
+    cmd_service::init_service(
+        ServiceName::FsServer,
+        crate::cmd_build::BuildMode::Debug,
+        &init_config,
+    )?;
+    cmd_service::start_service(ServiceName::FsServer)?;
+
+    for i in 0..20 {
+        std::thread::sleep(Duration::from_millis(500));
+        let status = std::process::Command::new("mountpoint")
+            .arg("-q")
+            .arg(mount_point)
+            .status();
+        if let Ok(s) = status
+            && s.success()
+        {
+            println!(
+                "    FUSE (writeback=default) mounted at {} (after {}ms)",
+                mount_point,
+                (i + 1) * 500
+            );
+            return Ok(());
+        }
+    }
+
+    Err(std::io::Error::other(format!(
+        "FUSE mount at {} not ready after 10 seconds",
+        mount_point
+    )))
+}
+
 fn mount_fuse_ro(bucket: &str, disk_cache: bool) -> CmdResult {
     mount_fuse_with_opts(bucket, false, disk_cache)
 }
@@ -238,6 +289,10 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     run_test!(
         "Symlink (create / readlink / lstat / unlink)",
         test_symlink_basic
+    );
+    run_test!(
+        "Writeback default mode (symlink commit via async worker)",
+        test_writeback_default_mode_symlink
     );
     run_test!("Rename", test_rename);
     run_test!("Unlink with Open Handle", test_unlink_open_handle);
@@ -825,6 +880,82 @@ async fn test_symlink_basic(disk_cache: bool) -> CmdResult {
 
     unmount_fuse()?;
     println!("{}", "SUCCESS: symlink basic test passed".green());
+    Ok(())
+}
+
+/// Exercise the writeback-default-mode path end-to-end. With
+/// `writeback_mode = "default"`, vfs_symlink enqueues the
+/// `InodeIntent::PutInode` instead of firing NSS synchronously; the
+/// background worker drains the queue ~50ms later. The test:
+///   1. Mounts FUSE in writeback default mode.
+///   2. Creates a symlink (returns immediately to the kernel).
+///   3. Verifies the local view (readlink) sees it instantly.
+///   4. Polls until the kernel-side dir listing also shows it -- this
+///      proves the worker actually committed via NSS, not just the
+///      local InodeTable.
+///   5. Unmounts to flush the queue at destroy.
+///   6. Re-mounts in *strict* mode and confirms the symlink is durable
+///      (readlink succeeds against a freshly-spawned fs_server with no
+///      InodeTable cache holdover).
+async fn test_writeback_default_mode_symlink(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_writeback(&bucket, true, disk_cache)?;
+
+    println!("  Step 2: Create a symlink via FUSE_SYMLINK");
+    let link_path = format!("{}/wb-symlink", MOUNT_POINT);
+    let target = "../etc/wb-target";
+    std::os::unix::fs::symlink(target, &link_path).expect("FUSE_SYMLINK failed");
+    println!("    enqueued: wb-symlink -> {}", target);
+
+    println!("  Step 3: Local view must surface the symlink immediately");
+    let resolved = std::fs::read_link(&link_path).expect("local readlink failed");
+    assert_eq!(
+        resolved.to_str().unwrap(),
+        target,
+        "local readlink saw stale target"
+    );
+
+    println!("  Step 4: Wait for the worker to commit to NSS (poll up to 5s)");
+    let mount_point = MOUNT_POINT;
+    let mut committed = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        // dir listing goes through the FUSE -> vfs_readdir -> NSS
+        // ListInodes path; hitting a freshly-listed entry proves NSS
+        // persisted the write.
+        let entries: Vec<_> = std::fs::read_dir(mount_point)
+            .expect("readdir failed")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        if entries.iter().any(|n| n == "wb-symlink") {
+            committed = true;
+            break;
+        }
+    }
+    assert!(
+        committed,
+        "worker failed to commit symlink within 5s; default-mode pipeline broken"
+    );
+    println!("    NSS commit observed via dir listing");
+
+    println!("  Step 5: Unmount (drains residual queue, blocks new enqueues)");
+    unmount_fuse()?;
+
+    println!("  Step 6: Re-mount in strict mode; symlink must be durable");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let resolved2 = std::fs::read_link(&link_path).expect("post-remount readlink failed");
+    assert_eq!(resolved2.to_str().unwrap(), target);
+
+    let _ = std::fs::remove_file(&link_path);
+    unmount_fuse()?;
+
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode symlink path passed".green()
+    );
     Ok(())
 }
 

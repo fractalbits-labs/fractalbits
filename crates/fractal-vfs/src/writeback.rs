@@ -384,6 +384,17 @@ pub struct InodeErrorState {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FhErrSeq(pub u32);
 
+/// A Stage A intent the worker has popped and is about to ship to NSS.
+/// Carries everything needed to fire the RPC and to route the result
+/// back via `mark_stage_a_committed` / `mark_stage_a_failed`.
+#[derive(Debug, Clone)]
+pub struct DrainableInodeIntent {
+    pub s3_key: S3Key,
+    pub generation: Generation,
+    pub op: InodeOp,
+    pub fhs: Vec<FhId>,
+}
+
 /// Per-block content for the pending-data overlay. Mirrors the
 /// per-handle WriteBuffer's `BlockState` shape so the cross-handle
 /// view stays in sync with what individual writers buffered.
@@ -585,6 +596,21 @@ impl WritebackQueue {
     /// exporter.
     pub fn telemetry(&self) -> QueueState {
         self.inner.lock().expect("writeback queue poisoned").state
+    }
+
+    /// Reverse-map: find any inode whose pipeline holds a cycle at
+    /// `generation`. Used by the worker to route per-intent results
+    /// back to the owning inode's cycle / errseq state. Returns `None`
+    /// when no inode has a cycle at this generation (the cycle was
+    /// already drained).
+    pub fn inode_for_generation(&self, generation: Generation) -> Option<u64> {
+        let inner = self.inner.lock().expect("writeback queue poisoned");
+        for (ino, cycles) in inner.file_pipeline.iter() {
+            if cycles.contains_key(&generation) {
+                return Some(*ino);
+            }
+        }
+        None
     }
 
     /// Active generation for an inode, or `Generation(0)` if none has
@@ -789,6 +815,124 @@ impl WritebackQueue {
             .expect("writeback queue poisoned")
             .state
             .depth
+    }
+
+    /// Pop up to `max_batch` Pending Stage A intents whose dependencies
+    /// are satisfied, mark them InFlight, and return drainable
+    /// snapshots for the worker to ship. Each cycle whose Stage A is
+    /// in this batch is sealed and advanced to `StageAQueued`.
+    pub fn drain_stage_a(&self, max_batch: usize) -> Vec<DrainableInodeIntent> {
+        let mut inner = self.inner.lock().expect("writeback queue poisoned");
+        let mut out = Vec::new();
+
+        let candidate_keys: Vec<(S3Key, Generation)> = inner
+            .inode_intents
+            .iter()
+            .filter(|(_, intent)| intent.state == IntentState::Pending)
+            .map(|(key, _)| key.clone())
+            .take(max_batch)
+            .collect();
+
+        for key in candidate_keys {
+            let intent = match inner.inode_intents.get_mut(&key) {
+                Some(i) => i,
+                None => continue,
+            };
+            if intent.state != IntentState::Pending {
+                continue;
+            }
+            let drainable = DrainableInodeIntent {
+                s3_key: key.0.clone(),
+                generation: key.1,
+                op: intent.op.clone(),
+                fhs: intent.fhs.clone(),
+            };
+            intent.state = IntentState::InFlight;
+            out.push(drainable);
+        }
+
+        // Promote each owning cycle to StageAQueued + sealed.
+        for d in &out {
+            let mut to_advance: Vec<(u64, Generation)> = Vec::new();
+            for (ino, cycles) in inner.file_pipeline.iter() {
+                if let Some(cycle) = cycles.get(&d.generation)
+                    && cycle.stage == FileCommitStage::Idle
+                {
+                    to_advance.push((*ino, d.generation));
+                }
+            }
+            for (ino, generation) in to_advance {
+                let cycle = inner
+                    .file_pipeline
+                    .get_mut(&ino)
+                    .and_then(|c| c.get_mut(&generation));
+                if let Some(cycle) = cycle {
+                    cycle.seal();
+                    cycle.stage = FileCommitStage::StageAQueued;
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Apply a successful Stage A result. The intent is removed from
+    /// the queue and the depth counter decremented; the inode's cycle
+    /// is advanced through `StageACommitted` to `Done`. (Phase 1a has
+    /// no Stage B/C/D worker yet, so Stage A short-circuits directly
+    /// to `Done` for the create-only path. When Stage B work lands,
+    /// this routine stops at `StageACommitted` and the next stage
+    /// driver picks up.)
+    pub fn mark_stage_a_committed(&self, key: &str, generation: Generation, inode: u64) {
+        let mut inner = self.inner.lock().expect("writeback queue poisoned");
+        let removed = inner
+            .inode_intents
+            .remove(&(key.to_string(), generation))
+            .is_some();
+        if removed {
+            inner.state.depth = inner.state.depth.saturating_sub(1);
+        }
+
+        if let Some(cycle) = inner
+            .file_pipeline
+            .get_mut(&inode)
+            .and_then(|c| c.get_mut(&generation))
+        {
+            if cycle.stage == FileCommitStage::StageAQueued {
+                cycle.stage = FileCommitStage::StageACommitted;
+            }
+            if cycle.stage == FileCommitStage::StageACommitted {
+                cycle.stage = FileCommitStage::Done;
+            }
+        }
+    }
+
+    /// Apply a failed Stage A result: mark the inode tainted, bump
+    /// errseq so an open fh's next fsync surfaces EIO, and short-
+    /// circuit the cycle to `Done`. The application is expected to
+    /// close and reopen on the remote winner.
+    pub fn mark_stage_a_failed(&self, key: &str, generation: Generation, inode: u64) {
+        let mut inner = self.inner.lock().expect("writeback queue poisoned");
+        let removed = inner
+            .inode_intents
+            .remove(&(key.to_string(), generation))
+            .is_some();
+        if removed {
+            inner.state.depth = inner.state.depth.saturating_sub(1);
+        }
+
+        let entry = inner.errseq.entry(inode).or_default();
+        entry.errseq = entry.errseq.wrapping_add(1);
+        entry.tainted = true;
+        inner.state.deferred_errors = inner.state.deferred_errors.saturating_add(1);
+
+        if let Some(cycle) = inner
+            .file_pipeline
+            .get_mut(&inode)
+            .and_then(|c| c.get_mut(&generation))
+        {
+            cycle.stage = FileCommitStage::Done;
+        }
     }
 
     /// Advance a cycle's pipeline stage. The transitions follow the
@@ -1655,6 +1799,91 @@ mod tests {
         assert!(q.is_enqueue_blocked());
         q.set_enqueue_blocked(false);
         assert!(!q.is_enqueue_blocked());
+    }
+
+    // ── Stage A drainer ────────────────────────────────────────────
+
+    #[test]
+    fn drain_stage_a_pops_pending_and_seals_the_cycle() {
+        let q = WritebackQueue::new();
+        // Open a cycle for inode 42 at gen 0.
+        q.open_cycle(42, Generation(0), 0, 0);
+        let r = q.upsert_inode_intent(
+            "/foo".to_string(),
+            Generation(0),
+            InodeOp::PutInode {
+                parent_key: "/".to_string(),
+                name: "foo".to_string(),
+                layout_bytes: Bytes::from_static(b"v1"),
+            },
+            FhId(7),
+        );
+        assert_eq!(r, CoalesceOutcome::Inserted);
+
+        let drained = q.drain_stage_a(64);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].s3_key, "/foo");
+        assert_eq!(drained[0].generation, Generation(0));
+        assert!(drained[0].fhs.contains(&FhId(7)));
+
+        // Cycle must now be sealed and at StageAQueued.
+        let st = q.cycle_state(42, Generation(0)).unwrap();
+        assert_eq!(st.stage, FileCommitStage::StageAQueued);
+        assert!(st.terminal_size.is_sealed());
+
+        // Re-draining is a no-op (intent is now InFlight).
+        assert_eq!(q.drain_stage_a(64).len(), 0);
+    }
+
+    #[test]
+    fn mark_stage_a_committed_drives_cycle_to_done() {
+        let q = WritebackQueue::new();
+        q.open_cycle(7, Generation(0), 0, 0);
+        q.upsert_inode_intent(
+            "/x".to_string(),
+            Generation(0),
+            InodeOp::PutInode {
+                parent_key: "/".to_string(),
+                name: "x".to_string(),
+                layout_bytes: Bytes::from_static(b""),
+            },
+            FhId(1),
+        );
+        let drained = q.drain_stage_a(8);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(q.depth(), 1);
+
+        q.mark_stage_a_committed("/x", Generation(0), 7);
+
+        // Depth must drop and the cycle advance to Done.
+        assert_eq!(q.depth(), 0);
+        let st = q.cycle_state(7, Generation(0)).unwrap();
+        assert_eq!(st.stage, FileCommitStage::Done);
+    }
+
+    #[test]
+    fn mark_stage_a_failed_taints_inode_and_bumps_errseq() {
+        let q = WritebackQueue::new();
+        q.open_cycle(9, Generation(0), 0, 0);
+        q.upsert_inode_intent(
+            "/y".to_string(),
+            Generation(0),
+            InodeOp::PutInode {
+                parent_key: "/".to_string(),
+                name: "y".to_string(),
+                layout_bytes: Bytes::from_static(b""),
+            },
+            FhId(2),
+        );
+        let _ = q.drain_stage_a(8);
+
+        q.mark_stage_a_failed("/y", Generation(0), 9);
+
+        assert_eq!(q.depth(), 0);
+        assert!(q.is_tainted(9));
+        assert_eq!(q.errseq(9), 1);
+        let st = q.cycle_state(9, Generation(0)).unwrap();
+        assert_eq!(st.stage, FileCommitStage::Done);
     }
 
     #[test]

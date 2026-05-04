@@ -208,6 +208,9 @@ impl Config {
         if let Ok(v) = std::env::var("FS_SERVER_WORKER_THREADS") {
             self.worker_threads = v.parse().unwrap_or(self.worker_threads);
         }
+        if let Ok(v) = std::env::var("FS_SERVER_WRITEBACK_MODE") {
+            self.writeback.mode = v;
+        }
     }
 }
 
