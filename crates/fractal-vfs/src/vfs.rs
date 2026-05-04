@@ -1178,9 +1178,12 @@ impl VfsCore {
 
     async fn flush_write_buffer(&self, fh_id: u64) -> Result<(), FsError> {
         // Snapshot the WriteBuffer and detach its block map so we can
-        // run async work outside the DashMap guard. If anything fails
-        // after this point the handle is left with `dirty=false` and an
-        // empty intent map; the caller retries by writing again.
+        // run async work outside the DashMap guard. The block map is
+        // moved out to avoid holding the DashMap guard across awaits;
+        // if any post-snapshot step fails, restore_blocks_on_failure
+        // puts them back so the next flush invocation retries the
+        // same work (forward retry). On success the deferred state is
+        // cleared at the end of the function.
         let (
             s3_key,
             file_size,
@@ -1216,7 +1219,96 @@ impl VfsCore {
         };
 
         let trace_id = TraceId::new();
+
+        // Run the post-snapshot BSS + NSS work. On any error, restore
+        // the blocks back into wb so the next flush retries them.
+        let result = self
+            .flush_publish(
+                fh_id,
+                &s3_key,
+                file_size,
+                committed_size,
+                committed_blob_version,
+                existing_blob_guid,
+                block_size,
+                &blocks,
+                &trace_id,
+            )
+            .await;
+
+        let layout = match result {
+            Ok(layout) => layout,
+            Err(e) => {
+                // Restore blocks for forward-retry. The handle's
+                // single-writer invariant means no concurrent vfs_write
+                // ran during this call, so the slot we took the blocks
+                // out of is still empty and the put-back is a direct
+                // assignment.
+                if let Some(mut handle) = self.file_handles.get_mut(&fh_id)
+                    && let Some(ref mut wb) = handle.write_buf
+                {
+                    if wb.blocks.is_empty() {
+                        wb.blocks = blocks;
+                    } else {
+                        for (b, state) in blocks {
+                            wb.blocks.entry(b).or_insert(state);
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        };
+
+        // Update file handle with new layout and clear deferred state.
+        // The committed file_size has just been published so the buffer
+        // becomes clean; existing_blob_guid is updated so subsequent
+        // partial-block edits lazy-load from the new blob.
+        if let Some(mut handle) = self.file_handles.get_mut(&fh_id) {
+            handle.layout = Some(layout.clone());
+            if let Some(ref mut wb) = handle.write_buf {
+                wb.dirty = false;
+                wb.size_changed = false;
+                wb.existing_blob_guid = layout.blob_guid().ok();
+                wb.block_size = block_size;
+                // wb.blocks already drained when we took it out above.
+            }
+        }
+
+        // Update inode table layout
+        {
+            let handle = self.file_handles.get(&fh_id);
+            if let Some(handle) = handle
+                && let Some(mut entry) = self.inodes.get_mut(handle.ino)
+            {
+                entry.layout = Some(layout);
+            }
+        }
+
+        // Invalidate dir cache for parent prefix
+        let parent_prefix = parent_prefix_of(&s3_key);
+        self.dir_cache.invalidate(&parent_prefix);
+
+        Ok(())
+    }
+
+    /// Publish the buffered changes to BSS + NSS. Returns the new
+    /// `ObjectLayout` on success. Failure leaves the caller responsible
+    /// for restoring `wb.blocks` so a subsequent flush can retry.
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_publish(
+        &self,
+        fh_id: u64,
+        s3_key: &str,
+        file_size: u64,
+        committed_size: u64,
+        committed_blob_version: u64,
+        existing_blob_guid: Option<data_types::DataBlobGuid>,
+        block_size: u32,
+        blocks: &std::collections::BTreeMap<u32, BlockState>,
+        trace_id: &TraceId,
+    ) -> Result<ObjectLayout, FsError> {
         let block_size_usize = block_size as usize;
+        let _ = fh_id; // currently unused; reserved for future per-handle context
 
         // Override-flush vs replace-flush dispatch.
         //
@@ -1249,21 +1341,14 @@ impl VfsCore {
                     block_size,
                     file_size,
                     committed_size,
-                    &blocks,
-                    &trace_id,
+                    blocks,
+                    trace_id,
                 )
                 .await?;
                 (guid, new_version, true)
             } else {
                 let data = self
-                    .materialize_for_flush(
-                        None,
-                        file_size,
-                        0,
-                        block_size,
-                        &blocks,
-                        &trace_id,
-                    )
+                    .materialize_for_flush(None, file_size, 0, block_size, blocks, trace_id)
                     .await?;
                 let blob_guid = self.backend().create_blob_guid();
                 let num_blocks = if data.is_empty() {
@@ -1277,7 +1362,7 @@ impl VfsCore {
                     let chunk = data.slice(start..end);
                     let padded = pad_to_block_size(chunk, block_size_usize);
                     self.backend()
-                        .write_block(blob_guid, block_i as u32, padded, 1, &trace_id)
+                        .write_block(blob_guid, block_i as u32, padded, 1, trace_id)
                         .await?;
                 }
                 (blob_guid, 1, false)
@@ -1302,7 +1387,7 @@ impl VfsCore {
         );
         if let Err(e) = self
             .backend()
-            .write_parent_inode(final_blob_guid, parent_meta, &trace_id)
+            .write_parent_inode(final_blob_guid, parent_meta, trace_id)
             .await
         {
             tracing::warn!(
@@ -1343,7 +1428,7 @@ impl VfsCore {
         // Put inode in NSS, get old object bytes
         let old_bytes = self
             .backend()
-            .put_inode(&s3_key, layout_bytes, &trace_id)
+            .put_inode(s3_key, layout_bytes, trace_id)
             .await?;
 
         // Replace flush only: clean up the old blob's blocks if NSS had
@@ -1358,40 +1443,11 @@ impl VfsCore {
             && old_layout.blob_guid().ok() != Some(final_blob_guid)
         {
             self.backend()
-                .delete_blob_blocks(&old_layout, &trace_id)
+                .delete_blob_blocks(&old_layout, trace_id)
                 .await;
         }
 
-        // Update file handle with new layout and clear deferred state.
-        // The committed file_size has just been published so the buffer
-        // becomes clean; existing_blob_guid is updated so subsequent
-        // partial-block edits lazy-load from the new blob.
-        if let Some(mut handle) = self.file_handles.get_mut(&fh_id) {
-            handle.layout = Some(layout.clone());
-            if let Some(ref mut wb) = handle.write_buf {
-                wb.dirty = false;
-                wb.size_changed = false;
-                wb.existing_blob_guid = Some(final_blob_guid);
-                wb.block_size = block_size;
-                // wb.blocks already drained when we took it out above.
-            }
-        }
-
-        // Update inode table layout
-        {
-            let handle = self.file_handles.get(&fh_id);
-            if let Some(handle) = handle
-                && let Some(mut entry) = self.inodes.get_mut(handle.ino)
-            {
-                entry.layout = Some(layout);
-            }
-        }
-
-        // Invalidate dir cache for parent prefix
-        let parent_prefix = parent_prefix_of(&s3_key);
-        self.dir_cache.invalidate(&parent_prefix);
-
-        Ok(())
+        Ok(layout)
     }
 
     async fn fetch_dir_entries(
