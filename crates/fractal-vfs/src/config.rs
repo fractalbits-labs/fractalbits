@@ -1,6 +1,112 @@
 use serde::Deserialize;
 use std::time::Duration;
 
+/// Writeback-cache durability mode.
+///
+/// `Strict` is the legacy synchronous path: every FUSE op blocks until
+/// the corresponding NSS / BSS RPC completes. `Default` enables the
+/// writeback fast path for the enabled operation slice and falls back
+/// to strict for the rest.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WritebackMode {
+    #[default]
+    Strict,
+    Default,
+}
+
+#[allow(dead_code)]
+impl WritebackMode {
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "default" => WritebackMode::Default,
+            _ => WritebackMode::Strict,
+        }
+    }
+
+    pub fn is_strict(&self) -> bool {
+        matches!(self, WritebackMode::Strict)
+    }
+}
+
+/// Writeback knobs. All fields have safe defaults that keep the queue
+/// in strict mode until the workload validation gate passes.
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone)]
+pub struct WritebackConfig {
+    /// Mode string; `strict` (default) or `default`. Loose mode is
+    /// not exposed today.
+    #[serde(default = "default_writeback_mode")]
+    pub mode: String,
+    #[serde(default = "default_max_batch_size")]
+    pub max_batch_size: u32,
+    #[serde(default = "default_max_batch_wait_ms")]
+    pub max_batch_wait_ms: u32,
+    #[serde(default = "default_max_retry_duration_ms")]
+    pub max_retry_duration_ms: u32,
+    #[serde(default = "default_max_inflight_age_ms")]
+    pub max_inflight_age_ms: u32,
+    #[serde(default = "default_worker_pool_size")]
+    pub worker_pool_size: u32,
+    #[serde(default = "default_queue_capacity_mb")]
+    pub queue_capacity_mb: u32,
+}
+
+fn default_writeback_mode() -> String {
+    "strict".to_string()
+}
+fn default_max_batch_size() -> u32 {
+    1024
+}
+fn default_max_batch_wait_ms() -> u32 {
+    50
+}
+fn default_max_retry_duration_ms() -> u32 {
+    30_000
+}
+fn default_max_inflight_age_ms() -> u32 {
+    60_000
+}
+fn default_worker_pool_size() -> u32 {
+    8
+}
+fn default_queue_capacity_mb() -> u32 {
+    16
+}
+
+fn default_prefetch_full_threshold_mb() -> u64 {
+    256
+}
+
+fn default_prefetch_partial_threshold_mb() -> u64 {
+    4096
+}
+
+fn default_prefetch_pressure_decline() -> f64 {
+    0.90
+}
+
+#[allow(dead_code)]
+impl WritebackConfig {
+    pub fn parsed_mode(&self) -> WritebackMode {
+        WritebackMode::from_str_lossy(&self.mode)
+    }
+}
+
+impl Default for WritebackConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_writeback_mode(),
+            max_batch_size: default_max_batch_size(),
+            max_batch_wait_ms: default_max_batch_wait_ms(),
+            max_retry_duration_ms: default_max_retry_duration_ms(),
+            max_inflight_age_ms: default_max_inflight_age_ms(),
+            worker_pool_size: default_worker_pool_size(),
+            queue_capacity_mb: default_queue_capacity_mb(),
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub rss_addrs: Vec<String>,
@@ -29,6 +135,28 @@ pub struct Config {
     pub disk_cache_size_gb: u64,
     pub passthrough_enabled: bool,
     pub passthrough_max_object_size_gb: u64,
+
+    /// Open-time whole-blob prefetch threshold. Files at or below this
+    /// size always prefetch on open. Default 256 MiB.
+    #[serde(default = "default_prefetch_full_threshold_mb")]
+    pub prefetch_full_threshold_mb: u64,
+    /// Larger files prefetch only when the kernel sets `FOPEN_KEEP_CACHE`
+    /// (a sequential / bulk-read hint) and the file is at or below this
+    /// size. Default 4096 MiB.
+    #[serde(default = "default_prefetch_partial_threshold_mb")]
+    pub prefetch_partial_threshold_mb: u64,
+    /// Per-volume opt-in: always prefetch regardless of size hints.
+    /// Suitable for log / training / backup workloads.
+    #[serde(default)]
+    pub workload_bulk_read: bool,
+    /// Decline prefetch when current disk-cache usage is at or above
+    /// this fraction of capacity (0.0-1.0). Default 0.90.
+    #[serde(default = "default_prefetch_pressure_decline")]
+    pub prefetch_pressure_decline: f64,
+
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub writeback: WritebackConfig,
 }
 
 impl Config {
@@ -104,6 +232,11 @@ impl Default for Config {
             disk_cache_size_gb: 50,
             passthrough_enabled: false,
             passthrough_max_object_size_gb: 10,
+            prefetch_full_threshold_mb: default_prefetch_full_threshold_mb(),
+            prefetch_partial_threshold_mb: default_prefetch_partial_threshold_mb(),
+            workload_bulk_read: false,
+            prefetch_pressure_decline: default_prefetch_pressure_decline(),
+            writeback: WritebackConfig::default(),
         }
     }
 }

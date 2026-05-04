@@ -85,13 +85,14 @@ struct FileHandle {
 pub struct VfsCore {
     backend_config: Arc<BackendConfig>,
     inodes: Arc<InodeTable>,
-    disk_cache: Option<DiskCache>,
+    disk_cache: Option<Arc<DiskCache>>,
     dir_cache: DirCache,
     file_handles: DashMap<u64, FileHandle>,
     next_fh: AtomicU64,
     read_write: bool,
     passthrough_enabled: bool,
     passthrough_max_object_size: u64,
+    prefetch_policy: crate::prefetch::PrefetchPolicy,
     fuse_dev_fd: Option<Arc<OwnedFd>>,
     // Tracks blob data for unlinked files that still have open handles.
     // Cleanup is deferred until the last handle is released.
@@ -124,7 +125,7 @@ impl VfsCore {
                         size_gb = config.disk_cache_size_gb,
                         "disk cache enabled"
                     );
-                    Some(dc)
+                    Some(Arc::new(dc))
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to init disk cache, falling back to no cache");
@@ -138,6 +139,7 @@ impl VfsCore {
         let passthrough_enabled = config.passthrough_enabled;
         let passthrough_max_object_size =
             config.passthrough_max_object_size_gb * 1024 * 1024 * 1024;
+        let prefetch_policy = crate::prefetch::PrefetchPolicy::from_config(config);
 
         Self {
             backend_config,
@@ -149,6 +151,7 @@ impl VfsCore {
             read_write,
             passthrough_enabled,
             passthrough_max_object_size,
+            prefetch_policy,
             fuse_dev_fd: None,
             deferred_blob_cleanup: DashMap::new(),
             inode_write_owner: DashMap::new(),
@@ -354,7 +357,12 @@ impl VfsCore {
         };
 
         // Check if fully cached
-        if !dc.is_complete(blob_guid.blob_id, blob_guid.volume_id, file_size) {
+        if !dc.is_complete(
+            blob_guid.blob_id,
+            blob_guid.volume_id,
+            layout.blob_version,
+            file_size,
+        ) {
             return (0, 0);
         }
 
@@ -364,7 +372,8 @@ impl VfsCore {
         };
 
         // Open the cache file and register as backing fd
-        let cache_path = dc.cache_file_path(blob_guid.blob_id, blob_guid.volume_id);
+        let cache_path =
+            dc.cache_file_path(blob_guid.blob_id, blob_guid.volume_id, layout.blob_version);
         let backing_file = match std::fs::File::open(&cache_path) {
             Ok(f) => f,
             Err(e) => {
@@ -418,6 +427,7 @@ impl VfsCore {
     async fn read_block_cached(
         &self,
         blob_guid: data_types::DataBlobGuid,
+        blob_version: u64,
         block_num: u32,
         block_content_len: usize,
         file_size: u64,
@@ -426,7 +436,13 @@ impl VfsCore {
         // Try disk cache
         if let Some(dc) = &self.disk_cache
             && let Some(cached) = dc
-                .get(blob_guid.blob_id, blob_guid.volume_id, block_num, file_size)
+                .get(
+                    blob_guid.blob_id,
+                    blob_guid.volume_id,
+                    blob_version,
+                    block_num,
+                    file_size,
+                )
                 .await
         {
             return Ok(cached);
@@ -443,6 +459,7 @@ impl VfsCore {
             dc.insert(
                 blob_guid.blob_id,
                 blob_guid.volume_id,
+                blob_version,
                 block_num,
                 file_size,
                 &data,
@@ -506,6 +523,7 @@ impl VfsCore {
             let block_data = self
                 .read_block_cached(
                     blob_guid,
+                    layout.blob_version,
                     block_num,
                     block_content_len,
                     file_size,
@@ -528,6 +546,7 @@ impl VfsCore {
             let block_data = self
                 .read_block_cached(
                     blob_guid,
+                    layout.blob_version,
                     block_num,
                     block_content_len,
                     file_size,
@@ -606,6 +625,7 @@ impl VfsCore {
                     let block_data = self
                         .read_block_cached(
                             blob_guid,
+                            part_obj.blob_version,
                             block_num,
                             block_content_len,
                             part_size,
@@ -644,6 +664,7 @@ impl VfsCore {
     async fn read_block_cached_into(
         &self,
         blob_guid: data_types::DataBlobGuid,
+        blob_version: u64,
         block_num: u32,
         file_size: u64,
         buf: &mut [u8],
@@ -652,6 +673,7 @@ impl VfsCore {
             dc.get_into(
                 blob_guid.blob_id,
                 blob_guid.volume_id,
+                blob_version,
                 block_num,
                 file_size,
                 buf,
@@ -708,6 +730,7 @@ impl VfsCore {
                 if let Some(n) = self
                     .read_block_cached_into(
                         blob_guid,
+                        layout.blob_version,
                         block_num,
                         file_size,
                         &mut buf[written..written + chunk_len],
@@ -723,7 +746,13 @@ impl VfsCore {
                 // slice the needed portion
                 let mut tmp = vec![0u8; block_content_len];
                 if let Some(n) = self
-                    .read_block_cached_into(blob_guid, block_num, file_size, &mut tmp)
+                    .read_block_cached_into(
+                        blob_guid,
+                        layout.blob_version,
+                        block_num,
+                        file_size,
+                        &mut tmp,
+                    )
                     .await
                 {
                     let end = slice_end.min(n);
@@ -747,7 +776,14 @@ impl VfsCore {
                 let bcl = std::cmp::min(block_size, file_size - bs) as usize;
 
                 let block_data = self
-                    .read_block_cached(blob_guid, bn, bcl, file_size, &trace_id)
+                    .read_block_cached(
+                        blob_guid,
+                        layout.blob_version,
+                        bn,
+                        bcl,
+                        file_size,
+                        &trace_id,
+                    )
                     .await?;
 
                 let ss = if bn == first_block {
@@ -1226,6 +1262,61 @@ impl VfsCore {
             None
         };
 
+        // Promote the cached entry to MRU on every open. Reads served
+        // by `FUSE_PASSTHROUGH` bypass the per-block touch path
+        // entirely, so without this hook a hot file served via
+        // passthrough would never advance in LRU and the evictor would
+        // treat it as cold.
+        if !is_write
+            && let Some(dc) = &self.disk_cache
+            && let Some(ref l) = layout
+            && let Ok(blob_guid) = l.blob_guid()
+        {
+            dc.touch_versioned(blob_guid.blob_id, blob_guid.volume_id, l.blob_version);
+        }
+
+        // Spawn a whole-blob prefetch when the open-time policy says
+        // yes and the cache is not already complete. Read-only opens
+        // only; writers own the blob's bytes via `WriteBuffer` and
+        // have no need for a parallel prefetch.
+        if !is_write
+            && let Some(dc) = &self.disk_cache
+            && let Some(ref l) = layout
+            && let Ok(file_size) = l.size()
+            && let Ok(blob_guid) = l.blob_guid()
+        {
+            let usage = dc.current_usage();
+            let capacity = dc.capacity_bytes();
+            // FOPEN_KEEP_CACHE is the kernel's sequential-read hint;
+            // the open(2) flag itself does not directly map, so for
+            // now we treat any non-O_RANDOM read as a candidate.
+            // O_RANDOM is not a portable flag; absent it on Linux,
+            // the conservative default is `false`; only the
+            // full-threshold and workload_bulk_read branches fire.
+            let keep_cache_hint = false;
+            if !crate::prefetch::cache_pressure_high(usage, capacity, &self.prefetch_policy)
+                && crate::prefetch::should_prefetch(
+                    file_size,
+                    keep_cache_hint,
+                    &self.prefetch_policy,
+                )
+                && !dc.is_complete(
+                    blob_guid.blob_id,
+                    blob_guid.volume_id,
+                    l.blob_version,
+                    file_size,
+                )
+            {
+                let dc_arc = Arc::clone(dc);
+                let backend_cfg = Arc::clone(&self.backend_config);
+                let layout_clone = l.clone();
+                compio_runtime::spawn(async move {
+                    spawn_prefetch_task(backend_cfg, dc_arc, layout_clone).await;
+                })
+                .detach();
+            }
+        }
+
         self.file_handles.insert(
             fh,
             FileHandle {
@@ -1693,6 +1784,117 @@ impl VfsCore {
             namelen: 1024,
             frsize: DEFAULT_BLOCK_SIZE,
         }
+    }
+}
+
+/// Background whole-blob prefetch. Walks every block of `layout`,
+/// fetches it from BSS, and inserts it into the disk cache. Each
+/// per-block fetch goes through the same path as a read miss
+/// (`backend.read_block` + `dc.insert`) so block_id, version, and
+/// checksum semantics stay identical between prefetch-warmed entries
+/// and lazy-warmed ones.
+///
+/// Errors are logged and ignored: a prefetch is best-effort, and a
+/// transient failure is acceptable; the kernel's block-on-demand
+/// path still serves the read.
+async fn spawn_prefetch_task(
+    backend_cfg: Arc<BackendConfig>,
+    disk_cache: Arc<DiskCache>,
+    layout: ObjectLayout,
+) {
+    let Ok(file_size) = layout.size() else {
+        return;
+    };
+    if file_size == 0 {
+        return;
+    }
+    let Ok(blob_guid) = layout.blob_guid() else {
+        return;
+    };
+    let block_size = layout.block_size as u64;
+    if block_size == 0 {
+        return;
+    }
+    // Re-check pressure: an unrelated workload may have filled the
+    // cache between the open-time decision and the task starting.
+    let policy = crate::prefetch::PrefetchPolicy {
+        full_threshold_bytes: u64::MAX,
+        partial_threshold_bytes: u64::MAX,
+        workload_bulk_read: false,
+        // Reuse the cache's high-watermark fraction for the in-task
+        // pressure decline.
+        pressure_decline: 0.95,
+    };
+    if crate::prefetch::cache_pressure_high(
+        disk_cache.current_usage(),
+        disk_cache.capacity_bytes(),
+        &policy,
+    ) {
+        return;
+    }
+
+    let backend = match StorageBackend::new(&backend_cfg) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "prefetch: failed to construct backend");
+            return;
+        }
+    };
+
+    let last_block = ((file_size - 1) / block_size) as u32;
+    let trace_id = TraceId::new();
+
+    for block_num in 0..=last_block {
+        let block_start = block_num as u64 * block_size;
+        let block_content_len = std::cmp::min(block_size, file_size - block_start) as usize;
+
+        // If another path has already populated this block (e.g. a
+        // racing read), the cache hit short-circuits the BSS round
+        // trip.
+        if disk_cache
+            .get(
+                blob_guid.blob_id,
+                blob_guid.volume_id,
+                layout.blob_version,
+                block_num,
+                file_size,
+            )
+            .await
+            .is_some()
+        {
+            continue;
+        }
+
+        let (data, checksum) = match backend
+            .read_block(blob_guid, block_num, block_content_len, &trace_id)
+            .await
+        {
+            Ok(r) => r,
+            Err(FsError::Rpc(rpc_client_common::RpcError::NotFound)) => {
+                // Sparse hole; intentionally not cached. The
+                // block-on-demand path treats missing blocks as zeros.
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    %blob_guid, block_num, error = %e,
+                    "prefetch block fetch failed; abandoning prefetch"
+                );
+                return;
+            }
+        };
+
+        disk_cache
+            .insert(
+                blob_guid.blob_id,
+                blob_guid.volume_id,
+                layout.blob_version,
+                block_num,
+                file_size,
+                &data,
+                checksum,
+            )
+            .await;
     }
 }
 
