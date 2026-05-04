@@ -83,6 +83,15 @@ pub enum Command {
     // not used by the Rust client today; keep contiguous numbering.
     ReserveBlocks = 25,
     ListBlobBlocks = 26,
+    /// Batched block mutations: one outer header followed by N
+    /// (sub_header, sub_body) records in the body. Each sub_header is
+    /// the same `MessageHeader` type with its own per-entry command,
+    /// blob_id, version, block_number, content_len; the sub_body is
+    /// `sub_header.content_len` bytes of payload. Server walks the
+    /// body, dispatches each sub-record through the existing per-op
+    /// handler, returns a response body of N (sub_header_with_errno,
+    /// optional sub_body) records reporting per-entry status.
+    BssBatch = 27,
 }
 
 #[allow(clippy::derivable_impls)]
