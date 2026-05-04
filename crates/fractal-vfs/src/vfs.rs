@@ -1107,7 +1107,7 @@ impl VfsCore {
         // new EOF and the next block boundary must not resurface on a
         // later re-extend).
         let needs_tail_zero =
-            file_size > 0 && file_size < committed_size && file_size % bsz_u64 != 0;
+            file_size > 0 && file_size < committed_size && !file_size.is_multiple_of(bsz_u64);
         let tail_block = if needs_tail_zero {
             Some((file_size / bsz_u64) as u32)
         } else {
@@ -1866,7 +1866,7 @@ impl VfsCore {
                 // tail-zero the WRONG block. Synthesize the Rewrite
                 // here so the destroyed tail is captured even across
                 // shrink-then-grow within the same session.
-                if new_size > 0 && new_size % bsz_u64 != 0 {
+                if new_size > 0 && !new_size.is_multiple_of(bsz_u64) {
                     let last = (new_size / bsz_u64) as u32;
                     let kept = (new_size % bsz_u64) as usize;
                     let block_was_committed = (last as u64) * bsz_u64 < committed_size;

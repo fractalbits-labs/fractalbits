@@ -797,7 +797,7 @@ mod tests {
         let content_length = 3 * block_size;
 
         // Insert 3 files: blob1, blob2, blob3 (one block each)
-        let blobs: Vec<Uuid> = (1..=3).map(|i| Uuid::from_u128(i)).collect();
+        let blobs: Vec<Uuid> = (1..=3).map(Uuid::from_u128).collect();
         for (i, blob_id) in blobs.iter().enumerate() {
             let data = vec![i as u8 + 1; block_size as usize];
             let checksum = xxhash_rust::xxh3::xxh3_64(&data);
