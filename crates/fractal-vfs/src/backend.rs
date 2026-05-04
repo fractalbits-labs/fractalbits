@@ -450,8 +450,47 @@ impl StorageBackend {
 
     /// Delete blob blocks for a given ObjectLayout. Fire-and-forget: logs
     /// warnings on failure but does not return errors.
+    ///
+    /// Uses `list_blob_blocks` to enumerate the actually-allocated
+    /// blocks (Data + Reserved entries) and only issues a delete for
+    /// those, so cleanup is O(allocated_blocks) instead of
+    /// O(logical_blocks). Sparse-file unlinks no longer round-trip a
+    /// delete RPC for every hole. Falls back to the dense
+    /// `0..num_blocks` walk when the listing call fails -- the
+    /// hole-tolerant per-block deletes keep that path correct.
     pub async fn delete_blob_blocks(&self, layout: &ObjectLayout, trace_id: &TraceId) {
-        for (blob_guid, block_number) in blob_blocks_to_delete(layout) {
+        let blob_guid = match layout.blob_guid() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let num_blocks = match layout.num_blocks() {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        if num_blocks == 0 {
+            return;
+        }
+
+        let blocks: Vec<u32> = match self
+            .data_vg_proxy
+            .list_blob_blocks(blob_guid, 0, num_blocks as u32, trace_id)
+            .await
+        {
+            Ok(entries) => entries.into_iter().map(|e| e.block_number).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    %blob_guid,
+                    error = %e,
+                    "list_blob_blocks failed during cleanup; falling back to dense walk"
+                );
+                blob_blocks_to_delete(layout)
+                    .into_iter()
+                    .map(|(_, b)| b)
+                    .collect()
+            }
+        };
+
+        for block_number in blocks {
             if let Err(e) = self
                 .data_vg_proxy
                 .delete_blob(blob_guid, block_number, layout.blob_version, trace_id)
