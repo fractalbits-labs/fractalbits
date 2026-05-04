@@ -42,6 +42,16 @@ pub enum FsError {
     #[error("invalid object state")]
     InvalidState,
 
+    /// `lseek(SEEK_HOLE | SEEK_DATA)` past EOF, or `SEEK_DATA` with no
+    /// further data in the file. Maps to ENXIO.
+    #[error("no such device or address")]
+    NoData,
+
+    /// Invalid argument to a syscall (e.g. unknown fallocate mode bits,
+    /// unsupported lseek `whence`). Maps to EINVAL.
+    #[error("invalid argument")]
+    InvalidArg,
+
     #[error("deserialization error: {0}")]
     Deserialize(String),
 
@@ -70,6 +80,8 @@ impl From<FsError> for io::Error {
             }
             FsError::DataVg(_) => io::Error::from_raw_os_error(libc::EIO),
             FsError::InvalidState => io::Error::from_raw_os_error(libc::EINVAL),
+            FsError::NoData => io::Error::from_raw_os_error(libc::ENXIO),
+            FsError::InvalidArg => io::Error::from_raw_os_error(libc::EINVAL),
             FsError::Deserialize(_) => io::Error::from_raw_os_error(libc::EIO),
             FsError::Internal(_) => io::Error::from_raw_os_error(libc::EIO),
         }

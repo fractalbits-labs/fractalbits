@@ -92,6 +92,13 @@ enum BlockState {
     /// tail-zero. The current flush path materializes these into the
     /// contiguous buffer it hands to replace-on-flush.
     Rewrite(Bytes),
+    /// PUNCH_HOLE intent: schedule a versioned `delete_block` at flush
+    /// time so the BSS entry is dropped at the new blob_version. Reads
+    /// (dirty-handle merge and post-flush) treat the block as zeros via
+    /// `BlockNotFound`. Distinguished from a plain hole because a punched
+    /// block sits inside the file's logical range and the deletion must
+    /// be replayed on flush even if it has no Rewrite content.
+    Delete,
 }
 
 struct WriteBuffer {
@@ -132,6 +139,14 @@ struct WriteBuffer {
     /// lose the original committed bound. Reset to `None` only on a
     /// successful flush.
     trim_upper: Option<u32>,
+    /// Block indices that fallocate has reserved. The set lives only
+    /// on the client -- there is no backing BSS reservation entry yet,
+    /// so on flush a reserved-but-unwritten block is materialised the
+    /// same way a hole is (absent from BSS, read as zero). Reads and
+    /// `lseek(SEEK_DATA)` treat reserved blocks as logical-data per
+    /// Linux convention even before flush; once a write replaces the
+    /// reservation, the reservation entry is removed.
+    pending_reservations: std::collections::BTreeSet<u32>,
 }
 
 impl WriteBuffer {
@@ -149,12 +164,18 @@ impl WriteBuffer {
             dirty: false,
             eof_low_watermark: None,
             trim_upper: None,
+            pending_reservations: std::collections::BTreeSet::new(),
         }
     }
 
     /// Drop any per-block intents past the new EOF. Called by shrink.
+    /// Also drops pending reservations past the new EOF -- a shrink
+    /// supersedes any fallocate reservation that landed on a block the
+    /// file no longer covers.
     fn drop_blocks_past(&mut self, new_last_block_excl: u32) {
         self.blocks.retain(|b, _| *b < new_last_block_excl);
+        self.pending_reservations
+            .retain(|b| *b < new_last_block_excl);
     }
 
     /// Returns true when block index `b` sits in a range whose committed
@@ -972,6 +993,12 @@ impl VfsCore {
 
             let block_bytes: Bytes = match blocks.get(&b) {
                 Some(BlockState::Rewrite(b2)) | Some(BlockState::Cached(b2)) => b2.clone(),
+                Some(BlockState::Delete) => {
+                    // Buffered PUNCH_HOLE: read as zeros for the same-handle
+                    // dirty merge, matching what the post-flush read will
+                    // see once the per-block delete lands.
+                    Bytes::from(vec![0u8; block_content_len])
+                }
                 None => {
                     // Block destroyed by an earlier shrink in this
                     // session: POSIX requires zeros, so don't consult
@@ -1044,6 +1071,11 @@ impl VfsCore {
             let new_content_len = std::cmp::min(bsz, file_size - block_start) as usize;
             let block_bytes = match blocks.get(&b) {
                 Some(BlockState::Rewrite(bytes)) | Some(BlockState::Cached(bytes)) => bytes.clone(),
+                Some(BlockState::Delete) => {
+                    // Punched-hole block: materialize as zeros so the
+                    // replace-on-flush body matches the post-flush read view.
+                    Bytes::from(vec![0u8; new_content_len])
+                }
                 None => {
                     let committed_content_len = if block_start < committed_size {
                         std::cmp::min(bsz, committed_size - block_start) as usize
@@ -1190,6 +1222,31 @@ impl VfsCore {
                         "Failed to delete shrunken block"
                     );
                 }
+            }
+        }
+
+        // Step 2b: PUNCH_HOLE deletes for blocks the user explicitly
+        // dropped via fallocate. These sit inside the file's logical
+        // range (block_num < new_block_count) -- they are NOT covered by
+        // the EOF-trim above, which only walks blocks past EOF. Issued
+        // at new_version so a concurrent reader at the previous version
+        // still sees the old block until the layout flips.
+        for (block_num, state) in blocks {
+            if !matches!(state, BlockState::Delete) {
+                continue;
+            }
+            if let Err(e) = self
+                .backend()
+                .delete_block(blob_guid, *block_num, new_version, trace_id)
+                .await
+            {
+                tracing::warn!(
+                    %blob_guid,
+                    block_num,
+                    new_version,
+                    error = %e,
+                    "Failed to delete punched block"
+                );
             }
         }
 
@@ -1379,6 +1436,7 @@ impl VfsCore {
                 // the new committed state.
                 wb.eof_low_watermark = None;
                 wb.trim_upper = None;
+                wb.pending_reservations.clear();
                 // wb.blocks already drained when we took it out above.
             }
         }
@@ -2242,6 +2300,10 @@ impl VfsCore {
             let copy_dst_end = (end.saturating_sub(block_start).min(bsz_u64)) as usize;
             // Build the new block bytes. Start from existing content
             // (Rewrite/Cached/loaded) or zeros for a fresh block.
+            // A buffered Delete (PUNCH_HOLE) on this block is overwritten
+            // by the user write, which means the hole is no longer
+            // logically present -- start from zeros and let the write
+            // populate the touched range.
             let mut block_bytes: BytesMut = match wb.blocks.get(&b) {
                 Some(BlockState::Rewrite(b2)) | Some(BlockState::Cached(b2)) => {
                     let mut bm = BytesMut::with_capacity(wb.block_size as usize);
@@ -2251,6 +2313,7 @@ impl VfsCore {
                     }
                     bm
                 }
+                Some(BlockState::Delete) => BytesMut::zeroed(wb.block_size as usize),
                 None => {
                     if let Some(loaded_bytes) = loaded.get(&b) {
                         let mut bm = BytesMut::with_capacity(wb.block_size as usize);
@@ -2269,6 +2332,9 @@ impl VfsCore {
                 .copy_from_slice(&data[copy_src_start..copy_src_end]);
             wb.blocks
                 .insert(b, BlockState::Rewrite(block_bytes.freeze()));
+            // A real upload supersedes any prior fallocate reservation
+            // for this block index.
+            wb.pending_reservations.remove(&b);
         }
         if end > wb.file_size {
             wb.file_size = end;
@@ -2277,6 +2343,420 @@ impl VfsCore {
         wb.dirty = true;
 
         Ok(data.len() as u32)
+    }
+
+    /// `fallocate(2)` for FUSE.
+    ///
+    /// Supported modes:
+    ///
+    /// - `0`: pre-allocate / extend. Records a reservation hint for the
+    ///   touched range and grows `wb.file_size` to `max(file_size,
+    ///   offset + length)`. Reads of unwritten blocks in the reserved
+    ///   range observe zeros.
+    /// - `FALLOC_FL_KEEP_SIZE`: pre-allocate without growing. Same as
+    ///   above but `wb.file_size` is left untouched.
+    /// - `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`: drop fully
+    ///   covered interior blocks via `BlockState::Delete` and zero the
+    ///   touched range of any partially covered edge block via an
+    ///   `edge_block_zero` Rewrite. `wb.file_size` is untouched.
+    ///
+    /// All state stays in the WriteBuffer; the BSS-side mutations land
+    /// at flush time.
+    pub async fn vfs_fallocate(
+        &self,
+        fh: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+    ) -> Result<(), FsError> {
+        self.check_write_enabled()?;
+        if length == 0 {
+            return Ok(());
+        }
+        let keep_size = mode & libc::FALLOC_FL_KEEP_SIZE as u32 != 0;
+        let punch_hole = mode & libc::FALLOC_FL_PUNCH_HOLE as u32 != 0;
+        // Linux requires PUNCH_HOLE be combined with KEEP_SIZE.
+        if punch_hole && !keep_size {
+            return Err(FsError::InvalidArg);
+        }
+        // Reject mode bits we don't model. Allowing them silently
+        // would let userspace assume semantics we never delivered.
+        let known = libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE;
+        if mode & !(known as u32) != 0 {
+            return Err(FsError::InvalidArg);
+        }
+
+        let end = offset + length;
+
+        // Phase 1: snapshot enough state to compute the touched range
+        // and decide which blocks need a lazy load for edge zeroing.
+        let (block_size, existing_blob_guid, committed_size, edge_loads) = {
+            let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
+            let block_size = handle
+                .layout
+                .as_ref()
+                .map(|l| l.block_size)
+                .unwrap_or(DEFAULT_BLOCK_SIZE);
+            let committed_size = handle
+                .layout
+                .as_ref()
+                .and_then(|l| l.size().ok())
+                .unwrap_or(0);
+            let layout_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
+            let wb = handle.write_buf.get_or_insert_with(|| {
+                WriteBuffer::new(layout_blob_guid, committed_size, block_size)
+            });
+            let bsz_u64 = wb.block_size as u64;
+            let mut edge_loads: Vec<u32> = Vec::new();
+
+            if punch_hole {
+                let hole_end = end;
+                let lo_partial = !offset.is_multiple_of(bsz_u64);
+                let hi_partial = !hole_end.is_multiple_of(bsz_u64);
+                let first_full = offset.div_ceil(bsz_u64) as u32;
+                let last_full_excl = (hole_end / bsz_u64) as u32;
+
+                let lo_block = (offset / bsz_u64) as u32;
+                let hi_block = (hole_end / bsz_u64) as u32;
+
+                // Determine which edge blocks need a lazy load. We only
+                // load when:
+                //   - The block has committed bytes in BSS, AND
+                //   - There isn't already a buffered (Rewrite/Cached)
+                //     copy we can edit in place, AND
+                //   - The shrink-destroys watermark hasn't already
+                //     turned this block into zeros.
+                let mut consider_edge = |b: u32| {
+                    if matches!(
+                        wb.blocks.get(&b),
+                        Some(BlockState::Rewrite(_)) | Some(BlockState::Cached(_))
+                    ) {
+                        return;
+                    }
+                    if wb.block_destroyed_by_shrink(b) {
+                        return;
+                    }
+                    let block_start = b as u64 * bsz_u64;
+                    if block_start >= committed_size {
+                        return;
+                    }
+                    edge_loads.push(b);
+                };
+
+                if lo_partial {
+                    consider_edge(lo_block);
+                }
+                // Only schedule the trailing edge load when it isn't the
+                // same block as the leading edge AND isn't a fully-covered
+                // interior block (which we Delete instead of zeroing).
+                if hi_partial && hi_block != lo_block && hi_block >= first_full {
+                    // hi_block >= first_full means hi_block is past the
+                    // last fully-covered interior block.
+                    let _ = last_full_excl; // silence unused warning when no full blocks
+                    consider_edge(hi_block);
+                }
+            }
+            (
+                block_size,
+                wb.existing_blob_guid,
+                committed_size,
+                edge_loads,
+            )
+        };
+
+        // Phase 2: lazy-load edge blocks outside the DashMap guard.
+        let trace_id = TraceId::new();
+        let mut loaded: std::collections::BTreeMap<u32, Bytes> = std::collections::BTreeMap::new();
+        if punch_hole {
+            let bsz_u64 = block_size as u64;
+            for b in edge_loads {
+                let block_start = b as u64 * bsz_u64;
+                let committed_content_len = if block_start < committed_size {
+                    std::cmp::min(bsz_u64, committed_size - block_start) as usize
+                } else {
+                    0
+                };
+                let bytes = self
+                    .lazy_load_block_for_flush(
+                        existing_blob_guid,
+                        b,
+                        committed_content_len,
+                        block_size as usize,
+                        &trace_id,
+                    )
+                    .await?;
+                loaded.insert(b, bytes);
+            }
+        }
+
+        // Phase 3: re-acquire the guard and apply the buffered edits.
+        let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
+        let wb = handle
+            .write_buf
+            .as_mut()
+            .ok_or(FsError::Internal("write_buf gone".into()))?;
+        let bsz_u64 = wb.block_size as u64;
+        let bsz_usize = wb.block_size as usize;
+
+        if punch_hole {
+            let hole_end = end;
+            let first_full = offset.div_ceil(bsz_u64) as u32;
+            let last_full_excl = (hole_end / bsz_u64) as u32;
+            let lo_block = (offset / bsz_u64) as u32;
+            let hi_block = (hole_end / bsz_u64) as u32;
+
+            let edge_zero = |wb: &mut WriteBuffer,
+                             loaded: &std::collections::BTreeMap<u32, Bytes>,
+                             b: u32,
+                             lo: usize,
+                             hi: usize| {
+                let mut buf = BytesMut::with_capacity(bsz_usize);
+                let existing: Option<Bytes> = match wb.blocks.get(&b) {
+                    Some(BlockState::Rewrite(b2)) | Some(BlockState::Cached(b2)) => {
+                        Some(b2.clone())
+                    }
+                    _ => loaded.get(&b).cloned(),
+                };
+                if let Some(existing) = existing {
+                    buf.extend_from_slice(&existing);
+                }
+                if buf.len() < bsz_usize {
+                    buf.resize(bsz_usize, 0);
+                }
+                for byte in &mut buf[lo..hi] {
+                    *byte = 0;
+                }
+                wb.blocks.insert(b, BlockState::Rewrite(buf.freeze()));
+                wb.pending_reservations.remove(&b);
+            };
+
+            // Special case: hole confined to a single partial block.
+            if lo_block == hi_block
+                && !offset.is_multiple_of(bsz_u64)
+                && !hole_end.is_multiple_of(bsz_u64)
+            {
+                edge_zero(
+                    wb,
+                    &loaded,
+                    lo_block,
+                    (offset % bsz_u64) as usize,
+                    (hole_end % bsz_u64) as usize,
+                );
+            } else {
+                if !offset.is_multiple_of(bsz_u64) {
+                    let lo = (offset % bsz_u64) as usize;
+                    edge_zero(wb, &loaded, lo_block, lo, bsz_usize);
+                }
+                if !hole_end.is_multiple_of(bsz_u64) && hi_block >= first_full {
+                    let hi = (hole_end % bsz_u64) as usize;
+                    edge_zero(wb, &loaded, hi_block, 0, hi);
+                }
+            }
+
+            if first_full < last_full_excl {
+                for b in first_full..last_full_excl {
+                    wb.blocks.insert(b, BlockState::Delete);
+                    wb.pending_reservations.remove(&b);
+                }
+            }
+            wb.dirty = true;
+            return Ok(());
+        }
+
+        // mode == 0 or KEEP_SIZE: reservation-only path. Record the
+        // touched range so flush has something to publish if the user
+        // did nothing else, and so SEEK_DATA / dirty-handle reads count
+        // the range as data per Linux convention.
+        let first_block = (offset / bsz_u64) as u32;
+        let last_block_excl = end.div_ceil(bsz_u64) as u32;
+        for b in first_block..last_block_excl {
+            // Don't shadow buffered Rewrite or committed Data with a
+            // reservation entry; the reservation is only for blocks
+            // that don't already have content.
+            if matches!(
+                wb.blocks.get(&b),
+                Some(BlockState::Rewrite(_)) | Some(BlockState::Cached(_))
+            ) {
+                continue;
+            }
+            wb.pending_reservations.insert(b);
+        }
+
+        if !keep_size && end > wb.file_size {
+            wb.file_size = end;
+            wb.size_changed = true;
+        }
+        wb.dirty = true;
+        Ok(())
+    }
+
+    /// `lseek(fd, offset, SEEK_HOLE | SEEK_DATA)`.
+    ///
+    /// Walks the blocks of the file from `ceil(offset / block_size)`
+    /// forward, consulting the dirty WriteBuffer first and falling
+    /// back to a per-block BSS probe (`read_block`, treating
+    /// `BlockNotFound` as a hole). The EOF source depends on whether
+    /// the handle has a write buffer:
+    ///   - dirty/write handle -> `wb.file_size`
+    ///   - read-only handle  -> the BSS parent inode's `total_size`
+    ///     when available, otherwise the cached layout `size`.
+    pub async fn vfs_lseek(&self, fh: u64, offset: u64, whence: u32) -> Result<u64, FsError> {
+        let seek_data = whence == libc::SEEK_DATA as u32;
+        let seek_hole = whence == libc::SEEK_HOLE as u32;
+        if !seek_data && !seek_hole {
+            return Err(FsError::InvalidArg);
+        }
+
+        // Snapshot the bits we need without holding the guard across awaits.
+        let (
+            file_size_hint,
+            block_size,
+            existing_blob_guid,
+            blocks,
+            pending_reservations,
+            eof_low_watermark,
+            has_write_buffer,
+        ) = {
+            let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
+            let block_size = handle
+                .layout
+                .as_ref()
+                .map(|l| l.block_size)
+                .unwrap_or(DEFAULT_BLOCK_SIZE);
+            let layout_size = handle
+                .layout
+                .as_ref()
+                .and_then(|l| l.size().ok())
+                .unwrap_or(0);
+            let layout_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
+            if let Some(ref wb) = handle.write_buf {
+                (
+                    wb.file_size,
+                    wb.block_size,
+                    wb.existing_blob_guid,
+                    wb.blocks.clone(),
+                    wb.pending_reservations.clone(),
+                    wb.eof_low_watermark,
+                    true,
+                )
+            } else {
+                (
+                    layout_size,
+                    block_size,
+                    layout_blob_guid,
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeSet::new(),
+                    None,
+                    false,
+                )
+            }
+        };
+
+        // Read-only handle: refresh authoritative size from the BSS
+        // parent inode if available. Same policy as the read path --
+        // no per-handle cache.
+        let trace_id = TraceId::new();
+        let file_size = if !has_write_buffer {
+            if let Some(guid) = existing_blob_guid {
+                match self.backend().read_parent_inode(guid, &trace_id).await {
+                    Ok(Some(meta)) => meta.total_size,
+                    Ok(None) => file_size_hint,
+                    Err(e) => {
+                        tracing::warn!(%guid, error = %e, "read_parent_inode failed during lseek; falling back");
+                        file_size_hint
+                    }
+                }
+            } else {
+                file_size_hint
+            }
+        } else {
+            file_size_hint
+        };
+
+        // Match Linux semantics: offset >= file_size returns ENXIO
+        // for both SEEK_HOLE and SEEK_DATA.
+        if offset >= file_size {
+            return Err(FsError::NoData);
+        }
+
+        let bsz_u64 = block_size as u64;
+        let first_block = (offset / bsz_u64) as u32;
+        let last_block_excl = file_size.div_ceil(bsz_u64) as u32;
+
+        // Per-block classifier. `Some(true)` -> data, `Some(false)` ->
+        // hole, `None` -> not buffered, fall through to BSS probe.
+        let buffered_kind = |b: u32| -> Option<bool> {
+            match blocks.get(&b) {
+                Some(BlockState::Rewrite(_)) | Some(BlockState::Cached(_)) => Some(true),
+                Some(BlockState::Delete) => Some(false),
+                None => {
+                    if pending_reservations.contains(&b) {
+                        return Some(true);
+                    }
+                    if eof_low_watermark.is_some_and(|low| b >= low) {
+                        return Some(false);
+                    }
+                    None
+                }
+            }
+        };
+
+        // BSS-side per-block probe. Without a real ListBlobBlocks RPC
+        // we issue a small `read_block(.., 1)`: a `BlockNotFound`
+        // (hole) is the cheap classification we care about, and a
+        // success means the block has data.
+        async fn block_has_data(
+            backend: &StorageBackend,
+            guid: data_types::DataBlobGuid,
+            block: u32,
+            block_size: u32,
+            file_size: u64,
+            trace_id: &TraceId,
+        ) -> Result<bool, FsError> {
+            let block_start = block as u64 * block_size as u64;
+            let probe_len = std::cmp::min(block_size as u64, file_size - block_start) as usize;
+            if probe_len == 0 {
+                return Ok(false);
+            }
+            match backend.read_block(guid, block, probe_len, trace_id).await {
+                Ok(_) => Ok(true),
+                Err(FsError::DataVg(volume_group_proxy::DataVgError::BlockNotFound))
+                | Err(FsError::Rpc(rpc_client_common::RpcError::NotFound)) => Ok(false),
+                Err(e) => Err(e),
+            }
+        }
+
+        for b in first_block..last_block_excl {
+            let is_data = match buffered_kind(b) {
+                Some(d) => d,
+                None => match existing_blob_guid {
+                    Some(guid) => {
+                        block_has_data(self.backend(), guid, b, block_size, file_size, &trace_id)
+                            .await?
+                    }
+                    None => false,
+                },
+            };
+            let result_offset = if b == first_block {
+                offset
+            } else {
+                b as u64 * bsz_u64
+            };
+            if seek_data && is_data {
+                return Ok(result_offset);
+            }
+            if seek_hole && !is_data {
+                return Ok(result_offset);
+            }
+        }
+
+        if seek_hole {
+            // No further data in the file; SEEK_HOLE returns the EOF.
+            Ok(file_size)
+        } else {
+            // SEEK_DATA hit no data: ENXIO.
+            Err(FsError::NoData)
+        }
     }
 
     pub async fn vfs_flush(&self, fh: u64) -> Result<(), FsError> {
