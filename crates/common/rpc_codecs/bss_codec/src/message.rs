@@ -79,6 +79,10 @@ pub enum Command {
     GetMetadataBlob = 20,
     DeleteMetadataBlob = 21,
     ListBlobs = 22,
+    // 23 / 24 reserved for PutJournal / GetJournal on the BSS side --
+    // not used by the Rust client today; keep contiguous numbering.
+    ReserveBlocks = 25,
+    ListBlobBlocks = 26,
 }
 
 #[allow(clippy::derivable_impls)]

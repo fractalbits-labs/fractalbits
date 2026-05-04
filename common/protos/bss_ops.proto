@@ -22,10 +22,78 @@ message ListBlobsResponse {
     uint64 checksum_body = 3;
     uint64 version = 4;
     bool is_deleted = 5;
+    // Entry type for the block ART entry. 0 = Data (default for legacy
+    // entries, has a payload body), 1 = Reserved (allocation claim
+    // produced by ReserveBlocks, no body). Older servers / older
+    // clients that ignore this field treat every entry as Data.
+    uint32 entry_type = 6;
   }
 
   message Blobs {
     repeated BlobEntry blobs = 1;
     bool has_more = 2;
+  }
+}
+
+// ReserveBlocks: pre-allocate a contiguous block range under
+// `blob_guid` (in the header) at `expected_version` (header.version),
+// without writing block bodies. Per-block versioned: BSS skips any
+// block in [first_block, first_block + block_count) whose stored
+// version > expected_version, and is idempotent on equal/older
+// versions (Reserved or Data). Response: header.errno set on failure;
+// body carries a per-block status summary so callers can detect
+// "skipped due to newer entry" vs. "claim landed".
+message ReserveBlocksRequest {
+  // Number of contiguous blocks to claim, starting at header.block_number.
+  uint32 block_count = 1;
+  // Logical block size used by this file. Recorded so the BSS server
+  // sizes its allocation claim correctly (no body payload is sent).
+  uint32 block_size = 2;
+}
+
+message ReserveBlocksResponse {
+  oneof result {
+    Stats ok = 1;
+    string err = 2;
+  }
+
+  message Stats {
+    // Blocks whose entry now exists at version >= expected_version.
+    uint32 reserved = 1;
+    // Blocks skipped because a newer entry (Data / Delete / Reserved
+    // at version > expected_version) already supersedes the claim.
+    uint32 skipped_newer = 2;
+    // Blocks whose Data/Reserved entry at version <= expected_version
+    // already covered the claim (idempotent no-op).
+    uint32 idempotent = 3;
+  }
+}
+
+// ListBlobBlocks: enumerate the BSS-visible block entries for a
+// single blob over the range
+// [first_block, first_block + block_count). Returns each block that
+// has any entry (Data or Reserved); blocks not present in the
+// response are holes. Used by lseek(SEEK_HOLE/SEEK_DATA) and by the
+// scan / repair pass.
+message ListBlobBlocksRequest {
+  uint32 first_block = 1;
+  uint32 block_count = 2;
+}
+
+message ListBlobBlocksResponse {
+  oneof result {
+    Blocks ok = 1;
+    string err = 2;
+  }
+
+  message BlobBlockEntry {
+    uint32 block_number = 1;
+    // 0 = Data, 1 = Reserved. Mirrors ListBlobsResponse.BlobEntry.entry_type.
+    uint32 entry_type = 2;
+    uint64 version = 3;
+  }
+
+  message Blocks {
+    repeated BlobBlockEntry blocks = 1;
   }
 }
