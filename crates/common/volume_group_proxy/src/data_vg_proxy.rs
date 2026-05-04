@@ -1290,6 +1290,8 @@ impl DataVgProxy {
         }
 
         let mut successful_deletes = 0;
+        let mut not_found_count = 0;
+        let mut other_error_count = 0;
         let mut errors = Vec::with_capacity(available_nodes.len());
 
         while let Some((node, address, result)) = delete_futures.next().await {
@@ -1299,6 +1301,17 @@ impl DataVgProxy {
                     successful_deletes += 1;
                     debug!("Successful delete from BSS node: {}", address);
                 }
+                Err(RpcError::NotFound) => {
+                    // The block was never on this replica -- a hole, or a
+                    // node that legitimately missed the original write.
+                    // Tracked separately from real errors so that a
+                    // unanimous NotFound across all responding nodes
+                    // collapses to a successful delete-of-hole instead
+                    // of a quorum failure.
+                    node.record_success();
+                    debug!("BSS node {} reports NotFound on delete", address);
+                    not_found_count += 1;
+                }
                 Err(rpc_error) => {
                     node.record_failure();
                     warn!(
@@ -1306,6 +1319,7 @@ impl DataVgProxy {
                         address, rpc_error
                     );
                     errors.push(format!("{}: {}", address, rpc_error));
+                    other_error_count += 1;
                 }
             }
 
@@ -1314,7 +1328,7 @@ impl DataVgProxy {
                 spawn_background(async move {
                     while let Some((bg_node, addr, res)) = delete_futures.next().await {
                         match res {
-                            Ok(()) => {
+                            Ok(()) | Err(RpcError::NotFound) => {
                                 bg_node.record_success();
                                 debug!("Background delete to {} completed", addr);
                             }
@@ -1337,6 +1351,21 @@ impl DataVgProxy {
                 );
                 return Ok(());
             }
+        }
+
+        // Hole tolerance: every responding node agreed the block was
+        // already absent. The block is therefore deleted by definition
+        // (it was never there on the surviving replicas). Sparse files
+        // hit this on shrink-trim of holes, and the strict quorum path
+        // would otherwise spuriously fail the flush.
+        if successful_deletes == 0 && other_error_count == 0 && not_found_count > 0 {
+            histogram!("datavg_delete_blob_nanos", "result" => "hole_tolerated")
+                .record(start.elapsed().as_nanos() as f64);
+            debug!(
+                "Delete: all {} responding nodes reported NotFound for blob {}:{} -- treating as success",
+                not_found_count, blob_guid.blob_id, block_number
+            );
+            return Ok(());
         }
 
         histogram!("datavg_delete_blob_nanos", "result" => "quorum_failure")
@@ -1857,6 +1886,8 @@ impl DataVgProxy {
         }
 
         let mut successful_deletes = 0;
+        let mut not_found_count = 0;
+        let mut other_error_count = 0;
         let mut errors = Vec::new();
 
         while let Some((node, address, result)) = delete_futures.next().await {
@@ -1866,10 +1897,19 @@ impl DataVgProxy {
                     successful_deletes += 1;
                     debug!("EC delete success from {}", address);
                 }
+                Err(RpcError::NotFound) => {
+                    // Hole on this shard. Counted separately so unanimous
+                    // NotFound across responding nodes collapses to a
+                    // successful delete-of-hole below.
+                    node.record_success();
+                    debug!("EC delete: BSS node {} reports NotFound", address);
+                    not_found_count += 1;
+                }
                 Err(rpc_error) => {
                     node.record_failure();
                     warn!("EC delete failed from {}: {}", address, rpc_error);
                     errors.push(format!("{}: {}", address, rpc_error));
+                    other_error_count += 1;
                 }
             }
 
@@ -1877,7 +1917,7 @@ impl DataVgProxy {
                 spawn_background(async move {
                     while let Some((bg_node, addr, res)) = delete_futures.next().await {
                         match res {
-                            Ok(()) => {
+                            Ok(()) | Err(RpcError::NotFound) => {
                                 bg_node.record_success();
                                 debug!("EC background delete to {} completed", addr);
                             }
@@ -1897,6 +1937,16 @@ impl DataVgProxy {
                 );
                 return Ok(());
             }
+        }
+
+        if successful_deletes == 0 && other_error_count == 0 && not_found_count > 0 {
+            histogram!("datavg_delete_blob_nanos", "result" => "ec_hole_tolerated")
+                .record(start.elapsed().as_nanos() as f64);
+            debug!(
+                "EC delete: all {} responding shards reported NotFound for blob {}:{} -- treating as success",
+                not_found_count, blob_guid.blob_id, block_number
+            );
+            return Ok(());
         }
 
         histogram!("datavg_delete_blob_nanos", "result" => "ec_quorum_failure")
