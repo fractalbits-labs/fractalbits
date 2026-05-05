@@ -577,6 +577,25 @@ impl WritebackQueue {
         inner.pending_overlay.get(&inode).cloned()
     }
 
+    /// Mount-wide barrier snapshot: every dirty `(inode, generation)`
+    /// pair the queue holds at this instant. The caller polls each
+    /// of these via `cycles_at_or_below_drained` until they all
+    /// reach `Done`. Used by `syncfs(2)` and `fsyncdir` (subtree
+    /// scoped via the caller's prefix filter) to capture a stable
+    /// drain target without holding the queue lock for long.
+    pub fn snapshot_dirty_cycles(&self) -> Vec<(u64, Generation)> {
+        let inner = self.inner.lock().expect("writeback queue poisoned");
+        let mut out = Vec::new();
+        for (ino, cycles) in inner.file_pipeline.iter() {
+            for (generation, cycle) in cycles.iter() {
+                if cycle.stage != FileCommitStage::Done {
+                    out.push((*ino, *generation));
+                }
+            }
+        }
+        out
+    }
+
     /// `true` iff every cycle on `inode` at generation `<= barrier`
     /// has reached `Done`. The fsync drain loop polls this after
     /// scheduling work; a true return means the drain is complete.

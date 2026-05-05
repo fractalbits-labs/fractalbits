@@ -310,6 +310,10 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         "Writeback default mode (ancestor deps; 30 mkdirs)",
         test_writeback_default_mode_ancestor_deps
     );
+    run_test!(
+        "Writeback default mode (fsyncdir drains queue)",
+        test_writeback_default_mode_fsyncdir
+    );
     run_test!("Rename", test_rename);
     run_test!("Unlink with Open Handle", test_unlink_open_handle);
     run_test!("Overwrite Existing File", test_overwrite_existing);
@@ -1237,6 +1241,68 @@ async fn test_writeback_default_mode_ancestor_deps(disk_cache: bool) -> CmdResul
     println!(
         "{}",
         "SUCCESS: writeback default mode ancestor deps (30 mkdirs) passed".green()
+    );
+    Ok(())
+}
+
+/// fsyncdir under default mode drains every dirty writeback cycle
+/// before returning. The test creates a burst of writes, opens the
+/// parent dir, fsync()s it, and then asserts every entry is visible
+/// without polling -- proving the barrier actually waited for the
+/// queue to drain.
+async fn test_writeback_default_mode_fsyncdir(disk_cache: bool) -> CmdResult {
+    use std::os::fd::AsRawFd;
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_writeback(&bucket, true, disk_cache)?;
+
+    println!("  Step 2: Burst-create 20 files at the mount root");
+    let n = 20usize;
+    for i in 0..n {
+        let path = format!("{}/wb-fsyncdir-{:03}.txt", MOUNT_POINT, i);
+        std::fs::write(&path, format!("payload-{}", i).as_bytes())
+            .unwrap_or_else(|e| panic!("write file {}: {}", i, e));
+    }
+    println!("    enqueued {} files", n);
+
+    println!("  Step 3: fsync the parent directory; must block until queue drains");
+    let dir = std::fs::File::open(MOUNT_POINT).expect("open mount root");
+    let dir_fd = dir.as_raw_fd();
+    let r = unsafe { libc::fsync(dir_fd) };
+    if r != 0 {
+        let err = std::io::Error::last_os_error();
+        panic!("fsync(dir) failed: {}", err);
+    }
+    drop(dir);
+
+    println!("  Step 4: Without polling, every file must already be in NSS");
+    let entries: Vec<_> = std::fs::read_dir(MOUNT_POINT)
+        .expect("readdir failed")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let visible = (0..n)
+        .filter(|i| {
+            entries
+                .iter()
+                .any(|name| name == &format!("wb-fsyncdir-{:03}.txt", i))
+        })
+        .count();
+    assert_eq!(
+        visible, n,
+        "fsyncdir did not drain the queue: {}/{} files visible",
+        visible, n
+    );
+
+    // Cleanup
+    for i in 0..n {
+        let _ = std::fs::remove_file(format!("{}/wb-fsyncdir-{:03}.txt", MOUNT_POINT, i));
+    }
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode fsyncdir drain passed".green()
     );
     Ok(())
 }

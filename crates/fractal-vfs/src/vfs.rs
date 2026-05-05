@@ -3107,6 +3107,43 @@ impl VfsCore {
         }
     }
 
+    /// Drain every dirty cycle on every inode the queue currently
+    /// knows about. Mount-wide barrier semantics: `syncfs(2)` and
+    /// `fsyncdir` (which calls this when there's no efficient
+    /// subtree filter) wait until every snapshotted cycle reaches
+    /// its terminal stage. New cycles that arrive after the
+    /// snapshot are not waited on -- they belong to the next
+    /// `syncfs`.
+    pub async fn drain_all_dirty_cycles(&self) -> Result<(), FsError> {
+        let snapshot = self.writeback.snapshot_dirty_cycles();
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        let poll_dur = Duration::from_millis(5);
+        let timeout_secs = self.backend_config.config.rpc_request_timeout_seconds * 4;
+        let deadline = SystemTime::now() + Duration::from_secs(timeout_secs);
+        let mut tainted_seen = false;
+        for (inode, barrier) in snapshot {
+            loop {
+                if self.writeback.cycles_at_or_below_drained(inode, barrier) {
+                    if self.writeback.is_tainted(inode) {
+                        tainted_seen = true;
+                    }
+                    break;
+                }
+                if SystemTime::now() > deadline {
+                    tracing::warn!(inode, barrier = barrier.0, "drain_all_dirty_cycles timeout");
+                    return Err(FsError::Internal("writeback drain timeout".to_string()));
+                }
+                compio_runtime::time::sleep(poll_dur).await;
+            }
+        }
+        if tainted_seen {
+            return Err(FsError::Internal("writeback drain".to_string()));
+        }
+        Ok(())
+    }
+
     /// Drain every writeback cycle for `inode` whose generation is
     /// at or below the barrier captured at entry. Returns when every
     /// cycle has reached `Done` (success or short-circuit on failure).

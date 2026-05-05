@@ -391,6 +391,13 @@ impl Filesystem for FuseServer {
         _fh: u64,
         _datasync: bool,
     ) -> FsResult<()> {
+        // Default mode: drain every dirty writeback cycle the queue
+        // currently knows about. Cheap mount-wide barrier; a true
+        // subtree-scoped variant is a future optimization. Strict
+        // mode is a no-op.
+        if self.vfs.writeback_mode_is_default() {
+            self.vfs.drain_all_dirty_cycles().await.map_err(fs_err)?;
+        }
         Ok(())
     }
 
