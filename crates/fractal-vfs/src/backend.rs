@@ -7,6 +7,7 @@ use file_ops::{
     parse_delete_inode, parse_get_inode, parse_get_inode_with_bytes, parse_list_inodes,
     parse_mpu_parts, parse_put_inode, parse_put_inode_cas,
 };
+use rpc_client_bss::BssBatchSubOp;
 use rpc_client_common::RpcError;
 use rpc_client_common::nss_rpc_retry;
 use rpc_client_nss::RpcClientNss;
@@ -530,46 +531,32 @@ impl StorageBackend {
         }
     }
 
-    /// Delete a specific (blob_guid, block_number) at a given version.
-    /// Used by override flush to drop blocks past the new EOF.
-    pub async fn delete_block(
+    /// Send N block-mutation sub-ops (writes / deletes / reserves)
+    /// against a single Replicated volume as one batched RPC per
+    /// replica, with M-of-N quorum reduction per entry.
+    ///
+    /// Returns one `Result<(), FsError>` per input sub-op, in the same
+    /// order. Per-entry failures are surfaced inside the vector; the
+    /// outer `Result` only fails when the whole batch couldn't be
+    /// dispatched (e.g. transport, EC volume).
+    ///
+    /// Caller groups by volume_id before invoking. Today this is the
+    /// writeback worker's Stage B drainer (`flush_publish` and
+    /// `override_flush_blocks`); future paths can reuse it for any
+    /// burst of independent block mutations.
+    pub async fn flush_blocks_batched(
         &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        version: u64,
+        sub_ops: Vec<BssBatchSubOp>,
         trace_id: &TraceId,
-    ) -> Result<(), FsError> {
-        self.data_vg_proxy
-            .delete_blob(blob_guid, block_number, version, trace_id)
+    ) -> Result<Vec<Result<(), FsError>>, FsError> {
+        let entry_results = self
+            .data_vg_proxy
+            .put_blocks_batched(sub_ops, trace_id)
             .await?;
-        Ok(())
-    }
-
-    /// Reserve a single block on `blob_guid` at `expected_version`.
-    /// Version-guarded: a stored entry at a higher version skips the
-    /// reserve (mapped to `Ok(())` via the `VersionSkipped` rule in
-    /// `DataVgProxy::reserve_blob`). Failures other than skip are
-    /// surfaced for the caller to log, since reservations are
-    /// best-effort and a flush that fails to reserve still publishes
-    /// the new size via the parent inode update.
-    pub async fn reserve_block(
-        &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        block_size: u32,
-        expected_version: u64,
-        trace_id: &TraceId,
-    ) -> Result<(), FsError> {
-        self.data_vg_proxy
-            .reserve_blob(
-                blob_guid,
-                block_number,
-                block_size,
-                expected_version,
-                trace_id,
-            )
-            .await?;
-        Ok(())
+        Ok(entry_results
+            .into_iter()
+            .map(|r| r.map_err(FsError::from))
+            .collect())
     }
 
     /// Enumerate the BSS-side block entries for `blob_guid` over the

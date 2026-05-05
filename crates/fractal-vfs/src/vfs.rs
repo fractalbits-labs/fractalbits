@@ -1264,7 +1264,11 @@ impl VfsCore {
         // non-aligned shrink, the tail beyond `kept` is zeroed before
         // upload so the buffered user write doesn't preserve bytes
         // past the new EOF.
+        //
+        // All Rewrite blocks for one override flush hit the same blob
+        // (and therefore the same volume), so they all batch together.
         let mut wrote_tail_block = false;
+        let mut rewrite_sub_ops: Vec<rpc_client_bss::BssBatchSubOp> = Vec::new();
         for (block_num, state) in blocks {
             if let BlockState::Rewrite(bytes) = state {
                 let mut block_bytes = BytesMut::with_capacity(block_size_usize);
@@ -1278,15 +1282,24 @@ impl VfsCore {
                     }
                     wrote_tail_block = true;
                 }
-                self.backend()
-                    .write_block(
-                        blob_guid,
-                        *block_num,
-                        block_bytes.freeze(),
-                        new_version,
-                        trace_id,
-                    )
-                    .await?;
+                let frozen = block_bytes.freeze();
+                let body_checksum = xxhash_rust::xxh3::xxh3_64(&frozen);
+                rewrite_sub_ops.push(rpc_client_bss::BssBatchSubOp::PutDataBlob {
+                    blob_guid,
+                    block_number: *block_num,
+                    body: frozen,
+                    body_checksum,
+                    version: new_version,
+                });
+            }
+        }
+        if !rewrite_sub_ops.is_empty() {
+            let entry_results = self
+                .backend()
+                .flush_blocks_batched(rewrite_sub_ops, trace_id)
+                .await?;
+            for r in entry_results {
+                r?;
             }
         }
 
@@ -1313,49 +1326,68 @@ impl VfsCore {
         let watermark_upper = trim_upper.unwrap_or(0);
         let lower = std::cmp::min(plain_lower, watermark_lower);
         let upper = std::cmp::max(plain_upper, watermark_upper);
+        // Build one DeleteDataBlob batch covering both EOF-trim
+        // deletes (blocks in [lower, upper) that aren't superseded by
+        // a Rewrite this flush) and PUNCH_HOLE deletes (blocks
+        // explicitly tagged with `BlockState::Delete`). Both classes
+        // share the same blob and version, so a single batch dispatches
+        // them as one round-trip.
+        let mut delete_sub_ops: Vec<rpc_client_bss::BssBatchSubOp> = Vec::new();
+        let mut delete_block_nums: Vec<u32> = Vec::new();
         if lower < upper {
             for block_num in lower..upper {
                 if matches!(blocks.get(&block_num), Some(BlockState::Rewrite(_))) {
                     continue;
                 }
-                if let Err(e) = self
-                    .backend()
-                    .delete_block(blob_guid, block_num, new_version, trace_id)
-                    .await
-                {
-                    tracing::warn!(
-                        %blob_guid,
-                        block_num,
-                        new_version,
-                        error = %e,
-                        "Failed to delete shrunken block"
-                    );
-                }
+                delete_sub_ops.push(rpc_client_bss::BssBatchSubOp::DeleteDataBlob {
+                    blob_guid,
+                    block_number: block_num,
+                    version: new_version,
+                });
+                delete_block_nums.push(block_num);
             }
         }
-
-        // Step 2b: PUNCH_HOLE deletes for blocks the user explicitly
-        // dropped via fallocate. These sit inside the file's logical
-        // range (block_num < new_block_count) -- they are NOT covered by
-        // the EOF-trim above, which only walks blocks past EOF. Issued
-        // at new_version so a concurrent reader at the previous version
-        // still sees the old block until the layout flips.
         for (block_num, state) in blocks {
             if !matches!(state, BlockState::Delete) {
                 continue;
             }
-            if let Err(e) = self
+            delete_sub_ops.push(rpc_client_bss::BssBatchSubOp::DeleteDataBlob {
+                blob_guid,
+                block_number: *block_num,
+                version: new_version,
+            });
+            delete_block_nums.push(*block_num);
+        }
+        if !delete_sub_ops.is_empty() {
+            match self
                 .backend()
-                .delete_block(blob_guid, *block_num, new_version, trace_id)
+                .flush_blocks_batched(delete_sub_ops, trace_id)
                 .await
             {
-                tracing::warn!(
-                    %blob_guid,
-                    block_num,
-                    new_version,
-                    error = %e,
-                    "Failed to delete punched block"
-                );
+                Ok(entry_results) => {
+                    for (i, r) in entry_results.into_iter().enumerate() {
+                        if let Err(e) = r {
+                            tracing::warn!(
+                                %blob_guid,
+                                block_num = delete_block_nums[i],
+                                new_version,
+                                error = %e,
+                                "Failed to delete block (override flush)",
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Whole-batch dispatch error (transport / EC volume).
+                    // Same best-effort posture as the per-block path:
+                    // log and continue.
+                    tracing::warn!(
+                        %blob_guid,
+                        new_version,
+                        error = %e,
+                        "Override delete batch dispatch failed"
+                    );
+                }
             }
         }
 
@@ -1645,13 +1677,16 @@ impl VfsCore {
                     trace_id,
                 )
                 .await?;
-                // Issue per-block ReserveBlocks for any range fallocate
-                // requested. Skipped on blocks that already have a
-                // Rewrite intent or a Delete intent in this flush --
-                // those entries already supersede the reservation. The
-                // reservation is best-effort: a partial failure is
-                // logged and not fatal to the flush, mirroring the way
-                // the parent inode update itself is best-effort.
+                // Issue ReserveBlocks for any range fallocate requested,
+                // batched as a single BssBatch per blob. Skipped on
+                // blocks that already have a Rewrite intent or a Delete
+                // intent in this flush -- those entries already
+                // supersede the reservation. The reservation is
+                // best-effort: a partial failure is logged and not
+                // fatal to the flush, mirroring the way the parent
+                // inode update itself is best-effort.
+                let mut reserve_sub_ops: Vec<rpc_client_bss::BssBatchSubOp> = Vec::new();
+                let mut reserve_block_nums: Vec<u32> = Vec::new();
                 for &block_num in pending_reservations.iter() {
                     if matches!(
                         blocks.get(&block_num),
@@ -1659,18 +1694,41 @@ impl VfsCore {
                     ) {
                         continue;
                     }
-                    if let Err(e) = self
+                    reserve_sub_ops.push(rpc_client_bss::BssBatchSubOp::ReserveBlocks {
+                        blob_guid: guid,
+                        block_number: block_num,
+                        block_size,
+                        expected_version: new_version,
+                    });
+                    reserve_block_nums.push(block_num);
+                }
+                if !reserve_sub_ops.is_empty() {
+                    match self
                         .backend()
-                        .reserve_block(guid, block_num, block_size, new_version, trace_id)
+                        .flush_blocks_batched(reserve_sub_ops, trace_id)
                         .await
                     {
-                        tracing::warn!(
-                            %guid,
-                            block_num,
-                            new_version,
-                            error = %e,
-                            "Failed to reserve block; continuing"
-                        );
+                        Ok(entry_results) => {
+                            for (i, r) in entry_results.into_iter().enumerate() {
+                                if let Err(e) = r {
+                                    tracing::warn!(
+                                        %guid,
+                                        block_num = reserve_block_nums[i],
+                                        new_version,
+                                        error = %e,
+                                        "Failed to reserve block; continuing"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                %guid,
+                                new_version,
+                                error = %e,
+                                "Reserve batch dispatch failed; continuing"
+                            );
+                        }
                     }
                 }
                 (guid, new_version, true)
@@ -1684,14 +1742,33 @@ impl VfsCore {
                 } else {
                     data.len().div_ceil(block_size_usize)
                 };
-                for block_i in 0..num_blocks {
-                    let start = block_i * block_size_usize;
-                    let end = std::cmp::min(start + block_size_usize, data.len());
-                    let chunk = data.slice(start..end);
-                    let padded = pad_to_block_size(chunk, block_size_usize);
-                    self.backend()
-                        .write_block(blob_guid, block_i as u32, padded, 1, trace_id)
+                if num_blocks > 0 {
+                    // Replace-flush: build a single BssBatch covering
+                    // every block at version=1. One round-trip per
+                    // replica (vs N) collapses the bulk-create RPC
+                    // budget.
+                    let mut sub_ops = Vec::with_capacity(num_blocks);
+                    for block_i in 0..num_blocks {
+                        let start = block_i * block_size_usize;
+                        let end = std::cmp::min(start + block_size_usize, data.len());
+                        let chunk = data.slice(start..end);
+                        let padded = pad_to_block_size(chunk, block_size_usize);
+                        let body_checksum = xxhash_rust::xxh3::xxh3_64(&padded);
+                        sub_ops.push(rpc_client_bss::BssBatchSubOp::PutDataBlob {
+                            blob_guid,
+                            block_number: block_i as u32,
+                            body: padded,
+                            body_checksum,
+                            version: 1,
+                        });
+                    }
+                    let entry_results = self
+                        .backend()
+                        .flush_blocks_batched(sub_ops, trace_id)
                         .await?;
+                    for r in entry_results {
+                        r?;
+                    }
                 }
                 (blob_guid, 1, false)
             };
