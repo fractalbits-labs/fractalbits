@@ -3105,6 +3105,16 @@ impl VfsCore {
         // before returning. Surfaces deferred EIO if any cycle failed.
         // No-op in strict mode (the queue is always empty there) and
         // for inodes with no dirty cycles.
+        //
+        // `force_sync_drain` distinguishes the two callers:
+        //   * `fsync(2)` / `O_SYNC` writes: must drain (durability ask).
+        //   * `close(2)` -> FUSE_FLUSH: errors-only, no durability ask.
+        //     Blocking on close() per file would serialise the queue
+        //     against userspace and erase the writeback win on
+        //     create-heavy workloads (`tar -xf`, `cp -r`). The cycle
+        //     stays queued and the worker drains it on its own; any
+        //     deferred EIO propagates via errseq the next time the
+        //     same fd path opens or fsyncs.
         if self.writeback_mode == WritebackMode::Default
             && let Some(handle) = self.file_handles.get(&fh)
         {
@@ -3114,6 +3124,15 @@ impl VfsCore {
         }
 
         Ok(())
+    }
+
+    /// Variant of `vfs_flush` that skips the writeback barrier wait,
+    /// used for the FUSE_FLUSH path (close-on-fd, not fsync). Still
+    /// flushes the buffered write data so errors propagate, but does
+    /// not stall on the queue.
+    pub async fn vfs_flush_no_drain(&self, fh: u64) -> Result<(), FsError> {
+        self.ensure_writeback_worker_started();
+        self.flush_write_buffer(fh).await
     }
 
     /// Queue-aware put_inode that the worker batches across concurrent
@@ -3127,6 +3146,40 @@ impl VfsCore {
     /// Used by flush_write_buffer in default mode so vfs_release
     /// flush traffic actually rides the InodeBatch path. Strict mode
     /// keeps the direct backend.put_inode_cas call.
+    /// Fire-and-forget enqueue of a `PutInode` intent. Used by
+    /// `vfs_create` early-publish so the placeholder lands without
+    /// blocking the create() call; the worker drains it on its next
+    /// tick. Subsequent `flush_publish` at close uses CAS against the
+    /// placeholder bytes -- if the worker hasn't committed yet, that
+    /// CAS naturally waits via `put_inode_via_queue`'s poll loop.
+    pub fn enqueue_inode_intent_async(
+        &self,
+        inode: u64,
+        s3_key: &str,
+        parent_key: &str,
+        name: &str,
+        layout_bytes: Bytes,
+        expected_old_value: Option<Bytes>,
+    ) {
+        self.ensure_writeback_worker_started();
+        use crate::writeback::FhId;
+        let generation = self.allocate_flush_generation(inode);
+        self.writeback
+            .open_cycle(inode, generation, layout_bytes.len() as u64, 0);
+        self.writeback.upsert_inode_intent(
+            s3_key.to_string(),
+            generation,
+            inode,
+            WbInodeOp::PutInode {
+                parent_key: parent_key.to_string(),
+                name: name.to_string(),
+                layout_bytes,
+                expected_old_value,
+            },
+            FhId(0),
+        );
+    }
+
     pub async fn put_inode_via_queue(
         &self,
         inode: u64,
@@ -3328,19 +3381,28 @@ impl VfsCore {
         wb.dirty = true;
 
         // Default-mode early-publish: enqueue a placeholder PutInode
-        // immediately so cross-instance lookups can find the file
-        // before close. The terminal flush at vfs_release uses CAS
-        // against the placeholder bytes captured here, surfacing
-        // ESTALE if a concurrent writer beat us. Strict mode keeps
-        // the legacy "publish on flush" behavior.
+        // so cross-instance lookups can find the file before close.
+        // The enqueue is fire-and-forget -- the worker drains it on
+        // its next tick. The terminal flush at vfs_release CASes
+        // against these bytes and naturally serializes against the
+        // placeholder cycle (same key, increasing generation) inside
+        // the queue, so we don't need to block create() to wait for
+        // the placeholder to commit. Strict mode keeps the legacy
+        // "publish on flush" behavior.
         let (layout_at_create, layout_bytes_at_create) = if self.writeback_mode_is_default() {
             let placeholder_layout = file_ops::create_dir_marker_layout();
             let placeholder_bytes: Bytes =
                 to_bytes_in::<_, rkyv::rancor::Error>(&placeholder_layout, Vec::new())
                     .map_err(FsError::from)?
                     .into();
-            self.put_inode_via_queue(ino, &key, &prefix, name, placeholder_bytes.clone(), None)
-                .await?;
+            self.enqueue_inode_intent_async(
+                ino,
+                &key,
+                &prefix,
+                name,
+                placeholder_bytes.clone(),
+                None,
+            );
             (Some(placeholder_layout), Some(placeholder_bytes))
         } else {
             (None, None)
@@ -3574,7 +3636,12 @@ impl VfsCore {
         // direct put_dir_marker call.
         if self.writeback_mode_is_default() {
             // Build the dir marker layout + bytes locally so we can
-            // enqueue without touching NSS yet.
+            // enqueue without touching NSS yet. The enqueue is
+            // fire-and-forget; the worker drains it on the next tick.
+            // Subsequent vfs_create against this dir uses the local
+            // inode table for parent-prefix lookup, so the placeholder
+            // doesn't need to commit before children land. fsyncdir /
+            // syncfs / unmount drain barriers all wait for commit.
             let layout = file_ops::create_dir_marker_layout();
             let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())
                 .map_err(FsError::from)?
@@ -3582,8 +3649,7 @@ impl VfsCore {
             let (ino, _) =
                 self.inodes
                     .lookup_or_insert(&key, EntryType::Directory, Some(layout.clone()));
-            self.put_inode_via_queue(ino, &key, &prefix, name, layout_bytes, None)
-                .await?;
+            self.enqueue_inode_intent_async(ino, &key, &prefix, name, layout_bytes, None);
             self.dir_cache.invalidate(&prefix);
             return Ok(self.make_dir_attr(ino));
         }
