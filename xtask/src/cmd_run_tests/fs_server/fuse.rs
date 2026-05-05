@@ -306,6 +306,10 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         "Writeback default mode (5-level mkdir -p)",
         test_writeback_default_mode_mkdir
     );
+    run_test!(
+        "Writeback default mode (ancestor deps; 30 mkdirs)",
+        test_writeback_default_mode_ancestor_deps
+    );
     run_test!("Rename", test_rename);
     run_test!("Unlink with Open Handle", test_unlink_open_handle);
     run_test!("Overwrite Existing File", test_overwrite_existing);
@@ -1177,6 +1181,62 @@ async fn test_writeback_default_mode_mkdir(disk_cache: bool) -> CmdResult {
     println!(
         "{}",
         "SUCCESS: writeback default mode mkdir (5-level nested) passed".green()
+    );
+    Ok(())
+}
+
+/// Stress the in-batch dependency edge: rapid-fire 100 mkdir+creat
+/// pairs under default mode where each creat lands in a freshly
+/// created dir. The worker must batch them with the dir's PutInode
+/// preceding the file's, and the in-batch depends_on_index must point
+/// the file at the dir so server-side ordering is enforced even when
+/// the HashMap drain order is arbitrary.
+async fn test_writeback_default_mode_ancestor_deps(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_writeback(&bucket, true, disk_cache)?;
+
+    println!("  Step 2: Rapid-fire 30 (mkdir, mkdir/, ) pairs");
+    let n = 30usize;
+    for i in 0..n {
+        let dir = format!("{}/wb-deps-d{:03}", MOUNT_POINT, i);
+        std::fs::create_dir(&dir).unwrap_or_else(|e| panic!("mkdir wb-deps-d{:03}: {}", i, e));
+    }
+    println!("    enqueued {} mkdirs", n);
+
+    println!("  Step 3: Poll until every dir is visible (up to 10s)");
+    let mount_point = MOUNT_POINT;
+    let mut all_dirs = false;
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(100));
+        let entries: Vec<_> = std::fs::read_dir(mount_point)
+            .expect("readdir failed")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let visible = (0..n)
+            .filter(|i| entries.iter().any(|nm| nm == &format!("wb-deps-d{:03}", i)))
+            .count();
+        if visible == n {
+            all_dirs = true;
+            break;
+        }
+    }
+    assert!(
+        all_dirs,
+        "default-mode mkdir burst failed to commit {} dirs",
+        n
+    );
+
+    // Cleanup
+    for i in 0..n {
+        let _ = std::fs::remove_dir(format!("{}/wb-deps-d{:03}", MOUNT_POINT, i));
+    }
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode ancestor deps (30 mkdirs) passed".green()
     );
     Ok(())
 }

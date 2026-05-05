@@ -1975,6 +1975,7 @@ impl VfsCore {
             Arc::clone(&self.writeback),
             self.writeback_poll_ms,
         );
+        spawn_writeback_metrics_exporter(Arc::clone(&self.writeback));
         tracing::info!(poll_ms = self.writeback_poll_ms, "writeback worker started");
     }
 
@@ -3067,6 +3068,7 @@ impl VfsCore {
         self.writeback.upsert_inode_intent(
             s3_key.to_string(),
             generation,
+            inode,
             WbInodeOp::PutInode {
                 parent_key: parent_key.to_string(),
                 name: name.to_string(),
@@ -3305,6 +3307,7 @@ impl VfsCore {
                 let _outcome = self.writeback.upsert_inode_intent(
                     key.clone(),
                     generation,
+                    ino,
                     WbInodeOp::PutInode {
                         parent_key: prefix.clone(),
                         name: name.to_string(),
@@ -3815,14 +3818,33 @@ async fn spawn_prefetch_task(
     }
 }
 
+/// Periodically scrape `WritebackQueue` telemetry into the
+/// `metrics_wrapper` backend. Required by the metrics-first contract
+/// before tuning `max_batch_wait_ms` / `worker_pool_size`. Spawns
+/// alongside the worker on first FUSE op.
+fn spawn_writeback_metrics_exporter(queue: Arc<WritebackQueue>) {
+    use metrics_wrapper::gauge;
+    let scrape_interval = Duration::from_millis(500);
+    compio_runtime::spawn(async move {
+        loop {
+            compio_runtime::time::sleep(scrape_interval).await;
+            let st = queue.telemetry();
+            gauge!("wb_queue_depth").set(st.depth as f64);
+            gauge!("wb_bytes_buffered").set(st.bytes_buffered as f64);
+            gauge!("wb_deferred_errors").set(st.deferred_errors as f64);
+            gauge!("wb_backpressure_waits").set(st.backpressure_waits as f64);
+            gauge!("wb_dependency_stalls").set(st.dependency_stalls as f64);
+            gauge!("wb_enqueue_blocked").set(if st.enqueue_blocked { 1.0 } else { 0.0 });
+        }
+    })
+    .detach();
+}
+
 /// Long-running writeback worker. Polls the queue every `poll_ms`,
-/// drains pending Stage A intents, and fires NSS `put_inode` for each.
-/// Spawned at FUSE init when `WritebackMode::Default` is configured;
-/// runs until the process exits.
-///
-/// Phase 1a uses single-op RPCs (one `put_inode` per intent) so it can
-/// land without protocol-layer changes. Cross-file batching via a
-/// dedicated `InodeBatch` RPC is the natural follow-up.
+/// drains pending Stage A intents, and fires one batched
+/// `InodeBatch` RPC per drain window. Spawned at FUSE init when
+/// `WritebackMode::Default` is configured; runs until the process
+/// exits.
 fn spawn_writeback_worker(
     backend_cfg: Arc<BackendConfig>,
     queue: Arc<WritebackQueue>,
@@ -3911,6 +3933,45 @@ fn spawn_writeback_worker(
                 }
             }
 
+            // Ancestor dependency wiring: for each entry, find the
+            // longest same-batch directory entry whose key is a strict
+            // prefix of this entry's key. That entry must commit
+            // first; on its failure the server marks this entry
+            // DEPENDENCY_FAILED and short-circuits, which the
+            // group-requeue path then handles. Computed in O(N^2) on
+            // batch size; N <= max_batch_size (default 1024) so the
+            // walk is cheap relative to the RPC round-trip it amortizes.
+            let entry_keys: Vec<String> = drained
+                .iter()
+                .map(|d| {
+                    // The drainable key is the s3_key without NUL
+                    // termination; entries are NUL-terminated when
+                    // shipped, but for prefix comparison we strip it
+                    // and use trailing slash as the directory marker.
+                    d.s3_key.clone()
+                })
+                .collect();
+            for i in 0..batch_entries.len() {
+                let cur_key = &entry_keys[i];
+                let parent = parent_prefix_of(cur_key);
+                let mut best_dep: Option<u32> = None;
+                let mut best_len = 0usize;
+                for (j, other_key) in entry_keys.iter().enumerate().take(i) {
+                    // A directory entry's key ends in `/`. The current
+                    // entry's parent prefix also ends in `/` (or is
+                    // `/` for top-level). Match by exact equality so
+                    // we only depend on the *immediate* parent dir
+                    // among the same-batch entries.
+                    if other_key == &parent && other_key.len() > best_len {
+                        best_len = other_key.len();
+                        best_dep = Some(j as u32);
+                    }
+                }
+                if let Some(dep_idx) = best_dep {
+                    batch_entries[i].depends_on_index.push(dep_idx);
+                }
+            }
+
             let batch_result = backend.inode_batch(batch_entries, &trace_id).await;
 
             match batch_result {
@@ -3921,7 +3982,7 @@ fn spawn_writeback_worker(
                         "writeback InodeBatch RPC failed"
                     );
                     for intent in &drained {
-                        let inode = inode_for_intent(&queue, intent);
+                        let inode = intent.inode;
                         queue.mark_stage_a_failed(&intent.s3_key, intent.generation, inode, false);
                     }
                 }
@@ -3932,13 +3993,13 @@ fn spawn_writeback_worker(
                         "writeback InodeBatch result count mismatch"
                     );
                     for intent in &drained {
-                        let inode = inode_for_intent(&queue, intent);
+                        let inode = intent.inode;
                         queue.mark_stage_a_failed(&intent.s3_key, intent.generation, inode, false);
                     }
                 }
                 Ok(results) => {
                     for (intent, result) in drained.iter().zip(results.iter()) {
-                        let inode = inode_for_intent(&queue, intent);
+                        let inode = intent.inode;
                         let status = nss_codec::BatchEntryStatus::try_from(result.status)
                             .unwrap_or(nss_codec::BatchEntryStatus::StatusUnspecified);
                         match status {
@@ -3984,23 +4045,6 @@ fn spawn_writeback_worker(
         }
     })
     .detach();
-}
-
-/// Best-effort inode lookup for a drained intent. The queue keys
-/// pipeline cycles by inode number, but the drainable carries the
-/// generation only -- so we ask the queue for any inode whose
-/// active_generation matches. In Phase 1a this is unambiguous because
-/// each cycle is on its own inode.
-fn inode_for_intent(
-    queue: &WritebackQueue,
-    intent: &crate::writeback::DrainableInodeIntent,
-) -> u64 {
-    // The active-generation lookup returns Generation(0) for unknown
-    // inodes; we walk every inode the queue knows about and match on
-    // generation. The set is small in practice (one file per cycle in
-    // Phase 1a). When the worker is widened to handle many files at
-    // once, this lookup gets a dedicated index.
-    queue.inode_for_generation(intent.generation).unwrap_or(0)
 }
 
 /// Extract the parent prefix from an s3_key.

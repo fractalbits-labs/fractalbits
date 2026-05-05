@@ -168,6 +168,13 @@ pub enum BlockOp {
 pub struct InodeIntent {
     pub op: InodeOp,
     pub generation: Generation,
+    /// Owning inode. The cycle pipeline is keyed by `(inode,
+    /// generation)`; the intent map is keyed by `(S3Key, generation)`.
+    /// Carrying the inode here lets the worker route per-entry
+    /// results back to the right cycle even when multiple fresh
+    /// inodes all start at the same generation (e.g. a tar burst of
+    /// mkdirs each at generation=1 on a different inode).
+    pub inode: u64,
     pub deps: Vec<IntentId>,
     pub state: IntentState,
     pub fhs: Vec<FhId>,
@@ -417,6 +424,9 @@ pub struct FhErrSeq(pub u32);
 pub struct DrainableInodeIntent {
     pub s3_key: S3Key,
     pub generation: Generation,
+    /// Owning inode of this intent's cycle. Used by the worker to
+    /// route per-entry results back to the right cycle.
+    pub inode: u64,
     pub op: InodeOp,
     pub fhs: Vec<FhId>,
 }
@@ -709,6 +719,7 @@ impl WritebackQueue {
         &self,
         key: S3Key,
         generation: Generation,
+        inode: u64,
         op: InodeOp,
         fh: FhId,
     ) -> CoalesceOutcome {
@@ -742,6 +753,7 @@ impl WritebackQueue {
         let intent = InodeIntent {
             op,
             generation,
+            inode,
             deps: Vec::new(),
             state: IntentState::Pending,
             fhs: vec![fh],
@@ -870,6 +882,7 @@ impl WritebackQueue {
             let drainable = DrainableInodeIntent {
                 s3_key: key.0.clone(),
                 generation: key.1,
+                inode: intent.inode,
                 op: intent.op.clone(),
                 fhs: intent.fhs.clone(),
             };
@@ -1449,6 +1462,7 @@ mod tests {
         let r1 = q.upsert_inode_intent(
             key.clone(),
             Generation(0),
+            42,
             InodeOp::PutInode {
                 parent_key: "/a".to_string(),
                 name: "b".to_string(),
@@ -1463,6 +1477,7 @@ mod tests {
         let r2 = q.upsert_inode_intent(
             key.clone(),
             Generation(0),
+            42,
             InodeOp::PutInode {
                 parent_key: "/a".to_string(),
                 name: "b".to_string(),
@@ -1482,6 +1497,7 @@ mod tests {
         let r1 = q.upsert_inode_intent(
             key.clone(),
             Generation(0),
+            42,
             InodeOp::SetAttr {
                 key: key.clone(),
                 attrs: AttrMutation {
@@ -1496,6 +1512,7 @@ mod tests {
         let r2 = q.upsert_inode_intent(
             key.clone(),
             Generation(0),
+            42,
             InodeOp::SetAttr {
                 key: key.clone(),
                 attrs: AttrMutation {
@@ -1884,6 +1901,7 @@ mod tests {
         let r = q.upsert_inode_intent(
             "/foo".to_string(),
             Generation(0),
+            42,
             InodeOp::PutInode {
                 parent_key: "/".to_string(),
                 name: "foo".to_string(),
@@ -1916,6 +1934,7 @@ mod tests {
         q.upsert_inode_intent(
             "/x".to_string(),
             Generation(0),
+            7,
             InodeOp::PutInode {
                 parent_key: "/".to_string(),
                 name: "x".to_string(),
@@ -1943,6 +1962,7 @@ mod tests {
         q.upsert_inode_intent(
             "/y".to_string(),
             Generation(0),
+            9,
             InodeOp::PutInode {
                 parent_key: "/".to_string(),
                 name: "y".to_string(),
