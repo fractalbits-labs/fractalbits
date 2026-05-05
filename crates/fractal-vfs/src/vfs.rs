@@ -1764,9 +1764,14 @@ impl VfsCore {
         // Default mode routes Stage A through the writeback queue so
         // multiple concurrent flushes coalesce into one InodeBatch
         // RPC instead of N round-trips. Strict mode keeps the
-        // existing direct path. The queue path's CAS guard is gated
-        // by `is_override`: only the override path captures the
-        // expected bytes at open time.
+        // existing direct path.
+        //
+        // The queue path passes `expected_layout_bytes` directly:
+        // when vfs_create early-publishes a placeholder layout, even
+        // a "fresh" file has a layout at NSS that the close-time
+        // flush must CAS against. The override-vs-replace distinction
+        // (which gates the old-blob cleanup logic below) is
+        // independent of the CAS-or-not decision.
         let old_bytes = if self.writeback_mode_is_default() {
             let inode = self.file_handles.get(&fh_id).map(|h| h.ino).unwrap_or(0);
             let parent_key = parent_prefix_of(s3_key);
@@ -1774,18 +1779,13 @@ impl VfsCore {
                 .rsplit_once('/')
                 .map(|(_, n)| n.to_string())
                 .unwrap_or_else(|| s3_key.to_string());
-            let expected = if is_override {
-                expected_layout_bytes
-            } else {
-                None
-            };
             self.put_inode_via_queue(
                 inode,
                 s3_key,
                 &parent_key,
                 &name,
                 layout_bytes.clone(),
-                expected,
+                expected_layout_bytes,
             )
             .await?;
             Bytes::new()
@@ -3212,13 +3212,33 @@ impl VfsCore {
         let mut wb = WriteBuffer::new(None, 0, DEFAULT_BLOCK_SIZE);
         wb.size_changed = true;
         wb.dirty = true;
+
+        // Default-mode early-publish: enqueue a placeholder PutInode
+        // immediately so cross-instance lookups can find the file
+        // before close. The terminal flush at vfs_release uses CAS
+        // against the placeholder bytes captured here, surfacing
+        // ESTALE if a concurrent writer beat us. Strict mode keeps
+        // the legacy "publish on flush" behavior.
+        let (layout_at_create, layout_bytes_at_create) = if self.writeback_mode_is_default() {
+            let placeholder_layout = file_ops::create_dir_marker_layout();
+            let placeholder_bytes: Bytes =
+                to_bytes_in::<_, rkyv::rancor::Error>(&placeholder_layout, Vec::new())
+                    .map_err(FsError::from)?
+                    .into();
+            self.put_inode_via_queue(ino, &key, &prefix, name, placeholder_bytes.clone(), None)
+                .await?;
+            (Some(placeholder_layout), Some(placeholder_bytes))
+        } else {
+            (None, None)
+        };
+
         self.file_handles.insert(
             fh,
             FileHandle {
                 ino,
                 s3_key: key,
-                layout: None,
-                layout_bytes: None,
+                layout: layout_at_create,
+                layout_bytes: layout_bytes_at_create,
                 write_buf: Some(wb),
                 backing_id: None,
             },
