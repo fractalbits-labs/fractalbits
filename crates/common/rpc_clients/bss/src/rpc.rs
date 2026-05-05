@@ -597,6 +597,7 @@ impl RpcClient {
     /// or outer errno != 0); per-entry application failures surface as
     /// `Err` inside the per-entry vector but the outer `Ok` covers
     /// transport success.
+    #[allow(clippy::field_reassign_with_default)]
     pub async fn put_bss_batch(
         &self,
         sub_ops: Vec<BssBatchSubOp>,

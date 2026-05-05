@@ -79,12 +79,21 @@ async fn test_bss_batch_put_delete_reserve() {
 
     // Build three sub-ops covering all supported per-entry commands so
     // a single round-trip exercises the dispatcher's per-op fan-out.
-    let put_guid = DataBlobGuid { blob_id: Uuid::now_v7(), volume_id: 1 };
+    let put_guid = DataBlobGuid {
+        blob_id: Uuid::now_v7(),
+        volume_id: 1,
+    };
     let put_body: Bytes = vec![0xab; 4096].into();
     let put_chk = xxhash_rust::xxh3::xxh3_64(&put_body);
 
-    let reserve_guid = DataBlobGuid { blob_id: Uuid::now_v7(), volume_id: 1 };
-    let delete_guid = DataBlobGuid { blob_id: Uuid::now_v7(), volume_id: 1 };
+    let reserve_guid = DataBlobGuid {
+        blob_id: Uuid::now_v7(),
+        volume_id: 1,
+    };
+    let delete_guid = DataBlobGuid {
+        blob_id: Uuid::now_v7(),
+        volume_id: 1,
+    };
 
     // Pre-populate the delete-target so the batch sub-Delete actually
     // tombstones a real entry rather than getting NotFound.
@@ -134,13 +143,29 @@ async fn test_bss_batch_put_delete_reserve() {
     // either succeeds or returns VersionSkipped depending on FA delete
     // semantics; we only assert the outer dispatch returned a per-entry
     // result for it.
-    assert!(results[0].status.is_ok(), "Put sub failed: {:?}", results[0].status);
-    assert!(results[2].status.is_ok(), "Reserve sub failed: {:?}", results[2].status);
+    assert!(
+        results[0].status.is_ok(),
+        "Put sub failed: {:?}",
+        results[0].status
+    );
+    assert!(
+        results[2].status.is_ok(),
+        "Reserve sub failed: {:?}",
+        results[2].status
+    );
 
     // Verify the Put landed by reading it back.
     let mut readback = Bytes::new();
     rpc_client
-        .get_data_blob(put_guid, 0, &mut readback, put_body.len(), None, &TraceId::new(), 0)
+        .get_data_blob(
+            put_guid,
+            0,
+            &mut readback,
+            put_body.len(),
+            None,
+            &TraceId::new(),
+            0,
+        )
         .await
         .expect("readback put");
     assert_eq!(readback, put_body);
@@ -165,7 +190,10 @@ async fn test_bss_batch_burst_puts() {
     let mut sub_ops: Vec<BssBatchSubOp> = Vec::with_capacity(N);
     let mut expected: Vec<(DataBlobGuid, Bytes)> = Vec::with_capacity(N);
     for i in 0..N {
-        let guid = DataBlobGuid { blob_id: Uuid::now_v7(), volume_id: 1 };
+        let guid = DataBlobGuid {
+            blob_id: Uuid::now_v7(),
+            volume_id: 1,
+        };
         let body: Bytes = vec![(i as u8).wrapping_mul(7); 4096].into();
         let chk = xxhash_rust::xxh3::xxh3_64(&body);
         sub_ops.push(BssBatchSubOp::PutDataBlob {
@@ -192,7 +220,15 @@ async fn test_bss_batch_burst_puts() {
         let (guid, body) = &expected[idx];
         let mut readback = Bytes::new();
         rpc_client
-            .get_data_blob(*guid, 0, &mut readback, body.len(), None, &TraceId::new(), 0)
+            .get_data_blob(
+                *guid,
+                0,
+                &mut readback,
+                body.len(),
+                None,
+                &TraceId::new(),
+                0,
+            )
             .await
             .expect("readback burst put");
         assert_eq!(&readback, body, "burst sub[{idx}] readback mismatch");

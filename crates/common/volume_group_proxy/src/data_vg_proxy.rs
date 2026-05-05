@@ -6,7 +6,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use metrics_wrapper::{counter, histogram};
 use rand::seq::{IndexedRandom, SliceRandom};
 use reed_solomon_simd::{decode as rs_decode, encode as rs_encode};
-use rpc_client_bss::RpcClientBss;
+use rpc_client_bss::{BssBatchSubOp, RpcClientBss};
 use rpc_client_common::RpcError;
 use std::{
     sync::{
@@ -32,6 +32,18 @@ static EPOCH: OnceLock<Instant> = OnceLock::new();
 
 fn current_timestamp_nanos() -> u64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+/// Surface a DataVgError as the RpcError shape that batched callers
+/// expect (per-entry vector). `BssRpc` is preserved since the
+/// underlying transport already returned an `RpcError`; everything
+/// else collapses to `InternalResponseError` so callers don't have
+/// to unify two error enums in their per-entry paths.
+fn datavg_to_rpc_err(e: DataVgError) -> rpc_client_common::RpcError {
+    match e {
+        DataVgError::BssRpc(rpc) => rpc,
+        other => rpc_client_common::RpcError::InternalResponseError(other.to_string()),
+    }
 }
 
 /// Configuration for circuit breaker behavior
@@ -2051,6 +2063,340 @@ impl DataVgProxy {
             write_quorum,
             errors.join("; ")
         )))
+    }
+
+    /// Send N block mutations against a single Replicated volume as
+    /// one batched RPC per replica, with M-of-N quorum reduction per
+    /// entry. Returns one `Result<(), RpcError>` per input sub-op in
+    /// the same order.
+    ///
+    /// All sub-ops must target the same `volume_id`; the caller groups
+    /// by volume before invoking. Per-entry semantics mirror the
+    /// non-batched paths (`put_data_blob_vectored`, `delete_data_blob`,
+    /// `reserve_blocks`):
+    ///
+    /// - Each replica's per-entry status of `Ok(())` or
+    ///   `Err(VersionSkipped)` counts as a per-entry success
+    ///   (idempotent).
+    /// - An entry is committed when its replica-success count reaches
+    ///   `write_quorum`.
+    /// - Override path (`max_entry_version > 1`) drains all replicas
+    ///   before returning so background overrides never lag.
+    /// - First-write path (`max_entry_version == 1`) terminates as
+    ///   soon as every entry is *decided* -- either reached quorum, or
+    ///   provably cannot with the remaining responses -- and finishes
+    ///   the rest in a background task.
+    ///
+    /// EC volumes are not yet supported (each block targets specific
+    /// shards) and return `InitializationError`. Callers that operate
+    /// on EC volumes should fall back to the per-block path.
+    pub async fn put_blocks_batched(
+        &self,
+        sub_ops: Vec<BssBatchSubOp>,
+        trace_id: &TraceId,
+    ) -> Result<Vec<Result<(), RpcError>>, DataVgError> {
+        // BSS recv buffers are sized for one max-shard payload + one
+        // header (`max_payload_size + page_size`, ~512KB + 4KB today --
+        // see core/common/configs.zig `blob_size`). Each outer BssBatch
+        // RPC's body must therefore fit under ~512KB. With 128KB-block
+        // sub_ops, three full payloads (~394KB) fit; a fourth (~525KB)
+        // does not. We aim for ~480KB as the split point so a chunk
+        // can pack three 128KB blocks plus header overhead with a
+        // small safety margin. Multi-MB writes split into multiple
+        // sequential BssBatch RPCs and per-entry results concatenate
+        // in input order; this still beats the strict serial path
+        // (one RPC per block per replica) by roughly
+        // `entries_per_chunk` x.
+        const MAX_BATCH_BODY_SIZE: usize = 480 * 1024;
+        const SUB_HEADER_SIZE: usize = 160;
+        if sub_ops.len() > 1 {
+            let mut chunks: Vec<Vec<BssBatchSubOp>> = Vec::new();
+            let mut current: Vec<BssBatchSubOp> = Vec::new();
+            let mut current_size: usize = 0;
+            for op in sub_ops.into_iter() {
+                let entry_size = SUB_HEADER_SIZE
+                    + match &op {
+                        BssBatchSubOp::PutDataBlob { body, .. } => body.len(),
+                        _ => 0,
+                    };
+                if !current.is_empty() && current_size + entry_size > MAX_BATCH_BODY_SIZE {
+                    chunks.push(std::mem::take(&mut current));
+                    current_size = 0;
+                }
+                current_size += entry_size;
+                current.push(op);
+            }
+            if !current.is_empty() {
+                chunks.push(current);
+            }
+            if chunks.len() > 1 {
+                let mut all_results: Vec<Result<(), RpcError>> =
+                    Vec::with_capacity(chunks.iter().map(|c| c.len()).sum());
+                for chunk in chunks {
+                    let part = Box::pin(self.put_blocks_batched(chunk, trace_id)).await?;
+                    all_results.extend(part);
+                }
+                return Ok(all_results);
+            }
+            // Single chunk -- fall through to the unchunked dispatch.
+            let only = chunks.into_iter().next().unwrap();
+            return Box::pin(self.put_blocks_batched_one_chunk(only, trace_id)).await;
+        }
+
+        self.put_blocks_batched_one_chunk(sub_ops, trace_id).await
+    }
+
+    /// Inner dispatch for a single chunk that fits under the BSS
+    /// per-message size limit. `put_blocks_batched` slices the input
+    /// and calls this for each chunk.
+    #[allow(clippy::cognitive_complexity)]
+    async fn put_blocks_batched_one_chunk(
+        &self,
+        sub_ops: Vec<BssBatchSubOp>,
+        trace_id: &TraceId,
+    ) -> Result<Vec<Result<(), RpcError>>, DataVgError> {
+        if sub_ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = sub_ops.len();
+        let volume_id = match &sub_ops[0] {
+            BssBatchSubOp::PutDataBlob { blob_guid, .. } => blob_guid.volume_id,
+            BssBatchSubOp::DeleteDataBlob { blob_guid, .. } => blob_guid.volume_id,
+            BssBatchSubOp::ReserveBlocks { blob_guid, .. } => blob_guid.volume_id,
+        };
+        let volume = self.find_volume(volume_id).ok_or_else(|| {
+            DataVgError::InitializationError(format!("Volume {volume_id} not found in DataVgProxy"))
+        })?;
+        let write_quorum = match &volume.mode {
+            VolumeMode::Replicated { w, .. } => *w as usize,
+            VolumeMode::ErasureCoded { .. } => {
+                // EC volumes shard each block across data + parity
+                // shards using the existing per-block paths. The
+                // single-shard BssBatch dispatch doesn't map onto
+                // EC's per-shard layout, so fall back to per-entry
+                // serialised dispatch and aggregate results in
+                // input order.
+                return self.put_blocks_batched_ec_fallback(sub_ops, trace_id).await;
+            }
+        };
+
+        // The override-path heuristic uses the highest version across
+        // entries. A batch that covers a fresh write (v=1) plus an
+        // override (v>1) drains all replicas because at least one
+        // entry needs the post-quorum sync.
+        let max_entry_version: u64 = sub_ops
+            .iter()
+            .map(|op| match op {
+                BssBatchSubOp::PutDataBlob { version, .. } => *version,
+                BssBatchSubOp::DeleteDataBlob { version, .. } => *version,
+                BssBatchSubOp::ReserveBlocks {
+                    expected_version, ..
+                } => *expected_version,
+            })
+            .max()
+            .unwrap_or(1);
+
+        let rpc_timeout = self.rpc_timeout;
+        let trace_id = *trace_id;
+
+        let available_nodes: Vec<_> = volume
+            .bss_nodes
+            .iter()
+            .filter(|node| node.is_available())
+            .cloned()
+            .collect();
+        if available_nodes.len() < write_quorum {
+            return Err(DataVgError::QuorumFailure(format!(
+                "Insufficient available nodes ({}/{}) for batched write quorum ({})",
+                available_nodes.len(),
+                volume.bss_nodes.len(),
+                write_quorum
+            )));
+        }
+        let total_nodes = available_nodes.len();
+
+        let mut futures = FuturesUnordered::new();
+        for node in &available_nodes {
+            let node = node.clone();
+            let sub_ops = sub_ops.clone();
+            futures.push(async move {
+                let address = node.address.clone();
+                let result = node
+                    .get_client()
+                    .put_bss_batch(sub_ops, Some(rpc_timeout), &trace_id, 0)
+                    .await;
+                (node, address, result)
+            });
+        }
+
+        // Per-entry success counts feed the quorum check; per-entry
+        // last-error keeps a representative error string to surface
+        // when an entry can't reach quorum (RpcError isn't Clone, so
+        // we stash the formatted message instead and rebuild a generic
+        // RpcError at the end).
+        let mut per_entry_success: Vec<usize> = vec![0; n];
+        let mut per_entry_last_err: Vec<Option<String>> = vec![None; n];
+        let mut nodes_responded: usize = 0;
+        let mut decided = false;
+
+        while let Some((node, address, result)) = futures.next().await {
+            nodes_responded += 1;
+            match result {
+                Ok(per_entry_results) => {
+                    node.record_success();
+                    if per_entry_results.len() != n {
+                        warn!(
+                            "BSS node {address} returned {} entries for batch of {n}; ignoring",
+                            per_entry_results.len()
+                        );
+                    } else {
+                        for (i, r) in per_entry_results.into_iter().enumerate() {
+                            match r.status {
+                                Ok(()) | Err(RpcError::VersionSkipped) => {
+                                    per_entry_success[i] += 1;
+                                }
+                                Err(e) => {
+                                    per_entry_last_err[i] = Some(e.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    node.record_failure();
+                    let err_str = format!("{address}: {e}");
+                    warn!("BSS batch RPC to {address} failed: {e}");
+                    // A whole-batch transport failure means none of
+                    // this node's entries count; record the err as a
+                    // last-resort failure surface for any entry that
+                    // never gets an Ok.
+                    for slot in per_entry_last_err.iter_mut() {
+                        if slot.is_none() {
+                            *slot = Some(err_str.clone());
+                        }
+                    }
+                }
+            }
+
+            // Early termination: every entry is decided once it has
+            // either reached quorum, or its remaining nodes can't
+            // possibly push it to quorum.
+            let remaining = total_nodes - nodes_responded;
+            decided = per_entry_success
+                .iter()
+                .all(|&s| s >= write_quorum || s + remaining < write_quorum);
+            if decided && max_entry_version == 1 {
+                break;
+            }
+            if decided && max_entry_version > 1 && nodes_responded == total_nodes {
+                break;
+            }
+        }
+
+        // Drain remaining replicas:
+        //   - override path: synchronously, like put_data_blob_vectored
+        //   - first-write path: in the background to record success/failure
+        //     telemetry without holding up the caller.
+        if !decided || nodes_responded < total_nodes {
+            if max_entry_version > 1 {
+                while let Some((node, address, result)) = futures.next().await {
+                    match result {
+                        Ok(_) => {
+                            node.record_success();
+                            debug!("Override batched write to {address} completed");
+                        }
+                        Err(e) => {
+                            node.record_failure();
+                            warn!("Override batched write to {address} failed: {e}");
+                        }
+                    }
+                }
+            } else {
+                spawn_background(async move {
+                    while let Some((node, address, result)) = futures.next().await {
+                        match result {
+                            Ok(_) => {
+                                node.record_success();
+                                debug!("Background batched write to {address} completed");
+                            }
+                            Err(e) => {
+                                node.record_failure();
+                                warn!("Background batched write to {address} failed: {e}");
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        let entry_results: Vec<Result<(), RpcError>> = per_entry_success
+            .iter()
+            .zip(per_entry_last_err.into_iter())
+            .map(|(&succ, err_msg)| {
+                if succ >= write_quorum {
+                    Ok(())
+                } else {
+                    Err(RpcError::InternalResponseError(format!(
+                        "BssBatch entry quorum not met ({succ}/{write_quorum}){}",
+                        err_msg.map(|m| format!(": {m}")).unwrap_or_default()
+                    )))
+                }
+            })
+            .collect();
+        Ok(entry_results)
+    }
+
+    /// EC-volume fallback for `put_blocks_batched`. Dispatches each
+    /// sub-op through the existing per-block path (`put_blob` /
+    /// `delete_blob` / `reserve_blob`) which already knows how to
+    /// route across data + parity shards. Results land in the same
+    /// order as `sub_ops`.
+    #[allow(clippy::needless_pass_by_value)]
+    async fn put_blocks_batched_ec_fallback(
+        &self,
+        sub_ops: Vec<BssBatchSubOp>,
+        trace_id: &TraceId,
+    ) -> Result<Vec<Result<(), RpcError>>, DataVgError> {
+        let mut results = Vec::with_capacity(sub_ops.len());
+        for op in sub_ops {
+            let result: Result<(), RpcError> = match op {
+                BssBatchSubOp::PutDataBlob {
+                    blob_guid,
+                    block_number,
+                    body,
+                    body_checksum: _,
+                    version,
+                } => self
+                    .put_blob(blob_guid, block_number, body, version, trace_id)
+                    .await
+                    .map_err(datavg_to_rpc_err),
+                BssBatchSubOp::DeleteDataBlob {
+                    blob_guid,
+                    block_number,
+                    version,
+                } => self
+                    .delete_blob(blob_guid, block_number, version, trace_id)
+                    .await
+                    .map_err(datavg_to_rpc_err),
+                BssBatchSubOp::ReserveBlocks {
+                    blob_guid,
+                    block_number,
+                    block_size,
+                    expected_version,
+                } => self
+                    .reserve_blob(
+                        blob_guid,
+                        block_number,
+                        block_size,
+                        expected_version,
+                        trace_id,
+                    )
+                    .await
+                    .map_err(datavg_to_rpc_err),
+            };
+            results.push(result);
+        }
+        Ok(results)
     }
 
     /// Enumerate the BSS-side block-level entries for `blob_guid`
