@@ -146,6 +146,17 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
             cmd_service::stop_service(ServiceName::All)?;
             result
         }
+        TestType::Pjdfstest { subdir } => {
+            cmd_service::init_service(
+                ServiceName::All,
+                BuildMode::Debug,
+                &InitConfig::default(),
+            )?;
+            cmd_service::start_service(ServiceName::All)?;
+            let result = fs_server::pjdfs::run_pjdfstest(subdir.as_deref()).await;
+            cmd_service::stop_service(ServiceName::All)?;
+            result
+        }
         TestType::All => {
             test_fs_server(false).await?;
             test_bss_node_failure().await?;
