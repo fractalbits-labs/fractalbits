@@ -146,9 +146,21 @@ impl Filesystem for FuseServer {
         offset: u64,
         data: &[u8],
         _write_flags: u32,
-        _flags: u32,
+        flags: u32,
     ) -> FsResult<usize> {
         let written = self.vfs.vfs_write(fh, offset, data).await.map_err(fs_err)?;
+
+        // O_SYNC / O_DSYNC: every write is durability-tied, drain the
+        // queue before the FUSE reply so the kernel sees the same
+        // synchronous guarantee userspace asked for. Default mode
+        // only -- strict mode's writes are already synchronous via
+        // flush at release.
+        if self.vfs.writeback_mode_is_default()
+            && (flags & (libc::O_SYNC as u32 | libc::O_DSYNC as u32)) != 0
+        {
+            self.vfs.vfs_flush(fh).await.map_err(fs_err)?;
+        }
+
         Ok(written as usize)
     }
 

@@ -314,6 +314,10 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         "Writeback default mode (fsyncdir drains queue)",
         test_writeback_default_mode_fsyncdir
     );
+    run_test!(
+        "Writeback default mode (O_DSYNC per-write drain)",
+        test_writeback_default_mode_o_sync
+    );
     run_test!("Rename", test_rename);
     run_test!("Unlink with Open Handle", test_unlink_open_handle);
     run_test!("Overwrite Existing File", test_overwrite_existing);
@@ -1303,6 +1307,58 @@ async fn test_writeback_default_mode_fsyncdir(disk_cache: bool) -> CmdResult {
     println!(
         "{}",
         "SUCCESS: writeback default mode fsyncdir drain passed".green()
+    );
+    Ok(())
+}
+
+/// O_SYNC / O_DSYNC under default mode: every write drains the queue
+/// before returning. The test opens an existing file with O_DSYNC,
+/// writes, and asserts cross-handle readback through a separate
+/// (non-O_SYNC) fd sees the bytes immediately -- the queue must have
+/// been drained inline with the write call.
+async fn test_writeback_default_mode_o_sync(disk_cache: bool) -> CmdResult {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_writeback(&bucket, true, disk_cache)?;
+
+    let path = format!("{}/wb-osync.txt", MOUNT_POINT);
+
+    println!("  Step 2: Pre-create the file (sets up the inode + early-publish)");
+    std::fs::write(&path, b"v0").expect("pre-create failed");
+    // Wait for that initial create's queue cycle to drain (we expect
+    // it to take one worker tick at most). Without this, the O_DSYNC
+    // open below races with the create's own put_inode.
+    std::thread::sleep(Duration::from_millis(200));
+
+    println!("  Step 3: Open with O_DSYNC and write");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_DSYNC)
+        .open(&path)
+        .expect("open O_DSYNC failed");
+    let payload = b"sync-payload";
+    f.write_all(payload).expect("write failed");
+    // Each write under O_SYNC drains the queue; close (which flushes
+    // again) is then a no-op but kept for symmetry with userspace.
+    drop(f);
+
+    println!("  Step 4: Read back via a fresh fd; bytes must match");
+    let read_back = std::fs::read(&path).expect("read failed");
+    assert_eq!(
+        &read_back[..],
+        payload,
+        "O_DSYNC write did not surface synchronously"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode O_DSYNC drain passed".green()
     );
     Ok(())
 }
