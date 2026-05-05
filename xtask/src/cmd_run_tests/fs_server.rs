@@ -1,3 +1,4 @@
+pub mod bench;
 pub mod fuse;
 
 use crate::CmdResult;

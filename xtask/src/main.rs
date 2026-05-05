@@ -609,6 +609,16 @@ pub enum TestType {
         #[clap(long, help = "Run only with disk cache enabled")]
         disk_cache_only: bool,
     },
+    /// A/B benchmark: untar a tarball into FUSE in strict vs default
+    /// writeback mode and compare wall-clock + RPC counts.
+    FsBench {
+        #[clap(
+            long,
+            default_value = "/tmp/bench-include.tar",
+            help = "Path to the tarball to untar"
+        )]
+        tarball: String,
+    },
 }
 
 #[derive(Parser, Clone, EnumString)]
