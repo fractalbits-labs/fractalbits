@@ -7,11 +7,11 @@ use bss_codec::{
     MessageHeader, ReserveBlocksRequest, ReserveBlocksResponse, list_blob_blocks_response,
     list_blobs_response, reserve_blocks_response,
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use data_types::{DataBlobGuid, TraceId};
 use prost::Message as PbMessage;
 use rpc_client_common::{InflightRpcGuard, RpcError, encode_protobuf};
-use rpc_codec_common::MessageFrame;
+use rpc_codec_common::{MessageFrame, MessageHeaderTrait};
 use tracing::error;
 
 /// Check the errno field in the response header and return appropriate error
@@ -587,6 +587,205 @@ impl RpcClient {
         check_response_errno(&resp_frame.header)?;
         Ok(())
     }
+
+    /// Send a batched block-mutation RPC to a single BSS instance.
+    ///
+    /// All sub-ops must target the same `volume_id` (the caller groups
+    /// them by routing). Returns one `Result<(), RpcError>` per
+    /// sub-op, in the same order as `sub_ops`. The outer call returns
+    /// `Err(...)` only when the entire RPC failed (transport, decode,
+    /// or outer errno != 0); per-entry application failures surface as
+    /// `Err` inside the per-entry vector but the outer `Ok` covers
+    /// transport success.
+    pub async fn put_bss_batch(
+        &self,
+        sub_ops: Vec<BssBatchSubOp>,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<Vec<BssBatchEntryResult>, RpcError> {
+        let _guard = InflightRpcGuard::new("bss", "put_bss_batch");
+        if sub_ops.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let n_entries = sub_ops.len();
+        // All entries must share the same volume so the batch can be
+        // routed to one BSS instance. Validate up-front rather than
+        // letting the server discover the mismatch via misrouted keys.
+        let volume_id = sub_ops[0].volume_id();
+        for op in &sub_ops[1..] {
+            if op.volume_id() != volume_id {
+                return Err(RpcError::InternalResponseError(format!(
+                    "BssBatch sub-ops span volumes {volume_id} and {}; group by volume first",
+                    op.volume_id()
+                )));
+            }
+        }
+
+        // Pre-size the body buffer: each sub is a 160-byte header plus
+        // its own body. Avoids reallocations as we extend.
+        let header_sz = size_of::<MessageHeader>();
+        let mut body_total: usize = 0;
+        for op in &sub_ops {
+            body_total += header_sz + op.body_len();
+        }
+        let mut body_buf = BytesMut::with_capacity(body_total);
+
+        for op in &sub_ops {
+            let mut sub_header = MessageHeader::default();
+            sub_header.id = self.gen_request_id();
+            sub_header.command = op.command();
+            sub_header.volume_id = op.volume_id();
+            sub_header.trace_id = trace_id.0;
+            sub_header.retry_count = retry_count as u8;
+            match op {
+                BssBatchSubOp::PutDataBlob {
+                    blob_guid,
+                    block_number,
+                    body,
+                    body_checksum,
+                    version,
+                } => {
+                    sub_header.blob_id = blob_guid.blob_id.into_bytes();
+                    sub_header.block_number = *block_number;
+                    sub_header.content_len = body.len() as u32;
+                    sub_header.size = (header_sz + body.len()) as u32;
+                    sub_header.checksum_body = *body_checksum;
+                    sub_header.version = *version;
+                }
+                BssBatchSubOp::DeleteDataBlob {
+                    blob_guid,
+                    block_number,
+                    version,
+                } => {
+                    sub_header.blob_id = blob_guid.blob_id.into_bytes();
+                    sub_header.block_number = *block_number;
+                    sub_header.size = header_sz as u32;
+                    sub_header.version = *version;
+                }
+                BssBatchSubOp::ReserveBlocks {
+                    blob_guid,
+                    block_number,
+                    block_size: _,
+                    expected_version,
+                } => {
+                    sub_header.blob_id = blob_guid.blob_id.into_bytes();
+                    sub_header.block_number = *block_number;
+                    sub_header.size = header_sz as u32;
+                    sub_header.version = *expected_version;
+                }
+            }
+            // Each sub-header carries its own checksum so a future
+            // server-side per-sub validator can verify mid-stream
+            // without re-hashing the entire batch.
+            sub_header.set_checksum();
+            body_buf.extend_from_slice(bytemuck::bytes_of(&sub_header));
+            if let BssBatchSubOp::PutDataBlob { body, .. } = op {
+                body_buf.extend_from_slice(body);
+            }
+        }
+        let body_bytes: Bytes = body_buf.freeze();
+
+        let mut header = MessageHeader::default();
+        let request_id = self.gen_request_id();
+        header.id = request_id;
+        header.command = Command::BssBatch;
+        header.volume_id = volume_id;
+        header.content_len = body_bytes.len() as u32;
+        header.size = (header_sz + body_bytes.len()) as u32;
+        header.retry_count = retry_count as u8;
+        header.trace_id = trace_id.0;
+        header.set_body_checksum(&body_bytes);
+
+        let msg_frame = MessageFrame::new(header, body_bytes);
+        let resp_frame = self
+            .send_request(msg_frame, timeout, Some(crate::OperationType::PutData))
+            .await
+            .map_err(|e| {
+                if !e.retryable() {
+                    error!(rpc=%"put_bss_batch", %request_id, %volume_id, n_entries, error=?e, "bss rpc failed");
+                }
+                e
+            })?;
+        check_response_errno(&resp_frame.header)?;
+
+        // Response body is N x 160-byte sub-headers (no sub-bodies for
+        // Put/Delete/Reserve responses). Decode each and map errno -> Result.
+        let resp_body = resp_frame.body;
+        if resp_body.len() != n_entries * header_sz {
+            return Err(RpcError::InternalResponseError(format!(
+                "BssBatch response body len {} != expected {}",
+                resp_body.len(),
+                n_entries * header_sz
+            )));
+        }
+        let mut results = Vec::with_capacity(n_entries);
+        for i in 0..n_entries {
+            let off = i * header_sz;
+            let sub_header_bytes = &resp_body[off..off + header_sz];
+            let sub_header: MessageHeader = bytemuck::pod_read_unaligned(sub_header_bytes);
+            let status = check_response_errno(&sub_header);
+            results.push(BssBatchEntryResult { status });
+        }
+        Ok(results)
+    }
+}
+
+/// One sub-operation in a BssBatch RPC. Sub-ops in the same batch
+/// must target the same `volume_id` (the caller groups them by
+/// routing); each carries its own per-blob version and key.
+#[derive(Debug, Clone)]
+pub enum BssBatchSubOp {
+    PutDataBlob {
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        body: Bytes,
+        body_checksum: u64,
+        version: u64,
+    },
+    DeleteDataBlob {
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        version: u64,
+    },
+    ReserveBlocks {
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        block_size: u32,
+        expected_version: u64,
+    },
+}
+
+impl BssBatchSubOp {
+    fn volume_id(&self) -> u16 {
+        match self {
+            BssBatchSubOp::PutDataBlob { blob_guid, .. } => blob_guid.volume_id,
+            BssBatchSubOp::DeleteDataBlob { blob_guid, .. } => blob_guid.volume_id,
+            BssBatchSubOp::ReserveBlocks { blob_guid, .. } => blob_guid.volume_id,
+        }
+    }
+    fn body_len(&self) -> usize {
+        match self {
+            BssBatchSubOp::PutDataBlob { body, .. } => body.len(),
+            BssBatchSubOp::DeleteDataBlob { .. } => 0,
+            BssBatchSubOp::ReserveBlocks { .. } => 0,
+        }
+    }
+    fn command(&self) -> Command {
+        match self {
+            BssBatchSubOp::PutDataBlob { .. } => Command::PutDataBlob,
+            BssBatchSubOp::DeleteDataBlob { .. } => Command::DeleteDataBlob,
+            BssBatchSubOp::ReserveBlocks { .. } => Command::ReserveBlocks,
+        }
+    }
+}
+
+/// Per-entry outcome of a BssBatch RPC. The vector returned by
+/// `put_bss_batch` has one entry per input sub-op, in the same order.
+#[derive(Debug)]
+pub struct BssBatchEntryResult {
+    pub status: Result<(), RpcError>,
 }
 
 #[cfg(test)]

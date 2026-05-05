@@ -9,6 +9,7 @@ tokio-runtime = ["rpc_client_common/tokio-runtime"]
 compio-runtime = ["rpc_client_common/compio-runtime"]
 
 [dependencies]
+bytemuck.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 uuid.workspace = true
