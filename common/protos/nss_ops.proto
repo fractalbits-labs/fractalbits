@@ -124,11 +124,15 @@ message RenameRequest {
   string root_blob_name = 1;
   string src_path = 2;
   string dst_path = 3;
+  // Only honored for rename-object (paths ending with \0). When true and the
+  // destination already exists, the rename overwrites it and the old dst value
+  // is returned in RenameResponse.ok.
+  bool force_overwrite = 4;
 }
 
 message RenameResponse {
   oneof result {
-    string ok = 1;
+    bytes ok = 1;
     google.protobuf.Empty err_src_nonexisted = 2;
     google.protobuf.Empty err_dst_existed = 3;
     string err_other = 4;

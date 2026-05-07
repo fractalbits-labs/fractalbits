@@ -277,6 +277,7 @@ impl RpcClient {
             root_blob_name: root_blob_name.to_string(),
             src_path: src_path.to_string(),
             dst_path: dst_path.to_string(),
+            force_overwrite: false,
         };
 
         let mut header = MessageHeader::default();
@@ -316,6 +317,7 @@ impl RpcClient {
         root_blob_name: &str,
         src_path: &str,
         dst_path: &str,
+        force_overwrite: bool,
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
@@ -330,6 +332,7 @@ impl RpcClient {
             root_blob_name: root_blob_name.to_string(),
             src_path: nss_src_path,
             dst_path: nss_dst_path,
+            force_overwrite,
         };
 
         let mut header = MessageHeader::default();

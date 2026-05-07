@@ -29,6 +29,7 @@ pub async fn rename_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
             &bucket.root_blob_name,
             &src_path,
             &dst_path,
+            false,
             Some(ctx.app.config.rpc_request_timeout()),
             &ctx.trace_id
         ),
