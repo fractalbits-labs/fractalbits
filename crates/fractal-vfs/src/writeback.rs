@@ -7,11 +7,10 @@
 //! RPC, BSS block writes batch into one `BssBatch`, and per-file commit
 //! ordering A->B->C->D is enforced by the per-inode pipeline.
 //!
-//! Initial scope: exclusive-writer regular files, `create`, `mkdir`,
+//! Scope: exclusive-writer regular files, `create`, `mkdir`,
 //! regular-file `write`, `flush` / `release`, `fsync`, and post-create
-//! non-size `setattr`. Default mode only. One active remote generation
-//! per file. Stage A CAS conflict ⇒ fail/taint, no transparent rebase.
-//! All other operations route to the existing strict path.
+//! non-size `setattr`. One active remote generation per file. Stage A
+//! CAS conflict ⇒ fail/taint, no transparent rebase.
 //!
 //! This module owns the intent map, the generation counter, the stage
 //! enum, and the per-file pipeline state. Worker scheduling and FUSE op
@@ -107,7 +106,7 @@ pub enum InodeOp {
 }
 
 /// Subset of inode attributes mutable via `setattr` in the initial
-/// scope (non-size only -- size changes route to strict).
+/// scope (non-size only -- size changes go through `vfs_setattr_size`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AttrMutation {
     pub mode: Option<u32>,

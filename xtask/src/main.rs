@@ -117,8 +117,7 @@ enum Cmd {
     },
 
     /// Run the pjdfstest POSIX compliance suite against an fs_server
-    /// FUSE mount (writeback default mode). Shortcut for
-    /// `xtask run-tests pjdfstest`.
+    /// FUSE mount. Shortcut for `xtask run-tests pjdfstest`.
     #[clap(about = "Run pjdfstest POSIX compliance suite")]
     Pjdfstest {
         /// Restrict to a single tests/<NAME>/ subgroup (e.g. chmod,
@@ -543,10 +542,6 @@ pub struct FsServerConfig {
     pub disk_cache_enabled: bool,
     pub disk_cache_path: String,
     pub disk_cache_size_gb: u64,
-    /// Writeback durability mode passed through to fs_server via the
-    /// `FS_SERVER_WRITEBACK_MODE` env var. Empty string = use the
-    /// fs_server config default (`strict`).
-    pub writeback_mode: String,
     /// When true, fs_server gets `FS_SERVER_ALLOW_OTHER=true` so the
     /// FUSE mount lets users other than the daemon's owner (notably
     /// `root`) read and write the mount. Required when the test
@@ -630,20 +625,9 @@ pub enum TestType {
         #[clap(long, help = "Run only with disk cache enabled")]
         disk_cache_only: bool,
     },
-    /// A/B benchmark: untar a tarball into FUSE in strict vs default
-    /// writeback mode and compare wall-clock + RPC counts.
-    FsBench {
-        #[clap(
-            long,
-            default_value = "/tmp/bench-include.tar",
-            help = "Path to the tarball to untar"
-        )]
-        tarball: String,
-    },
     /// Build (on first run) and execute the pjdfstest POSIX
-    /// compliance suite against a FUSE mount in writeback default
-    /// mode. Optionally restrict to a single subgroup with
-    /// `--subdir chmod` etc.
+    /// compliance suite against a FUSE mount. Optionally restrict to
+    /// a single subgroup with `--subdir chmod` etc.
     Pjdfstest {
         #[clap(
             long,

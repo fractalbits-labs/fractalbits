@@ -1374,12 +1374,6 @@ Environment="MINIO_REGION=localdev""##
                     fs.disk_cache_size_gb
                 );
             }
-            if !fs.writeback_mode.is_empty() {
-                env_settings += &format!(
-                    "\nEnvironment=\"FS_SERVER_WRITEBACK_MODE={}\"",
-                    fs.writeback_mode
-                );
-            }
             if fs.allow_other {
                 env_settings += "\nEnvironment=\"FS_SERVER_ALLOW_OTHER=true\"";
             }

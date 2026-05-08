@@ -1,6 +1,5 @@
 //! pjdfstest driver. Clones, bootstraps, and runs the POSIX
-//! filesystem compliance suite against an fs_server FUSE mount in
-//! `writeback_mode=default` so the writeback queue path is exercised.
+//! filesystem compliance suite against an fs_server FUSE mount.
 //!
 //! pjdfstest is a third-party C + Perl test suite that walks the
 //! POSIX system-call surface (`chmod`, `chown`, `link`, `mkdir`,
@@ -11,9 +10,7 @@
 //!
 //! Failures are documented but not fatal: many subdirs assume
 //! Linux/BSD-specific features (chflags, capabilities, ACLs) that
-//! fs_server intentionally doesn't expose. The promotion gate looks
-//! at the regression delta against strict mode, not the absolute
-//! pass count.
+//! fs_server intentionally doesn't expose.
 
 use crate::cmd_service;
 use crate::{CmdResult, FsServerConfig, InitConfig, ServiceName};
@@ -159,8 +156,7 @@ fn mount_fuse_default(bucket: &str) -> CmdResult {
     }?;
     run_cmd!(mkdir -p $mount_point)?;
 
-    let mut cfg = fs_cfg(bucket);
-    cfg.writeback_mode = "default".to_string();
+    let cfg = fs_cfg(bucket);
     cmd_service::init_service(
         ServiceName::FsServer,
         crate::cmd_build::BuildMode::Debug,

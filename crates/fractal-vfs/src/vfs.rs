@@ -10,7 +10,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::backend::{BackendConfig, StorageBackend};
 use crate::cache::{DirCache, DirEntry};
-use crate::config::WritebackMode;
 use crate::disk_cache::DiskCache;
 use crate::error::FsError;
 use crate::inode::{EntryType, InodeTable, ROOT_INODE};
@@ -225,14 +224,12 @@ pub struct VfsCore {
     passthrough_enabled: bool,
     passthrough_max_object_size: u64,
     prefetch_policy: crate::prefetch::PrefetchPolicy,
-    /// Writeback queue. Always present, but only consulted when
-    /// `writeback_mode` is `Default`. Worker is spawned lazily on
-    /// the first FUSE op (the FUSE adapter's `init()` trait method
-    /// is dead in this codebase -- the session handles FUSE_INIT
-    /// itself -- so we spawn from inside the compio runtime when
-    /// the first op arrives).
+    /// Writeback queue. Worker is spawned lazily on the first FUSE
+    /// op (the FUSE adapter's `init()` trait method is dead in this
+    /// codebase -- the session handles FUSE_INIT itself -- so we
+    /// spawn from inside the compio runtime when the first op
+    /// arrives).
     writeback: Arc<WritebackQueue>,
-    writeback_mode: WritebackMode,
     /// `max_batch_wait_ms` from the writeback config; the drainer
     /// polls this often.
     writeback_poll_ms: u32,
@@ -290,7 +287,6 @@ impl VfsCore {
         let passthrough_max_object_size =
             config.passthrough_max_object_size_gb * 1024 * 1024 * 1024;
         let prefetch_policy = crate::prefetch::PrefetchPolicy::from_config(config);
-        let writeback_mode = config.writeback.parsed_mode();
         let writeback_poll_ms = config.writeback.max_batch_wait_ms.max(1);
         let writeback = Arc::new(WritebackQueue::new());
 
@@ -306,7 +302,6 @@ impl VfsCore {
             passthrough_max_object_size,
             prefetch_policy,
             writeback,
-            writeback_mode,
             writeback_poll_ms,
             writeback_worker_started: AtomicBool::new(false),
             fuse_dev_fd: None,
@@ -529,13 +524,6 @@ impl VfsCore {
     fn release_write_lock(&self, inode: u64, fh: u64) {
         self.inode_write_owner
             .remove_if(&inode, |_, owner| *owner == fh);
-    }
-
-    /// `true` when the writeback queue is configured for default mode.
-    /// Callers branch on this to enqueue ops vs. running the strict
-    /// synchronous path.
-    pub fn writeback_mode_is_default(&self) -> bool {
-        self.writeback_mode == WritebackMode::Default
     }
 
     /// Borrow the writeback queue. Used by external spawn handlers that
@@ -1866,10 +1854,11 @@ impl VfsCore {
     ///
     /// `expected_layout_bytes` carries the bytes the caller believes
     /// NSS has stored for this key; when present, the override-flush
-    /// NSS write goes through `put_inode_cas` and a guard mismatch
-    /// surfaces as `FsError::CasConflict`. Pass `None` to skip the
-    /// guard (initial-create flow, where we expect the slot to be new
-    /// or whatever is there is the loser of an earlier crash).
+    /// NSS write rides the queue with a CAS guard and a guard
+    /// mismatch surfaces as `FsError::CasConflict`. Pass `None` to
+    /// skip the guard (initial-create flow, where we expect the slot
+    /// to be new or whatever is there is the loser of an earlier
+    /// crash).
     #[allow(clippy::too_many_arguments)]
     async fn flush_publish(
         &self,
@@ -2119,18 +2108,9 @@ impl VfsCore {
             .map_err(FsError::from)?
             .into();
 
-        // Override flushes go through the CAS variant when we have a
-        // snapshot of what NSS held at open time. A guard mismatch
-        // means a cross-instance writer published a newer version
-        // first; the in-memory write buffer is provably stale, so we
-        // surface CasConflict (ESTALE) to userspace and let the caller
-        // close + reopen. Non-override (initial-create) and the
-        // missing-bytes fallback (no read at open) keep the original
-        // unconditional put_inode path.
-        // Default mode routes Stage A through the writeback queue so
-        // multiple concurrent flushes coalesce into one InodeBatch
-        // RPC instead of N round-trips. Strict mode keeps the
-        // existing direct path.
+        // Stage A routes through the writeback queue so multiple
+        // concurrent flushes coalesce into one InodeBatch RPC
+        // instead of N round-trips.
         //
         // The queue path passes `expected_layout_bytes` directly:
         // when vfs_create early-publishes a placeholder layout, even
@@ -2141,11 +2121,10 @@ impl VfsCore {
         tracing::warn!(
             key = %s3_key,
             is_override,
-            mode_default = self.writeback_mode_is_default(),
             has_expected = expected_layout_bytes.is_some(),
             "flush_publish entered"
         );
-        let old_bytes = if self.writeback_mode_is_default() {
+        let old_bytes = {
             let inode = self.file_handles.get(&fh_id).map(|h| h.ino).unwrap_or(0);
             let parent_key = parent_prefix_of(s3_key);
             let name = s3_key
@@ -2210,35 +2189,6 @@ impl VfsCore {
                 put_result?;
             }
             Bytes::new()
-        } else if is_override && let Some(expected) = expected_layout_bytes {
-            // Strict-mode override flush: optimistic CAS with the
-            // open-time cached guard, then refetch + retry once on
-            // CasConflict. Mirrors the default-mode retry above so
-            // a kernel-driven SETATTR racing with our flush doesn't
-            // surface ESTALE on the first attempt.
-            match self
-                .backend()
-                .put_inode_cas(s3_key, layout_bytes.clone(), expected, trace_id)
-                .await
-            {
-                Ok(prev) => prev,
-                Err(FsError::CasConflict) => {
-                    let fresh_expected = self
-                        .backend()
-                        .get_inode_with_bytes(s3_key, trace_id)
-                        .await
-                        .map(|(_, b)| b)
-                        .unwrap_or_default();
-                    self.backend()
-                        .put_inode_cas(s3_key, layout_bytes.clone(), fresh_expected, trace_id)
-                        .await?
-                }
-                Err(e) => return Err(e),
-            }
-        } else {
-            self.backend()
-                .put_inode(s3_key, layout_bytes.clone(), trace_id)
-                .await?
         };
 
         // Replace flush only: clean up the old blob's blocks if NSS had
@@ -2399,9 +2349,6 @@ impl VfsCore {
     /// fast path: a relaxed atomic load + branch in steady state. The
     /// `compare_exchange` only fires once per process.
     fn ensure_writeback_worker_started(&self) {
-        if self.writeback_mode != WritebackMode::Default {
-            return;
-        }
         if self.writeback_worker_started.load(Ordering::Relaxed) {
             return;
         }
@@ -2425,13 +2372,11 @@ impl VfsCore {
         // Block new enqueues; the worker keeps draining whatever is
         // already InFlight / Pending until the queue depth hits 0 or
         // the host process exits.
-        if self.writeback_mode == WritebackMode::Default {
-            self.writeback.set_enqueue_blocked(true);
-            tracing::info!(
-                queue_depth = self.writeback.depth(),
-                "writeback enqueue blocked at destroy; draining residual"
-            );
-        }
+        self.writeback.set_enqueue_blocked(true);
+        tracing::info!(
+            queue_depth = self.writeback.depth(),
+            "writeback enqueue blocked at destroy; draining residual"
+        );
         tracing::info!("Filesystem destroyed");
     }
 
@@ -2907,8 +2852,7 @@ impl VfsCore {
         }
 
         // Phase 2: persist. If we have an updated layout, serialise
-        // and route through the writeback queue (default mode) or
-        // direct put_inode (strict). The persistence is
+        // and route through the writeback queue. The persistence is
         // best-effort; failure is logged and the in-memory mutation
         // still stands so the caller's setattr is observable
         // locally.
@@ -2927,28 +2871,14 @@ impl VfsCore {
             if let Some(mut e) = self.inodes.get_mut(inode) {
                 e.layout = Some(layout);
             }
-            match self.writeback_mode {
-                WritebackMode::Strict => {
-                    let trace_id = TraceId::new();
-                    if let Err(e) = self
-                        .backend()
-                        .put_inode(&s3_key, layout_bytes, &trace_id)
-                        .await
-                    {
-                        tracing::warn!(key = %s3_key, error = %e, "vfs_setattr_posix: NSS put failed");
-                    }
-                }
-                WritebackMode::Default => {
-                    self.enqueue_inode_intent_async(
-                        inode,
-                        &s3_key,
-                        &parent_key,
-                        &name,
-                        layout_bytes,
-                        expected_old_bytes,
-                    );
-                }
-            }
+            self.enqueue_inode_intent_async(
+                inode,
+                &s3_key,
+                &parent_key,
+                &name,
+                layout_bytes,
+                expected_old_bytes,
+            );
         }
         Ok(())
     }
@@ -3998,39 +3928,26 @@ impl VfsCore {
         self.ensure_writeback_worker_started();
         self.flush_write_buffer(fh).await?;
 
-        // Default-mode writeback drain: if this fh's inode has any
-        // queued cycles at gen <= barrier, wait for them to commit
-        // before returning. Surfaces deferred EIO if any cycle failed.
-        // No-op in strict mode (the queue is always empty there) and
-        // for inodes with no dirty cycles.
+        // Writeback drain: if this fh's inode has any queued cycles
+        // at gen <= barrier, wait for them to commit before
+        // returning. Surfaces deferred EIO if any cycle failed.
+        // No-op for inodes with no dirty cycles.
         //
-        // `force_sync_drain` distinguishes the two callers:
-        //   * `fsync(2)` / `O_SYNC` writes: must drain (durability ask).
-        //   * `close(2)` -> FUSE_FLUSH: errors-only, no durability ask.
-        //     Blocking on close() per file would serialise the queue
-        //     against userspace and erase the writeback win on
-        //     create-heavy workloads (`tar -xf`, `cp -r`). The cycle
-        //     stays queued and the worker drains it on its own; any
-        //     deferred EIO propagates via errseq the next time the
-        //     same fd path opens or fsyncs.
-        if self.writeback_mode == WritebackMode::Default
-            && let Some(handle) = self.file_handles.get(&fh)
-        {
+        // This is the fsync(2) / O_SYNC path: durability-tied.
+        // close(2) -> FUSE_FLUSH is a no-op (see `fuse_server::flush`)
+        // -- blocking on close() per file would serialise the queue
+        // against userspace and erase the writeback win on
+        // create-heavy workloads (`tar -xf`, `cp -r`). The cycle
+        // stays queued and the worker drains it on its own; any
+        // deferred EIO propagates via errseq the next time the same
+        // fd path opens or fsyncs.
+        if let Some(handle) = self.file_handles.get(&fh) {
             let inode = handle.ino;
             drop(handle);
             self.drain_inode_to_barrier(inode).await?;
         }
 
         Ok(())
-    }
-
-    /// Variant of `vfs_flush` that skips the writeback barrier wait,
-    /// used for the FUSE_FLUSH path (close-on-fd, not fsync). Still
-    /// flushes the buffered write data so errors propagate, but does
-    /// not stall on the queue.
-    pub async fn vfs_flush_no_drain(&self, fh: u64) -> Result<(), FsError> {
-        self.ensure_writeback_worker_started();
-        self.flush_write_buffer(fh).await
     }
 
     /// Queue-aware put_inode that the worker batches across concurrent
@@ -4041,9 +3958,8 @@ impl VfsCore {
     ///   * Err(CasConflict) on STATUS_CAS_CONFLICT (caller must reopen)
     ///   * Err(Internal) on any other failure
     ///
-    /// Used by flush_write_buffer in default mode so vfs_release
-    /// flush traffic actually rides the InodeBatch path. Strict mode
-    /// keeps the direct backend.put_inode_cas call.
+    /// Used by flush_write_buffer so vfs_release flush traffic rides
+    /// the InodeBatch path.
     /// Fire-and-forget enqueue of a `PutInode` intent. Used by
     /// `vfs_create` early-publish so the placeholder lands without
     /// blocking the create() call; the worker drains it on its next
@@ -4323,60 +4239,47 @@ impl VfsCore {
         wb.size_changed = true;
         wb.dirty = true;
 
-        // Default-mode early-publish: enqueue a placeholder PutInode
-        // so cross-instance lookups can find the file before close.
-        // The enqueue is fire-and-forget -- the worker drains it on
-        // its next tick. The terminal flush at vfs_release CASes
-        // against these bytes and naturally serializes against the
-        // placeholder cycle (same key, increasing generation) inside
-        // the queue, so we don't need to block create() to wait for
-        // the placeholder to commit. Strict mode keeps the legacy
-        // "publish on flush" behavior.
-        let (layout_at_create, layout_bytes_at_create) = if self.writeback_mode_is_default() {
-            // File placeholder is a `Normal` zero-byte layout, NOT a
-            // `Directory` marker. A directory marker would be
-            // `is_listable() == false` and `vfs_lookup` would treat
-            // the early-published key as ENOENT until close-time
-            // flush_publish replaces it with the real Normal layout.
-            let placeholder_layout = file_ops::create_file_placeholder_layout();
-            let placeholder_bytes: Bytes =
-                to_bytes_in::<_, rkyv::rancor::Error>(&placeholder_layout, Vec::new())
-                    .map_err(FsError::from)?
-                    .into();
-            // Seed the inode entry's layout from the placeholder so
-            // a follow-up vfs_getattr (e.g. the one fuse_server::setattr
-            // calls to build its reply, fired the moment userspace does
-            // chmod-after-create) takes the in-memory branch instead of
-            // falling back to backend().get_inode(key) -- the worker
-            // hasn't yet drained the placeholder PutInode, so NSS would
-            // return NotFound and the kernel would surface ENOENT to
-            // userspace. Deterministic in default mode because the
-            // 50ms drain tick is always wider than the 1-2ms gap
-            // between create(2) returning and the next chmod(2)
-            // arriving from the same shell loop.
-            if let Some(mut entry) = self.inodes.get_mut(ino) {
-                entry.layout = Some(placeholder_layout.clone());
-            }
-            self.enqueue_inode_intent_async(
-                ino,
-                &key,
-                &prefix,
-                name,
-                placeholder_bytes.clone(),
-                None,
-            );
-            (Some(placeholder_layout), Some(placeholder_bytes))
-        } else {
-            (None, None)
-        };
+        // Early-publish: enqueue a placeholder PutInode so
+        // cross-instance lookups can find the file before close. The
+        // enqueue is fire-and-forget -- the worker drains it on its
+        // next tick. The terminal flush at vfs_release CASes against
+        // these bytes and naturally serializes against the placeholder
+        // cycle (same key, increasing generation) inside the queue,
+        // so we don't need to block create() to wait for the
+        // placeholder to commit.
+        //
+        // File placeholder is a `Normal` zero-byte layout, NOT a
+        // `Directory` marker. A directory marker would be
+        // `is_listable() == false` and `vfs_lookup` would treat the
+        // early-published key as ENOENT until close-time flush_publish
+        // replaces it with the real Normal layout.
+        let placeholder_layout = file_ops::create_file_placeholder_layout();
+        let placeholder_bytes: Bytes =
+            to_bytes_in::<_, rkyv::rancor::Error>(&placeholder_layout, Vec::new())
+                .map_err(FsError::from)?
+                .into();
+        // Seed the inode entry's layout from the placeholder so a
+        // follow-up vfs_getattr (e.g. the one fuse_server::setattr
+        // calls to build its reply, fired the moment userspace does
+        // chmod-after-create) takes the in-memory branch instead of
+        // falling back to backend().get_inode(key) -- the worker
+        // hasn't yet drained the placeholder PutInode, so NSS would
+        // return NotFound and the kernel would surface ENOENT to
+        // userspace. The 5ms drain tick is always wider than the
+        // 1-2ms gap between create(2) returning and the next chmod(2)
+        // arriving from the same shell loop.
+        if let Some(mut entry) = self.inodes.get_mut(ino) {
+            entry.layout = Some(placeholder_layout.clone());
+        }
+        self.enqueue_inode_intent_async(ino, &key, &prefix, name, placeholder_bytes.clone(), None);
 
         self.file_handles.insert(
             fh,
             FileHandle {
                 ino,
                 s3_key: key,
-                layout: layout_at_create,
-                layout_bytes: layout_bytes_at_create,
+                layout: Some(placeholder_layout),
+                layout_bytes: Some(placeholder_bytes),
                 write_buf: Some(wb),
                 backing_id: None,
             },
@@ -4450,41 +4353,32 @@ impl VfsCore {
             .inodes
             .lookup_or_insert(&key, EntryType::File, Some(layout.clone()));
 
-        match self.writeback_mode {
-            WritebackMode::Strict => {
-                // Strict path: synchronous publish, return on completion.
-                self.backend()
-                    .put_inode(&key, layout_bytes, &trace_id)
-                    .await?;
-            }
-            WritebackMode::Default => {
-                // Writeback path: open a fresh cycle for this inode and
-                // enqueue the PutInode intent. The worker drains it
-                // asynchronously; vfs_fsync (or implicit on next
-                // syncfs) waits for the cycle to commit.
-                use crate::writeback::{FhId, Generation};
-                let generation = Generation(0);
-                self.writeback
-                    .open_cycle(ino, generation, layout_bytes.len() as u64, 0);
-                let _outcome = self.writeback.upsert_inode_intent(
-                    key.clone(),
-                    generation,
-                    ino,
-                    WbInodeOp::PutInode {
-                        parent_key: prefix.clone(),
-                        name: name.to_string(),
-                        layout_bytes,
-                        // Symlinks are brand-new entries -- no CAS
-                        // guard. Worker uses unconditional put_inode.
-                        expected_old_value: None,
-                    },
-                    // No fh is allocated for symlinks (the kernel does
-                    // not call open() on the link itself); use a
-                    // sentinel FhId so error routing can still walk the
-                    // owner set.
-                    FhId(0),
-                );
-            }
+        // Open a fresh cycle for this inode and enqueue the PutInode
+        // intent. The worker drains it asynchronously; vfs_fsync (or
+        // implicit on next syncfs) waits for the cycle to commit.
+        {
+            use crate::writeback::{FhId, Generation};
+            let generation = Generation(0);
+            self.writeback
+                .open_cycle(ino, generation, layout_bytes.len() as u64, 0);
+            let _outcome = self.writeback.upsert_inode_intent(
+                key.clone(),
+                generation,
+                ino,
+                WbInodeOp::PutInode {
+                    parent_key: prefix.clone(),
+                    name: name.to_string(),
+                    layout_bytes,
+                    // Symlinks are brand-new entries -- no CAS guard.
+                    // Worker uses unconditional put_inode.
+                    expected_old_value: None,
+                },
+                // No fh is allocated for symlinks (the kernel does
+                // not call open() on the link itself); use a
+                // sentinel FhId so error routing can still walk the
+                // owner set.
+                FhId(0),
+            );
         }
 
         // Invalidate dir cache so the new symlink shows up in listings.
@@ -4775,30 +4669,23 @@ impl VfsCore {
             .inodes
             .lookup_or_insert(&key, EntryType::File, Some(layout.clone()));
 
-        match self.writeback_mode {
-            WritebackMode::Strict => {
-                self.backend()
-                    .put_inode(&key, layout_bytes, &trace_id)
-                    .await?;
-            }
-            WritebackMode::Default => {
-                use crate::writeback::{FhId, Generation};
-                let generation = Generation(0);
-                self.writeback
-                    .open_cycle(ino, generation, layout_bytes.len() as u64, 0);
-                let _outcome = self.writeback.upsert_inode_intent(
-                    key.clone(),
-                    generation,
-                    ino,
-                    WbInodeOp::PutInode {
-                        parent_key: prefix.clone(),
-                        name: name.to_string(),
-                        layout_bytes,
-                        expected_old_value: None,
-                    },
-                    FhId(0),
-                );
-            }
+        {
+            use crate::writeback::{FhId, Generation};
+            let generation = Generation(0);
+            self.writeback
+                .open_cycle(ino, generation, layout_bytes.len() as u64, 0);
+            let _outcome = self.writeback.upsert_inode_intent(
+                key.clone(),
+                generation,
+                ino,
+                WbInodeOp::PutInode {
+                    parent_key: prefix.clone(),
+                    name: name.to_string(),
+                    layout_bytes,
+                    expected_old_value: None,
+                },
+                FhId(0),
+            );
         }
 
         self.dir_cache.invalidate(&prefix);
@@ -5074,8 +4961,6 @@ impl VfsCore {
         Self::check_path_max(&prefix, name)?;
         let key = format!("{}{}/", prefix, name);
 
-        let trace_id = TraceId::new();
-
         // Build the layout once with the caller-provided posix folded
         // in so the bytes we actually persist in NSS carry the
         // requested mode / uid / gid / times. The default-zero posix
@@ -5097,51 +4982,27 @@ impl VfsCore {
             }
         };
 
-        // Default mode: route through the writeback queue so multiple
-        // concurrent mkdir calls (e.g. tar walking the kernel-source
-        // tree) coalesce into one InodeBatch RPC instead of N
-        // synchronous put_inode round-trips. Strict mode keeps the
-        // direct put_dir_marker call.
-        if self.writeback_mode_is_default() {
-            // Build the dir marker layout + bytes locally so we can
-            // enqueue without touching NSS yet. The enqueue is
-            // fire-and-forget; the worker drains it on the next tick.
-            // Subsequent vfs_create against this dir uses the local
-            // inode table for parent-prefix lookup, so the placeholder
-            // doesn't need to commit before children land. fsyncdir /
-            // syncfs / unmount drain barriers all wait for commit.
-            let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())
-                .map_err(FsError::from)?
-                .into();
-            let (ino, _) =
-                self.inodes
-                    .lookup_or_insert(&key, EntryType::Directory, Some(layout.clone()));
-            seed_posix(ino);
-            self.enqueue_inode_intent_async(ino, &key, &prefix, name, layout_bytes, None);
-            self.dir_cache.invalidate(&prefix);
-            self.touch_parent_times(parent);
-            return Ok(self.make_dir_attr(ino));
-        }
-
-        // Strict mode keeps the direct put_dir_marker call but now
-        // sends the layout we built (with init_posix folded in)
-        // rather than the default-zero one the helper synthesises.
+        // Route through the writeback queue so multiple concurrent
+        // mkdir calls (e.g. tar walking the kernel-source tree)
+        // coalesce into one InodeBatch RPC instead of N synchronous
+        // put_inode round-trips. Build the dir marker layout + bytes
+        // locally so we can enqueue without touching NSS yet. The
+        // enqueue is fire-and-forget; the worker drains it on the
+        // next tick. Subsequent vfs_create against this dir uses the
+        // local inode table for parent-prefix lookup, so the
+        // placeholder doesn't need to commit before children land.
+        // fsyncdir / syncfs / unmount drain barriers all wait for
+        // commit.
         let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())
             .map_err(FsError::from)?
             .into();
-        self.backend()
-            .put_inode(&key, layout_bytes, &trace_id)
-            .await?;
-
-        let (ino, _) = self
-            .inodes
-            .lookup_or_insert(&key, EntryType::Directory, None);
+        let (ino, _) =
+            self.inodes
+                .lookup_or_insert(&key, EntryType::Directory, Some(layout.clone()));
         seed_posix(ino);
-
-        // Invalidate dir cache for parent
+        self.enqueue_inode_intent_async(ino, &key, &prefix, name, layout_bytes, None);
         self.dir_cache.invalidate(&prefix);
         self.touch_parent_times(parent);
-
         Ok(self.make_dir_attr(ino))
     }
 
@@ -5759,9 +5620,8 @@ fn spawn_writeback_metrics_exporter(queue: Arc<WritebackQueue>) {
 
 /// Long-running writeback worker. Polls the queue every `poll_ms`,
 /// drains pending Stage A intents, and fires one batched
-/// `InodeBatch` RPC per drain window. Spawned at FUSE init when
-/// `WritebackMode::Default` is configured; runs until the process
-/// exits.
+/// `InodeBatch` RPC per drain window. Spawned at FUSE init; runs
+/// until the process exits.
 fn spawn_writeback_worker(
     backend_cfg: Arc<BackendConfig>,
     queue: Arc<WritebackQueue>,

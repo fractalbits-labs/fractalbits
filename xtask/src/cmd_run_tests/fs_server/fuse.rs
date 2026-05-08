@@ -33,57 +33,6 @@ fn fs_server_config(bucket: &str, read_write: bool, disk_cache: bool) -> FsServe
     cfg
 }
 
-/// Same as `mount_fuse_with_opts` but sets `writeback_mode = "default"`
-/// so the writeback queue / worker are active for this mount.
-fn mount_fuse_writeback(bucket: &str, read_write: bool, disk_cache: bool) -> CmdResult {
-    let mount_point = MOUNT_POINT;
-
-    run_cmd! {
-        ignore fusermount3 -u $mount_point 2>/dev/null;
-        ignore fusermount -u $mount_point 2>/dev/null;
-    }?;
-    run_cmd!(mkdir -p $mount_point)?;
-    if disk_cache {
-        let dc_path = disk_cache_path();
-        run_cmd!(mkdir -p $dc_path)?;
-    }
-    let mut fs_cfg = fs_server_config(bucket, read_write, disk_cache);
-    fs_cfg.writeback_mode = "default".to_string();
-    let init_config = InitConfig {
-        fs_server: fs_cfg,
-        ..Default::default()
-    };
-    cmd_service::init_service(
-        ServiceName::FsServer,
-        crate::cmd_build::BuildMode::Debug,
-        &init_config,
-    )?;
-    cmd_service::start_service(ServiceName::FsServer)?;
-
-    for i in 0..20 {
-        std::thread::sleep(Duration::from_millis(500));
-        let status = std::process::Command::new("mountpoint")
-            .arg("-q")
-            .arg(mount_point)
-            .status();
-        if let Ok(s) = status
-            && s.success()
-        {
-            println!(
-                "    FUSE (writeback=default) mounted at {} (after {}ms)",
-                mount_point,
-                (i + 1) * 500
-            );
-            return Ok(());
-        }
-    }
-
-    Err(std::io::Error::other(format!(
-        "FUSE mount at {} not ready after 10 seconds",
-        mount_point
-    )))
-}
-
 fn mount_fuse_ro(bucket: &str, disk_cache: bool) -> CmdResult {
     mount_fuse_with_opts(bucket, false, disk_cache)
 }
@@ -907,11 +856,10 @@ async fn test_symlink_basic(disk_cache: bool) -> CmdResult {
     Ok(())
 }
 
-/// Exercise the writeback-default-mode path end-to-end. With
-/// `writeback_mode = "default"`, vfs_symlink enqueues the
-/// `InodeIntent::PutInode` instead of firing NSS synchronously; the
-/// background worker drains the queue ~50ms later. The test:
-///   1. Mounts FUSE in writeback default mode.
+/// Exercise the writeback path end-to-end. `vfs_symlink` enqueues
+/// the `InodeIntent::PutInode` instead of firing NSS synchronously;
+/// the background worker drains the queue ~50ms later. The test:
+///   1. Mounts FUSE.
 ///   2. Creates a symlink (returns immediately to the kernel).
 ///   3. Verifies the local view (readlink) sees it instantly.
 ///   4. Polls until the kernel-side dir listing also shows it -- this
@@ -924,8 +872,8 @@ async fn test_symlink_basic(disk_cache: bool) -> CmdResult {
 async fn test_writeback_default_mode_symlink(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
-    println!("  Step 1: Mount FUSE in writeback default mode");
-    mount_fuse_writeback(&bucket, true, disk_cache)?;
+    println!("  Step 1: Mount FUSE");
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create a symlink via FUSE_SYMLINK");
     let link_path = format!("{}/wb-symlink", MOUNT_POINT);
@@ -968,7 +916,7 @@ async fn test_writeback_default_mode_symlink(disk_cache: bool) -> CmdResult {
     println!("  Step 5: Unmount (drains residual queue, blocks new enqueues)");
     unmount_fuse()?;
 
-    println!("  Step 6: Re-mount in strict mode; symlink must be durable");
+    println!("  Step 6: Re-mount; symlink must be durable");
     mount_fuse_rw(&bucket, disk_cache)?;
     let resolved2 = std::fs::read_link(&link_path).expect("post-remount readlink failed");
     assert_eq!(resolved2.to_str().unwrap(), target);
@@ -976,10 +924,7 @@ async fn test_writeback_default_mode_symlink(disk_cache: bool) -> CmdResult {
     let _ = std::fs::remove_file(&link_path);
     unmount_fuse()?;
 
-    println!(
-        "{}",
-        "SUCCESS: writeback default mode symlink path passed".green()
-    );
+    println!("{}", "SUCCESS: symlink durability test passed".green());
     Ok(())
 }
 
@@ -989,19 +934,18 @@ async fn test_writeback_default_mode_symlink(disk_cache: bool) -> CmdResult {
 ///   1. Mounts in writeback default mode.
 ///   2. Creates + writes a file via FUSE (the write is buffered in
 ///      WriteBuffer; nothing has hit NSS yet).
-///   3. close() returns -- in default mode this is fast because the
-///      flush is spawned. We don't measure latency here; correctness
-///      is what matters.
+///   3. close() returns fast -- the flush is spawned, not awaited.
+///      We don't measure latency here; correctness is what matters.
 ///   4. Polls the kernel-side dir listing until the new file appears.
 ///      Listing the parent directory exercises the FUSE -> vfs_readdir
 ///      -> NSS ListInodes path, so an entry being visible proves NSS
-///      received the put_inode_cas from the spawn task.
+///      received the queued PutInode from the spawn task.
 ///   5. Reads the file back via FUSE and verifies the bytes match.
 async fn test_writeback_default_mode_async_release(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
-    println!("  Step 1: Mount FUSE in writeback default mode");
-    mount_fuse_writeback(&bucket, true, disk_cache)?;
+    println!("  Step 1: Mount FUSE");
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create + write + close a file (close returns before NSS commit)");
     let key = "wb-async-release.bin";
@@ -1060,7 +1004,7 @@ async fn test_writeback_default_mode_batched(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in writeback default mode");
-    mount_fuse_writeback(&bucket, true, disk_cache)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create 50 symlinks rapid-fire (no fsync between)");
     let n = 50usize;
@@ -1133,7 +1077,7 @@ async fn test_writeback_default_mode_mkdir(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in writeback default mode");
-    mount_fuse_writeback(&bucket, true, disk_cache)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Create a 5-deep nested directory tree");
     let path_a = format!("{}/wb-mkdir-a", MOUNT_POINT);
@@ -1203,7 +1147,7 @@ async fn test_writeback_default_mode_ancestor_deps(disk_cache: bool) -> CmdResul
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in writeback default mode");
-    mount_fuse_writeback(&bucket, true, disk_cache)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Rapid-fire 30 (mkdir, mkdir/, ) pairs");
     let n = 30usize;
@@ -1259,7 +1203,7 @@ async fn test_writeback_default_mode_fsyncdir(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in writeback default mode");
-    mount_fuse_writeback(&bucket, true, disk_cache)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     println!("  Step 2: Burst-create 20 files at the mount root");
     let n = 20usize;
@@ -1322,7 +1266,7 @@ async fn test_writeback_default_mode_o_sync(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in writeback default mode");
-    mount_fuse_writeback(&bucket, true, disk_cache)?;
+    mount_fuse_rw(&bucket, disk_cache)?;
 
     let path = format!("{}/wb-osync.txt", MOUNT_POINT);
 
@@ -1505,7 +1449,11 @@ async fn test_rename_atomic_replace(disk_cache: bool) -> CmdResult {
 
     println!("  Step 4: Verify src is gone and dst now has source content");
     let src_err = std::fs::read(&src_path).expect_err("src should no longer exist");
-    assert_eq!(src_err.raw_os_error(), Some(libc::ENOENT), "Expected ENOENT");
+    assert_eq!(
+        src_err.raw_os_error(),
+        Some(libc::ENOENT),
+        "Expected ENOENT"
+    );
     let dst_data = std::fs::read(&dst_path).expect("dst should still exist");
     assert_eq!(
         dst_data, b"source content",
@@ -1514,10 +1462,7 @@ async fn test_rename_atomic_replace(disk_cache: bool) -> CmdResult {
     println!("    src: ENOENT, dst: holds source bytes");
 
     unmount_fuse()?;
-    println!(
-        "{}",
-        "SUCCESS: Rename atomic-replace test passed".green()
-    );
+    println!("{}", "SUCCESS: Rename atomic-replace test passed".green());
     Ok(())
 }
 

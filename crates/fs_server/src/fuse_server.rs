@@ -377,39 +377,27 @@ impl Filesystem for FuseServer {
     ) -> FsResult<usize> {
         let written = self.vfs.vfs_write(fh, offset, data).await.map_err(fs_err)?;
 
-        // O_SYNC / O_DSYNC: every write is durability-tied, drain the
-        // queue before the FUSE reply so the kernel sees the same
-        // synchronous guarantee userspace asked for. Default mode
-        // only -- strict mode's writes are already synchronous via
-        // flush at release.
-        if self.vfs.writeback_mode_is_default()
-            && (flags & (libc::O_SYNC as u32 | libc::O_DSYNC as u32)) != 0
-        {
+        // O_SYNC / O_DSYNC: every write is durability-tied, drain
+        // the queue before the FUSE reply so the kernel sees the
+        // same synchronous guarantee userspace asked for.
+        if (flags & (libc::O_SYNC as u32 | libc::O_DSYNC as u32)) != 0 {
             self.vfs.vfs_flush(fh).await.map_err(fs_err)?;
         }
 
         Ok(written as usize)
     }
 
-    async fn flush(&self, _req: Request, _inode: u64, fh: u64, _lock_owner: u64) -> FsResult<()> {
-        // FUSE_FLUSH fires on every close(2). It is *not* a durability
-        // request -- POSIX only requires errors-on-close to propagate,
-        // and in default mode the spawned vfs_release path is what
+    async fn flush(&self, _req: Request, _inode: u64, _fh: u64, _lock_owner: u64) -> FsResult<()> {
+        // FUSE_FLUSH fires on every close(2). It is *not* a
+        // durability request -- POSIX only requires errors-on-close
+        // to propagate, and the spawned vfs_release path is what
         // actually carries the put_inode_via_queue wait. Doing the
         // flush_write_buffer here forces every close to await one
-        // worker tick (poll_ms = 50ms) for the queue commit, which
-        // turns the writeback win into a 10x regression on tar / cp
-        // create-heavy workloads (measured: 52ms/flush in default vs
-        // 5ms/flush in strict). Skip the work entirely in default
-        // mode and let vfs_release do it off the FUSE worker thread.
-        // Strict mode keeps the synchronous flush so close() reports
-        // the write errors that would otherwise reach userspace via
-        // the next op.
-        if self.vfs.writeback_mode_is_default() {
-            Ok(())
-        } else {
-            self.vfs.vfs_flush_no_drain(fh).await.map_err(fs_err)
-        }
+        // worker tick for the queue commit, which would turn the
+        // writeback win into a 10x regression on tar / cp
+        // create-heavy workloads. Skip the work entirely and let
+        // vfs_release do it off the FUSE worker thread.
+        Ok(())
     }
 
     async fn fsync(&self, _req: Request, _inode: u64, fh: u64, _datasync: bool) -> FsResult<()> {
@@ -428,10 +416,10 @@ impl Filesystem for FuseServer {
     ) -> FsResult<()> {
         self.vfs.release_passthrough(fh);
 
-        // Default mode: spawn the synchronous release/flush work in
-        // the background and return to the kernel immediately. A
-        // pending-flush cycle is registered in the queue so vfs_fsync
-        // and the FUSE_FSYNC drain path can wait for it.
+        // Spawn the synchronous release/flush work in the background
+        // and return to the kernel immediately. A pending-flush
+        // cycle is registered in the queue so vfs_fsync and the
+        // FUSE_FSYNC drain path can wait for it.
         //
         // We deliberately keep the inode write lock held until the
         // spawn completes -- a subsequent vfs_open of the same inode
@@ -439,8 +427,7 @@ impl Filesystem for FuseServer {
         // semantic. Crash mid-flush after close means the data is
         // lost (POSIX legal without fsync); the loss bound is the
         // worker queue depth + the flush RPC chain.
-        if self.vfs.writeback_mode_is_default()
-            && let Some((ino, has_dirty, file_size)) = self.vfs.peek_release_state(fh)
+        if let Some((ino, has_dirty, file_size)) = self.vfs.peek_release_state(fh)
             && has_dirty
         {
             let queue = self.vfs.writeback_queue().clone();
@@ -756,13 +743,10 @@ impl Filesystem for FuseServer {
         _fh: u64,
         _datasync: bool,
     ) -> FsResult<()> {
-        // Default mode: drain every dirty writeback cycle the queue
-        // currently knows about. Cheap mount-wide barrier; a true
-        // subtree-scoped variant is a future optimization. Strict
-        // mode is a no-op.
-        if self.vfs.writeback_mode_is_default() {
-            self.vfs.drain_all_dirty_cycles().await.map_err(fs_err)?;
-        }
+        // Drain every dirty writeback cycle the queue currently
+        // knows about. Cheap mount-wide barrier; a true
+        // subtree-scoped variant is a future optimization.
+        self.vfs.drain_all_dirty_cycles().await.map_err(fs_err)?;
         Ok(())
     }
 

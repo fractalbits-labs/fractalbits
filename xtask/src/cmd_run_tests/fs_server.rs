@@ -1,4 +1,3 @@
-pub mod bench;
 pub mod fuse;
 pub mod pjdfs;
 

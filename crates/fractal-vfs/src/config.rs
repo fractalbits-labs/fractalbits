@@ -1,44 +1,10 @@
 use serde::Deserialize;
 use std::time::Duration;
 
-/// Writeback-cache durability mode.
-///
-/// `Strict` is the legacy synchronous path: every FUSE op blocks until
-/// the corresponding NSS / BSS RPC completes. `Default` enables the
-/// writeback fast path for the enabled operation slice and falls back
-/// to strict for the rest. `Loose` is a future full-target option not
-/// enabled today.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum WritebackMode {
-    #[default]
-    Strict,
-    Default,
-}
-
-#[allow(dead_code)]
-impl WritebackMode {
-    pub fn from_str_lossy(s: &str) -> Self {
-        match s {
-            "default" => WritebackMode::Default,
-            _ => WritebackMode::Strict,
-        }
-    }
-
-    pub fn is_strict(&self) -> bool {
-        matches!(self, WritebackMode::Strict)
-    }
-}
-
-/// Writeback knobs. All fields have safe defaults that keep the queue
-/// in strict mode until the workload validation gate passes.
+/// Writeback queue knobs.
 #[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 pub struct WritebackConfig {
-    /// Mode string; `strict` (default) or `default`. Loose mode is
-    /// not exposed today.
-    #[serde(default = "default_writeback_mode")]
-    pub mode: String,
     #[serde(default = "default_max_batch_size")]
     pub max_batch_size: u32,
     #[serde(default = "default_max_batch_wait_ms")]
@@ -53,22 +19,19 @@ pub struct WritebackConfig {
     pub queue_capacity_mb: u32,
 }
 
-fn default_writeback_mode() -> String {
-    "strict".to_string()
-}
 fn default_max_batch_size() -> u32 {
     1024
 }
 fn default_max_batch_wait_ms() -> u32 {
-    // Tick the writeback worker at 5 ms in default mode. The
-    // historical 50 ms was tuned for batch density on write-heavy
-    // workloads, but also bounded the latency of any
-    // drain-on-demand path (vfs_lookup's wait_for_lookup_drain,
-    // syncfs barrier, etc.) -- a 50 ms tick meant a chmod stuck
-    // behind an undrained mkdir cycle could stall up to 50 ms.
-    // 5 ms keeps the worker responsive without measurably
-    // affecting batch density: even at 10 us per enqueue the
-    // queue accumulates dozens of intents per tick under load.
+    // Tick the writeback worker at 5 ms. The historical 50 ms was
+    // tuned for batch density on write-heavy workloads, but also
+    // bounded the latency of any drain-on-demand path
+    // (vfs_lookup's wait_for_lookup_drain, syncfs barrier, etc.)
+    // -- a 50 ms tick meant a chmod stuck behind an undrained
+    // mkdir cycle could stall up to 50 ms. 5 ms keeps the worker
+    // responsive without measurably affecting batch density: even
+    // at 10 us per enqueue the queue accumulates dozens of
+    // intents per tick under load.
     5
 }
 fn default_max_retry_duration_ms() -> u32 {
@@ -96,17 +59,9 @@ fn default_prefetch_pressure_decline() -> f64 {
     0.90
 }
 
-#[allow(dead_code)]
-impl WritebackConfig {
-    pub fn parsed_mode(&self) -> WritebackMode {
-        WritebackMode::from_str_lossy(&self.mode)
-    }
-}
-
 impl Default for WritebackConfig {
     fn default() -> Self {
         Self {
-            mode: default_writeback_mode(),
             max_batch_size: default_max_batch_size(),
             max_batch_wait_ms: default_max_batch_wait_ms(),
             max_retry_duration_ms: default_max_retry_duration_ms(),
@@ -216,9 +171,6 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FS_SERVER_WORKER_THREADS") {
             self.worker_threads = v.parse().unwrap_or(self.worker_threads);
-        }
-        if let Ok(v) = std::env::var("FS_SERVER_WRITEBACK_MODE") {
-            self.writeback.mode = v;
         }
         if let Ok(v) = std::env::var("FS_SERVER_ALLOW_OTHER") {
             self.allow_other = v.parse().unwrap_or(self.allow_other);
