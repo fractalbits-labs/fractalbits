@@ -652,7 +652,19 @@ fn write_fuse_init_reply(
         want_flags |= FUSE_NO_OPENDIR_SUPPORT as u64;
     }
     if opts.handle_killpriv {
+        // V1 (bit 19) only covers FUSE_WRITE -- the kernel still
+        // clears suid/sgid in-kernel for SETATTR/OPEN paths and
+        // never lifts the clear up to userspace, so a non-root
+        // chown(2) on a setuid file leaves our daemon's mode
+        // unchanged. V2 (bit 28, Linux 5.12+) extends the contract
+        // to SETATTR and OPEN: the kernel sets FATTR_KILL_SUIDGID
+        // on those requests so userspace handles the clear.
+        // Advertise both so a non-root chown's SETATTR carries the
+        // flag; kernels that only know V1 will mask V2 out during
+        // negotiation, leaving V1 (which is enough for the
+        // non-owner-write contract) intact.
         want_flags |= FUSE_HANDLE_KILLPRIV as u64;
+        want_flags |= FUSE_HANDLE_KILLPRIV_V2 as u64;
     }
     if opts.passthrough {
         // FUSE_PASSTHROUGH and FUSE_WRITEBACK_CACHE are mutually exclusive

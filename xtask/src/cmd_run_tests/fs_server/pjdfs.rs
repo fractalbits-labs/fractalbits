@@ -139,6 +139,14 @@ fn fs_cfg(bucket: &str) -> FsServerConfig {
         read_write: true,
         disk_cache_enabled: false,
         disk_cache_path: disk_cache_path(),
+        // pjdfstest is meant to run as root so it can `setuid(65534)`
+        // and exercise cross-user EPERM paths. We shell out to
+        // `sudo prove`, which means root needs to read / write the
+        // FUSE mount the daemon (running as the user) just created.
+        // FUSE only allows that if mounted with `allow_other`, and
+        // the host needs `user_allow_other` enabled in
+        // /etc/fuse.conf for the user to set that flag.
+        allow_other: true,
         ..Default::default()
     }
 }
@@ -228,14 +236,30 @@ pub async fn run_pjdfstest(subdir: Option<&str>) -> CmdResult {
         Some(s) => format!("{}/tests/{}", pjd_dir.display(), s),
         None => format!("{}/tests", pjd_dir.display()),
     };
-    println!("  running prove against {prove_target}");
+    println!("  running prove (as root, via sudo) against {prove_target}");
 
     // Inherit PATH+pjdfstest dir so the .t scripts find the binary.
     let path_env = std::env::var("PATH").unwrap_or_default();
     let path_with_pjd = format!("{bin_dir}:{path_env}");
 
-    let status = Command::new("prove")
-        .args(["-r", &prove_target])
+    // pjdfstest's whole point is to fork + setuid(65534) and verify
+    // the cross-user EPERM contract; running it as the unprivileged
+    // user just hides those tests behind "EPERM expected, got 0".
+    // We invoke `sudo -E` so the env (PATH + the pjdfstest binary
+    // dir we just prepended) is preserved across the privilege drop.
+    // Caller must have passwordless sudo configured for this session
+    // (`sudo -v` once is enough); the host's /etc/fuse.conf must
+    // also have `user_allow_other` so the FUSE mount is reachable
+    // from root.
+    let verbose = std::env::var("PJDFS_VERBOSE").is_ok();
+    let mut args: Vec<&str> = vec!["-E", "prove"];
+    if verbose {
+        args.push("-v");
+    }
+    args.push("-r");
+    args.push(&prove_target);
+    let status = Command::new("sudo")
+        .args(&args)
         .current_dir(&test_root)
         .env("PATH", &path_with_pjd)
         .status()?;

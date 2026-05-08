@@ -44,6 +44,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .init();
 
+    let main_build_info = option_env!("MAIN_BUILD_INFO").unwrap_or("unknown");
+    let build_timestamp = option_env!("BUILD_TIMESTAMP").unwrap_or("unknown");
+    let build_info = format!("{}, build time: {}", main_build_info, build_timestamp);
+    eprintln!("build info: {}", build_info);
+
     let opt = Opt::parse();
     let mut cfg: Config = match opt.config_file {
         Some(config_file) => ::config::Config::builder()
@@ -82,8 +87,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fs_name("fractalbits")
         .read_only(!read_write)
         .allow_other(cfg.allow_other)
+        // When allow_other is set, also turn on the kernel's
+        // standard permission checks. The FUSE driver can
+        // verify mode bits / sticky / owner against the
+        // cached inode attrs (which we serve via getattr)
+        // and reject unauthorised ops at the kernel before
+        // they reach fs_server. This unblocks the bulk of
+        // pjdfstest's cross-user EPERM / EACCES contract
+        // suites without us needing to implement a
+        // hand-rolled permission policy for every entry
+        // point.
+        .default_permissions(cfg.allow_other)
         .write_back(read_write && !cfg.passthrough_enabled)
-        .passthrough(cfg.passthrough_enabled);
+        .passthrough(cfg.passthrough_enabled)
+        // FUSE_HANDLE_KILLPRIV: opt out of the kernel-side
+        // suid/sgid clear so the kernel forwards the implicit
+        // chmod to userspace via FUSE_SETATTR with
+        // FATTR_KILL_SUIDGID (or via FUSE_WRITE flagged with
+        // FUSE_WRITE_KILL_SUIDGID). The setattr handler treats
+        // the killpriv-flagged change as kernel-driven and
+        // bypasses the "non-owner cannot chmod" EPERM contract,
+        // matching POSIX's "writes by a non-owner clear
+        // suid/sgid" rule that pjdfstest chmod/12.t verifies.
+        .handle_killpriv(true);
 
     let session =
         Session::new(mount_point.into(), mount_options)?.with_worker_count(cfg.worker_threads);

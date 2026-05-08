@@ -57,6 +57,24 @@ pub enum FsError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Path component longer than NAME_MAX (255). Maps to
+    /// ENAMETOOLONG.
+    #[error("name too long")]
+    NameTooLong,
+
+    /// Permission denied (typically chmod / chown / unlink in a
+    /// sticky directory by a non-owner). Maps to EPERM. The kernel
+    /// already gates a lot of these with `default_permissions`, but
+    /// fs_server is the source of truth for the FUSE_SETATTR /
+    /// FUSE_UNLINK / FUSE_RENAME paths when we don't pass that flag.
+    #[error("operation not permitted")]
+    PermissionDenied,
+
+    /// Search permission denied on a path component (typically a
+    /// directory the caller doesn't have execute on). Maps to EACCES.
+    #[error("permission denied")]
+    AccessDenied,
 }
 
 impl From<FsError> for io::Error {
@@ -84,6 +102,9 @@ impl From<FsError> for io::Error {
             FsError::InvalidArg => io::Error::from_raw_os_error(libc::EINVAL),
             FsError::Deserialize(_) => io::Error::from_raw_os_error(libc::EIO),
             FsError::Internal(_) => io::Error::from_raw_os_error(libc::EIO),
+            FsError::NameTooLong => io::Error::from_raw_os_error(libc::ENAMETOOLONG),
+            FsError::PermissionDenied => io::Error::from_raw_os_error(libc::EPERM),
+            FsError::AccessDenied => io::Error::from_raw_os_error(libc::EACCES),
         }
     }
 }

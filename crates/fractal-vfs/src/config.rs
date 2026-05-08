@@ -60,7 +60,16 @@ fn default_max_batch_size() -> u32 {
     1024
 }
 fn default_max_batch_wait_ms() -> u32 {
-    50
+    // Tick the writeback worker at 5 ms in default mode. The
+    // historical 50 ms was tuned for batch density on write-heavy
+    // workloads, but also bounded the latency of any
+    // drain-on-demand path (vfs_lookup's wait_for_lookup_drain,
+    // syncfs barrier, etc.) -- a 50 ms tick meant a chmod stuck
+    // behind an undrained mkdir cycle could stall up to 50 ms.
+    // 5 ms keeps the worker responsive without measurably
+    // affecting batch density: even at 10 us per enqueue the
+    // queue accumulates dozens of intents per tick under load.
+    5
 }
 fn default_max_retry_duration_ms() -> u32 {
     30_000
@@ -210,6 +219,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FS_SERVER_WRITEBACK_MODE") {
             self.writeback.mode = v;
+        }
+        if let Ok(v) = std::env::var("FS_SERVER_ALLOW_OTHER") {
+            self.allow_other = v.parse().unwrap_or(self.allow_other);
         }
     }
 }

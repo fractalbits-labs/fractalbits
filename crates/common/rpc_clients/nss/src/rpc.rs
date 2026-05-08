@@ -371,6 +371,7 @@ impl RpcClient {
         root_blob_name: &str,
         src_path: &str,
         dst_path: &str,
+        force_overwrite: bool,
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
@@ -380,7 +381,7 @@ impl RpcClient {
             root_blob_name: root_blob_name.to_string(),
             src_path: src_path.to_string(),
             dst_path: dst_path.to_string(),
-            force_overwrite: false,
+            force_overwrite,
         };
 
         let mut header = MessageHeader::default();
@@ -418,6 +419,12 @@ impl RpcClient {
         }
     }
 
+    /// Rename an object in NSS. When `force_overwrite=true` and the
+    /// destination already exists, the rename atomically replaces it
+    /// and the prior dst value is returned as `Bytes`; the caller
+    /// uses those bytes to GC the orphaned blob. When the dst didn't
+    /// exist (or `force_overwrite=false`), the returned buffer is
+    /// empty.
     #[allow(clippy::too_many_arguments)]
     pub async fn rename_object(
         &self,
@@ -428,7 +435,7 @@ impl RpcClient {
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
-    ) -> Result<(), RpcError> {
+    ) -> Result<Bytes, RpcError> {
         let mut nss_src_path = src_path.to_string();
         nss_src_path.push('\0');
         let mut nss_dst_path = dst_path.to_string();
@@ -465,7 +472,7 @@ impl RpcClient {
         let resp: RenameResponse =
             PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
         match resp.result.unwrap() {
-            nss_codec::rename_response::Result::Ok(_) => Ok(()),
+            nss_codec::rename_response::Result::Ok(old_value) => Ok(old_value),
             nss_codec::rename_response::Result::ErrSrcNonexisted(_) => Err(RpcError::NotFound),
             nss_codec::rename_response::Result::ErrDstExisted(_) => Err(RpcError::AlreadyExists),
             nss_codec::rename_response::Result::ErrNoSuchRootBlob(_) => {

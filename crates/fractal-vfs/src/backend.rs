@@ -3,9 +3,9 @@
 use bytes::Bytes;
 use data_types::{Bucket, DataBlobGuid, DataVgInfo, RoutingKey, TraceId};
 use file_ops::{
-    ListEntry, blob_blocks_to_delete, create_dir_marker_layout, mpu_get_part_prefix,
-    parse_delete_inode, parse_get_inode, parse_get_inode_with_bytes, parse_list_inodes,
-    parse_mpu_parts, parse_put_inode, parse_put_inode_cas,
+    ListEntry, blob_blocks_to_delete, mpu_get_part_prefix, parse_delete_inode, parse_get_inode,
+    parse_get_inode_with_bytes, parse_list_inodes, parse_mpu_parts, parse_put_inode,
+    parse_put_inode_cas,
 };
 use rpc_client_bss::BssBatchSubOp;
 use rpc_client_common::RpcError;
@@ -414,20 +414,92 @@ impl StorageBackend {
         Ok(parse_delete_inode(resp)?)
     }
 
-    /// Rename an object (file) in NSS.
+    /// Fetch the `InodeRecord` for a hardlink-promoted inode. Uses the
+    /// generic NSS key/value RPC against the `#hardlink/<inode_id>`
+    /// key (`InodeRecord::key_for`), then deserialises as
+    /// `InodeRecord` instead of `ObjectLayout`. See
+    /// `misc/docs/017-fs/TBR/20-fs-symlinks-and-hardlinks-design.md`
+    /// section 4.2 for the keyspace rationale.
+    pub async fn get_inode_record(
+        &self,
+        inode_id: uuid::Uuid,
+        trace_id: &TraceId,
+    ) -> Result<data_types::object_layout::InodeRecord, FsError> {
+        use nss_codec::{GetInodeResponse, get_inode_response};
+        let key = data_types::object_layout::InodeRecord::key_for(inode_id);
+        let resp: GetInodeResponse = nss_rpc_retry!(
+            self.nss_client.borrow(),
+            get_inode(
+                &self.root_blob_name,
+                &key,
+                Some(self.config.rpc_request_timeout()),
+                trace_id
+            ),
+            self,
+            trace_id
+        )
+        .await?;
+        let bytes = match resp.result.unwrap() {
+            get_inode_response::Result::Ok(b) => b,
+            get_inode_response::Result::ErrNotFound(())
+            | get_inode_response::Result::ErrNoSuchRootBlob(()) => return Err(FsError::NotFound),
+            get_inode_response::Result::ErrOther(e) => return Err(FsError::Internal(e)),
+        };
+        rkyv::from_bytes::<data_types::object_layout::InodeRecord, rkyv::rancor::Error>(&bytes)
+            .map_err(|e| FsError::Internal(format!("InodeRecord deserialization: {e}")))
+    }
+
+    /// Persist the `InodeRecord` for a hardlink-promoted inode at the
+    /// `#hardlink/<inode_id>` key. Uses unconditional put; the
+    /// per-record CAS slot model from doc 20 section 4.5 is deferred
+    /// to the post-MVP step.
+    pub async fn put_inode_record(
+        &self,
+        inode_id: uuid::Uuid,
+        record: &data_types::object_layout::InodeRecord,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        let key = data_types::object_layout::InodeRecord::key_for(inode_id);
+        let bytes: Bytes = rkyv::to_bytes::<rkyv::rancor::Error>(record)
+            .map_err(|e| FsError::Internal(format!("InodeRecord serialization: {e}")))?
+            .to_vec()
+            .into();
+        self.put_inode(&key, bytes, trace_id).await?;
+        Ok(())
+    }
+
+    /// Delete the `#hardlink/<inode_id>` keyspace entry. Called once
+    /// `nlink` reaches 0 and no local fhs hold the inode open. See
+    /// `vfs_unlink` for the surrounding GC.
+    pub async fn delete_inode_record(
+        &self,
+        inode_id: uuid::Uuid,
+        trace_id: &TraceId,
+    ) -> Result<Option<Bytes>, FsError> {
+        let key = data_types::object_layout::InodeRecord::key_for(inode_id);
+        self.delete_inode(&key, trace_id).await
+    }
+
+    /// Rename an object (file) in NSS. When `force_overwrite` is set
+    /// and the destination already exists, the rename atomically
+    /// replaces it and the prior dst value bytes are returned;
+    /// callers use those bytes to GC the orphaned blob. When dst
+    /// didn't exist (or `force_overwrite=false` and dst was free),
+    /// the returned `Bytes` is empty.
     pub async fn rename_file(
         &self,
         src_key: &str,
         dst_key: &str,
+        force_overwrite: bool,
         trace_id: &TraceId,
-    ) -> Result<(), FsError> {
+    ) -> Result<Bytes, FsError> {
         let result = nss_rpc_retry!(
             self.nss_client.borrow(),
             rename_object(
                 &self.root_blob_name,
                 src_key,
                 dst_key,
-                false,
+                force_overwrite,
                 Some(self.config.rpc_request_timeout()),
                 trace_id
             ),
@@ -437,18 +509,22 @@ impl StorageBackend {
         .await;
 
         match result {
-            Ok(()) => Ok(()),
+            Ok(old_value) => Ok(old_value),
             Err(RpcError::NotFound) => Err(FsError::NotFound),
             Err(RpcError::AlreadyExists) => Err(FsError::AlreadyExists),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// Rename a folder (directory prefix) in NSS.
+    /// Rename a folder (directory prefix) in NSS. When `force_overwrite=true`
+    /// and the destination prefix already exists, NSS atomically replaces
+    /// it with `src_key`'s subtree (the orphaned dst subtree is leaked
+    /// pending NSS-side blob reclamation).
     pub async fn rename_folder(
         &self,
         src_key: &str,
         dst_key: &str,
+        force_overwrite: bool,
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
         let result = nss_rpc_retry!(
@@ -457,6 +533,7 @@ impl StorageBackend {
                 &self.root_blob_name,
                 src_key,
                 dst_key,
+                force_overwrite,
                 Some(self.config.rpc_request_timeout()),
                 trace_id
             ),
@@ -629,15 +706,5 @@ impl StorageBackend {
             Err(FsError::Rpc(RpcError::NotFound)) => Ok(None),
             Err(e) => Err(e),
         }
-    }
-
-    /// Create a directory marker in NSS.
-    /// Stores a minimal ObjectLayout with size=0 because NSS rejects empty values.
-    pub async fn put_dir_marker(&self, key: &str, trace_id: &TraceId) -> Result<(), FsError> {
-        let layout = create_dir_marker_layout();
-        let value: Vec<u8> =
-            rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())?;
-        self.put_inode(key, Bytes::from(value), trace_id).await?;
-        Ok(())
     }
 }

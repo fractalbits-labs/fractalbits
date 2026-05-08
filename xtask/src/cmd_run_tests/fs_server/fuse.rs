@@ -321,7 +321,7 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     run_test!("Rename", test_rename);
     run_test!("Unlink with Open Handle", test_unlink_open_handle);
     run_test!("Overwrite Existing File", test_overwrite_existing);
-    run_test!("Rename No-Replace (EEXIST)", test_rename_noreplace);
+    run_test!("Rename Atomic Replace", test_rename_atomic_replace);
     run_test!("Truncate Write", test_truncate_write);
     run_test!("Write in Subdirectory", test_write_in_subdirectory);
     run_test!("Rename Directory", test_rename_directory);
@@ -1486,7 +1486,7 @@ async fn test_overwrite_existing(disk_cache: bool) -> CmdResult {
     Ok(())
 }
 
-async fn test_rename_noreplace(disk_cache: bool) -> CmdResult {
+async fn test_rename_atomic_replace(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
@@ -1499,26 +1499,24 @@ async fn test_rename_noreplace(disk_cache: bool) -> CmdResult {
     std::fs::write(&dst_path, b"destination content").expect("Failed to write dst");
     println!("    Created: rename-src.txt and rename-dst.txt");
 
-    println!("  Step 3: Rename with existing destination should return EEXIST");
-    let err =
-        std::fs::rename(&src_path, &dst_path).expect_err("Rename should have failed with EEXIST");
-    assert_eq!(err.raw_os_error(), Some(17), "Expected EEXIST");
-    println!("    Rename correctly returned EEXIST");
+    println!("  Step 3: rename(2) over an existing dst atomically replaces it");
+    std::fs::rename(&src_path, &dst_path).expect("rename(src, dst) should succeed");
+    println!("    Rename succeeded");
 
-    println!("  Step 4: Verify both files are unchanged");
-    let src_data = std::fs::read(&src_path).expect("Failed to read src");
-    let dst_data = std::fs::read(&dst_path).expect("Failed to read dst");
-    assert_eq!(src_data, b"source content", "Source file content changed");
+    println!("  Step 4: Verify src is gone and dst now has source content");
+    let src_err = std::fs::read(&src_path).expect_err("src should no longer exist");
+    assert_eq!(src_err.raw_os_error(), Some(libc::ENOENT), "Expected ENOENT");
+    let dst_data = std::fs::read(&dst_path).expect("dst should still exist");
     assert_eq!(
-        dst_data, b"destination content",
-        "Destination file content changed"
+        dst_data, b"source content",
+        "Destination should now hold source's content"
     );
-    println!("    Both files unchanged: OK");
+    println!("    src: ENOENT, dst: holds source bytes");
 
     unmount_fuse()?;
     println!(
         "{}",
-        "SUCCESS: Rename no-replace (EEXIST) test passed".green()
+        "SUCCESS: Rename atomic-replace test passed".green()
     );
     Ok(())
 }

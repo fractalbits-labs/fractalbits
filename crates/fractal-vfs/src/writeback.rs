@@ -874,6 +874,48 @@ impl WritebackQueue {
             .depth
     }
 
+    /// `true` iff there is any non-terminal (Pending or InFlight)
+    /// intent for `key`. Used by the lookup path to decide whether
+    /// to wait for the worker drain before reading NSS, so a
+    /// chmod/mkdir that hasn't yet committed can't be observed as
+    /// stale by a forget+relookup. inode_intents is a HashMap so
+    /// the probe walks every entry, but the common case is a
+    /// shallow queue and the lock is held for the whole walk.
+    pub fn has_pending_intent_for_key(&self, key: &str) -> bool {
+        let inner = self.inner.lock().expect("writeback queue poisoned");
+        inner.inode_intents.iter().any(|((k, _), intent)| {
+            k == key && matches!(intent.state, IntentState::Pending | IntentState::InFlight)
+        })
+    }
+
+    /// True if any not-yet-committed PutInode intent has a key under
+    /// `prefix`. Used by `vfs_rmdir` so the empty-check waits for
+    /// in-flight child publishes (a `mknod` or `create` queued moments
+    /// before the rmdir would otherwise be invisible to NSS list and
+    /// the rmdir would erroneously succeed).
+    pub fn has_pending_intent_under_prefix(&self, prefix: &str) -> bool {
+        let inner = self.inner.lock().expect("writeback queue poisoned");
+        inner.inode_intents.iter().any(|((k, _), intent)| {
+            k.starts_with(prefix)
+                && matches!(intent.state, IntentState::Pending | IntentState::InFlight)
+        })
+    }
+
+    /// True if any not-yet-committed PutInode intent for a directory
+    /// marker (key ending in `/`) sits under `prefix`. Used by
+    /// `compute_dir_nlink` so a `mkdir foo/bar` immediately followed
+    /// by `lstat foo` waits only for the dir-marker publish, not for
+    /// every queued regular-file PutInode under `foo` (which would
+    /// stall busy workloads while contributing nothing to nlink).
+    pub fn has_pending_dir_marker_under_prefix(&self, prefix: &str) -> bool {
+        let inner = self.inner.lock().expect("writeback queue poisoned");
+        inner.inode_intents.iter().any(|((k, _), intent)| {
+            k.starts_with(prefix)
+                && k.ends_with('/')
+                && matches!(intent.state, IntentState::Pending | IntentState::InFlight)
+        })
+    }
+
     /// Pop up to `max_batch` Pending Stage A intents whose dependencies
     /// are satisfied, mark them InFlight, and return drainable
     /// snapshots for the worker to ship. Each cycle whose Stage A is
@@ -882,11 +924,119 @@ impl WritebackQueue {
         let mut inner = self.inner.lock().expect("writeback queue poisoned");
         let mut out = Vec::new();
 
-        let candidate_keys: Vec<(S3Key, Generation)> = inner
+        // Collect every Pending intent, then dedupe by s3_key keeping
+        // only the highest generation per key. Multi-gen Pending
+        // intents at the same key arise when callers race for the
+        // same NSS row (vfs_create's placeholder + the close-time
+        // flush_publish + a vfs_link redirect, all targeting the
+        // same path). Without dedup the worker would batch them in
+        // hashmap iteration order and the older intents could land
+        // AFTER the newer one, leaving NSS at a stale value -- the
+        // exact race that lets a late `vfs_release` overwrite a
+        // freshly-promoted hardlink redirect with the closing fh's
+        // pre-link Normal layout. Last-writer-wins is the POSIX
+        // semantic: from the older caller's perspective NSS now
+        // holds the newer caller's value, which is what they would
+        // observe after their write committed and was immediately
+        // overwritten.
+        let pending_keys: Vec<(S3Key, Generation)> = inner
             .inode_intents
             .iter()
             .filter(|(_, intent)| intent.state == IntentState::Pending)
             .map(|(key, _)| key.clone())
+            .collect();
+        let mut max_gen_per_key: std::collections::HashMap<S3Key, Generation> =
+            std::collections::HashMap::new();
+        for (k, g) in pending_keys.iter() {
+            max_gen_per_key
+                .entry(k.clone())
+                .and_modify(|cur| {
+                    if *g > *cur {
+                        *cur = *g;
+                    }
+                })
+                .or_insert(*g);
+        }
+        // Supersede every non-max-gen Pending intent at a contested
+        // key: drop it from the queue and short-circuit its cycle to
+        // `Done` with `Committed` so any caller polling
+        // `cycle_outcome` (e.g. `put_inode_via_queue`) returns
+        // `Ok(())`. The newer intent's eventual NSS commit makes the
+        // older caller's "did my write land?" answer indistinguishable
+        // from a real commit followed by an immediate overwrite.
+        //
+        // CAS-guard repair: the winning intent was enqueued expecting
+        // the loser intents had already landed in NSS. Once we drop
+        // the losers, NSS still holds whatever the OLDEST loser was
+        // about to overwrite, so we rebase the winner's
+        // `expected_old_value` to the oldest loser's expected. This
+        // keeps the CAS chain unbroken: the winner sees what NSS
+        // actually has, not the hypothetical state the dropped
+        // intents would have produced. Without the rebase, the
+        // winner's CAS fails ESTALE every time a multi-gen pending
+        // burst hits the same key (pjdfstest fs-server O_DSYNC test
+        // is the deterministic repro: pre-create's create+release
+        // intents stack with the O_DSYNC write's flush intent).
+        let losers: Vec<(S3Key, Generation, u64)> = pending_keys
+            .iter()
+            .filter_map(|(k, g)| {
+                if max_gen_per_key.get(k) == Some(g) {
+                    return None;
+                }
+                inner
+                    .inode_intents
+                    .get(&(k.clone(), *g))
+                    .map(|intent| (k.clone(), *g, intent.inode))
+            })
+            .collect();
+        for (k, _) in max_gen_per_key.iter() {
+            let oldest_loser_expected: Option<Option<Bytes>> = losers
+                .iter()
+                .filter(|(loser_k, _, _)| loser_k == k)
+                .min_by_key(|(_, g, _)| *g)
+                .and_then(|(loser_k, loser_g, _)| {
+                    inner
+                        .inode_intents
+                        .get(&(loser_k.clone(), *loser_g))
+                        .and_then(|intent| match &intent.op {
+                            InodeOp::PutInode {
+                                expected_old_value, ..
+                            } => Some(expected_old_value.clone()),
+                            _ => None,
+                        })
+                });
+            if let Some(rebased_expected) = oldest_loser_expected {
+                let winner_gen = match max_gen_per_key.get(k) {
+                    Some(g) => *g,
+                    None => continue,
+                };
+                if let Some(winner) = inner.inode_intents.get_mut(&(k.clone(), winner_gen))
+                    && let InodeOp::PutInode {
+                        ref mut expected_old_value,
+                        ..
+                    } = winner.op
+                {
+                    *expected_old_value = rebased_expected;
+                }
+            }
+        }
+        for (k, g, ino) in losers {
+            if inner.inode_intents.remove(&(k, g)).is_some() {
+                inner.state.depth = inner.state.depth.saturating_sub(1);
+            }
+            if let Some(cycle) = inner
+                .file_pipeline
+                .get_mut(&ino)
+                .and_then(|c| c.get_mut(&g))
+            {
+                cycle.stage = FileCommitStage::Done;
+                cycle.outcome = CycleOutcome::Committed;
+            }
+        }
+
+        let candidate_keys: Vec<(S3Key, Generation)> = pending_keys
+            .into_iter()
+            .filter(|(k, g)| max_gen_per_key.get(k) == Some(g))
             .take(max_batch)
             .collect();
 
@@ -1261,22 +1411,39 @@ impl QueueInner {
 fn coalesce_inode_pending(existing: &mut InodeOp, new: &InodeOp) -> CoalesceOutcome {
     match (&mut *existing, new) {
         // PutInode + PutInode (same key) ⇒ replace the layout in
-        // place (latest wins). Uncommon because FUSE_CREATE is unique
-        // per path, but defensive.
+        // place (latest wins). Uncommon because FUSE_CREATE is
+        // unique per path, but the create-then-close flow hits it:
+        // vfs_create early-publishes a placeholder (`expected=None`,
+        // unconditional) and the close-time flush enqueues a CAS
+        // against `expected=placeholder_bytes`. Inherit the EXISTING
+        // intent's `expected_old_value`: the worker is about to do a
+        // single op against whatever NSS holds *now*, not against
+        // the placeholder that the first intent would have written.
+        // Taking the new intent's expected (placeholder_bytes) makes
+        // the worker CAS against a value NSS never observed, which
+        // surfaces as ESTALE on a brand-new file (pjdfstest
+        // open/25.t test 4 saw the read of a 2 GiB pwrite return
+        // zeros because the layout publish always failed).
         (
-            InodeOp::PutInode { .. },
+            existing_op @ InodeOp::PutInode { .. },
             InodeOp::PutInode {
                 parent_key,
                 name,
                 layout_bytes,
-                expected_old_value,
+                expected_old_value: _,
             },
         ) => {
-            *existing = InodeOp::PutInode {
+            let preserved_expected = match existing_op {
+                InodeOp::PutInode {
+                    expected_old_value, ..
+                } => expected_old_value.clone(),
+                _ => unreachable!(),
+            };
+            *existing_op = InodeOp::PutInode {
                 parent_key: parent_key.clone(),
                 name: name.clone(),
                 layout_bytes: layout_bytes.clone(),
-                expected_old_value: expected_old_value.clone(),
+                expected_old_value: preserved_expected,
             };
             CoalesceOutcome::ReplacedInPlace
         }

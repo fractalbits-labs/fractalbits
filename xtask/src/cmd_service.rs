@@ -1380,6 +1380,16 @@ Environment="MINIO_REGION=localdev""##
                     fs.writeback_mode
                 );
             }
+            if fs.allow_other {
+                env_settings += "\nEnvironment=\"FS_SERVER_ALLOW_OTHER=true\"";
+            }
+            // Stream stdout/stderr to a fixed file path so a hung
+            // run is debuggable even when journald rate-limits
+            // dropped recent entries. systemd's `append:` keeps the
+            // file growing across restarts; truncate the file at
+            // service init to scope each run.
+            env_settings += "\nStandardOutput=append:/tmp/fs_server.log";
+            env_settings += "\nStandardError=append:/tmp/fs_server.log";
             resolve_binary_path("fs_server", build_mode)
         }
         _ => unreachable!(),

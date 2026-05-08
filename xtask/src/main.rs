@@ -116,6 +116,21 @@ enum Cmd {
         test_type: Option<TestType>,
     },
 
+    /// Run the pjdfstest POSIX compliance suite against an fs_server
+    /// FUSE mount (writeback default mode). Shortcut for
+    /// `xtask run-tests pjdfstest`.
+    #[clap(about = "Run pjdfstest POSIX compliance suite")]
+    Pjdfstest {
+        /// Restrict to a single tests/<NAME>/ subgroup (e.g. chmod,
+        /// chown, mkdir, rename). Omit to run every subgroup.
+        ///
+        /// Available: chflags, chmod, chown, conf, ftruncate, granular,
+        /// link, mkdir, mkfifo, mknod, open, posix_fallocate, rename,
+        /// rmdir, symlink, truncate, unlink, utimensat. Pass `all` to
+        /// run every subgroup explicitly.
+        subdir: Option<String>,
+    },
+
     #[clap(about = "Git repos management commands")]
     #[command(subcommand)]
     Repo(RepoCommand),
@@ -532,6 +547,12 @@ pub struct FsServerConfig {
     /// `FS_SERVER_WRITEBACK_MODE` env var. Empty string = use the
     /// fs_server config default (`strict`).
     pub writeback_mode: String,
+    /// When true, fs_server gets `FS_SERVER_ALLOW_OTHER=true` so the
+    /// FUSE mount lets users other than the daemon's owner (notably
+    /// `root`) read and write the mount. Required when the test
+    /// driver shells out via `sudo`. The host's `/etc/fuse.conf` must
+    /// have `user_allow_other` enabled for this to take effect.
+    pub allow_other: bool,
 }
 
 impl Default for InitConfig {
@@ -920,6 +941,12 @@ async fn main() -> CmdResult {
         Cmd::RunTests { test_type } => {
             let test_type = test_type.unwrap_or(TestType::All);
             cmd_run_tests::run_tests(test_type).await?
+        }
+        Cmd::Pjdfstest { subdir } => {
+            // `all` is an alias for "run every subgroup", lowered to
+            // None so the prove target stays at the tests/ root.
+            let subdir = subdir.filter(|s| s != "all");
+            cmd_run_tests::run_tests(TestType::Pjdfstest { subdir }).await?
         }
         Cmd::Repo(repo_cmd) => cmd_repo::run_cmd_repo(repo_cmd)?,
         Cmd::Docker(docker_cmd) => cmd_docker::run_cmd_docker(docker_cmd)?,

@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use data_types::object_layout::ObjectLayout;
+use data_types::object_layout::{ObjectLayout, ObjectState, PosixAttrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -11,21 +11,92 @@ pub enum EntryType {
     Directory,
 }
 
+/// Pull the embedded `PosixAttrs` out of an `ObjectLayout`. Returns the
+/// zero value for layout shapes that don't carry one (Indirect, or
+/// Mpu(Uploading)) so callers can treat that as the
+/// "uninitialised, fall back to defaults" sentinel.
+pub fn layout_posix(layout: &ObjectLayout) -> PosixAttrs {
+    match &layout.state {
+        ObjectState::Normal(data) => data.core_meta_data.posix,
+        ObjectState::Mpu(data_types::object_layout::MpuState::Completed(core)) => core.posix,
+        ObjectState::Symlink(data) => data.core_meta_data.posix,
+        ObjectState::Special(data) => data.core_meta_data.posix,
+        ObjectState::Directory(data) => data.posix,
+        _ => PosixAttrs::default(),
+    }
+}
+
+/// Set the embedded `PosixAttrs` of an `ObjectLayout`, returning the
+/// updated layout. No-op for shapes that don't carry posix
+/// (Indirect, Mpu(Uploading)); used by `vfs_setattr_posix`'s
+/// queue-side persistence path so a standalone chmod / chown / utime
+/// against a file with no pending flush still survives a
+/// forget+relookup.
+pub fn layout_with_posix(mut layout: ObjectLayout, new_posix: PosixAttrs) -> ObjectLayout {
+    use data_types::object_layout::MpuState;
+    match &mut layout.state {
+        ObjectState::Normal(data) => data.core_meta_data.posix = new_posix,
+        ObjectState::Mpu(MpuState::Completed(core)) => core.posix = new_posix,
+        ObjectState::Symlink(data) => data.core_meta_data.posix = new_posix,
+        ObjectState::Special(data) => data.core_meta_data.posix = new_posix,
+        ObjectState::Directory(data) => data.posix = new_posix,
+        _ => {}
+    }
+    layout
+}
+
 pub struct InodeEntry {
     pub s3_key: String,
     pub entry_type: EntryType,
     pub layout: Option<ObjectLayout>,
+    /// In-memory POSIX attrs. On lookup we seed it from the layout's
+    /// embedded `PosixAttrs`; setattr mutates this directly without
+    /// re-publishing to NSS. The next `flush_publish` reads it back and
+    /// folds it into the layout it serialises so the changes survive
+    /// the close-time round-trip.
+    pub posix: PosixAttrs,
     pub cache_expiry: Instant,
+    /// `true` once unlink/rmdir has removed the name mapping for this
+    /// inode and issued the NSS delete. The kernel's dcache may still
+    /// hold a stale dentry pointing at this inode; subsequent FUSE
+    /// SETATTR / WRITE / RELEASE ops via that dentry must NOT write
+    /// the inode's bytes back to NSS, otherwise the unlinked file
+    /// resurrects (deterministic pjdfstest EEXIST on the next
+    /// iteration's create-at-the-same-name). Cleared on lookup_or_insert
+    /// when a new inode is allocated for the same key.
+    pub name_removed: bool,
+    /// `Some(uuid)` when this inode entry has been hardlink-promoted:
+    /// the user-facing s3_key carries an `ObjectState::Indirect` redirect
+    /// and the authoritative layout / posix / nlink live in the
+    /// `#hardlink/<uuid>` `InodeRecord`. `None` for the common case
+    /// (a name with `nlink == 1` that has never been linked). The
+    /// resolution cost is paid once at lookup; ops on the same fh
+    /// reuse the cached resolution. See doc 20 section 4.3.
+    pub inode_id: Option<uuid::Uuid>,
+    /// In-memory atime override in nanoseconds since the Unix epoch.
+    /// `0` means "no explicit atime set; mirror mtime in stat replies".
+    /// Persisted `PosixAttrs` deliberately omits atime (we never bump
+    /// it on `read(2)`), so this field carries the explicit value an
+    /// `utimensat(2)` user supplied. Volatile across forget+relookup,
+    /// which matches POSIX's "atime may be implementation-defined"
+    /// latitude and is enough for pjdfstest's stat-immediately-after
+    /// contract.
+    pub atime_ns: u64,
     refcount: AtomicU64,
 }
 
 impl InodeEntry {
     fn new(s3_key: String, entry_type: EntryType, layout: Option<ObjectLayout>) -> Self {
+        let posix = layout.as_ref().map(layout_posix).unwrap_or_default();
         Self {
             s3_key,
             entry_type,
             layout,
+            posix,
             cache_expiry: Instant::now(),
+            name_removed: false,
+            inode_id: None,
+            atime_ns: 0,
             refcount: AtomicU64::new(1),
         }
     }
@@ -71,7 +142,11 @@ impl InodeTable {
                 s3_key: "/".to_string(),
                 entry_type: EntryType::Directory,
                 layout: None,
+                posix: PosixAttrs::default(),
                 cache_expiry: Instant::now(),
+                name_removed: false,
+                inode_id: None,
+                atime_ns: 0,
                 refcount: AtomicU64::new(u64::MAX), // root never gets forgotten
             },
         );
@@ -82,6 +157,16 @@ impl InodeTable {
     }
 
     /// Look up or insert an inode for a given s3_key. Returns (ino, is_new).
+    /// When the entry already exists, refresh `entry.layout` from the
+    /// freshly-read NSS layout but DO NOT touch `entry.posix`: a setattr
+    /// that updated `posix` in-memory may have enqueued a PutInode that
+    /// the worker hasn't drained yet, so the layout we just fetched can
+    /// carry the pre-chmod posix and overwriting would lose the
+    /// freshly-set bits (deterministic pjdfstest chmod-then-stat
+    /// regression in default mode). The next worker tick commits the
+    /// new layout to NSS; cross-instance refresh of `entry.posix` is
+    /// handled explicitly by the eviction-then-fresh-load path, not
+    /// silently here.
     pub fn lookup_or_insert(
         &self,
         s3_key: &str,
@@ -89,12 +174,10 @@ impl InodeTable {
         layout: Option<ObjectLayout>,
     ) -> (u64, bool) {
         let dedup_key = (s3_key.to_string(), entry_type);
-        // Check if we already have this key
         if let Some(existing_ino) = self.key_to_ino.get(&dedup_key) {
             let ino = *existing_ino;
             if let Some(entry) = self.map.get(&ino) {
                 entry.increment_ref();
-                // Update layout if provided
                 drop(entry);
                 if let Some(new_layout) = layout
                     && let Some(mut entry) = self.map.get_mut(&ino)
@@ -132,29 +215,97 @@ impl InodeTable {
             .map(|r| *r)
     }
 
-    /// Remove name mapping for an inode (used during unlink/rmdir).
-    /// Removes the reverse map entry but keeps the inode in the map for open
-    /// file handles. The inode will be fully removed when refcount reaches 0.
-    pub fn remove_name_mapping(&self, ino: u64) {
+    /// Map an additional `s3_key` to an existing `ino`. Used by
+    /// `vfs_link` to give a hardlink-promoted inode a second
+    /// user-facing name without allocating a new in-memory inode.
+    /// The InodeEntry's own `s3_key` is left at whatever the original
+    /// allocator set; consumers that need a definitive list of all
+    /// aliases should walk `key_to_ino` (out of MVP scope -- the
+    /// callers that exist today only need find-by-key resolution).
+    pub fn add_alias(&self, s3_key: &str, entry_type: EntryType, ino: u64) {
+        self.key_to_ino
+            .insert((s3_key.to_string(), entry_type), ino);
+    }
+
+    /// Remove the alias `(removed_key, entry_type)` from the reverse
+    /// map. The inode itself stays in `map` until the kernel forgets
+    /// it. For non-hardlink inodes this also marks the entry
+    /// `name_removed` so any in-flight FUSE op via the now-stale
+    /// dentry stops re-publishing to NSS. For hardlink-promoted
+    /// inodes with multiple aliases, we only set `name_removed` once
+    /// the LAST alias is gone -- otherwise the still-live aliases
+    /// would lose their writeback path.
+    ///
+    /// If the removed key was the entry's primary `s3_key`, swap it
+    /// to any remaining alias so subsequent ops on the inode still
+    /// have a valid user-facing key for NSS round-trips.
+    pub fn remove_name_mapping(&self, ino: u64, removed_key: &str) {
         if ino == ROOT_INODE {
             return;
         }
-        if let Some(entry) = self.map.get(&ino) {
-            self.key_to_ino
-                .remove(&(entry.s3_key.clone(), entry.entry_type));
+        let entry_type = match self.map.get(&ino) {
+            Some(e) => e.entry_type,
+            None => return,
+        };
+        self.key_to_ino
+            .remove(&(removed_key.to_string(), entry_type));
+        let any_alias_left = self.key_to_ino.iter().any(|kv| *kv.value() == ino);
+        let replacement_alias = if any_alias_left {
+            self.key_to_ino.iter().find_map(|kv| {
+                if *kv.value() == ino {
+                    Some(kv.key().0.clone())
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(mut entry) = self.map.get_mut(&ino) {
+            if entry.s3_key == removed_key
+                && let Some(alt) = replacement_alias
+            {
+                entry.s3_key = alt;
+            }
+            if !any_alias_left {
+                entry.name_removed = true;
+            }
         }
     }
 
     /// Update the s3_key for an inode (used during rename).
     /// Updates both the inode entry and the reverse map.
-    pub fn update_s3_key(&self, ino: u64, new_key: &str) {
-        if let Some(mut entry) = self.map.get_mut(&ino) {
-            let old_key = (entry.s3_key.clone(), entry.entry_type);
-            self.key_to_ino.remove(&old_key);
+    /// Rename the `(old_key, ino)` entry in `key_to_ino` to `(new_key,
+    /// ino)`. If the inode entry's primary `s3_key` matches `old_key`,
+    /// it is updated too; otherwise we only touch the alias mapping.
+    /// The latter case applies to hardlink-promoted inodes where one
+    /// of several names is being renamed and the entry's authoritative
+    /// `s3_key` is tracking a different alias.
+    pub fn rename_alias(&self, ino: u64, old_key: &str, new_key: &str) {
+        let entry_type = match self.map.get(&ino) {
+            Some(e) => e.entry_type,
+            None => return,
+        };
+        self.key_to_ino.remove(&(old_key.to_string(), entry_type));
+        self.key_to_ino
+            .insert((new_key.to_string(), entry_type), ino);
+        if let Some(mut entry) = self.map.get_mut(&ino)
+            && entry.s3_key == old_key
+        {
             entry.s3_key = new_key.to_string();
-            self.key_to_ino
-                .insert((new_key.to_string(), entry.entry_type), ino);
         }
+    }
+
+    /// Back-compat shim: the existing rename path passes only the new
+    /// key and assumes the entry's current `s3_key` is the name being
+    /// renamed. New code should prefer `rename_alias` so hardlink
+    /// aliases are handled correctly.
+    pub fn update_s3_key(&self, ino: u64, new_key: &str) {
+        let old_key = match self.map.get(&ino) {
+            Some(e) => e.s3_key.clone(),
+            None => return,
+        };
+        self.rename_alias(ino, &old_key, new_key);
     }
 
     /// Update s3_keys for all child inodes under old_prefix to use new_prefix.

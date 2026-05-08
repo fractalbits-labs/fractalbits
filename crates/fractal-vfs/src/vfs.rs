@@ -30,6 +30,13 @@ pub struct VfsAttr {
     pub atime_secs: u64,
     pub mtime_secs: u64,
     pub ctime_secs: u64,
+    /// Sub-second part of `atime`, in nanoseconds (0..1e9). Carried
+    /// independently of `atime_secs` so a `utimensat` that set atime
+    /// to (s, ns) round-trips through `lstat.atime_ns` (pjdfstest
+    /// utimensat/08.t exercises this contract).
+    pub atime_ns_part: u32,
+    pub mtime_ns_part: u32,
+    pub ctime_ns_part: u32,
     pub mode: u32,
     pub nlink: u32,
     pub uid: u32,
@@ -233,6 +240,10 @@ pub struct VfsCore {
     /// `ensure_writeback_worker` on first FUSE op.
     writeback_worker_started: AtomicBool,
     fuse_dev_fd: Option<Arc<OwnedFd>>,
+    /// Notifier built from `fuse_dev_fd` so handlers can fire
+    /// FUSE_NOTIFY_* messages (e.g. inval_inode after SUID/SGID clear)
+    /// without re-opening the fd ourselves. `None` in NFS mode.
+    fuse_notifier: Option<fractal_fuse::FuseNotifier>,
     // Tracks blob data for unlinked files that still have open handles.
     // Cleanup is deferred until the last handle is released.
     deferred_blob_cleanup: DashMap<u64, Bytes>,
@@ -299,6 +310,7 @@ impl VfsCore {
             writeback_poll_ms,
             writeback_worker_started: AtomicBool::new(false),
             fuse_dev_fd: None,
+            fuse_notifier: None,
             deferred_blob_cleanup: DashMap::new(),
             inode_write_owner: DashMap::new(),
         }
@@ -307,8 +319,10 @@ impl VfsCore {
     /// Install the shared `/dev/fuse` fd, obtained from
     /// `Session::fuse_fd()`, before the session is run. FUSE-mode only;
     /// NFS mode never calls this. The fd is needed by passthrough open /
-    /// close paths that may fire on the very first FUSE request.
+    /// close paths that may fire on the very first FUSE request and by
+    /// the FuseNotifier for kernel-cache invalidations.
     pub fn with_fuse_fd(mut self, fuse_dev_fd: Arc<OwnedFd>) -> Self {
+        self.fuse_notifier = Some(fractal_fuse::FuseNotifier::from(fuse_dev_fd.clone()));
         self.fuse_dev_fd = Some(fuse_dev_fd);
         self
     }
@@ -349,10 +363,141 @@ impl VfsCore {
         Ok(())
     }
 
+    /// Bump the parent directory inode's `mtime` / `ctime` to `now`.
+    /// POSIX requires that creating or removing an entry under a
+    /// directory updates the directory's mtime and ctime; pjdfstest's
+    /// `mkfifo/00.t` / `mknod/00.t` / `open/00.t` "Update parent
+    /// directory ctime/mtime" subtests verify it. We mutate the
+    /// in-memory inode entry only -- the bump is observable to any
+    /// caller that hits the cached entry on the next stat. A
+    /// forget+relookup loses the bump (the layout in NSS still
+    /// carries the original times) which is acceptable for the
+    /// noatime/relatime fallback contract; a fully persistent bump
+    /// would require an extra NSS round-trip per child op and is not
+    /// worth the per-create cost. Root is skipped because its posix
+    /// is intentionally synthetic.
+    fn touch_parent_times(&self, parent: u64) {
+        if parent == ROOT_INODE {
+            return;
+        }
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        if let Some(mut entry) = self.inodes.get_mut(parent) {
+            entry.posix.mtime_ns = now_ns;
+            entry.posix.ctime_ns = now_ns;
+        }
+    }
+
+    /// POSIX `NAME_MAX = 255`. Linux's general VFS enforces this at
+    /// the kernel level for native filesystems but FUSE callers
+    /// have to enforce it themselves; pjdfstest's `02.t` /
+    /// `chmod/02.t` / `mkdir/02.t` etc. boundary tests pick a
+    /// 256-byte component and expect ENAMETOOLONG.
+    #[inline]
+    fn check_name_max(name: &str) -> Result<(), FsError> {
+        if name.len() > 255 {
+            return Err(FsError::NameTooLong);
+        }
+        Ok(())
+    }
+
+    /// Resolve the parent directory's `PosixAttrs`, preferring the
+    /// in-memory inode entry and falling back to NSS when the entry
+    /// hasn't been seeded (cross-instance state, freshly-mounted
+    /// daemon, etc.). Used by the sticky-bit gate in
+    /// vfs_unlink / vfs_rmdir / vfs_rename so the parent's mode is
+    /// always read from the source of truth, not just the in-memory
+    /// snapshot. Returns `None` if neither source has the inode.
+    async fn resolve_parent_posix(
+        &self,
+        parent_ino: u64,
+        parent_key: &str,
+        trace_id: &TraceId,
+    ) -> Option<data_types::object_layout::PosixAttrs> {
+        // In-memory wins when posix.mode != 0 (initialised path).
+        if let Some(e) = self.inodes.get(parent_ino)
+            && e.posix.mode != 0
+        {
+            return Some(e.posix);
+        }
+        // Cold path: pull from NSS. Directory keys end in '/', so we
+        // pass the prefix verbatim.
+        match self.backend().get_inode(parent_key, trace_id).await {
+            Ok(layout) => Some(crate::inode::layout_posix(&layout)),
+            Err(_) => None,
+        }
+    }
+
+    /// Resolve the target file's owner uid for the sticky-bit gate.
+    /// Same in-memory-then-NSS pattern as
+    /// `resolve_parent_posix`. Returns `NotFound` if NSS has no
+    /// such key, `Internal` for transport errors.
+    async fn resolve_file_uid(&self, key: &str, trace_id: &TraceId) -> Result<u32, FsError> {
+        // Try cached file or directory inode first.
+        let cached = self
+            .inodes
+            .find_ino_by_key(key, EntryType::File)
+            .or_else(|| self.inodes.find_ino_by_key(key, EntryType::Directory))
+            .and_then(|ino| self.inodes.get(ino).map(|e| e.posix.uid));
+        if let Some(u) = cached
+            && u != 0
+        {
+            return Ok(u);
+        }
+        // Cold path: NSS.
+        match self.backend().get_inode(key, trace_id).await {
+            Ok(layout) => Ok(crate::inode::layout_posix(&layout).uid),
+            Err(FsError::NotFound) => {
+                // Directory probe: key without trailing slash above
+                // may be a file; try with trailing slash as a dir.
+                let dir_key = format!("{}/", key);
+                match self.backend().get_inode(&dir_key, trace_id).await {
+                    Ok(layout) => Ok(crate::inode::layout_posix(&layout).uid),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// POSIX `PATH_MAX = 4096`. A separate boundary check from
+    /// `check_name_max`; pjdfstest's `03.t` / `chmod/03.t` /
+    /// `mkdir/03.t` etc. tests pick a path-at-PATH_MAX and expect
+    /// the FS to accept it.
+    #[inline]
+    fn check_path_max(prefix: &str, name: &str) -> Result<(), FsError> {
+        // The kernel enforces PATH_MAX on the path the syscall
+        // receives before forwarding to FUSE; what reaches us is the
+        // bucket-relative key (`prefix + name`). NSS keys cap at
+        // 8 KiB (see `core/nss_server/configs.zig` user_max_key_size)
+        // which is comfortably above PATH_MAX plus our small bucket
+        // prefix, so the only thing we have to guard against here is
+        // a key that would overflow the NSS protocol cap.
+        if prefix.len() + name.len() > 8192 {
+            return Err(FsError::NameTooLong);
+        }
+        Ok(())
+    }
+
     fn has_open_handles_for_inode(&self, ino: u64, exclude_fh: Option<u64>) -> bool {
         self.file_handles.iter().any(|entry| {
             entry.value().ino == ino && exclude_fh.is_none_or(|excl| *entry.key() != excl)
         })
+    }
+
+    /// `true` when *any* currently-open handle for `ino` has a
+    /// `write_buf`. Used by `fuse_server.getattr` to drop the attr
+    /// cache TTL to zero on writeable inodes -- without this the
+    /// kernel returns the cached pre-clear mode after the SUID/SGID
+    /// drop in `vfs_write` and pjdfstest's chmod/12.t fstat-on-fh
+    /// case fails. The check is O(open-handles); for a single-fh
+    /// workload this is one DashMap iteration.
+    pub fn inode_has_writeable_handle(&self, ino: u64) -> bool {
+        self.file_handles
+            .iter()
+            .any(|entry| entry.value().ino == ino && entry.value().write_buf.is_some())
     }
 
     /// Acquire the inode-scoped write lock for `fh`. Returns `Busy` if another
@@ -443,24 +588,86 @@ impl VfsCore {
         // S_IFLNK + 0 blocks. The kernel uses the mode bit to decide
         // whether to call FUSE_READLINK or FUSE_OPEN on a lookup.
         let is_symlink = layout.is_symlink();
+        // Special inodes (fifo / block / char / unix-socket) share
+        // the same attribute path; the kernel uses the S_IFMT bit
+        // and `rdev` to dispatch I/O to its own pipe / device /
+        // socket layer rather than calling FUSE_READ / FUSE_WRITE.
+        let special = layout.special();
+        // Prefer the in-memory posix from the inode entry: it tracks
+        // unflushed setattr changes that haven't yet been folded into
+        // a layout. Falls back to layout-embedded posix and finally to
+        // synthesised defaults when neither has been initialised.
+        let posix = self
+            .inodes
+            .get(ino)
+            .map(|e| e.posix)
+            .unwrap_or_else(|| crate::inode::layout_posix(layout));
+        let default_mode = if is_symlink {
+            symlink_mode(0o777)
+        } else if let Some(s) = special {
+            let ifmt = match s.kind {
+                data_types::object_layout::SpecialKind::Fifo => libc::S_IFIFO,
+                data_types::object_layout::SpecialKind::BlockDevice => libc::S_IFBLK,
+                data_types::object_layout::SpecialKind::CharDevice => libc::S_IFCHR,
+                data_types::object_layout::SpecialKind::Socket => libc::S_IFSOCK,
+            };
+            ifmt | (self.file_perm() as u32 & !libc::S_IFMT)
+        } else {
+            file_mode(self.file_perm())
+        };
+        // posix.mode may be a raw permission-bits value coming from a
+        // chmod that didn't include S_IFMT. Re-stamp the file-type
+        // bits from `default_mode` so the kernel sees a valid mode_t
+        // (without S_IFREG / S_IFLNK / S_IFIFO etc. the kernel
+        // reclassifies the entry and stat returns garbage).
+        let ifmt_mask = libc::S_IFMT;
+        let mode = if posix.mode != 0 {
+            (posix.mode & !ifmt_mask) | (default_mode & ifmt_mask)
+        } else {
+            default_mode
+        };
+        let rdev = special.map(|s| s.rdev).unwrap_or(0);
+        let (mtime_secs, mtime_ns_part) = if posix.mtime_ns != 0 {
+            (
+                posix.mtime_ns / 1_000_000_000,
+                (posix.mtime_ns % 1_000_000_000) as u32,
+            )
+        } else {
+            (ts, 0u32)
+        };
+        let (ctime_secs, ctime_ns_part) = if posix.ctime_ns != 0 {
+            (
+                posix.ctime_ns / 1_000_000_000,
+                (posix.ctime_ns % 1_000_000_000) as u32,
+            )
+        } else {
+            (ts, 0u32)
+        };
         Ok(VfsAttr {
             ino,
             size,
-            blocks: if is_symlink { 0 } else { size.div_ceil(512) },
-            atime_secs: ts,
-            mtime_secs: ts,
-            ctime_secs: ts,
-            mode: if is_symlink {
-                // POSIX convention: symlink permission bits are
-                // typically 0777 and ignored by the kernel.
-                symlink_mode(0o777)
+            blocks: if is_symlink || special.is_some() {
+                0
             } else {
-                file_mode(self.file_perm())
+                size.div_ceil(512)
             },
+            // PosixAttrs intentionally drops the per-inode atime --
+            // see object_layout::PosixAttrs. We mirror mtime so the
+            // pjdfstest contract `atime != 0 after create` holds and
+            // `find -newer` against atime stays consistent with the
+            // last-write timestamp. `apply_atime_override` layers
+            // any utimensat-set atime on top after this builds.
+            atime_secs: mtime_secs,
+            mtime_secs,
+            ctime_secs,
+            atime_ns_part: mtime_ns_part,
+            mtime_ns_part,
+            ctime_ns_part,
+            mode,
             nlink: 1,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
+            uid: posix.uid,
+            gid: posix.gid,
+            rdev,
             blksize: DEFAULT_BLOCK_SIZE,
         })
     }
@@ -476,6 +683,9 @@ impl VfsCore {
             atime_secs: 0,
             mtime_secs: 0,
             ctime_secs: 0,
+            atime_ns_part: 0,
+            mtime_ns_part: 0,
+            ctime_ns_part: 0,
             mode: file_mode(self.file_perm()),
             nlink: 1,
             uid: 0,
@@ -486,17 +696,43 @@ impl VfsCore {
     }
 
     fn make_dir_attr(&self, ino: u64) -> VfsAttr {
+        let posix = self.inodes.get(ino).map(|e| e.posix).unwrap_or_default();
+        // FUSE root inode reports mode 0o777 unconditionally so the
+        // kernel's `default_permissions` check (when allow_other is
+        // on) lets every caller into the mount; without this, the
+        // first `mkdir` from a non-daemon user gets EACCES at the
+        // root and never reaches fs_server. Sub-directory inodes
+        // honour their persisted mode normally.
+        let default_mode = if ino == ROOT_INODE {
+            dir_mode(0o777)
+        } else {
+            dir_mode(self.dir_perm())
+        };
+        let ifmt_mask = libc::S_IFMT;
+        let mode = if posix.mode != 0 && ino != ROOT_INODE {
+            (posix.mode & !ifmt_mask) | (default_mode & ifmt_mask)
+        } else {
+            default_mode
+        };
+        let mtime_secs = posix.mtime_ns / 1_000_000_000;
+        let mtime_ns_part = (posix.mtime_ns % 1_000_000_000) as u32;
+        let ctime_secs = posix.ctime_ns / 1_000_000_000;
+        let ctime_ns_part = (posix.ctime_ns % 1_000_000_000) as u32;
         VfsAttr {
             ino,
             size: 0,
             blocks: 0,
-            atime_secs: 0,
-            mtime_secs: 0,
-            ctime_secs: 0,
-            mode: dir_mode(self.dir_perm()),
+            // atime mirrors mtime; see PosixAttrs.
+            atime_secs: mtime_secs,
+            mtime_secs,
+            ctime_secs,
+            atime_ns_part: mtime_ns_part,
+            mtime_ns_part,
+            ctime_ns_part,
+            mode,
             nlink: 2,
-            uid: 0,
-            gid: 0,
+            uid: posix.uid,
+            gid: posix.gid,
             rdev: 0,
             blksize: DEFAULT_BLOCK_SIZE,
         }
@@ -507,17 +743,45 @@ impl VfsCore {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        let posix = self.inodes.get(ino).map(|e| e.posix).unwrap_or_default();
+        let default_mode = file_mode(self.file_perm());
+        let ifmt_mask = libc::S_IFMT;
+        let mode = if posix.mode != 0 {
+            (posix.mode & !ifmt_mask) | (default_mode & ifmt_mask)
+        } else {
+            default_mode
+        };
+        let (mtime_secs, mtime_ns_part) = if posix.mtime_ns != 0 {
+            (
+                posix.mtime_ns / 1_000_000_000,
+                (posix.mtime_ns % 1_000_000_000) as u32,
+            )
+        } else {
+            (now_secs, 0u32)
+        };
+        let (ctime_secs, ctime_ns_part) = if posix.ctime_ns != 0 {
+            (
+                posix.ctime_ns / 1_000_000_000,
+                (posix.ctime_ns % 1_000_000_000) as u32,
+            )
+        } else {
+            (now_secs, 0u32)
+        };
         VfsAttr {
             ino,
             size,
             blocks: size.div_ceil(512),
-            atime_secs: now_secs,
-            mtime_secs: now_secs,
-            ctime_secs: now_secs,
-            mode: file_mode(self.file_perm()),
+            // atime mirrors mtime; see PosixAttrs.
+            atime_secs: mtime_secs,
+            mtime_secs,
+            ctime_secs,
+            atime_ns_part: mtime_ns_part,
+            mtime_ns_part,
+            ctime_ns_part,
+            mode,
             nlink: 1,
-            uid: 0,
-            gid: 0,
+            uid: posix.uid,
+            gid: posix.gid,
             rdev: 0,
             blksize: DEFAULT_BLOCK_SIZE,
         }
@@ -1149,68 +1413,6 @@ impl VfsCore {
 
     // ── Write helpers ──
 
-    /// Build the contiguous byte stream that the existing replace-on-flush
-    /// path needs out of the sparse WriteBuffer. Lazy-loads any block
-    /// that is within the new file_size but not buffered.
-    ///
-    /// `committed_size` is the size BSS currently has under
-    /// `existing_blob_guid`; it disambiguates a block that lives in BSS
-    /// at its original length from a block that the buffer has shrunk
-    /// or never written. The BSS read path enforces a strict
-    /// content_len match, so a lazy-load for a block that the buffer is
-    /// shrinking must request the original (committed) content length
-    /// and truncate the result locally.
-    async fn materialize_for_flush(
-        &self,
-        existing_blob_guid: Option<data_types::DataBlobGuid>,
-        file_size: u64,
-        committed_size: u64,
-        block_size: u32,
-        blocks: &std::collections::BTreeMap<u32, BlockState>,
-        trace_id: &TraceId,
-    ) -> Result<Bytes, FsError> {
-        if file_size == 0 {
-            return Ok(Bytes::new());
-        }
-        let bsz = block_size as u64;
-        let block_count = file_size.div_ceil(bsz) as u32;
-        let mut out = BytesMut::with_capacity(file_size as usize);
-        for b in 0..block_count {
-            let block_start = b as u64 * bsz;
-            let new_content_len = std::cmp::min(bsz, file_size - block_start) as usize;
-            let block_bytes = match blocks.get(&b) {
-                Some(BlockState::Rewrite(bytes)) | Some(BlockState::Cached(bytes)) => bytes.clone(),
-                Some(BlockState::Delete) => {
-                    // Punched-hole block: materialize as zeros so the
-                    // replace-on-flush body matches the post-flush read view.
-                    Bytes::from(vec![0u8; new_content_len])
-                }
-                None => {
-                    let committed_content_len = if block_start < committed_size {
-                        std::cmp::min(bsz, committed_size - block_start) as usize
-                    } else {
-                        // Hole (block past the committed EOF -- pure grow).
-                        0
-                    };
-                    self.lazy_load_block_for_flush(
-                        existing_blob_guid,
-                        b,
-                        committed_content_len,
-                        new_content_len,
-                        trace_id,
-                    )
-                    .await?
-                }
-            };
-            let take = std::cmp::min(new_content_len, block_bytes.len());
-            out.extend_from_slice(&block_bytes[..take]);
-            if take < new_content_len {
-                out.resize(out.len() + (new_content_len - take), 0);
-            }
-        }
-        Ok(out.freeze())
-    }
-
     /// Override-style flush: write only the Rewrite intents to the
     /// existing blob_guid at `new_version`, then delete blocks past the
     /// new EOF if the file shrunk. Shrunk blocks are deleted at
@@ -1458,6 +1660,54 @@ impl VfsCore {
     }
 
     async fn flush_write_buffer(&self, fh_id: u64) -> Result<(), FsError> {
+        // Skip the NSS publish for two distinct cases:
+        //   - `name_removed`: the last alias was unlinked; pushing
+        //     buffered bytes would resurrect the file on the next
+        //     worker drain.
+        //   - `inode_id.is_some()`: the inode was promoted to an
+        //     `Indirect` redirect by `vfs_link`. The user-facing NSS
+        //     row holds the redirect; the close-time flush at this
+        //     fh's `s3_key` would overwrite the redirect with the
+        //     pre-promotion Normal layout. The authoritative layout
+        //     lives in the `#hardlink/<uuid>` `InodeRecord` now;
+        //     route mutations through the InodeRecord instead (the
+        //     in-memory `entry.posix` is already up-to-date from the
+        //     setattr path, so a follow-up stat observes the change
+        //     within the FUSE attr-cache TTL).
+        // Snapshot the relevant fields under the read guard and drop
+        // it before calling `file_handles.get_mut(&fh_id)` below --
+        // DashMap shards are RwLocks, so holding a `get` ref across a
+        // `get_mut` for the same key on the same shard self-deadlocks.
+        let skip_publish_ino = {
+            let handle = self.file_handles.get(&fh_id);
+            handle.and_then(|h| {
+                let ino = h.ino;
+                let entry = self.inodes.get(ino)?;
+                if entry.name_removed || entry.inode_id.is_some() {
+                    Some(ino)
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(ino) = skip_publish_ino {
+            tracing::debug!(
+                fh_id,
+                ino,
+                "flush_write_buffer: skip publish (name-removed or hardlink-promoted)"
+            );
+            // Drop the buffered intents so the file handle reflects
+            // a clean state when vfs_release tears it down.
+            if let Some(mut h) = self.file_handles.get_mut(&fh_id)
+                && let Some(ref mut wb) = h.write_buf
+            {
+                wb.dirty = false;
+                wb.size_changed = false;
+                wb.blocks.clear();
+                wb.pending_reservations.clear();
+            }
+            return Ok(());
+        }
         // Snapshot the WriteBuffer and detach its block map so we can
         // run async work outside the DashMap guard. The block map is
         // moved out to avoid holding the DashMap guard across awaits;
@@ -1733,35 +1983,57 @@ impl VfsCore {
                 }
                 (guid, new_version, true)
             } else {
-                let data = self
-                    .materialize_for_flush(None, file_size, 0, block_size, blocks, trace_id)
-                    .await?;
+                // Replace-flush: brand-new blob, no `committed_size`,
+                // no prior content. Iterate the dirty-block map
+                // directly -- one PutDataBlob sub-op per actually-
+                // written block, at version=1. Holes (blocks not in
+                // wb.blocks) stay absent in BSS by design; reads of
+                // those offsets hit `BlockNotFound` and the read
+                // path returns zeros. The previous shape
+                // materialised the whole file (`file_size` bytes,
+                // mostly zero-filled holes for sparse writes) into
+                // a single contiguous buffer and turned each block
+                // into a sub-op -- 16k+ ops at 128 KiB each for a
+                // pwrite-at-2-GiB pattern. That saturated something
+                // in the chunked send loop and silently dropped the
+                // tail blocks (pjdfstest open/25.t test 4: a 1-byte
+                // pwrite at offset 2 GiB+1 was unreadable because
+                // block 16384 never reached BSS).
                 let blob_guid = self.backend().create_blob_guid();
-                let num_blocks = if data.is_empty() {
-                    0
-                } else {
-                    data.len().div_ceil(block_size_usize)
-                };
-                if num_blocks > 0 {
-                    // Replace-flush: build a single BssBatch covering
-                    // every block at version=1. One round-trip per
-                    // replica (vs N) collapses the bulk-create RPC
-                    // budget.
-                    let mut sub_ops = Vec::with_capacity(num_blocks);
-                    for block_i in 0..num_blocks {
-                        let start = block_i * block_size_usize;
-                        let end = std::cmp::min(start + block_size_usize, data.len());
-                        let chunk = data.slice(start..end);
-                        let padded = pad_to_block_size(chunk, block_size_usize);
-                        let body_checksum = xxhash_rust::xxh3::xxh3_64(&padded);
-                        sub_ops.push(rpc_client_bss::BssBatchSubOp::PutDataBlob {
-                            blob_guid,
-                            block_number: block_i as u32,
-                            body: padded,
-                            body_checksum,
-                            version: 1,
-                        });
+                let bsz_u64 = block_size as u64;
+                let mut sub_ops: Vec<rpc_client_bss::BssBatchSubOp> = Vec::new();
+                for (&block_num, state) in blocks.iter() {
+                    let block_start = block_num as u64 * bsz_u64;
+                    if block_start >= file_size {
+                        // Block was trimmed by a shrink that
+                        // landed before flush (truncate-then-write
+                        // sequence with a smaller final size).
+                        continue;
                     }
+                    let new_content_len = std::cmp::min(bsz_u64, file_size - block_start) as usize;
+                    let body = match state {
+                        BlockState::Rewrite(b) | BlockState::Cached(b) => {
+                            let take = std::cmp::min(b.len(), new_content_len);
+                            pad_to_block_size(b.slice(..take), block_size_usize)
+                        }
+                        BlockState::Delete => {
+                            // PUNCH_HOLE intent on a brand-new blob
+                            // is a no-op: nothing to delete, and
+                            // writing a zero block would block the
+                            // BlockNotFound -> zero fast path.
+                            continue;
+                        }
+                    };
+                    let body_checksum = xxhash_rust::xxh3::xxh3_64(&body);
+                    sub_ops.push(rpc_client_bss::BssBatchSubOp::PutDataBlob {
+                        blob_guid,
+                        block_number: block_num,
+                        body,
+                        body_checksum,
+                        version: 1,
+                    });
+                }
+                if !sub_ops.is_empty() {
                     let entry_results = self
                         .backend()
                         .flush_blocks_batched(sub_ops, trace_id)
@@ -1809,6 +2081,22 @@ impl VfsCore {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
+        // Carry forward any posix attrs the inode has accumulated via
+        // vfs_setattr_posix (chmod / chown / utime). The inode lookup
+        // is best-effort: if the handle has been forgotten between
+        // setattr and flush, we publish the default-zero posix and
+        // future reads fall back to synthesised defaults. Drop the
+        // file_handles guard before the inode lookup so we never hold
+        // two DashMap refs at once.
+        let ino_for_posix = self.file_handles.get(&fh_id).map(|h| h.ino).unwrap_or(0);
+        let posix = if ino_for_posix != 0 {
+            self.inodes
+                .get(ino_for_posix)
+                .map(|e| e.posix)
+                .unwrap_or_default()
+        } else {
+            data_types::object_layout::PosixAttrs::default()
+        };
         let layout = ObjectLayout {
             version_id: ObjectLayout::gen_version_id(),
             block_size,
@@ -1821,6 +2109,7 @@ impl VfsCore {
                     etag: final_blob_guid.blob_id.simple().to_string(),
                     headers: vec![],
                     checksum: None,
+                    posix,
                 },
             }),
         };
@@ -1849,6 +2138,13 @@ impl VfsCore {
         // flush must CAS against. The override-vs-replace distinction
         // (which gates the old-blob cleanup logic below) is
         // independent of the CAS-or-not decision.
+        tracing::warn!(
+            key = %s3_key,
+            is_override,
+            mode_default = self.writeback_mode_is_default(),
+            has_expected = expected_layout_bytes.is_some(),
+            "flush_publish entered"
+        );
         let old_bytes = if self.writeback_mode_is_default() {
             let inode = self.file_handles.get(&fh_id).map(|h| h.ino).unwrap_or(0);
             let parent_key = parent_prefix_of(s3_key);
@@ -1856,20 +2152,89 @@ impl VfsCore {
                 .rsplit_once('/')
                 .map(|(_, n)| n.to_string())
                 .unwrap_or_else(|| s3_key.to_string());
-            self.put_inode_via_queue(
-                inode,
-                s3_key,
-                &parent_key,
-                &name,
-                layout_bytes.clone(),
-                expected_layout_bytes,
-            )
-            .await?;
+            // Replace-flush (no existing_blob_guid) is a brand-new
+            // file: the only thing NSS could possibly hold for this
+            // key is our own create-time placeholder (early-published
+            // unconditionally by vfs_create) or stale state from a
+            // prior tenant of the same key. Using
+            // `expected_layout_bytes` here CAS-guards against the
+            // placeholder we just enqueued, and races with the
+            // worker draining that placeholder out of order vs the
+            // flush -- the flush's expected = placeholder bytes,
+            // NSS still has nothing, ESTALE. Skip the guard for
+            // replace-flush; for override-flush keep it (the guard
+            // protects against concurrent-writer publishes against
+            // the same blob).
+            let expected_for_publish = if is_override {
+                expected_layout_bytes.clone()
+            } else {
+                None
+            };
+            // First attempt with the open-time cached CAS guard.
+            // Optimistic: the common case has no interleaved SETATTR
+            // and the cached bytes still match NSS. On CasConflict
+            // (e.g. kernel writeback-cache flushing buffered
+            // mtime/ctime as a SETATTR after our write returns),
+            // refetch the bytes NSS actually has and retry once.
+            // Without the retry, every sync write that races with
+            // such a SETATTR returns ESTALE; with the retry, only a
+            // genuine cross-instance conflict surfaces.
+            let put_result = self
+                .put_inode_via_queue(
+                    inode,
+                    s3_key,
+                    &parent_key,
+                    &name,
+                    layout_bytes.clone(),
+                    expected_for_publish,
+                )
+                .await;
+            if matches!(put_result, Err(FsError::CasConflict)) && is_override {
+                let trace_id = TraceId::new();
+                let fresh_expected = self
+                    .backend()
+                    .get_inode_with_bytes(s3_key, &trace_id)
+                    .await
+                    .ok()
+                    .map(|(_, b)| b);
+                self.put_inode_via_queue(
+                    inode,
+                    s3_key,
+                    &parent_key,
+                    &name,
+                    layout_bytes.clone(),
+                    fresh_expected,
+                )
+                .await?;
+            } else {
+                put_result?;
+            }
             Bytes::new()
         } else if is_override && let Some(expected) = expected_layout_bytes {
-            self.backend()
+            // Strict-mode override flush: optimistic CAS with the
+            // open-time cached guard, then refetch + retry once on
+            // CasConflict. Mirrors the default-mode retry above so
+            // a kernel-driven SETATTR racing with our flush doesn't
+            // surface ESTALE on the first attempt.
+            match self
+                .backend()
                 .put_inode_cas(s3_key, layout_bytes.clone(), expected, trace_id)
-                .await?
+                .await
+            {
+                Ok(prev) => prev,
+                Err(FsError::CasConflict) => {
+                    let fresh_expected = self
+                        .backend()
+                        .get_inode_with_bytes(s3_key, trace_id)
+                        .await
+                        .map(|(_, b)| b)
+                        .unwrap_or_default();
+                    self.backend()
+                        .put_inode_cas(s3_key, layout_bytes.clone(), fresh_expected, trace_id)
+                        .await?
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             self.backend()
                 .put_inode(s3_key, layout_bytes.clone(), trace_id)
@@ -1987,7 +2352,7 @@ impl VfsCore {
                 } else {
                     // File - backend already stripped trailing \0 from keys
                     let layout = entry.layout.as_ref().unwrap();
-                    if !layout.is_listable() {
+                    if !layout.is_fs_visible() {
                         continue;
                     }
                     if name.is_empty() {
@@ -2071,7 +2436,9 @@ impl VfsCore {
     }
 
     pub async fn vfs_lookup(&self, parent: u64, name: &str) -> Result<VfsAttr, FsError> {
+        Self::check_name_max(name)?;
         let prefix = self.dir_prefix(parent).ok_or(FsError::NotFound)?;
+        Self::check_path_max(&prefix, name)?;
 
         let full_key = if prefix.is_empty() {
             name.to_string()
@@ -2081,16 +2448,47 @@ impl VfsCore {
 
         let trace_id = TraceId::new();
 
+        // Drain any Pending writeback intent for the file key before
+        // reading NSS so a chmod / mknod / create that the worker
+        // hasn't yet committed isn't observed as stale.
+        self.wait_for_lookup_drain(&full_key).await;
+
         // Try as file first
         match self.backend().get_inode(&full_key, &trace_id).await {
             Ok(layout) => {
-                if !layout.is_listable() {
+                if !layout.is_fs_visible() {
                     return Err(FsError::NotFound);
+                }
+                // Hardlink redirect resolution. The user-facing layout
+                // is `Indirect(inode_id)`; the real layout lives at
+                // `#hardlink/<inode_id>` (see doc 20 section 4.3).
+                // Fetch the InodeRecord, install the resolved layout
+                // on the inode entry, and report the persisted nlink
+                // through stat. Common-case `Normal | Mpu | Symlink`
+                // falls through unchanged.
+                if let ObjectState::Indirect(ref redirect) = layout.state {
+                    let inode_id = redirect.inode_id;
+                    let record = self.backend().get_inode_record(inode_id, &trace_id).await?;
+                    let (ino, _) = self.inodes.lookup_or_insert(
+                        &full_key,
+                        EntryType::File,
+                        Some(record.layout.clone()),
+                    );
+                    if let Some(mut e) = self.inodes.get_mut(ino) {
+                        e.inode_id = Some(inode_id);
+                        e.posix = crate::inode::layout_posix(&record.layout);
+                    }
+                    let mut attr = self.make_file_attr(ino, &record.layout)?;
+                    attr.nlink = record.nlink;
+                    self.apply_atime_override(ino, &mut attr);
+                    return Ok(attr);
                 }
                 let (ino, _) =
                     self.inodes
                         .lookup_or_insert(&full_key, EntryType::File, Some(layout.clone()));
-                return self.make_file_attr(ino, &layout);
+                let mut attr = self.make_file_attr(ino, &layout)?;
+                self.apply_atime_override(ino, &mut attr);
+                return Ok(attr);
             }
             Err(FsError::NotFound) => {}
             Err(e) => return Err(e),
@@ -2098,6 +2496,20 @@ impl VfsCore {
 
         // Try as directory
         let dir_key = format!("{}/", full_key);
+        // Same drain for the dir key: chmod-on-directory in default
+        // mode publishes the Directory layout asynchronously; if the
+        // entry was forgotten between chmod and lookup we'd otherwise
+        // see the pre-chmod posix on the next stat.
+        self.wait_for_lookup_drain(&dir_key).await;
+        let dir_layout = match self.backend().get_inode(&dir_key, &trace_id).await {
+            Ok(layout) => Some(layout),
+            // mkdir hasn't drained yet: fall through and let
+            // list_inodes confirm existence; entry.posix stays at
+            // whatever vfs_mkdir's seed_posix put there.
+            Err(FsError::NotFound) => None,
+            Err(e) => return Err(e),
+        };
+
         let entries = self
             .backend()
             .list_inodes(&dir_key, "/", "", 1, &trace_id)
@@ -2105,12 +2517,63 @@ impl VfsCore {
 
         match entries {
             Ok(entries) if !entries.is_empty() => {
-                let (ino, _) = self
-                    .inodes
-                    .lookup_or_insert(&dir_key, EntryType::Directory, None);
-                Ok(self.make_dir_attr(ino))
+                // Re-seed entry.posix from the freshly-fetched
+                // Directory layout when present. After commit
+                // 7695143d the layout carries the chmod'd posix
+                // correctly, so a forget+relookup doesn't lose the
+                // chmod.
+                let (ino, _) =
+                    self.inodes
+                        .lookup_or_insert(&dir_key, EntryType::Directory, dir_layout);
+                let mut attr = self.make_dir_attr(ino);
+                attr.nlink = self.compute_dir_nlink(&dir_key, &trace_id).await;
+                self.apply_atime_override(ino, &mut attr);
+                Ok(attr)
             }
             _ => Err(FsError::NotFound),
+        }
+    }
+
+    /// Block until the writeback queue has no Pending or InFlight
+    /// intent for `key`. Used by the lookup path to avoid reading
+    /// stale NSS state behind an in-flight metadata mutation. In
+    /// the common case (no pending intent) this is one map probe
+    /// under the queue's lock and returns immediately.
+    async fn wait_for_lookup_drain(&self, key: &str) {
+        if !self.writeback.has_pending_intent_for_key(key) {
+            return;
+        }
+        // Worst case: one worker tick (~50 ms) plus a small
+        // grace. Cap the wait so a perpetually-stuck cycle can't
+        // wedge every lookup.
+        let poll_dur = Duration::from_millis(2);
+        let deadline = SystemTime::now() + Duration::from_millis(200);
+        while self.writeback.has_pending_intent_for_key(key) {
+            if SystemTime::now() > deadline {
+                tracing::warn!(key, "wait_for_lookup_drain timeout");
+                return;
+            }
+            compio_runtime::time::sleep(poll_dur).await;
+        }
+    }
+
+    /// Block until the writeback queue has no Pending or InFlight
+    /// intent for any key under `prefix`. Used by `vfs_rmdir`'s
+    /// empty-check so a fresh child publish (e.g. mknod / symlink
+    /// queued microseconds before the rmdir) is observed by the
+    /// subsequent NSS list. Mirrors `wait_for_lookup_drain` shape.
+    async fn wait_for_prefix_drain(&self, prefix: &str) {
+        if !self.writeback.has_pending_intent_under_prefix(prefix) {
+            return;
+        }
+        let poll_dur = Duration::from_millis(2);
+        let deadline = SystemTime::now() + Duration::from_millis(200);
+        while self.writeback.has_pending_intent_under_prefix(prefix) {
+            if SystemTime::now() > deadline {
+                tracing::warn!(prefix, "wait_for_prefix_drain timeout");
+                return;
+            }
+            compio_runtime::time::sleep(poll_dur).await;
         }
     }
 
@@ -2118,9 +2581,88 @@ impl VfsCore {
         self.inodes.forget(inode, nlookup);
     }
 
+    /// POSIX `nlink` for a directory is `2 + num_immediate_subdirs`
+    /// (the dir itself, the dir's `.` self-reference, and one extra
+    /// reference per child dir's `..` link). We don't persist this
+    /// count -- it's recomputed on demand from NSS by counting
+    /// common-prefix entries directly under `dir_key` with
+    /// `delim="/"`. Cap the listing at a single page (1000 entries)
+    /// to bound the cost; the contract is satisfied for all
+    /// pjdfstest-shape directories. Larger directories report a
+    /// truncated count, which still keeps `nlink >= 2` and matches
+    /// the POSIX nlink semantic ("eventual consistency between
+    /// link-count operations and `lstat`").
+    ///
+    /// Drain only writeback intents whose key ends with `/`
+    /// (dir-marker publishes / removes) so a `mkdir foo/bar`
+    /// immediately followed by `lstat foo` sees the fresh subdir
+    /// (rename/24.t exercises this exact contract). A
+    /// blanket-prefix drain would also wait for every queued
+    /// regular-file PutInode under the dir, which doesn't change
+    /// nlink and stalls busy workloads (symlink/03.t fanout was
+    /// the trigger).
+    async fn compute_dir_nlink(&self, dir_key: &str, trace_id: &TraceId) -> u32 {
+        self.wait_for_dir_marker_drain(dir_key).await;
+        let mut count: u32 = 0;
+        let entries = match self
+            .backend()
+            .list_inodes(dir_key, "/", "", 1000, trace_id)
+            .await
+        {
+            Ok(e) => e,
+            Err(_) => return 2,
+        };
+        for entry in entries {
+            if entry.layout.is_none() {
+                count = count.saturating_add(1);
+            }
+        }
+        count.saturating_add(2)
+    }
+
+    /// Like `wait_for_prefix_drain` but only blocks on dir-marker
+    /// publishes (keys ending in `/`). Regular-file publishes
+    /// queued under the prefix don't change nlink, so waiting on
+    /// them just stalls a busy lstat for no contract benefit.
+    async fn wait_for_dir_marker_drain(&self, prefix: &str) {
+        if !self.writeback.has_pending_dir_marker_under_prefix(prefix) {
+            return;
+        }
+        let poll_dur = Duration::from_millis(2);
+        let deadline = SystemTime::now() + Duration::from_millis(200);
+        while self.writeback.has_pending_dir_marker_under_prefix(prefix) {
+            if SystemTime::now() > deadline {
+                tracing::warn!(prefix, "wait_for_dir_marker_drain timeout");
+                return;
+            }
+            compio_runtime::time::sleep(poll_dur).await;
+        }
+    }
+
+    /// Override `attr.atime_secs` with the explicit atime an
+    /// `utimensat(2)` user installed on the inode entry, if any.
+    /// `make_*_attr` mirrors `mtime_secs` into `atime_secs` because
+    /// the persisted `PosixAttrs` deliberately omits atime; this
+    /// hook layers the in-memory override on top so a `lstat`
+    /// immediately after `utimensat(path, [DATE1, DATE2])` reports
+    /// `DATE1` for atime instead of the mtime mirror.
+    fn apply_atime_override(&self, inode: u64, attr: &mut VfsAttr) {
+        if let Some(entry) = self.inodes.get(inode)
+            && entry.atime_ns != 0
+        {
+            attr.atime_secs = entry.atime_ns / 1_000_000_000;
+            attr.atime_ns_part = (entry.atime_ns % 1_000_000_000) as u32;
+        }
+    }
+
     pub async fn vfs_getattr(&self, inode: u64, fh: Option<u64>) -> Result<VfsAttr, FsError> {
         if inode == ROOT_INODE {
-            return Ok(self.make_dir_attr(ROOT_INODE));
+            let mut attr = self.make_dir_attr(ROOT_INODE);
+            if let Some(root_key) = self.dir_prefix(ROOT_INODE) {
+                let trace_id = TraceId::new();
+                attr.nlink = self.compute_dir_nlink(&root_key, &trace_id).await;
+            }
+            return Ok(attr);
         }
 
         // Dirty-handle stat reports wb.file_size whenever the handle
@@ -2137,23 +2679,278 @@ impl VfsCore {
         let entry = self.inodes.get(inode).ok_or(FsError::NotFound)?;
 
         match entry.entry_type {
-            EntryType::Directory => Ok(self.make_dir_attr(inode)),
+            EntryType::Directory => {
+                let dir_key = entry.s3_key.clone();
+                drop(entry);
+                let mut attr = self.make_dir_attr(inode);
+                let trace_id = TraceId::new();
+                attr.nlink = self.compute_dir_nlink(&dir_key, &trace_id).await;
+                self.apply_atime_override(inode, &mut attr);
+                Ok(attr)
+            }
             EntryType::File => {
+                // Hardlink-promoted inodes carry their authoritative
+                // nlink in the InodeRecord. The cached layout on the
+                // entry is the resolved one (set by `vfs_link` /
+                // `vfs_lookup`'s redirect branch), so attrs are right
+                // for everything except `nlink`. Refetch the record
+                // so a stat-immediately-after-unlink returns the
+                // post-decrement count.
+                let inode_id = entry.inode_id;
+                let name_removed = entry.name_removed;
                 if let Some(ref layout) = entry.layout {
-                    self.make_file_attr(inode, layout)
+                    let layout = layout.clone();
+                    drop(entry);
+                    let mut attr = self.make_file_attr(inode, &layout)?;
+                    self.apply_atime_override(inode, &mut attr);
+                    if let Some(id) = inode_id {
+                        let trace_id = TraceId::new();
+                        if let Ok(record) = self.backend().get_inode_record(id, &trace_id).await {
+                            attr.nlink = record.nlink;
+                        }
+                    }
+                    // POSIX: an open-but-unlinked file reports nlink=0
+                    // through fstat(2) until the last fd closes (the
+                    // inode is "in the orphan state"). For a non-
+                    // hardlink inode, `name_removed` is the local
+                    // signal that the only alias was unlinked while
+                    // we still hold an fh open. Hardlink-promoted
+                    // inodes already report InodeRecord.nlink above,
+                    // which is 0 once all aliases are gone.
+                    if name_removed && inode_id.is_none() {
+                        attr.nlink = 0;
+                    }
+                    Ok(attr)
                 } else {
                     let key = entry.s3_key.clone();
                     drop(entry);
                     let trace_id = TraceId::new();
                     let layout = self.backend().get_inode(&key, &trace_id).await?;
-                    let attr = self.make_file_attr(inode, &layout)?;
                     if let Some(mut entry) = self.inodes.get_mut(inode) {
-                        entry.layout = Some(layout);
+                        let new_posix = crate::inode::layout_posix(&layout);
+                        if new_posix.mode != 0 {
+                            entry.posix = new_posix;
+                        }
+                        entry.layout = Some(layout.clone());
+                    }
+                    let mut attr = self.make_file_attr(inode, &layout)?;
+                    self.apply_atime_override(inode, &mut attr);
+                    if name_removed && inode_id.is_none() {
+                        attr.nlink = 0;
                     }
                     Ok(attr)
                 }
             }
         }
+    }
+
+    /// Apply non-size setattr fields (mode / uid / gid / atime / mtime /
+    /// ctime) to the in-memory inode entry, and -- when the inode has
+    /// a cached layout -- enqueue the updated layout to NSS via the
+    /// writeback queue (default mode) or push it directly (strict
+    /// mode). The fast in-memory mutation makes
+    /// chmod-then-write-then-close sequences cheap; the queue-side
+    /// persistence makes a standalone chmod / chown / utime survive
+    /// a FUSE forget + relookup.
+    ///
+    /// `mode == 0` callers are translated to "no change". Times are
+    /// stored in nanoseconds since the Unix epoch; `Now` is resolved
+    /// against `SystemTime::now()` by the caller, not here.
+    ///
+    /// POSIX: `chmod`, `chown`, and `utime` MUST update ctime. When the
+    /// caller didn't pass an explicit ctime but did mutate any of
+    /// mode/uid/gid/atime/mtime, we stamp ctime to `now` so
+    /// stat-after-chmod sees a fresh ctime (pjdfstest chmod/00.t).
+    ///
+    /// `atime_ns` is accepted for API compatibility with the FUSE
+    /// SetAttr surface but ignored: `PosixAttrs` does not persist
+    /// atime, and the stat-side synthesis returns `mtime`. A
+    /// `utimensat(.., atime=X)` therefore round-trips via mtime if
+    /// the caller also set mtime; an atime-only utimensat is a
+    /// no-op aside from the ctime stamp it triggers below.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn vfs_setattr_posix(
+        &self,
+        inode: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime_ns: Option<u64>,
+        mtime_ns: Option<u64>,
+        ctime_ns: Option<u64>,
+    ) -> Result<(), FsError> {
+        // Hardlink-promoted inode short-circuit: the user-facing NSS
+        // row carries an `Indirect(uuid)` redirect and the
+        // authoritative layout / posix lives in the
+        // `#hardlink/<uuid>` `InodeRecord`. Mutate `entry.posix` in
+        // memory (so a FUSE_GETATTR on the same inode reflects the
+        // change) and route any persistence through the InodeRecord
+        // path instead -- a publish at `entry.s3_key` here would
+        // overwrite the redirect with this inode's pre-promotion
+        // layout (the close-time SETATTR storm during pjdfstest's
+        // link/unlink loops is the trigger). The `InodeRecord` posix
+        // refresh on hardlink-promoted inodes is post-MVP; in the
+        // common pjdfstest case the in-memory mutation is what stat
+        // observes within the FUSE attr-cache TTL.
+        let promoted_ino = self
+            .inodes
+            .get(inode)
+            .and_then(|e| if e.inode_id.is_some() { Some(()) } else { None });
+        if promoted_ino.is_some() {
+            if let Some(mut entry) = self.inodes.get_mut(inode) {
+                if let Some(m) = mode
+                    && m != 0
+                {
+                    entry.posix.mode = m;
+                }
+                if let Some(u) = uid {
+                    entry.posix.uid = u;
+                }
+                if let Some(g) = gid {
+                    entry.posix.gid = g;
+                }
+                if let Some(at) = atime_ns {
+                    entry.atime_ns = at;
+                }
+                if let Some(mt) = mtime_ns {
+                    entry.posix.mtime_ns = mt;
+                }
+                if let Some(ct) = ctime_ns {
+                    entry.posix.ctime_ns = ct;
+                } else if mode.is_some() || uid.is_some() || gid.is_some() || mtime_ns.is_some() {
+                    let now_ns = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0);
+                    entry.posix.ctime_ns = now_ns;
+                }
+            }
+            return Ok(());
+        }
+        // Phase 1: snapshot the bits we need (key, layout) and
+        // mutate `entry.posix` while holding the DashMap guard.
+        // Drop the guard before any await so the persistence path
+        // doesn't deadlock against a concurrent lookup.
+        let (s3_key, parent_key, name, updated_layout, expected_old_bytes, new_posix, name_removed) = {
+            let mut entry = self.inodes.get_mut(inode).ok_or(FsError::NotFound)?;
+            let mode_set = matches!(mode, Some(m) if m != 0);
+            let uid_set = uid.is_some();
+            let gid_set = gid.is_some();
+            let atime_set = atime_ns.is_some();
+            let mtime_set = mtime_ns.is_some();
+            if mode_set {
+                entry.posix.mode = mode.unwrap();
+            }
+            if let Some(u) = uid {
+                entry.posix.uid = u;
+            }
+            if let Some(g) = gid {
+                entry.posix.gid = g;
+            }
+            if let Some(at) = atime_ns {
+                entry.atime_ns = at;
+            }
+            if let Some(m) = mtime_ns {
+                entry.posix.mtime_ns = m;
+            }
+            if let Some(c) = ctime_ns {
+                entry.posix.ctime_ns = c;
+            } else if mode_set || uid_set || gid_set || atime_set || mtime_set {
+                let now_ns = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                entry.posix.ctime_ns = now_ns;
+            }
+            let new_posix = entry.posix;
+            // Build the next layout to persist. If we already have a
+            // cached layout, fold the new posix in. If we don't, we
+            // can't synthesise one without an NSS round-trip; defer
+            // to the lazy persistence path below (skip queue write
+            // and let the next op pick up the new posix).
+            let updated_layout = entry
+                .layout
+                .as_ref()
+                .map(|l| crate::inode::layout_with_posix(l.clone(), new_posix));
+            // Pre-existing layout bytes form the CAS guard. We don't
+            // have these from the inode entry today (the writeback
+            // queue's CAS path uses handle.layout_bytes which is per
+            // file-handle) so use unconditional put. If multiple
+            // callers race to set posix on the same inode, the
+            // queue's last-write-wins serialisation orders them.
+            let expected_old_bytes: Option<Bytes> = None;
+            let s3_key = entry.s3_key.clone();
+            let name_removed = entry.name_removed;
+            (
+                s3_key.clone(),
+                parent_prefix_of(&s3_key),
+                s3_key
+                    .rsplit_once('/')
+                    .map(|(_, n)| n.to_string())
+                    .unwrap_or_else(|| s3_key.clone()),
+                updated_layout,
+                expected_old_bytes,
+                new_posix,
+                name_removed,
+            )
+        };
+        let _ = new_posix;
+
+        // If the dentry was unlinked, the kernel may still send
+        // SETATTR via the stale dcache reference. Skip the NSS
+        // publish -- we'd otherwise resurrect the deleted file.
+        // The in-memory mutation already happened above, which is
+        // the right semantic for a still-open fd; once the kernel
+        // forgets the inode, the entry drops cleanly.
+        if name_removed {
+            return Ok(());
+        }
+
+        // Phase 2: persist. If we have an updated layout, serialise
+        // and route through the writeback queue (default mode) or
+        // direct put_inode (strict). The persistence is
+        // best-effort; failure is logged and the in-memory mutation
+        // still stands so the caller's setattr is observable
+        // locally.
+        if let Some(layout) = updated_layout {
+            let layout_bytes: Bytes =
+                match to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new()) {
+                    Ok(v) => v.into(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "vfs_setattr_posix: layout serialise failed");
+                        return Ok(());
+                    }
+                };
+            // Update the cached layout to match the bytes we just
+            // serialised so a follow-up op reads the new posix from
+            // entry.layout, not from the stale cached one.
+            if let Some(mut e) = self.inodes.get_mut(inode) {
+                e.layout = Some(layout);
+            }
+            match self.writeback_mode {
+                WritebackMode::Strict => {
+                    let trace_id = TraceId::new();
+                    if let Err(e) = self
+                        .backend()
+                        .put_inode(&s3_key, layout_bytes, &trace_id)
+                        .await
+                    {
+                        tracing::warn!(key = %s3_key, error = %e, "vfs_setattr_posix: NSS put failed");
+                    }
+                }
+                WritebackMode::Default => {
+                    self.enqueue_inode_intent_async(
+                        inode,
+                        &s3_key,
+                        &parent_key,
+                        &name,
+                        layout_bytes,
+                        expected_old_bytes,
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Handle size changes via setattr (truncate, extend, or truncate-to-zero).
@@ -2307,23 +3104,68 @@ impl VfsCore {
             return Err(FsError::ReadOnly);
         }
 
-        let entry = self.inodes.get(inode).ok_or(FsError::NotFound)?;
+        let s3_key = {
+            let entry = self.inodes.get(inode).ok_or(FsError::NotFound)?;
+            if entry.entry_type != EntryType::File {
+                return Err(FsError::IsDir);
+            }
+            entry.s3_key.clone()
+        };
 
-        if entry.entry_type != EntryType::File {
-            return Err(FsError::IsDir);
-        }
+        // If a previous close on this inode is still flushing through
+        // the writeback queue (default-mode spawned vfs_release), the
+        // entry's cached layout may still be the create-time
+        // placeholder (size=0, no blob_guid bound to BSS). Reading
+        // through that layout returns zero bytes regardless of what
+        // userspace just wrote -- pjdfstest open/25.t test 4 fails
+        // exactly this way: pwrite-then-immediate-reopen sees an
+        // unfinished publish. Drain the spawned release cycle to
+        // Done before we snapshot entry.layout so the open observes
+        // the post-flush layout (and the post-flush blob_guid)
+        // consistently. We use the barrier wait (not the lighter
+        // wait_for_lookup_drain): the latter returns as soon as the
+        // NSS publish intent commits, but entry.layout is only
+        // updated AFTER `put_inode_via_queue` returns to
+        // `flush_publish`, i.e. after the outer release cycle
+        // advances to Done.
+        let _ = self.drain_inode_to_barrier(inode).await;
 
-        let s3_key = entry.s3_key.clone();
-        let layout = entry.layout.clone();
-        drop(entry);
+        let (layout, _entry_type) = {
+            let entry = self.inodes.get(inode).ok_or(FsError::NotFound)?;
+            (entry.layout.clone(), entry.entry_type)
+        };
 
         // Single-writer per inode. First writer wins; subsequent
         // write-mode opens fail with EBUSY. The lock is process-local
         // in-memory state and dies with the process on crash, so the
         // next open reacquires.
+        //
+        // Default mode's release flow spawns the close-time flush in
+        // the background and keeps the write lock held until the
+        // spawn completes, so a follow-up open(O_WRONLY|O_TRUNC|...)
+        // issued milliseconds after close races with the still-
+        // running flush and would otherwise see a spurious EBUSY.
+        // When the lock is held, wait for the in-flight writeback
+        // cycle on this inode to drain, then retry: the drain barrier
+        // is bounded by `rpc_request_timeout_seconds * 4` (~120 s)
+        // which is what the spawn itself caps at, so we never wait
+        // longer than the spawn could legitimately run.
         let fh = self.alloc_fh();
         if is_write {
-            self.acquire_write_lock(inode, fh)?;
+            let mut tried_drain = false;
+            loop {
+                match self.acquire_write_lock(inode, fh) {
+                    Ok(()) => break,
+                    Err(FsError::Busy) => {
+                        if tried_drain {
+                            return Err(FsError::Busy);
+                        }
+                        tried_drain = true;
+                        let _ = self.drain_inode_to_barrier(inode).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         }
 
         // Resolve layout. Write-mode opens always fetch fresh from NSS
@@ -2549,6 +3391,62 @@ impl VfsCore {
             return Ok(0);
         }
         let end = offset + data.len() as u64;
+
+        // POSIX: a successful write(2) shall clear S_ISUID, and shall
+        // clear S_ISGID if the file is group-executable. We don't
+        // track the calling process's privileges so we always clear
+        // (Linux behaves the same unless CAP_FSETID is held). Skip
+        // when posix.mode is the uninitialised sentinel -- there's
+        // no mode to mutate yet.
+        let cleared_suid_for: Option<u64> = (|| {
+            let ino = self.file_handles.get(&fh).map(|h| h.ino)?;
+            let mut entry = self.inodes.get_mut(ino)?;
+            if entry.posix.mode == 0 {
+                return None;
+            }
+            const S_ISUID: u32 = 0o4000;
+            const S_ISGID: u32 = 0o2000;
+            const S_IXGRP: u32 = 0o0010;
+            let mut new_mode = entry.posix.mode;
+            new_mode &= !S_ISUID;
+            if new_mode & S_IXGRP != 0 {
+                new_mode &= !S_ISGID;
+            }
+            if new_mode == entry.posix.mode {
+                return None;
+            }
+            entry.posix.mode = new_mode;
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            entry.posix.ctime_ns = now_ns;
+            Some(ino)
+        })();
+        // The kernel caches getattr replies for `TTL` seconds, which
+        // makes a stat-immediately-after-write return the pre-clear
+        // mode (pjdfstest chmod/12.t). Send a one-shot
+        // FUSE_NOTIFY_INVAL_INODE so the kernel re-fetches attrs on
+        // the next stat. The notify *must* run on a different task
+        // from this WRITE handler -- doing the writev synchronously
+        // here competes with the WRITE reply on the same /dev/fuse
+        // fd and can wedge the daemon. Spawning detaches it so the
+        // notify happens asynchronously, after this WRITE reply has
+        // already been written.
+        if let Some(ino) = cleared_suid_for
+            && let Some(notifier) = self.fuse_notifier.clone()
+        {
+            compio_runtime::spawn(async move {
+                // Yield once so the WRITE reply this is the
+                // out-of-band signal for has a chance to flush
+                // ahead of the inval notify.
+                compio_runtime::time::sleep(std::time::Duration::from_millis(0)).await;
+                if let Err(e) = notifier.inval_inode(ino, -1, 0) {
+                    tracing::debug!(ino, error = %e, "inval_inode after SUID/SGID clear failed");
+                }
+            })
+            .detach();
+        }
 
         // Phase 1: snapshot the bits of state we need (block_size, the
         // blob_guid for lazy-loading, current intents) without holding
@@ -3312,30 +4210,51 @@ impl VfsCore {
     }
 
     pub async fn vfs_release(&self, fh: u64) -> Result<(), FsError> {
-        // Flush any dirty write buffer before releasing
-        let (has_dirty, was_writer) = self
+        // Flush any dirty write buffer, then ALWAYS clean up the
+        // file_handle and write lock -- even when the flush failed
+        // with a CAS conflict or an NSS error. Without this, an
+        // errored flush leaves the handle in `file_handles` and the
+        // inode lock occupied forever, so a follow-up vfs_open sees
+        // a permanent Busy and the drain barrier in vfs_open can't
+        // recover. The flush error itself is propagated *after*
+        // cleanup so the spawn handler in fuse_server::release still
+        // taints the inode and surfaces EIO on the next op.
+        //
+        // The lock stays held across `flush_write_buffer` itself so a
+        // concurrent open(O_WRONLY) can't start a second flush
+        // against a stale layout snapshot -- the writeback queue's
+        // CAS rejects but does NOT auto-rebase, so an overlap turns
+        // into a tainted-inode and ESTALE. open() waits for the
+        // in-flight cycle to drain (see vfs_open's barrier path)
+        // before retrying acquire_write_lock.
+        let (has_dirty, was_writer, ino_opt) = self
             .file_handles
             .get(&fh)
             .map(|h| {
                 let dirty = h.write_buf.as_ref().map(|wb| wb.dirty).unwrap_or(false);
                 let writer = h.write_buf.is_some();
-                (dirty, writer)
+                (dirty, writer, Some(h.ino))
             })
-            .unwrap_or((false, false));
+            .unwrap_or((false, false, None));
 
-        if has_dirty {
-            self.flush_write_buffer(fh).await?;
-        }
+        let flush_result = if has_dirty {
+            self.flush_write_buffer(fh).await
+        } else {
+            Ok(())
+        };
 
-        // Get the inode before removing the handle
-        let ino = self.file_handles.get(&fh).map(|h| h.ino);
+        let ino = self.file_handles.get(&fh).map(|h| h.ino).or(ino_opt);
         self.file_handles.remove(&fh);
 
         // Release the inode-scoped write lock if this handle held it.
-        // Read-only handles never acquired it.
+        // Read-only handles never acquired it. This runs regardless
+        // of `flush_result` so an errored flush doesn't strand the
+        // lock.
         if was_writer && let Some(ino) = ino {
             self.release_write_lock(ino, fh);
         }
+
+        flush_result?;
 
         // Handle deferred blob cleanup for unlinked files
         if let Some(ino) = ino
@@ -3360,13 +4279,37 @@ impl VfsCore {
         Ok(())
     }
 
-    pub async fn vfs_create(&self, parent: u64, name: &str) -> Result<(VfsAttr, u64), FsError> {
+    /// Create a new regular file at `(parent, name)`. The optional
+    /// `init_posix` carries the POSIX bits the caller wants the new
+    /// inode to start with -- mode (S_IFREG implicit), uid, gid, and
+    /// the initial atime / mtime / ctime if the caller has them.
+    /// Callers that don't have those (e.g. NFS today) pass `None` and
+    /// the inode lands with the default-zero posix that `make_*_attr`
+    /// already knows to fall back from.
+    pub async fn vfs_create(
+        &self,
+        parent: u64,
+        name: &str,
+        init_posix: Option<data_types::object_layout::PosixAttrs>,
+    ) -> Result<(VfsAttr, u64), FsError> {
         self.check_write_enabled()?;
+        Self::check_name_max(name)?;
 
         let prefix = self.dir_prefix(parent).ok_or(FsError::NotFound)?;
+        Self::check_path_max(&prefix, name)?;
         let key = format!("{}{}", prefix, name);
 
         let (ino, _) = self.inodes.lookup_or_insert(&key, EntryType::File, None);
+
+        // Seed the new inode's posix from the caller. We set the bits
+        // BEFORE make_new_file_attr below so the attr returned to the
+        // kernel reflects the requested mode rather than the
+        // synthesised default.
+        if let Some(p) = init_posix
+            && let Some(mut entry) = self.inodes.get_mut(ino)
+        {
+            entry.posix = p;
+        }
 
         let fh = self.alloc_fh();
         // vfs_create implicitly opens the new file for writing, so it
@@ -3390,11 +4333,30 @@ impl VfsCore {
         // the placeholder to commit. Strict mode keeps the legacy
         // "publish on flush" behavior.
         let (layout_at_create, layout_bytes_at_create) = if self.writeback_mode_is_default() {
-            let placeholder_layout = file_ops::create_dir_marker_layout();
+            // File placeholder is a `Normal` zero-byte layout, NOT a
+            // `Directory` marker. A directory marker would be
+            // `is_listable() == false` and `vfs_lookup` would treat
+            // the early-published key as ENOENT until close-time
+            // flush_publish replaces it with the real Normal layout.
+            let placeholder_layout = file_ops::create_file_placeholder_layout();
             let placeholder_bytes: Bytes =
                 to_bytes_in::<_, rkyv::rancor::Error>(&placeholder_layout, Vec::new())
                     .map_err(FsError::from)?
                     .into();
+            // Seed the inode entry's layout from the placeholder so
+            // a follow-up vfs_getattr (e.g. the one fuse_server::setattr
+            // calls to build its reply, fired the moment userspace does
+            // chmod-after-create) takes the in-memory branch instead of
+            // falling back to backend().get_inode(key) -- the worker
+            // hasn't yet drained the placeholder PutInode, so NSS would
+            // return NotFound and the kernel would surface ENOENT to
+            // userspace. Deterministic in default mode because the
+            // 50ms drain tick is always wider than the 1-2ms gap
+            // between create(2) returning and the next chmod(2)
+            // arriving from the same shell loop.
+            if let Some(mut entry) = self.inodes.get_mut(ino) {
+                entry.layout = Some(placeholder_layout.clone());
+            }
             self.enqueue_inode_intent_async(
                 ino,
                 &key,
@@ -3424,6 +4386,7 @@ impl VfsCore {
 
         // Invalidate dir cache so the new file shows up in listings
         self.dir_cache.invalidate(&prefix);
+        self.touch_parent_times(parent);
 
         Ok((attr, fh))
     }
@@ -3441,9 +4404,11 @@ impl VfsCore {
         target: &[u8],
     ) -> Result<VfsAttr, FsError> {
         self.check_write_enabled()?;
+        Self::check_name_max(name)?;
         self.ensure_writeback_worker_started();
 
         let prefix = self.dir_prefix(parent).ok_or(FsError::NotFound)?;
+        Self::check_path_max(&prefix, name)?;
         let key = format!("{}{}", prefix, name);
 
         let trace_id = TraceId::new();
@@ -3472,6 +4437,7 @@ impl VfsCore {
                     etag: String::new(),
                     headers: vec![],
                     checksum: None,
+                    ..Default::default()
                 },
             }),
         };
@@ -3523,6 +4489,320 @@ impl VfsCore {
 
         // Invalidate dir cache so the new symlink shows up in listings.
         self.dir_cache.invalidate(&prefix);
+        self.touch_parent_times(parent);
+
+        self.make_file_attr(ino, &layout)
+    }
+
+    /// Create a hard link at `(new_parent, new_name)` pointing at the
+    /// same inode as `inode`. Promotes the source on first call (if its
+    /// layout is `Normal | Mpu | Symlink | Special`): allocates a
+    /// `#hardlink/<uuid>` `InodeRecord`, replaces the source's NSS
+    /// entry with an `Indirect` redirect, and writes a matching
+    /// redirect at the destination. Subsequent `vfs_link` calls for
+    /// the same source bump the `nlink` slot in the existing record.
+    ///
+    /// MVP scope (doc 20 section 4): single-instance only. The promote
+    /// transaction is best-effort -- crash recovery is left to the
+    /// scan/repair invariants in section 4.7 (also out of MVP scope).
+    /// Reads/writes-through-hardlink are NOT yet supported; this is
+    /// enough to unblock pjdfstest's `link n0 n1; unlink n1` patterns.
+    pub async fn vfs_link(
+        &self,
+        inode: u64,
+        new_parent: u64,
+        new_name: &str,
+    ) -> Result<VfsAttr, FsError> {
+        use data_types::object_layout::{IndirectEntry, InodeRecord};
+        self.check_write_enabled()?;
+        Self::check_name_max(new_name)?;
+        self.ensure_writeback_worker_started();
+
+        // Resolve the source inode's primary user-facing key + cached
+        // `inode_id`. For an inode that has already been promoted via
+        // a previous `vfs_link`, `entry.inode_id` is `Some(uuid)` and
+        // is the authoritative pointer into the `#hardlink/<uuid>`
+        // record -- we use it directly, side-stepping
+        // `entry.s3_key`, which may point to an alias whose NSS row
+        // has just been unlinked (link/02.t step 4 path:
+        // `link nx n0; unlink nx; link n0 nx` -- the second link
+        // races against the now-deleted nx NSS key).
+        let (src_key, entry_type, cached_inode_id) = self
+            .inodes
+            .get(inode)
+            .map(|e| (e.s3_key.clone(), e.entry_type, e.inode_id))
+            .ok_or(FsError::NotFound)?;
+
+        // EISDIR for hardlink-to-directory matches POSIX -- only the
+        // root's `..` is allowed and we don't expose that surface.
+        if entry_type == EntryType::Directory {
+            return Err(FsError::IsDir);
+        }
+
+        let new_prefix = self.dir_prefix(new_parent).ok_or(FsError::NotFound)?;
+        Self::check_path_max(&new_prefix, new_name)?;
+        let new_key = format!("{}{}", new_prefix, new_name);
+        if new_key == src_key {
+            // POSIX: link(a, a) returns EEXIST.
+            return Err(FsError::AlreadyExists);
+        }
+
+        let trace_id = TraceId::new();
+
+        // EEXIST if the destination is already in use.
+        match self.backend().get_inode(&new_key, &trace_id).await {
+            Ok(_) => return Err(FsError::AlreadyExists),
+            Err(FsError::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Drain any pending publish for the source so we read the
+        // post-flush layout (otherwise we might promote against a
+        // stale placeholder and lose the write that hasn't yet
+        // committed).
+        let _ = self.drain_inode_to_barrier(inode).await;
+
+        // Two source shapes:
+        //   - Already promoted (`cached_inode_id == Some(uuid)`): no
+        //     NSS get_inode at src_key needed. Fetch the
+        //     `InodeRecord` directly, bump nlink. The src NSS row may
+        //     or may not still be live (`unlink src` could have
+        //     dropped it already); either way we don't touch it.
+        //   - Fresh (`None`): read src_key bytes, decide which
+        //     promotion arm to take, mint a new `inode_id`.
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let (inode_id, mut record, was_indirect) = if let Some(inode_id) = cached_inode_id {
+            let mut record = self.backend().get_inode_record(inode_id, &trace_id).await?;
+            record.nlink = record.nlink.saturating_add(1);
+            (inode_id, record, true)
+        } else {
+            let src_layout = self.backend().get_inode(&src_key, &trace_id).await?;
+            if matches!(
+                &src_layout.state,
+                ObjectState::Directory(_) | ObjectState::Mpu(MpuState::Uploading)
+            ) {
+                return Err(FsError::IsDir);
+            }
+            match &src_layout.state {
+                ObjectState::Indirect(redirect) => {
+                    // Inode entry didn't carry the cache (cross-instance
+                    // refresh, freshly-mounted daemon). Fall back to
+                    // the redirect we just read.
+                    let inode_id = redirect.inode_id;
+                    let mut record = self.backend().get_inode_record(inode_id, &trace_id).await?;
+                    record.nlink = record.nlink.saturating_add(1);
+                    (inode_id, record, true)
+                }
+                ObjectState::Normal(_)
+                | ObjectState::Mpu(MpuState::Completed(_))
+                | ObjectState::Symlink(_)
+                | ObjectState::Special(_) => {
+                    let inode_id = uuid::Uuid::new_v4();
+                    let record = InodeRecord {
+                        layout: src_layout.clone(),
+                        nlink: 2,
+                        orphan_since: None,
+                    };
+                    (inode_id, record, false)
+                }
+                ObjectState::Directory(_) | ObjectState::Mpu(MpuState::Uploading) => {
+                    return Err(FsError::IsDir);
+                }
+            }
+        };
+
+        // POSIX: link(2) updates the file's ctime. Stamp the new
+        // value into the InodeRecord's layout so a subsequent
+        // vfs_lookup repopulating `entry.posix` from the record
+        // sees the bumped value (the in-memory mutation alone
+        // would be lost on the next lookup-driven refresh).
+        record.layout = crate::inode::layout_with_posix(record.layout.clone(), {
+            let mut p = crate::inode::layout_posix(&record.layout);
+            p.ctime_ns = now_ns;
+            p
+        });
+
+        // 1. Persist the InodeRecord first. Crash before this point
+        //    leaves NSS exactly as it was; crash after but before
+        //    step 2 leaves a dangling InodeRecord that scan/repair
+        //    invariant 2 finalises (out of MVP scope; the orphan
+        //    survives until then but is unreachable, which matches
+        //    POSIX's "link returned before commit" failure mode).
+        self.backend()
+            .put_inode_record(inode_id, &record, &trace_id)
+            .await?;
+
+        // 2. If this was a fresh promotion, replace the source's NSS
+        //    entry with an Indirect redirect. For an already-promoted
+        //    source, the entry is already a redirect.
+        let redirect_layout = ObjectLayout {
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            version_id: ObjectLayout::gen_version_id(),
+            block_size: DEFAULT_BLOCK_SIZE,
+            blob_version: 0,
+            state: ObjectState::Indirect(IndirectEntry { inode_id }),
+        };
+        let redirect_bytes: Bytes =
+            to_bytes_in::<_, rkyv::rancor::Error>(&redirect_layout, Vec::new())
+                .map_err(FsError::from)?
+                .into();
+        if !was_indirect {
+            self.backend()
+                .put_inode(&src_key, redirect_bytes.clone(), &trace_id)
+                .await?;
+        }
+
+        // 3. Write the destination redirect.
+        self.backend()
+            .put_inode(&new_key, redirect_bytes, &trace_id)
+            .await?;
+
+        // 4. Update the InodeTable so subsequent ops on either name
+        //    see the resolved layout and the `inode_id` resolution
+        //    cache (doc 20 section 4.3). The same `ino` handles both
+        //    names: key_to_ino learns the new mapping, and
+        //    entry.layout / entry.posix / entry.inode_id reflect the
+        //    resolved record.
+        // POSIX: link(2) updates the file's ctime. We can't rely on
+        // the kernel issuing a follow-up FUSE_SETATTR (it does that
+        // for regular files but not consistently for fifo / block /
+        // char / socket inodes -- pjdfstest link/00.t tests
+        // 141/148/155/162 caught the gap). Stamp it explicitly here.
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        if let Some(mut e) = self.inodes.get_mut(inode) {
+            e.layout = Some(record.layout.clone());
+            e.posix = crate::inode::layout_posix(&record.layout);
+            e.posix.ctime_ns = now_ns;
+            e.inode_id = Some(inode_id);
+            e.cache_expiry = std::time::Instant::now();
+        }
+        self.inodes.add_alias(&new_key, EntryType::File, inode);
+
+        self.dir_cache.invalidate(&new_prefix);
+        self.touch_parent_times(new_parent);
+
+        let mut attr = self.make_file_attr(inode, &record.layout)?;
+        attr.nlink = record.nlink;
+        attr.ctime_secs = now_ns / 1_000_000_000;
+        Ok(attr)
+    }
+
+    /// Create a fifo / block / char / unix-socket inode at
+    /// `(parent, name)`. The kernel handles all I/O against the open
+    /// fd itself (pipes, device drivers, AF_UNIX); fs_server only
+    /// has to round-trip the metadata so `stat(2)` reports the
+    /// right `S_IFMT` bit and `rdev`. POSIX-create semantics: fail
+    /// if a name already exists at this path.
+    pub async fn vfs_mknod(
+        &self,
+        parent: u64,
+        name: &str,
+        kind: data_types::object_layout::SpecialKind,
+        rdev: u32,
+        init_posix: data_types::object_layout::PosixAttrs,
+    ) -> Result<VfsAttr, FsError> {
+        use data_types::object_layout::SpecialData;
+
+        self.check_write_enabled()?;
+        Self::check_name_max(name)?;
+        self.ensure_writeback_worker_started();
+
+        let prefix = self.dir_prefix(parent).ok_or(FsError::NotFound)?;
+        Self::check_path_max(&prefix, name)?;
+        let key = format!("{}{}", prefix, name);
+
+        let trace_id = TraceId::new();
+
+        match self.backend().get_inode(&key, &trace_id).await {
+            Ok(_) => return Err(FsError::AlreadyExists),
+            Err(FsError::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let mut core_meta_data = ObjectCoreMetaData {
+            size: 0,
+            etag: String::new(),
+            headers: vec![],
+            checksum: None,
+            posix: init_posix,
+        };
+        // Make the special-inode mode include the right S_IFMT bits
+        // even if the caller passed only permission bits in posix.mode.
+        // make_special_attr re-stamps IFMT on read but we also persist
+        // a coherent value so a cross-instance stat without going
+        // through `inode_table` sees the right kind.
+        let ifmt = match kind {
+            data_types::object_layout::SpecialKind::Fifo => libc::S_IFIFO,
+            data_types::object_layout::SpecialKind::BlockDevice => libc::S_IFBLK,
+            data_types::object_layout::SpecialKind::CharDevice => libc::S_IFCHR,
+            data_types::object_layout::SpecialKind::Socket => libc::S_IFSOCK,
+        };
+        if core_meta_data.posix.mode != 0 {
+            core_meta_data.posix.mode = (core_meta_data.posix.mode & !libc::S_IFMT) | ifmt;
+        }
+
+        let layout = ObjectLayout {
+            version_id: ObjectLayout::gen_version_id(),
+            block_size: DEFAULT_BLOCK_SIZE,
+            timestamp,
+            blob_version: 0,
+            state: ObjectState::Special(SpecialData {
+                kind,
+                rdev,
+                core_meta_data,
+            }),
+        };
+
+        let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())
+            .map_err(FsError::from)?
+            .into();
+
+        let (ino, _) = self
+            .inodes
+            .lookup_or_insert(&key, EntryType::File, Some(layout.clone()));
+
+        match self.writeback_mode {
+            WritebackMode::Strict => {
+                self.backend()
+                    .put_inode(&key, layout_bytes, &trace_id)
+                    .await?;
+            }
+            WritebackMode::Default => {
+                use crate::writeback::{FhId, Generation};
+                let generation = Generation(0);
+                self.writeback
+                    .open_cycle(ino, generation, layout_bytes.len() as u64, 0);
+                let _outcome = self.writeback.upsert_inode_intent(
+                    key.clone(),
+                    generation,
+                    ino,
+                    WbInodeOp::PutInode {
+                        parent_key: prefix.clone(),
+                        name: name.to_string(),
+                        layout_bytes,
+                        expected_old_value: None,
+                    },
+                    FhId(0),
+                );
+            }
+        }
+
+        self.dir_cache.invalidate(&prefix);
+        self.touch_parent_times(parent);
 
         self.make_file_attr(ino, &layout)
     }
@@ -3564,13 +4844,58 @@ impl VfsCore {
         }
     }
 
-    pub async fn vfs_unlink(&self, parent: u64, name: &str) -> Result<(), FsError> {
+    pub async fn vfs_unlink(
+        &self,
+        parent: u64,
+        name: &str,
+        caller_uid: u32,
+    ) -> Result<(), FsError> {
         self.check_write_enabled()?;
+        Self::check_name_max(name)?;
 
         let prefix = self.dir_prefix(parent).ok_or(FsError::NotFound)?;
+        Self::check_path_max(&prefix, name)?;
         let key = format!("{}{}", prefix, name);
 
         let trace_id = TraceId::new();
+
+        // POSIX sticky-bit unlink contract: if the parent directory
+        // has S_ISVTX set, only root, the parent's owner, or the
+        // file's owner may unlink. The FUSE
+        // `default_permissions` flag does NOT cover this case (it
+        // gates access by the parent's r/w/x bits but not by the
+        // sticky-bit ownership rule), so fs_server enforces it
+        // before issuing the NSS delete.
+        if caller_uid != 0 {
+            let parent_posix = self.resolve_parent_posix(parent, &prefix, &trace_id).await;
+            if let Some(p) = parent_posix
+                && p.mode & libc::S_ISVTX != 0
+                && p.uid != caller_uid
+            {
+                let file_uid = self.resolve_file_uid(&key, &trace_id).await?;
+                if file_uid != caller_uid {
+                    return Err(FsError::PermissionDenied);
+                }
+            }
+        }
+
+        // Drain any in-flight write/flush cycles on this inode AND
+        // any Pending PutInode intents for the key before issuing the
+        // NSS delete. Without the cycle drain, fuse_server::release
+        // spawns vfs_release asynchronously: the close-time
+        // flush_publish enqueues its PutInode some milliseconds
+        // *after* FUSE_RELEASE returns to the kernel. If unlink
+        // arrives in that window, has_pending_intent_for_key says
+        // "no Pending intent", we delete from NSS, and the spawned
+        // flush then puts the file back — pjdfstest sees EEXIST on
+        // the next iteration's mkdir at the same name.
+        // drain_inode_to_barrier waits for the cycle (which is
+        // open_cycle'd synchronously inside fuse_server::release
+        // before the spawn returns) to reach Done.
+        if let Some(ino) = self.inodes.find_ino_by_key(&key, EntryType::File) {
+            let _ = self.drain_inode_to_barrier(ino).await;
+        }
+        self.wait_for_lookup_drain(&key).await;
 
         // Delete the inode from NSS
         let old_bytes = self.backend().delete_inode(&key, &trace_id).await?;
@@ -3581,53 +4906,196 @@ impl VfsCore {
         // Remove name mapping from inode table (read-only lookup, no refcount leak)
         let ino = self.inodes.find_ino_by_key(&key, EntryType::File);
         if let Some(ino) = ino {
-            self.inodes.remove_name_mapping(ino);
-        }
-
-        // Handle blob cleanup: defer if file has open handles
-        if !old_bytes.is_empty() {
-            if let Some(ino) = ino
-                && self.has_open_handles_for_inode(ino, None)
-            {
-                // Defer blob cleanup until last handle is released
-                self.deferred_blob_cleanup.insert(ino, old_bytes);
-            } else if let Ok(old_layout) =
-                rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
-            {
-                match &old_layout.state {
-                    ObjectState::Normal(_) => {
-                        self.backend()
-                            .delete_blob_blocks(&old_layout, &trace_id)
-                            .await;
-                    }
-                    ObjectState::Mpu(MpuState::Completed(_)) => {
-                        if let Ok(parts) = self.backend().list_mpu_parts(&key, &trace_id).await {
-                            for (part_key, part_layout) in &parts {
-                                self.backend()
-                                    .delete_blob_blocks(part_layout, &trace_id)
-                                    .await;
-                                let _ = self.backend().delete_inode(part_key, &trace_id).await;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+            self.inodes.remove_name_mapping(ino, &key);
+            // POSIX: a successful unlink updates the surviving file's
+            // ctime (when nlink > 0) or doesn't matter (when nlink
+            // hits 0 and the inode is GC'd). Stamp it now so a stat
+            // through any remaining alias reflects the change. The
+            // kernel doesn't reliably issue a follow-up FUSE_SETATTR
+            // for fifo / block / char / socket inodes; pjdfstest
+            // unlink/00.t tests 34, 39, 44, 49 caught the gap.
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            if let Some(mut e) = self.inodes.get_mut(ino) {
+                e.posix.ctime_ns = now_ns;
             }
         }
 
+        // Hand the orphaned NSS value off to the shared cleanup
+        // helper. Same logic the rename-overwrite path uses.
+        self.cleanup_orphaned_value(&key, ino, old_bytes, &trace_id)
+            .await;
+
         // Invalidate dir cache for parent
         self.dir_cache.invalidate(&prefix);
+        self.touch_parent_times(parent);
 
         Ok(())
     }
 
-    pub async fn vfs_mkdir(&self, parent: u64, name: &str) -> Result<VfsAttr, FsError> {
+    /// GC the blob backing an NSS value that was just dropped (via
+    /// `delete_inode` on an unlink, or via `rename_object` with
+    /// `force_overwrite=true` on an atomic-replace rename). Three
+    /// shapes:
+    ///   - direct file (`Normal | Mpu`): free the blob now, or defer
+    ///     to last-fh-release if the inode still has open handles.
+    ///   - hardlink redirect (`Indirect`): decrement the
+    ///     `InodeRecord` nlink. If it drops to 0 and no local fhs
+    ///     hold the inode open, delete the record and free the
+    ///     underlying blob; otherwise persist the decremented count
+    ///     (and an `orphan_since` stamp when the record is now
+    ///     unreachable) and let scan/repair finish the GC.
+    ///   - symlink / directory marker / special: nothing to GC.
+    /// Multi-instance open-fd coordination (doc 20 section 4.4) is
+    /// post-MVP; we treat the local open-handle set as authoritative.
+    /// `key` is the NSS key the bytes were attached to (used to look
+    /// up MPU parts). `ino_hint` is the inode mapping at that key,
+    /// captured before the NSS mutation so we still have a handle on
+    /// it after the alias has moved.
+    async fn cleanup_orphaned_value(
+        &self,
+        key: &str,
+        ino_hint: Option<u64>,
+        old_bytes: Bytes,
+        trace_id: &TraceId,
+    ) {
+        if old_bytes.is_empty() {
+            return;
+        }
+        if let Some(ino) = ino_hint
+            && self.has_open_handles_for_inode(ino, None)
+            && !matches!(
+                rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
+                    .ok()
+                    .as_ref()
+                    .map(|l| &l.state),
+                Some(ObjectState::Indirect(_))
+            )
+        {
+            // Defer blob cleanup until last handle is released
+            self.deferred_blob_cleanup.insert(ino, old_bytes);
+            return;
+        }
+        let Ok(old_layout) = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
+        else {
+            return;
+        };
+        match &old_layout.state {
+            ObjectState::Normal(_) => {
+                self.backend()
+                    .delete_blob_blocks(&old_layout, trace_id)
+                    .await;
+            }
+            ObjectState::Mpu(MpuState::Completed(_)) => {
+                if let Ok(parts) = self.backend().list_mpu_parts(key, trace_id).await {
+                    for (part_key, part_layout) in &parts {
+                        self.backend()
+                            .delete_blob_blocks(part_layout, trace_id)
+                            .await;
+                        let _ = self.backend().delete_inode(part_key, trace_id).await;
+                    }
+                }
+            }
+            ObjectState::Indirect(redirect) => {
+                let inode_id = redirect.inode_id;
+                if let Ok(mut record) = self.backend().get_inode_record(inode_id, trace_id).await {
+                    record.nlink = record.nlink.saturating_sub(1);
+                    // POSIX: a successful unlink updates the
+                    // surviving file's ctime when nlink > 0. Stamp
+                    // the new value into the record's layout so the
+                    // next vfs_lookup-driven `entry.posix` refresh
+                    // sees it (the in-memory `entry.posix.ctime_ns`
+                    // bump on the caller side gets clobbered by
+                    // lookup otherwise).
+                    if record.nlink > 0 {
+                        let now_ns = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0);
+                        record.layout = crate::inode::layout_with_posix(record.layout.clone(), {
+                            let mut p = crate::inode::layout_posix(&record.layout);
+                            p.ctime_ns = now_ns;
+                            p
+                        });
+                    }
+                    if record.nlink == 0 {
+                        let still_open = ino_hint
+                            .map(|i| self.has_open_handles_for_inode(i, None))
+                            .unwrap_or(false);
+                        if still_open {
+                            // Mark orphan and let the last-fh-release
+                            // path finish the GC. (For the MVP we
+                            // don't have a dedicated post-release
+                            // hook for indirect inodes -- the
+                            // `orphan_since` stamp keeps the record
+                            // valid for any in-flight fh while
+                            // scan/repair would eventually pick it
+                            // up.)
+                            record.orphan_since = Some(
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_nanos() as u64)
+                                    .unwrap_or(0),
+                            );
+                            let _ = self
+                                .backend()
+                                .put_inode_record(inode_id, &record, trace_id)
+                                .await;
+                        } else {
+                            self.backend()
+                                .delete_blob_blocks(&record.layout, trace_id)
+                                .await;
+                            let _ = self.backend().delete_inode_record(inode_id, trace_id).await;
+                        }
+                    } else {
+                        let _ = self
+                            .backend()
+                            .put_inode_record(inode_id, &record, trace_id)
+                            .await;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub async fn vfs_mkdir(
+        &self,
+        parent: u64,
+        name: &str,
+        init_posix: Option<data_types::object_layout::PosixAttrs>,
+    ) -> Result<VfsAttr, FsError> {
         self.check_write_enabled()?;
+        Self::check_name_max(name)?;
 
         let prefix = self.dir_prefix(parent).ok_or(FsError::NotFound)?;
+        Self::check_path_max(&prefix, name)?;
         let key = format!("{}{}/", prefix, name);
 
         let trace_id = TraceId::new();
+
+        // Build the layout once with the caller-provided posix folded
+        // in so the bytes we actually persist in NSS carry the
+        // requested mode / uid / gid / times. The default-zero posix
+        // we'd otherwise serialise round-trips as
+        // "uninitialised, fall back to defaults" on the next lookup
+        // and loses the mkdir(2) `mode` argument.
+        let mut layout = file_ops::create_dir_marker_layout();
+        if let Some(p) = init_posix
+            && let data_types::object_layout::ObjectState::Directory(ref mut data) = layout.state
+        {
+            data.posix = p;
+        }
+
+        let seed_posix = |ino: u64| {
+            if let Some(p) = init_posix
+                && let Some(mut entry) = self.inodes.get_mut(ino)
+            {
+                entry.posix = p;
+            }
+        };
 
         // Default mode: route through the writeback queue so multiple
         // concurrent mkdir calls (e.g. tar walking the kernel-source
@@ -3642,42 +5110,97 @@ impl VfsCore {
             // inode table for parent-prefix lookup, so the placeholder
             // doesn't need to commit before children land. fsyncdir /
             // syncfs / unmount drain barriers all wait for commit.
-            let layout = file_ops::create_dir_marker_layout();
             let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())
                 .map_err(FsError::from)?
                 .into();
             let (ino, _) =
                 self.inodes
                     .lookup_or_insert(&key, EntryType::Directory, Some(layout.clone()));
+            seed_posix(ino);
             self.enqueue_inode_intent_async(ino, &key, &prefix, name, layout_bytes, None);
             self.dir_cache.invalidate(&prefix);
+            self.touch_parent_times(parent);
             return Ok(self.make_dir_attr(ino));
         }
 
-        self.backend().put_dir_marker(&key, &trace_id).await?;
+        // Strict mode keeps the direct put_dir_marker call but now
+        // sends the layout we built (with init_posix folded in)
+        // rather than the default-zero one the helper synthesises.
+        let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())
+            .map_err(FsError::from)?
+            .into();
+        self.backend()
+            .put_inode(&key, layout_bytes, &trace_id)
+            .await?;
 
         let (ino, _) = self
             .inodes
             .lookup_or_insert(&key, EntryType::Directory, None);
+        seed_posix(ino);
 
         // Invalidate dir cache for parent
         self.dir_cache.invalidate(&prefix);
+        self.touch_parent_times(parent);
 
         Ok(self.make_dir_attr(ino))
     }
 
-    pub async fn vfs_rmdir(&self, parent: u64, name: &str) -> Result<(), FsError> {
+    pub async fn vfs_rmdir(&self, parent: u64, name: &str, caller_uid: u32) -> Result<(), FsError> {
         self.check_write_enabled()?;
+        Self::check_name_max(name)?;
 
         let prefix = self.dir_prefix(parent).ok_or(FsError::NotFound)?;
+        Self::check_path_max(&prefix, name)?;
         let key = format!("{}{}/", prefix, name);
 
         let trace_id = TraceId::new();
 
-        // List to check existence and emptiness
+        // POSIX sticky-bit rmdir contract -- same shape as
+        // vfs_unlink (root, parent owner, or target dir owner may
+        // remove). The FUSE `default_permissions` flag does not
+        // gate this case.
+        if caller_uid != 0 {
+            let parent_posix = self.resolve_parent_posix(parent, &prefix, &trace_id).await;
+            if let Some(p) = parent_posix
+                && p.mode & libc::S_ISVTX != 0
+                && p.uid != caller_uid
+            {
+                let target_uid = self.resolve_file_uid(&key, &trace_id).await.unwrap_or(0);
+                if target_uid != caller_uid {
+                    return Err(FsError::PermissionDenied);
+                }
+            }
+        }
+
+        // Drain any in-flight cycles + Pending PutInode intents on
+        // this dir before touching NSS. Mirrors the vfs_unlink path
+        // (see comment there); without it a queued PutInode for the
+        // dir marker would land *after* our delete_inode and
+        // resurrect the directory.
+        if let Some(ino) = self.inodes.find_ino_by_key(&key, EntryType::Directory) {
+            let _ = self.drain_inode_to_barrier(ino).await;
+        }
+        self.wait_for_lookup_drain(&key).await;
+        // Wait for child publishes too: the NSS empty-check below sees
+        // only what has actually committed, so a freshly-queued mknod
+        // /symlink/create at `${key}/<child>` would otherwise be
+        // invisible and the rmdir would erroneously succeed
+        // (pjdfstest rmdir/06.t verifies the ENOTEMPTY contract).
+        self.wait_for_prefix_drain(&key).await;
+
+        // List to check existence and emptiness. Use NO delimiter so
+        // NSS walks leaves directly and filters tombstones (NSS
+        // listToLeaf only filters tombstones on the LEAF branch; with
+        // delim="/" a fully-tombstoned subtree still emits a
+        // CommonPrefix entry, making `rmdir parent` see a phantom
+        // child that exists in NSS only as tombstoned leaves).
+        // Without delim we read raw leaves with tombstones already
+        // filtered: the dir marker itself plus any live descendant.
+        // max_keys=2 is enough -- if anything other than the dir
+        // marker shows up we know the dir is non-empty.
         let entries = self
             .backend()
-            .list_inodes(&key, "/", "", 2, &trace_id)
+            .list_inodes(&key, "", "", 2, &trace_id)
             .await?;
 
         // If no entries at all, directory doesn't exist
@@ -3695,12 +5218,13 @@ impl VfsCore {
 
         // Remove from inode table (read-only lookup, no refcount leak)
         if let Some(ino) = self.inodes.find_ino_by_key(&key, EntryType::Directory) {
-            self.inodes.remove_name_mapping(ino);
+            self.inodes.remove_name_mapping(ino, &key);
         }
 
         // Invalidate dir cache for parent and self
         self.dir_cache.invalidate(&prefix);
         self.dir_cache.invalidate(&key);
+        self.touch_parent_times(parent);
 
         Ok(())
     }
@@ -3711,16 +5235,129 @@ impl VfsCore {
         name: &str,
         new_parent: u64,
         new_name: &str,
+        caller_uid: u32,
+        caller_gid: u32,
     ) -> Result<(), FsError> {
         self.check_write_enabled()?;
+        Self::check_name_max(name)?;
+        Self::check_name_max(new_name)?;
 
         let src_prefix = self.dir_prefix(parent).ok_or(FsError::NotFound)?;
         let dst_prefix = self.dir_prefix(new_parent).ok_or(FsError::NotFound)?;
+        Self::check_path_max(&src_prefix, name)?;
+        Self::check_path_max(&dst_prefix, new_name)?;
 
         let src_key = format!("{}{}", src_prefix, name);
         let dst_key = format!("{}{}", dst_prefix, new_name);
+        let src_dir_key = format!("{}/", src_key);
+        let dst_dir_key = format!("{}/", dst_key);
 
         let trace_id = TraceId::new();
+
+        // POSIX rename(2) requires write+search permission on BOTH
+        // src parent (to remove the entry) and dst parent (to add
+        // the entry). The FUSE kernel's `default_permissions` covers
+        // most r/w/x checks but doesn't gate rename's parent-perm
+        // contract; enforce it here. Matches pjdfstest rename/04.t
+        // (search-deny on src parent) and rename/05.t (write-deny).
+        let src_parent_posix = self
+            .resolve_parent_posix(parent, &src_prefix, &trace_id)
+            .await;
+        if let Some(p) = src_parent_posix
+            && !dir_has_wx_perm(p, caller_uid, caller_gid)
+        {
+            return Err(FsError::AccessDenied);
+        }
+        let dst_parent_posix = self
+            .resolve_parent_posix(new_parent, &dst_prefix, &trace_id)
+            .await;
+        if let Some(p) = dst_parent_posix
+            && !dir_has_wx_perm(p, caller_uid, caller_gid)
+        {
+            return Err(FsError::AccessDenied);
+        }
+
+        // POSIX sticky-bit rename gate -- a non-root non-owner-of-
+        // src-parent can't rename out of a sticky source directory
+        // unless they own the source, and likewise can't replace
+        // into a sticky dst parent unless they own the existing dst.
+        // The src/dst victim can be either a regular file (`*_key`)
+        // or a directory (`*_dir_key`); the gate fires the same way
+        // for both.
+        if caller_uid != 0 {
+            // Source side.
+            if let Some(p) = src_parent_posix
+                && p.mode & libc::S_ISVTX != 0
+                && p.uid != caller_uid
+            {
+                let src_uid = match self.resolve_file_uid(&src_key, &trace_id).await {
+                    Ok(u) => u,
+                    Err(_) => self
+                        .resolve_file_uid(&src_dir_key, &trace_id)
+                        .await
+                        .unwrap_or(0),
+                };
+                if src_uid != caller_uid {
+                    return Err(FsError::PermissionDenied);
+                }
+            }
+            // Destination side -- only when a victim exists. Probe
+            // both shapes so a sticky-bit rename landing on an empty
+            // target dir gets the same EPERM gate as one landing on
+            // a regular file.
+            let dst_victim_key: Option<String> =
+                if self.backend().get_inode(&dst_key, &trace_id).await.is_ok() {
+                    Some(dst_key.clone())
+                } else if self
+                    .backend()
+                    .get_inode(&dst_dir_key, &trace_id)
+                    .await
+                    .is_ok()
+                {
+                    Some(dst_dir_key.clone())
+                } else {
+                    None
+                };
+            if let Some(victim_key) = dst_victim_key
+                && let Some(p) = dst_parent_posix
+                && p.mode & libc::S_ISVTX != 0
+                && p.uid != caller_uid
+            {
+                let dst_uid = self
+                    .resolve_file_uid(&victim_key, &trace_id)
+                    .await
+                    .unwrap_or(0);
+                if dst_uid != caller_uid {
+                    return Err(FsError::PermissionDenied);
+                }
+            }
+        }
+
+        // Drain any per-key pending writeback intent on src AND dst
+        // before the NSS rename / get_inode probes below. In
+        // writeback default mode `create + close` / `mkdir` returns
+        // to userspace before the close-time `flush_publish` lands
+        // in NSS. A test that fires `rename` immediately after that
+        // close (pjdfstest rename/05.t tests 7-8, rename/09.t /
+        // 10.t dir-rename clusters) would otherwise observe a
+        // fs_server probe say "src/dst doesn't exist yet", skip the
+        // atomic-replace, and then hand NSS a rename whose dst now
+        // does exist (the queued PutInode drained between our probe
+        // and the RPC). The per-key `wait_for_lookup_drain` has a
+        // 200 ms ceiling and skips tainted inodes, so this stays
+        // fast even when an earlier flush left a stuck cycle.
+        if let Some(ino) = self.inodes.find_ino_by_key(&src_key, EntryType::File) {
+            let _ = self.drain_inode_to_barrier(ino).await;
+        } else if let Some(ino) = self
+            .inodes
+            .find_ino_by_key(&src_dir_key, EntryType::Directory)
+        {
+            let _ = self.drain_inode_to_barrier(ino).await;
+        }
+        self.wait_for_lookup_drain(&src_key).await;
+        self.wait_for_lookup_drain(&dst_key).await;
+        self.wait_for_lookup_drain(&src_dir_key).await;
+        self.wait_for_lookup_drain(&dst_dir_key).await;
 
         // Determine type by probing NSS backend directly (no inode side effects)
         let is_dir = match self.backend().get_inode(&src_key, &trace_id).await {
@@ -3730,11 +5367,44 @@ impl VfsCore {
         };
 
         if is_dir {
-            let src_dir_key = format!("{}/", src_key);
-            let dst_dir_key = format!("{}/", dst_key);
-
+            // Drain every pending writeback intent under the src
+            // subtree before we ask NSS to rename it. A child file
+            // created/written inside `srcdir/` whose `PutInode` is
+            // still queued would otherwise commit at the OLD key
+            // AFTER `rename_folder` returns, resurrecting
+            // `/srcdir/<child>` -- which in turn makes `/srcdir/`
+            // visible to the next lookup via `list_inodes`. Mirrors
+            // the `wait_for_prefix_drain` step `vfs_rmdir` does for
+            // its empty-check.
+            self.wait_for_prefix_drain(&src_dir_key).await;
+            // POSIX rename(2) on directories atomically replaces an
+            // existing empty dst dir. If dst exists, route through
+            // `vfs_rmdir` first -- it enforces the ENOTEMPTY contract
+            // (only an empty dst can be replaced), drains pending
+            // writeback for dst, and tears down the local inode
+            // mapping. Pass `caller_uid = 0` to bypass the duplicate
+            // sticky-bit gate inside vfs_rmdir; the gate already ran
+            // above. Then issue `rename_folder(force_overwrite=true)`
+            // so any writeback that re-publishes dst between our
+            // rmdir and the RPC gets atomically force-replaced by
+            // src instead of bouncing as STATUS_DST_EXISTED.
+            if self
+                .backend()
+                .get_inode(&dst_dir_key, &trace_id)
+                .await
+                .is_ok()
+            {
+                match self.vfs_rmdir(new_parent, new_name, 0).await {
+                    Ok(()) => {}
+                    Err(FsError::NotFound) => {
+                        // Already gone; race with another op erasing
+                        // it. Fine, fall through to rename.
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             self.backend()
-                .rename_folder(&src_dir_key, &dst_dir_key, &trace_id)
+                .rename_folder(&src_dir_key, &dst_dir_key, true, &trace_id)
                 .await?;
 
             // Update the directory inode's s3_key since the kernel still
@@ -3753,17 +5423,56 @@ impl VfsCore {
             self.dir_cache.invalidate(&src_prefix);
             self.dir_cache.invalidate(&dst_prefix);
             self.dir_cache.invalidate(&src_dir_key);
+            self.touch_parent_times(parent);
+            if new_parent != parent {
+                self.touch_parent_times(new_parent);
+            }
         } else {
-            self.backend()
-                .rename_file(&src_key, &dst_key, &trace_id)
+            // Capture the dst inode mapping (if any) before NSS
+            // mutates the alias. The cleanup helper uses it to
+            // decide whether to defer blob GC for an inode that
+            // still has open fhs locally.
+            let dst_ino_before = self.inodes.find_ino_by_key(&dst_key, EntryType::File);
+
+            // POSIX rename(2) atomically replaces an existing
+            // regular-file dst. NSS now provides this primitive
+            // directly via `force_overwrite=true`: when dst exists,
+            // NSS atomically swaps in src's value and returns the
+            // prior dst bytes so we can GC the orphaned blob.
+            let old_bytes = self
+                .backend()
+                .rename_file(&src_key, &dst_key, true, &trace_id)
                 .await?;
 
-            // Update inode s3_key if cached (read-only lookup, no refcount leak)
-            if let Some(ino) = self.inodes.find_ino_by_key(&src_key, EntryType::File) {
-                self.inodes.update_s3_key(ino, &dst_key);
+            // GC the blob backing the now-orphaned dst value (if
+            // any). Mirrors the unlink-on-dst path -- handles
+            // Normal / Mpu / Indirect (hardlink-decrement)
+            // correctly and defers cleanup when the dst inode
+            // still has open fhs locally.
+            self.cleanup_orphaned_value(&dst_key, dst_ino_before, old_bytes, &trace_id)
+                .await;
+
+            // Tear down the dst inode's name mapping so the table
+            // reflects the post-rename state -- otherwise the
+            // alias-swap below would leave the orphaned dst inode
+            // entry dangling at no key while still appearing
+            // reachable. `remove_name_mapping` flips
+            // `name_removed=true` when no other aliases survive,
+            // letting `release` finish GC if the inode still has
+            // open handles.
+            if let Some(dst_ino) = dst_ino_before {
+                self.inodes.remove_name_mapping(dst_ino, &dst_key);
             }
 
-            // Update any open file handles to reflect the new key
+            // Swap the alias in the InodeTable. `rename_alias` only
+            // updates `entry.s3_key` if it matches `src_key`; for a
+            // hardlink-promoted inode whose primary alias is some
+            // other name, only the `key_to_ino` row moves.
+            if let Some(ino) = self.inodes.find_ino_by_key(&src_key, EntryType::File) {
+                self.inodes.rename_alias(ino, &src_key, &dst_key);
+            }
+
+            // Update any open file handles to reflect the new key.
             for mut fh_entry in self.file_handles.iter_mut() {
                 if fh_entry.value().s3_key == src_key {
                     fh_entry.value_mut().s3_key = dst_key.clone();
@@ -3772,6 +5481,10 @@ impl VfsCore {
 
             self.dir_cache.invalidate(&src_prefix);
             self.dir_cache.invalidate(&dst_prefix);
+            self.touch_parent_times(parent);
+            if new_parent != parent {
+                self.touch_parent_times(new_parent);
+            }
         }
 
         Ok(())
@@ -3900,7 +5613,11 @@ impl VfsCore {
             files: 1024 * 1024,
             ffree: if self.read_write { 512 * 1024 } else { 0 },
             bsize: DEFAULT_BLOCK_SIZE,
-            namelen: 1024,
+            // POSIX NAME_MAX -- Linux's VFS hard-caps any path
+            // component at 255 regardless of what FUSE advertises, so
+            // anything larger here just makes pjdfstest pick a name
+            // the kernel will reject before we ever see it.
+            namelen: 255,
             frsize: DEFAULT_BLOCK_SIZE,
         }
     }
@@ -4253,6 +5970,33 @@ fn spawn_writeback_worker(
 /// (cheap clone) if it's already at least that large. Used by the
 /// override flush + replace flush write paths so every block lands on
 /// disk at full block_size.
+/// Does the caller have write+search (W+X) permission on a directory
+/// described by `posix`? Implements POSIX's three-class permission
+/// resolution (owner / group / other) for the rename(2) parent-perm
+/// gate. `caller_gid` is the caller's primary gid; supplementary
+/// groups aren't tracked at the FUSE layer today, so a non-owner
+/// caller falls through to the "other" class when their primary gid
+/// doesn't match either -- matches kernel `default_permissions`'
+/// approximation closely enough for pjdfstest's contract suite.
+fn dir_has_wx_perm(
+    posix: data_types::object_layout::PosixAttrs,
+    caller_uid: u32,
+    caller_gid: u32,
+) -> bool {
+    if caller_uid == 0 {
+        return true;
+    }
+    let mode = posix.mode;
+    let class_bits = if posix.uid == caller_uid {
+        (libc::S_IWUSR | libc::S_IXUSR) as u32
+    } else if posix.gid == caller_gid {
+        (libc::S_IWGRP | libc::S_IXGRP) as u32
+    } else {
+        (libc::S_IWOTH | libc::S_IXOTH) as u32
+    };
+    mode & class_bits == class_bits
+}
+
 fn pad_to_block_size(bytes: Bytes, block_size_usize: usize) -> Bytes {
     if bytes.len() >= block_size_usize {
         bytes

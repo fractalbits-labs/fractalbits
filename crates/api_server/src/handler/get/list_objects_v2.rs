@@ -335,6 +335,14 @@ pub async fn list_objects(
                     prefix: entry.key[1..].to_owned(), // remove leading "/"
                 });
             }
+            Some(obj) if obj.is_directory() => {
+                // FS-side directory inode. The S3 listing surface
+                // expects directories as `CommonPrefixes`, not as
+                // objects, so emit them through that path.
+                common_prefixes.push(Prefix {
+                    prefix: entry.key[1..].to_owned(),
+                });
+            }
             Some(obj) => {
                 if !obj.is_listable() {
                     continue;

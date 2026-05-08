@@ -195,6 +195,11 @@ impl MountOptions {
         self
     }
 
+    pub fn handle_killpriv(mut self, hkp: bool) -> Self {
+        self.handle_killpriv = hkp;
+        self
+    }
+
     pub fn force_readdir_plus(mut self, rdp: bool) -> Self {
         self.force_readdir_plus = rdp;
         self

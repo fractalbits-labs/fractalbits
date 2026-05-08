@@ -136,22 +136,14 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         TestType::NssFailover => test_nss_failover(RssBackend::Etcd).await,
         TestType::FsServer { disk_cache_only } => test_fs_server(disk_cache_only).await,
         TestType::FsBench { tarball } => {
-            cmd_service::init_service(
-                ServiceName::All,
-                BuildMode::Debug,
-                &InitConfig::default(),
-            )?;
+            cmd_service::init_service(ServiceName::All, BuildMode::Debug, &InitConfig::default())?;
             cmd_service::start_service(ServiceName::All)?;
             let result = fs_server::bench::run_fs_bench(&tarball).await;
             cmd_service::stop_service(ServiceName::All)?;
             result
         }
         TestType::Pjdfstest { subdir } => {
-            cmd_service::init_service(
-                ServiceName::All,
-                BuildMode::Debug,
-                &InitConfig::default(),
-            )?;
+            cmd_service::init_service(ServiceName::All, BuildMode::Debug, &InitConfig::default())?;
             cmd_service::start_service(ServiceName::All)?;
             let result = fs_server::pjdfs::run_pjdfstest(subdir.as_deref()).await;
             cmd_service::stop_service(ServiceName::All)?;

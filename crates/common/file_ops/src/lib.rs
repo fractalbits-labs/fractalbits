@@ -197,9 +197,38 @@ pub fn parse_mpu_parts(result: ListInodesResult) -> Result<Vec<(String, ObjectLa
     Ok(parts)
 }
 
-/// Create a minimal directory marker ObjectLayout with size=0.
-/// NSS rejects empty values, so we store this sentinel layout for directories.
+/// Create a minimal directory marker ObjectLayout. NSS rejects
+/// empty values so we still need a non-empty payload, but the
+/// `Directory` state variant carries only the POSIX attrs the
+/// FUSE / NFS layer reads back via `stat(2)` on the directory
+/// itself -- no `blob_guid`, no size / etag / headers / checksum,
+/// none of which are meaningful for a directory inode.
 pub fn create_dir_marker_layout() -> ObjectLayout {
+    use data_types::object_layout::{DirectoryData, ObjectState, PosixAttrs};
+
+    ObjectLayout {
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        version_id: ObjectLayout::gen_version_id(),
+        block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
+        blob_version: 1,
+        state: ObjectState::Directory(DirectoryData {
+            posix: PosixAttrs::default(),
+        }),
+    }
+}
+
+/// Build a placeholder ObjectLayout for a freshly-created regular
+/// file in default writeback mode -- a `Normal` shape with a nil
+/// blob_guid and zero-byte body, enough for cross-instance
+/// `vfs_lookup` to find the key in NSS while the close-time
+/// `flush_publish` is still building the real layout. Distinct
+/// from `create_dir_marker_layout` so a file placeholder is
+/// `is_listable` (the lookup path treats Directory layouts as
+/// non-listable common-prefix-only entries).
+pub fn create_file_placeholder_layout() -> ObjectLayout {
     use data_types::DataBlobGuid;
     use data_types::object_layout::{ObjectCoreMetaData, ObjectMetaData, ObjectState};
 
@@ -216,12 +245,7 @@ pub fn create_dir_marker_layout() -> ObjectLayout {
                 blob_id: uuid::Uuid::nil(),
                 volume_id: 0,
             },
-            core_meta_data: ObjectCoreMetaData {
-                size: 0,
-                etag: String::new(),
-                headers: vec![],
-                checksum: None,
-            },
+            core_meta_data: ObjectCoreMetaData::default(),
         }),
     }
 }

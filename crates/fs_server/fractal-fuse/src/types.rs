@@ -175,6 +175,14 @@ pub struct SetAttr {
     pub mtime: Option<SetAttrTime>,
     pub ctime: Option<Timestamp>,
     pub fh: Option<u64>,
+    /// `FATTR_KILL_SUIDGID` -- kernel signals that the attribute
+    /// change is the implicit suid/sgid clear-on-write that POSIX
+    /// requires when a non-owner writes to a setuid/setgid file.
+    /// Userspace did not initiate this chmod, so the daemon should
+    /// not enforce the "non-owner cannot chmod" EPERM contract for
+    /// it: the kernel already performed the privilege check that
+    /// triggered the clear.
+    pub kill_suidgid: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -237,6 +245,7 @@ impl SetAttr {
             } else {
                 None
             },
+            kill_suidgid: valid & abi::FATTR_KILL_SUIDGID != 0,
         }
     }
 }
