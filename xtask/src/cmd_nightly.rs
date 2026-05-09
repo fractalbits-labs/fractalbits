@@ -125,7 +125,10 @@ pub fn run_cmd_nightly(multi_bss: bool) -> CmdResult {
     // Run NSS test first
     info!("Starting NSS crash recovery test...");
     if let Err(e) = run_crash_recovery_test_nss(multi_bss, true, &log_dir) {
-        error!("NSS crash recovery test failed. Logs and coredumps preserved in {}", log_dir);
+        error!(
+            "NSS crash recovery test failed. Logs and coredumps preserved in {}",
+            log_dir
+        );
         return Err(e);
     }
 

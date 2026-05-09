@@ -42,6 +42,37 @@ pub async fn resolve_bucket(
     }
 }
 
+/// Resolve a bucket directly from RSS, bypassing the local cache. Used by
+/// metadata-only endpoints (HEAD bucket, etc.) where serving stale
+/// "exists / does not exist" answers is worse than the extra RSS RPC.
+pub async fn resolve_bucket_no_cache(
+    app: &AppState,
+    bucket_name: &str,
+    trace_id: &TraceId,
+) -> Result<Bucket, S3Error> {
+    let start = Instant::now();
+    match app.fetch_bucket_no_cache(bucket_name, trace_id).await {
+        Ok(bucket) => {
+            let duration = start.elapsed();
+            histogram!("resolve_bucket_no_cache_nanos", "status" => "Ok")
+                .record(duration.as_nanos() as f64);
+            Ok(bucket.data)
+        }
+        Err(RpcError::NotFound) => {
+            let duration = start.elapsed();
+            histogram!("resolve_bucket_no_cache_nanos", "status" => "Fail_NotFound")
+                .record(duration.as_nanos() as f64);
+            Err(S3Error::NoSuchBucket)
+        }
+        Err(e) => {
+            let duration = start.elapsed();
+            histogram!("resolve_bucket_no_cache_nanos", "status" => "Fail_Others")
+                .record(duration.as_nanos() as f64);
+            Err(e.into())
+        }
+    }
+}
+
 pub enum BucketEndpoint {
     CreateBucket,
     DeleteBucket,

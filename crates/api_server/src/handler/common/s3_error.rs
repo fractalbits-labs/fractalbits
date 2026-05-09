@@ -942,6 +942,7 @@ impl From<file_ops::NssError> for S3Error {
     fn from(value: file_ops::NssError) -> Self {
         match value {
             file_ops::NssError::NotFound => Self::NoSuchKey,
+            file_ops::NssError::NoSuchRootBlob => Self::NoSuchBucket,
             file_ops::NssError::AlreadyExists => Self::BucketAlreadyExists,
             file_ops::NssError::Internal(e) => {
                 tracing::error!("NssError::Internal: {e}");

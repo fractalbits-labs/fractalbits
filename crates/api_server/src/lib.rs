@@ -1,8 +1,6 @@
 pub mod api_key_routes;
 pub mod blob_client;
 mod blob_storage;
-pub mod cache_mgmt;
-mod cache_registry;
 mod config;
 pub mod handler;
 pub mod http_stats;
@@ -20,12 +18,7 @@ use rpc_client_common::{RpcError, rss_rpc_retry};
 use rpc_client_nss::RpcClientNss;
 use rpc_client_rss::RpcClientRss;
 
-pub use cache_registry::CacheCoordinator;
-use std::{
-    collections::HashMap,
-    sync::{Arc, atomic::AtomicBool},
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{
     Mutex, OnceCell, RwLock, RwLockReadGuard,
     mpsc::{self, Receiver, Sender},
@@ -39,9 +32,6 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub struct AppState {
     pub config: Arc<Config>,
     pub cache: Arc<Cache<String, Versioned<String>>>,
-    pub cache_coordinator: Arc<CacheCoordinator<Versioned<String>>>,
-    pub az_status_coordinator: Arc<CacheCoordinator<String>>,
-    pub az_status_enabled: AtomicBool,
     pub worker_id: u16,
 
     // Per-routing-key NSS clients, lazily populated as buckets are resolved.
@@ -66,11 +56,8 @@ impl AppState {
 
     pub fn new_per_core_sync(
         config: Arc<Config>,
-        cache_coordinator: Arc<CacheCoordinator<Versioned<String>>>,
-        az_status_coordinator: Arc<CacheCoordinator<String>>,
         // Shared across all per-core AppStates (including the mgmt-only one)
-        // so update_nss_address notifications reach every worker and the S3
-        // path doesn't redundantly refresh per-core on failover.
+        // so the S3 path doesn't redundantly refresh per-core on failover.
         nss_clients: Arc<RwLock<HashMap<RoutingKey, NssEntry>>>,
         worker_id: u16,
     ) -> Self {
@@ -80,11 +67,10 @@ impl AppState {
 
         let cache = Arc::new(
             Cache::builder()
-                .time_to_idle(Duration::from_secs(300))
+                .time_to_live(Duration::from_secs(300))
                 .max_capacity(Self::PER_CORE_CACHE_CAPACITY)
                 .build(),
         );
-        cache_coordinator.register_cache(cache.clone());
 
         debug!("Per-core AppState initialized with lazy BlobClient initialization");
 
@@ -101,9 +87,6 @@ impl AppState {
             blob_deletion_tx: tx,
             blob_deletion_rx: Mutex::new(Some(rx)),
             cache,
-            cache_coordinator,
-            az_status_coordinator,
-            az_status_enabled: AtomicBool::new(false),
             worker_id,
             data_blob_tracker: OnceCell::new(),
         }
@@ -317,7 +300,7 @@ impl AppState {
                     None
                 };
 
-                let (blob_client, az_status_cache) = BlobClient::new_with_data_vg_info(
+                let blob_client = BlobClient::new_with_data_vg_info(
                     &self.config.blob_storage,
                     rx,
                     self.config.rss_rpc_timeout(),
@@ -327,11 +310,6 @@ impl AppState {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-
-                // Register az_status_cache if present (only for Multi-AZ)
-                if let Some(cache) = az_status_cache {
-                    self.az_status_coordinator.register_cache(cache);
-                }
 
                 Ok(Arc::new(blob_client))
             })
@@ -386,6 +364,37 @@ impl AppState {
         self.get_api_key("test_api_key".into(), trace_id).await
     }
 
+    /// Force-refetch an api_key from RSS, bypassing the local cache. The
+    /// freshly-fetched `Versioned<ApiKey>` is also written back to the cache
+    /// (so subsequent reads see it) and returned to the caller.
+    ///
+    /// Used by the authorization gate to handle the case where another
+    /// api_server has just added or removed a bucket from this api_key's
+    /// `authorized_buckets`: our cached copy says deny, but the source of
+    /// truth says allow (or vice versa). One refresh on the cold path of a
+    /// denial closes the staleness window without re-introducing recall.
+    pub async fn refresh_api_key(
+        &self,
+        key_id: String,
+        trace_id: &TraceId,
+    ) -> Result<Versioned<ApiKey>, RpcError> {
+        let full_key = format!("api_key:{key_id}");
+        let rss_client = self.get_rss_rpc_client();
+        let (version, data) = rss_rpc_retry!(
+            rss_client,
+            get(&full_key, Some(self.config.rss_rpc_timeout()), trace_id)
+        )
+        .await?;
+        let json = Versioned::new(version, data);
+        self.cache.insert(full_key, json.clone()).await;
+        counter!("api_key_refresh_from_rss").increment(1);
+        Ok((
+            json.version,
+            serde_json::from_slice(json.data.as_bytes()).unwrap(),
+        )
+            .into())
+    }
+
     pub async fn put_api_key(
         &self,
         api_key: &Versioned<ApiKey>,
@@ -425,7 +434,10 @@ impl AppState {
             delete(&full_key, Some(self.config.rss_rpc_timeout()), trace_id)
         )
         .await?;
-        self.cache_coordinator.invalidate_entry(&full_key).await;
+        // Drop our local cache entry. Other per-core caches and other
+        // api_server instances fall back to TTL — see the
+        // refresh-on-auth-deny path that picks up new versions on demand.
+        self.cache.invalidate(&full_key).await;
         Ok(())
     }
 
@@ -479,6 +491,52 @@ impl AppState {
             .into())
     }
 
+    /// Always read the bucket from RSS, bypassing the local cache. Updates
+    /// the cache with the fresh value on success, and invalidates the cache
+    /// entry on `RpcError::NotFound` (the bucket has been deleted upstream).
+    /// Used by metadata-only endpoints (HEAD bucket) and as the
+    /// authoritative second-look on suspected staleness.
+    pub async fn fetch_bucket_no_cache(
+        &self,
+        bucket_name: &str,
+        trace_id: &TraceId,
+    ) -> Result<Versioned<Bucket>, RpcError> {
+        let full_key = format!("bucket:{bucket_name}");
+        let rss_client = self.get_rss_rpc_client();
+        let result = rss_rpc_retry!(
+            rss_client,
+            get(&full_key, Some(self.config.rss_rpc_timeout()), trace_id)
+        )
+        .await;
+        match result {
+            Ok((version, data)) => {
+                let json = Versioned::new(version, data);
+                self.cache.insert(full_key, json.clone()).await;
+                counter!("bucket_refresh_from_rss").increment(1);
+                Ok((
+                    json.version,
+                    serde_json::from_slice(json.data.as_bytes()).unwrap(),
+                )
+                    .into())
+            }
+            Err(RpcError::NotFound) => {
+                self.cache.invalidate(&full_key).await;
+                counter!("bucket_refresh_from_rss_gone").increment(1);
+                Err(RpcError::NotFound)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Drop the cache entry for a bucket. Used after an NSS op surfaces
+    /// `NoSuchRootBlob`, which means the bucket has been deleted upstream
+    /// and our cached entry (if any) is stale. The next `get_bucket` call
+    /// will re-fetch from RSS and observe the deletion authoritatively.
+    pub async fn invalidate_bucket_cache(&self, bucket_name: &str) {
+        let full_key = format!("bucket:{bucket_name}");
+        self.cache.invalidate(&full_key).await;
+    }
+
     pub async fn create_bucket(
         &self,
         bucket_name: &str,
@@ -499,9 +557,10 @@ impl AppState {
         )
         .await?;
 
-        // Invalidate API key cache across all workers since it now has new bucket permissions
-        self.cache_coordinator
-            .invalidate_entry(&format!("api_key:{api_key_id}"))
+        // Drop our local api_key cache entry; other workers / api_servers
+        // pick up the new authorized_buckets via refresh-on-auth-deny or TTL.
+        self.cache
+            .invalidate(&format!("api_key:{api_key_id}"))
             .await;
         Ok(())
     }
@@ -524,12 +583,14 @@ impl AppState {
         )
         .await?;
 
-        // Invalidate both bucket and API key cache across all workers
-        self.cache_coordinator
-            .invalidate_entry(&format!("bucket:{bucket_name}"))
+        // Drop our local bucket and api_key cache entries; other workers /
+        // api_servers fall back to TTL or to NoSuchRootBlob from NSS on the
+        // next op against the deleted bucket.
+        self.cache
+            .invalidate(&format!("bucket:{bucket_name}"))
             .await;
-        self.cache_coordinator
-            .invalidate_entry(&format!("api_key:{api_key_id}"))
+        self.cache
+            .invalidate(&format!("api_key:{api_key_id}"))
             .await;
         Ok(())
     }

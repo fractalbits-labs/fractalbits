@@ -61,6 +61,11 @@ pub enum RpcError {
     NotFound,
     #[error("Entry already exists")]
     AlreadyExists,
+    /// The bucket's NSS root blob does not exist (deleted or never created).
+    /// Distinct from `NotFound`, which is "key not present in an existing
+    /// tree". Maps to `S3Error::NoSuchBucket` in api_server.
+    #[error("Root blob does not exist")]
+    NoSuchRootBlob,
     #[error("Bucket already owned by you")]
     BucketAlreadyOwnedByYou,
     #[error("Send error: {0}")]

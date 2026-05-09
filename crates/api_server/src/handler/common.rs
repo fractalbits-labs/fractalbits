@@ -63,6 +63,7 @@ pub async fn get_raw_object(
     app: &AppState,
     routing_key: &RoutingKey,
     root_blob_name: &str,
+    bucket_name: &str,
     key: &str,
     trace_id: &TraceId,
 ) -> Result<ObjectLayout, S3Error> {
@@ -81,7 +82,17 @@ pub async fn get_raw_object(
     )
     .await?;
 
-    Ok(parse_get_inode(resp)?)
+    match parse_get_inode(resp) {
+        Ok(layout) => Ok(layout),
+        Err(file_ops::NssError::NoSuchRootBlob) => {
+            // Bucket was deleted upstream (e.g. by another api_server). Drop
+            // our stale cache entry so subsequent ops stop using it; the
+            // From<NssError> conversion already maps to S3Error::NoSuchBucket.
+            app.invalidate_bucket_cache(bucket_name).await;
+            Err(S3Error::NoSuchBucket)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

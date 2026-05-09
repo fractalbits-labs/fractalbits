@@ -862,9 +862,6 @@ health_port = 18088
 # Metrics port
 metrics_port = 18087
 
-# API Server management port
-api_server_mgmt_port = 18088
-
 # Nss server rpc server address
 nss_addr = "{nss_endpoint}:8088"
 

@@ -306,12 +306,16 @@ impl RpcClient {
             nss_codec::rename_response::Result::Ok(_) => Ok(()),
             nss_codec::rename_response::Result::ErrSrcNonexisted(_) => Err(RpcError::NotFound),
             nss_codec::rename_response::Result::ErrDstExisted(_) => Err(RpcError::AlreadyExists),
+            nss_codec::rename_response::Result::ErrNoSuchRootBlob(_) => {
+                Err(RpcError::NoSuchRootBlob)
+            }
             nss_codec::rename_response::Result::ErrOther(e) => {
                 Err(RpcError::InternalResponseError(e))
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn rename_object(
         &self,
         root_blob_name: &str,
@@ -361,6 +365,9 @@ impl RpcClient {
             nss_codec::rename_response::Result::Ok(_) => Ok(()),
             nss_codec::rename_response::Result::ErrSrcNonexisted(_) => Err(RpcError::NotFound),
             nss_codec::rename_response::Result::ErrDstExisted(_) => Err(RpcError::AlreadyExists),
+            nss_codec::rename_response::Result::ErrNoSuchRootBlob(_) => {
+                Err(RpcError::NoSuchRootBlob)
+            }
             nss_codec::rename_response::Result::ErrOther(e) => {
                 Err(RpcError::InternalResponseError(e))
             }
