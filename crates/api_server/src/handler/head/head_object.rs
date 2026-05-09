@@ -20,6 +20,7 @@ pub async fn head_object_handler(ctx: ObjectRequestContext) -> Result<HttpRespon
         &ctx.app,
         &bucket.routing_key,
         &bucket.root_blob_name,
+        &ctx.bucket_name,
         &ctx.key,
         &ctx.trace_id,
     )

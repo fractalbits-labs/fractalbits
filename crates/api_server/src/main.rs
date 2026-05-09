@@ -1,8 +1,8 @@
 use actix_files::Files;
+use actix_web::HttpResponse;
 use actix_web::{App, HttpServer, middleware::Logger, rt::System, web};
-use api_server::{AppState, CacheCoordinator, Config, api_key_routes, cache_mgmt, handler};
+use api_server::{AppState, Config, api_key_routes, handler};
 use clap::Parser;
-use data_types::Versioned;
 use rustls::{
     ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer},
@@ -148,11 +148,8 @@ fn main() -> std::io::Result<()> {
         vec![None; worker_count]
     };
 
-    let cache_coordinator: Arc<CacheCoordinator<Versioned<String>>> =
-        Arc::new(CacheCoordinator::new());
-    let az_status_coordinator: Arc<CacheCoordinator<String>> = Arc::new(CacheCoordinator::new());
-    // Shared across all per-core AppStates so a single /mgmt/nss/update_address
-    // notification updates the NSS client map for every S3 worker.
+    // Shared across all per-core AppStates so the NSS client map is unified
+    // across every S3 worker; lazy refresh on RPC failure repopulates it.
     let nss_clients = AppState::new_shared_nss_clients();
 
     let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
@@ -211,8 +208,6 @@ fn main() -> std::io::Result<()> {
         let https_listener = https_addr.map(make_reuseport_listener).transpose()?;
 
         let config = config.clone();
-        let cache_coordinator = cache_coordinator.clone();
-        let az_status_coordinator = az_status_coordinator.clone();
         let nss_clients = nss_clients.clone();
         let web_root = gui_web_root.clone();
         let https_config = https_config.clone();
@@ -233,8 +228,6 @@ fn main() -> std::io::Result<()> {
                 System::new().block_on(async move {
                     let app_state = Arc::new(AppState::new_per_core_sync(
                         config.clone(),
-                        cache_coordinator,
-                        az_status_coordinator,
                         nss_clients,
                         worker_idx as u16,
                     ));
@@ -332,13 +325,11 @@ fn main() -> std::io::Result<()> {
     }
 
     // Dedicated mgmt HttpServer: serves on mgmt_addr using a shared AppState.
-    // Having this on its own thread means cache-invalidation POSTs from RSS
-    // can be handled even when the S3 workers are all stuck waiting on RSS/NSS,
-    // avoiding the circular stall that trips the observer's stale-health detector.
+    // Having this on its own thread means /mgmt/health responds even when the
+    // S3 workers are all stuck waiting on RSS/NSS, avoiding the circular stall
+    // that trips the observer's stale-health detector.
     let mgmt_server_handle = {
         let config = config.clone();
-        let cache_coordinator = cache_coordinator.clone();
-        let az_status_coordinator = az_status_coordinator.clone();
         let nss_clients = nss_clients.clone();
         let (mgmt_tx, mgmt_rx) = std::sync::mpsc::channel();
         let mgmt_handle = thread::Builder::new()
@@ -347,8 +338,6 @@ fn main() -> std::io::Result<()> {
                 System::new().block_on(async move {
                     let app_state = Arc::new(AppState::new_per_core_sync(
                         config.clone(),
-                        cache_coordinator,
-                        az_status_coordinator,
                         nss_clients,
                         u16::MAX, // mgmt worker id (distinct from S3 workers)
                     ));
@@ -358,27 +347,15 @@ fn main() -> std::io::Result<()> {
                         App::new()
                             .app_data(web::Data::new(app_state))
                             .wrap(Logger::default())
-                            .service(
-                                web::scope("/mgmt")
-                                    .route("/health", web::get().to(cache_mgmt::mgmt_health))
-                                    .route(
-                                        "/cache/invalidate/bucket/{name}",
-                                        web::post().to(cache_mgmt::invalidate_bucket),
-                                    )
-                                    .route(
-                                        "/cache/invalidate/api_key/{id}",
-                                        web::post().to(cache_mgmt::invalidate_api_key),
-                                    )
-                                    .route(
-                                        "/cache/update/az_status/{id}",
-                                        web::post().to(cache_mgmt::update_az_status),
-                                    )
-                                    .route("/cache/clear", web::post().to(cache_mgmt::clear_cache))
-                                    .route(
-                                        "/nss/update_address",
-                                        web::post().to(cache_mgmt::update_nss_address),
-                                    ),
-                            )
+                            .service(web::scope("/mgmt").route(
+                                "/health",
+                                web::get().to(|| async {
+                                    HttpResponse::Ok().json(serde_json::json!({
+                                        "status": "healthy",
+                                        "service": "api_server"
+                                    }))
+                                }),
+                            ))
                             .service(
                                 web::scope("/api_keys")
                                     .route("/", web::post().to(api_key_routes::create_api_key))

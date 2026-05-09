@@ -35,8 +35,8 @@ impl BlobClient {
         rpc_connection_timeout: Duration,
         data_blob_tracker: Option<Arc<DataBlobTracker>>,
         data_vg_info: data_types::DataVgInfo,
-    ) -> Result<(Self, Option<Arc<Cache<String, String>>>), BlobStorageError> {
-        let (storage, az_status_cache) = Self::create_storage_impl(
+    ) -> Result<Self, BlobStorageError> {
+        let storage = Self::create_storage_impl(
             blob_storage_config,
             rpc_request_timeout,
             rpc_connection_timeout,
@@ -45,8 +45,7 @@ impl BlobClient {
         )
         .await?;
 
-        let client = Self::create_client_with_task(storage, rx);
-        Ok((client, az_status_cache))
+        Ok(Self::create_client_with_task(storage, rx))
     }
 
     async fn create_storage_impl(
@@ -55,7 +54,7 @@ impl BlobClient {
         rpc_connection_timeout: Duration,
         data_blob_tracker: Option<Arc<DataBlobTracker>>,
         data_vg_info: data_types::DataVgInfo,
-    ) -> Result<(Arc<BlobStorageImpl>, Option<Arc<Cache<String, String>>>), BlobStorageError> {
+    ) -> Result<Arc<BlobStorageImpl>, BlobStorageError> {
         let storage = match &blob_storage_config.backend {
             BlobStorageBackend::S3HybridSingleAz => {
                 let s3_hybrid_config = blob_storage_config
@@ -87,6 +86,9 @@ impl BlobClient {
                 let s3_express_multi_az_config =
                     Self::get_s3_express_multi_az_config(blob_storage_config, "S3ExpressMultiAz")?;
 
+                // Internal-only az_status cache; was previously also exposed
+                // via /mgmt/cache/update/az_status fan-out, which has been
+                // removed along with the rest of the recall machinery.
                 let az_status_cache = Arc::new(
                     Cache::builder()
                         .time_to_idle(Duration::from_secs(30))
@@ -94,16 +96,14 @@ impl BlobClient {
                         .build(),
                 );
 
-                let storage = BlobStorageImpl::S3ExpressMultiAz(
+                BlobStorageImpl::S3ExpressMultiAz(
                     S3ExpressMultiAzStorage::new(
                         s3_express_multi_az_config,
                         data_blob_tracker,
-                        az_status_cache.clone(),
+                        az_status_cache,
                     )
                     .await?,
-                );
-
-                return Ok((Arc::new(storage), Some(az_status_cache)));
+                )
             }
             BlobStorageBackend::AllInBssSingleAz => BlobStorageImpl::AllInBssSingleAz(
                 AllInBssSingleAzStorage::new_with_data_vg_info(
@@ -115,7 +115,7 @@ impl BlobClient {
             ),
         };
 
-        Ok((Arc::new(storage), None))
+        Ok(Arc::new(storage))
     }
 
     fn create_client_with_task(

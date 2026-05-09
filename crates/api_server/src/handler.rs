@@ -227,6 +227,19 @@ pub async fn any_handler(req: HttpRequest, payload: Payload) -> Result<HttpRespo
     }
 }
 
+fn check_bucket_authorization(
+    api_key: &ApiKey,
+    bucket: &str,
+    authorization_type: &Authorization,
+) -> bool {
+    match authorization_type {
+        Authorization::Read => api_key.allow_read(bucket),
+        Authorization::Write => api_key.allow_write(bucket),
+        Authorization::Owner => api_key.allow_owner(bucket),
+        Authorization::None => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn any_handler_inner<'a>(
     app: Arc<AppState>,
@@ -242,18 +255,33 @@ async fn any_handler_inner<'a>(
     let start = Instant::now();
     let endpoint_name = endpoint.as_str();
 
-    let api_key = check_signature(app.clone(), request, auth.as_ref(), trace_id).await?;
+    let mut api_key = check_signature(app.clone(), request, auth.as_ref(), trace_id).await?;
     histogram!("verify_request_duration_nanos", "endpoint" => endpoint_name)
         .record(start.elapsed().as_nanos() as f64);
 
-    // Check authorization
+    // Check authorization. If denied against the cached api_key, fall through
+    // to a single refresh-from-RSS retry: another api_server may have just
+    // added this bucket to the api_key's authorized_buckets (e.g. a freshly
+    // created bucket) and our cache has not yet expired.
     let authorization_type = endpoint.authorization_type();
-    let allowed = match authorization_type {
-        Authorization::Read => api_key.data.allow_read(&bucket),
-        Authorization::Write => api_key.data.allow_write(&bucket),
-        Authorization::Owner => api_key.data.allow_owner(&bucket),
-        Authorization::None => true,
-    };
+    let mut allowed = check_bucket_authorization(&api_key.data, &bucket, &authorization_type);
+    if !allowed && !matches!(authorization_type, Authorization::None) {
+        match app
+            .refresh_api_key(api_key.data.key_id.clone(), trace_id)
+            .await
+        {
+            Ok(refreshed) if refreshed.version > api_key.version => {
+                allowed = check_bucket_authorization(&refreshed.data, &bucket, &authorization_type);
+                if allowed {
+                    api_key = refreshed;
+                }
+            }
+            Ok(_) => {} // refreshed.version <= cached: cache was up to date, deny stands
+            Err(e) => {
+                warn!("api_key refresh on auth-deny failed: {e}; deny stands");
+            }
+        }
+    }
     debug!(
         "Authorization check: endpoint={:?}, bucket={}, required={:?}, allowed={}",
         endpoint_name, bucket, authorization_type, allowed

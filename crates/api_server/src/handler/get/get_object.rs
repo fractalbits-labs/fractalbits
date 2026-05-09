@@ -95,6 +95,7 @@ pub async fn get_object_handler(ctx: ObjectRequestContext) -> Result<HttpRespons
         &ctx.app,
         &bucket.routing_key,
         &bucket.root_blob_name,
+        &ctx.bucket_name,
         &ctx.key,
         &ctx.trace_id,
     )

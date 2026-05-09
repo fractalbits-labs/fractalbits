@@ -27,7 +27,8 @@ message PutInodeRequest {
 message PutInodeResponse {
   oneof result {
     bytes ok = 1;
-    string err = 2;
+    google.protobuf.Empty err_no_such_root_blob = 2;
+    string err_other = 3;
   }
 }
 
@@ -41,7 +42,8 @@ message GetInodeResponse {
   oneof result {
     bytes ok = 1;
     google.protobuf.Empty err_not_found = 2;
-    string err_other = 3;
+    google.protobuf.Empty err_no_such_root_blob = 3;
+    string err_other = 4;
   }
 }
 
@@ -58,17 +60,18 @@ message ListInodesRequest {
 message ListInodesResponse {
   oneof result {
     Inodes ok = 1;
-    string err = 2;
+    google.protobuf.Empty err_no_such_root_blob = 2;
+    string err_other = 3;
   }
 
   message Inode {
-    string key = 3;
-    bytes inode = 4;
+    string key = 1;
+    bytes inode = 2;
   }
 
   message Inodes {
-    repeated Inode inodes = 5;
-    bool has_more = 6;
+    repeated Inode inodes = 1;
+    bool has_more = 2;
   }
 }
 
@@ -83,7 +86,8 @@ message DeleteInodeResponse {
     bytes ok = 1;
     google.protobuf.Empty err_not_found = 2;
     google.protobuf.Empty err_already_deleted = 3;
-    string err_other = 4;
+    google.protobuf.Empty err_no_such_root_blob = 4;
+    string err_other = 5;
   }
 }
 
@@ -135,6 +139,7 @@ message RenameResponse {
     bytes ok = 1;
     google.protobuf.Empty err_src_nonexisted = 2;
     google.protobuf.Empty err_dst_existed = 3;
-    string err_other = 4;
+    google.protobuf.Empty err_no_such_root_blob = 4;
+    string err_other = 5;
   }
 }

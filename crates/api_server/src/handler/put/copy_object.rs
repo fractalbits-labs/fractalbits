@@ -275,6 +275,7 @@ async fn get_copy_source_object(
         &app,
         &source_bucket.routing_key,
         &source_bucket.root_blob_name,
+        &source_bucket_name,
         &source_key,
         &trace_id,
     )

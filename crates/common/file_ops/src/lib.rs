@@ -9,6 +9,11 @@ use nss_codec::{
 pub enum NssError {
     NotFound,
     AlreadyExists,
+    /// The bucket's root blob does not exist on NSS — either it was never
+    /// created or it has been deleted (e.g. by a `delete_bucket` on another
+    /// api_server). Distinct from `NotFound`, which means the key is not
+    /// present in an existing tree.
+    NoSuchRootBlob,
     Internal(String),
     Deserialization(String),
 }
@@ -18,6 +23,7 @@ impl std::fmt::Display for NssError {
         match self {
             NssError::NotFound => write!(f, "not found"),
             NssError::AlreadyExists => write!(f, "already exists"),
+            NssError::NoSuchRootBlob => write!(f, "root blob does not exist"),
             NssError::Internal(e) => write!(f, "internal error: {e}"),
             NssError::Deserialization(e) => write!(f, "deserialization error: {e}"),
         }
@@ -42,6 +48,9 @@ pub fn parse_get_inode(resp: GetInodeResponse) -> Result<ObjectLayout, NssError>
         get_inode_response::Result::ErrNotFound(()) => {
             return Err(NssError::NotFound);
         }
+        get_inode_response::Result::ErrNoSuchRootBlob(()) => {
+            return Err(NssError::NoSuchRootBlob);
+        }
         get_inode_response::Result::ErrOther(e) => {
             tracing::error!("NSS get_inode error: {e}");
             return Err(NssError::Internal(e));
@@ -55,7 +64,10 @@ pub fn parse_get_inode(resp: GetInodeResponse) -> Result<ObjectLayout, NssError>
 pub fn parse_list_inodes(resp: ListInodesResponse) -> Result<ListInodesResult, NssError> {
     let (inodes, has_more) = match resp.result.unwrap() {
         list_inodes_response::Result::Ok(res) => (res.inodes, res.has_more),
-        list_inodes_response::Result::Err(e) => {
+        list_inodes_response::Result::ErrNoSuchRootBlob(()) => {
+            return Err(NssError::NoSuchRootBlob);
+        }
+        list_inodes_response::Result::ErrOther(e) => {
             tracing::error!("NSS list_inodes error: {e}");
             return Err(NssError::Internal(e));
         }
@@ -95,7 +107,8 @@ pub fn parse_list_inodes(resp: ListInodesResponse) -> Result<ListInodesResult, N
 pub fn parse_put_inode(resp: PutInodeResponse) -> Result<Bytes, NssError> {
     match resp.result.unwrap() {
         put_inode_response::Result::Ok(res) => Ok(res),
-        put_inode_response::Result::Err(e) => {
+        put_inode_response::Result::ErrNoSuchRootBlob(()) => Err(NssError::NoSuchRootBlob),
+        put_inode_response::Result::ErrOther(e) => {
             tracing::error!("NSS put_inode error: {e}");
             Err(NssError::Internal(e))
         }
@@ -107,6 +120,7 @@ pub fn parse_delete_inode(resp: DeleteInodeResponse) -> Result<Option<Bytes>, Ns
         delete_inode_response::Result::Ok(res) => Ok(Some(res)),
         delete_inode_response::Result::ErrNotFound(()) => Ok(None),
         delete_inode_response::Result::ErrAlreadyDeleted(()) => Ok(None),
+        delete_inode_response::Result::ErrNoSuchRootBlob(()) => Err(NssError::NoSuchRootBlob),
         delete_inode_response::Result::ErrOther(e) => {
             tracing::error!("NSS delete_inode error: {e}");
             Err(NssError::Internal(e))

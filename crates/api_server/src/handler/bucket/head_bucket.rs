@@ -1,6 +1,6 @@
 use actix_web::HttpResponse;
 
-use super::resolve_bucket;
+use super::resolve_bucket_no_cache;
 use crate::handler::{BucketRequestContext, common::s3_error::S3Error};
 use tracing::error;
 
@@ -24,7 +24,11 @@ pub async fn head_bucket_handler(ctx: BucketRequestContext) -> Result<HttpRespon
         }
     }
 
-    resolve_bucket(&ctx.app, &ctx.bucket_name, &ctx.trace_id)
+    // HEAD bucket is a metadata-only existence check; serving it from a
+    // possibly-stale local cache could falsely report "exists" for a bucket
+    // that was just deleted on another api_server. Always re-validate
+    // against RSS.
+    resolve_bucket_no_cache(&ctx.app, &ctx.bucket_name, &ctx.trace_id)
         .await
         .map_err(|e| {
             error!("head_bucket failed due to bucket resolving: {e}");
