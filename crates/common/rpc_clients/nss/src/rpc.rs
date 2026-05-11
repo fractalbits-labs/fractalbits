@@ -366,6 +366,7 @@ impl RpcClient {
         Ok(resp)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn rename_folder(
         &self,
         root_blob_name: &str,

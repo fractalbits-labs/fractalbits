@@ -222,22 +222,10 @@ impl Filesystem for FuseServer {
         // cleared mode into the same `vfs_setattr_posix` call.
         // Fixes pjdfstest chown/00.t failures 599, 603, 614-615 etc.
         let mut effective_mode = set_attr.mode;
-        if set_attr.kill_suidgid && effective_mode.is_none() {
-            let cur = self.vfs.vfs_getattr(inode, fh).await.map_err(fs_err)?;
-            let mut m = cur.mode;
-            if m & libc::S_ISUID != 0 {
-                m &= !libc::S_ISUID;
-            }
-            if m & libc::S_ISGID != 0 && m & libc::S_IXGRP != 0 {
-                m &= !libc::S_ISGID;
-            }
-            if m != cur.mode {
-                effective_mode = Some(m);
-            }
-        } else if effective_mode.is_none()
-            && req.uid != 0
-            && (set_attr.uid.is_some() || set_attr.gid.is_some())
-        {
+        let needs_suid_clear = effective_mode.is_none()
+            && (set_attr.kill_suidgid
+                || (req.uid != 0 && (set_attr.uid.is_some() || set_attr.gid.is_some())));
+        if needs_suid_clear {
             let cur = self.vfs.vfs_getattr(inode, fh).await.map_err(fs_err)?;
             let mut m = cur.mode;
             if m & libc::S_ISUID != 0 {

@@ -1409,6 +1409,21 @@ impl VfsCore {
     ) -> Result<(), FsError> {
         let block_size_usize = block_size as usize;
         let bsz_u64 = block_size as u64;
+        // Commit envelope rides every BssBatch in this override flush.
+        // All three sub-batches (rewrite, delete, put) target the same
+        // blob, and the file's authoritative state after the flush is
+        // `(file_size, new_block_count, new_version)`. Intermediate
+        // batches publish the same final commit; readers between
+        // sub-batches see the new size with whatever blocks have
+        // landed so far -- same race window as today's "all blocks,
+        // then parent inode" flow.
+        let commit_block_count = file_size.div_ceil(bsz_u64) as u32;
+        let commit = rpc_client_bss::BlobCommitInfo {
+            blob_guid,
+            blob_version: new_version,
+            total_size: file_size,
+            block_count: commit_block_count,
+        };
 
         // Identify the surviving last block of a non-aligned shrink so
         // its tail can be zeroed (POSIX shrink-destroys: bytes between
@@ -1463,7 +1478,7 @@ impl VfsCore {
         if !rewrite_sub_ops.is_empty() {
             let entry_results = self
                 .backend()
-                .flush_blocks_batched(rewrite_sub_ops, trace_id)
+                .flush_blocks_batched(rewrite_sub_ops, commit, trace_id)
                 .await?;
             for r in entry_results {
                 r?;
@@ -1528,7 +1543,7 @@ impl VfsCore {
         if !delete_sub_ops.is_empty() {
             match self
                 .backend()
-                .flush_blocks_batched(delete_sub_ops, trace_id)
+                .flush_blocks_batched(delete_sub_ops, commit, trace_id)
                 .await
             {
                 Ok(entry_results) => {
@@ -1982,9 +1997,16 @@ impl VfsCore {
                     reserve_block_nums.push(block_num);
                 }
                 if !reserve_sub_ops.is_empty() {
+                    let bsz_u64 = block_size as u64;
+                    let commit = rpc_client_bss::BlobCommitInfo {
+                        blob_guid: guid,
+                        blob_version: new_version,
+                        total_size: file_size,
+                        block_count: file_size.div_ceil(bsz_u64) as u32,
+                    };
                     match self
                         .backend()
-                        .flush_blocks_batched(reserve_sub_ops, trace_id)
+                        .flush_blocks_batched(reserve_sub_ops, commit, trace_id)
                         .await
                     {
                         Ok(entry_results) => {
@@ -2063,9 +2085,15 @@ impl VfsCore {
                     });
                 }
                 if !sub_ops.is_empty() {
+                    let commit = rpc_client_bss::BlobCommitInfo {
+                        blob_guid,
+                        blob_version: 1,
+                        total_size: file_size,
+                        block_count: file_size.div_ceil(bsz_u64) as u32,
+                    };
                     let entry_results = self
                         .backend()
-                        .flush_blocks_batched(sub_ops, trace_id)
+                        .flush_blocks_batched(sub_ops, commit, trace_id)
                         .await?;
                     for r in entry_results {
                         r?;
@@ -2074,36 +2102,10 @@ impl VfsCore {
                 (blob_guid, 1, false)
             };
 
-        // Write the parent inode meta record after all data block
-        // writes have landed. The parent record carries the new
-        // (total_size, block_count) at this version and is the
-        // single commit point for the file's logical size on data
-        // reads -- a reader who races the flush sees either the old
-        // parent (and reads bytes against the old size) or the new
-        // one, but never a half-applied state.
-        //
-        // Failure here is non-fatal: the data blocks landed, the
-        // logical size is still recoverable from NSS layout.size,
-        // and the next flush re-publishes the parent at a higher
-        // version. We log and proceed.
-        let parent_meta = data_types::parent_inode::ParentInodeMeta::new(
-            final_blob_version,
-            file_size,
-            block_size,
-        );
-        if let Err(e) = self
-            .backend()
-            .write_parent_inode(final_blob_guid, parent_meta, trace_id)
-            .await
-        {
-            tracing::warn!(
-                %final_blob_guid,
-                final_blob_version,
-                file_size,
-                error = %e,
-                "Failed to publish parent inode; continuing"
-            );
-        }
+        // Commit info is now published as part of every BssBatch
+        // envelope (`flush_blocks_batched`); no separate write needed.
+        // BSS records `(file_size, block_count)` at
+        // `final_blob_version` once the batch lands.
 
         // Build ObjectLayout
         let timestamp = SystemTime::now()
@@ -3212,15 +3214,15 @@ impl VfsCore {
                 let trace_id = TraceId::new();
                 match self
                     .backend()
-                    .read_parent_inode(blob_guid, l.blob_version, &trace_id)
+                    .get_blob_info(blob_guid, l.blob_version, &trace_id)
                     .await
                 {
-                    Ok(Some(meta)) => Some(meta.total_size),
+                    Ok(Some(info)) => Some(info.total_size),
                     Ok(None) => None,
                     Err(e) => {
                         tracing::warn!(
                             %blob_guid, error = %e,
-                            "read_parent_inode failed during open; falling back to layout size"
+                            "get_blob_info failed during open; falling back to layout size"
                         );
                         None
                     }
@@ -3923,13 +3925,13 @@ impl VfsCore {
             if let Some(guid) = existing_blob_guid {
                 match self
                     .backend()
-                    .read_parent_inode(guid, layout_blob_version, &trace_id)
+                    .get_blob_info(guid, layout_blob_version, &trace_id)
                     .await
                 {
-                    Ok(Some(meta)) => meta.total_size,
+                    Ok(Some(info)) => info.total_size,
                     Ok(None) => file_size_hint,
                     Err(e) => {
-                        tracing::warn!(%guid, error = %e, "read_parent_inode failed during lseek; falling back");
+                        tracing::warn!(%guid, error = %e, "get_blob_info failed during lseek; falling back");
                         file_size_hint
                     }
                 }
@@ -4926,6 +4928,7 @@ impl VfsCore {
     ///     (and an `orphan_since` stamp when the record is now
     ///     unreachable) and let scan/repair finish the GC.
     ///   - symlink / directory marker / special: nothing to GC.
+    ///
     /// Multi-instance open-fd coordination (doc 20 section 4.4) is
     /// post-MVP; we treat the local open-handle set as authoritative.
     /// `key` is the NSS key the bytes were attached to (used to look
@@ -5931,11 +5934,11 @@ fn dir_has_wx_perm(
     }
     let mode = posix.mode;
     let class_bits = if posix.uid == caller_uid {
-        (libc::S_IWUSR | libc::S_IXUSR) as u32
+        libc::S_IWUSR | libc::S_IXUSR
     } else if posix.gid == caller_gid {
-        (libc::S_IWGRP | libc::S_IXGRP) as u32
+        libc::S_IWGRP | libc::S_IXGRP
     } else {
-        (libc::S_IWOTH | libc::S_IXOTH) as u32
+        libc::S_IWOTH | libc::S_IXOTH
     };
     mode & class_bits == class_bits
 }

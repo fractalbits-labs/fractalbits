@@ -590,36 +590,49 @@ impl RpcClient {
 
     /// Send a batched block-mutation RPC to a single BSS instance.
     ///
-    /// All sub-ops must target the same `volume_id` (the caller groups
-    /// them by routing). Returns one `Result<(), RpcError>` per
+    /// All sub-ops must target the same `volume_id` and the same
+    /// `blob_guid` (the latter == `commit.blob_guid`). Caller groups
+    /// by routing + blob. Returns one `Result<(), RpcError>` per
     /// sub-op, in the same order as `sub_ops`. The outer call returns
     /// `Err(...)` only when the entire RPC failed (transport, decode,
     /// or outer errno != 0); per-entry application failures surface as
     /// `Err` inside the per-entry vector but the outer `Ok` covers
     /// transport success.
+    ///
+    /// `commit` describes the blob's authoritative state after the
+    /// batch lands. BSS publishes it after all sub-ops complete;
+    /// this is the file-level commit point that `get_blob_info`
+    /// reads back. Batches that don't logically change file size
+    /// pass the current `(total_size, block_count)` re-stamped at
+    /// the new `blob_version`.
     #[allow(clippy::field_reassign_with_default)]
     pub async fn put_bss_batch(
         &self,
         sub_ops: Vec<BssBatchSubOp>,
+        commit: BlobCommitInfo,
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<Vec<BssBatchEntryResult>, RpcError> {
         let _guard = InflightRpcGuard::new("bss", "put_bss_batch");
-        if sub_ops.is_empty() {
-            return Ok(Vec::new());
-        }
 
         let n_entries = sub_ops.len();
-        // All entries must share the same volume so the batch can be
-        // routed to one BSS instance. Validate up-front rather than
-        // letting the server discover the mismatch via misrouted keys.
-        let volume_id = sub_ops[0].volume_id();
-        for op in &sub_ops[1..] {
+        // Determine target volume. Empty-batch (commit-only) RPCs are
+        // valid; they take the commit's volume_id. Non-empty batches
+        // also require all sub-ops to share the commit's blob_guid.
+        let volume_id = commit.blob_guid.volume_id;
+        for op in &sub_ops {
             if op.volume_id() != volume_id {
                 return Err(RpcError::InternalResponseError(format!(
-                    "BssBatch sub-ops span volumes {volume_id} and {}; group by volume first",
+                    "BssBatch sub-op volume {} != commit volume {volume_id}",
                     op.volume_id()
+                )));
+            }
+            if op.blob_guid().blob_id != commit.blob_guid.blob_id {
+                return Err(RpcError::InternalResponseError(format!(
+                    "BssBatch sub-op blob_id {} != commit blob_id {}; batches must be per-blob",
+                    op.blob_guid().blob_id,
+                    commit.blob_guid.blob_id,
                 )));
             }
         }
@@ -697,6 +710,14 @@ impl RpcClient {
         header.size = (header_sz + body_bytes.len()) as u32;
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
+        // Envelope commit fields: blob_id + version reuse the outer
+        // header's existing slots; total_size + block_count live in
+        // the dedicated commit_* fields. BSS publishes the commit
+        // after all sub-ops complete.
+        header.blob_id = commit.blob_guid.blob_id.into_bytes();
+        header.version = commit.blob_version;
+        header.commit_total_size = commit.total_size;
+        header.commit_block_count = commit.block_count;
         header.set_body_checksum(&body_bytes);
 
         let msg_frame = MessageFrame::new(header, body_bytes);
@@ -731,6 +752,61 @@ impl RpcClient {
         }
         Ok(results)
     }
+
+    /// Read the BSS-recorded commit info for `blob_guid`. Returns
+    /// the stored `(total_size, block_count, blob_version)` tuple as
+    /// recorded by the most recent `put_bss_batch` against this blob.
+    ///
+    /// `expected_version` is the caller's last-known blob version
+    /// used by the version-aware read path to pick the freshest
+    /// reply across replicas. Pass 0 for "any version" when the
+    /// caller has no prior. Returns `Ok(None)` if this replica has no
+    /// commit entry for the blob (new blob, or partition that missed
+    /// the publish); the caller's fan-out logic decides how to merge
+    /// across replicas.
+    #[allow(clippy::field_reassign_with_default)]
+    pub async fn get_blob_info(
+        &self,
+        blob_guid: DataBlobGuid,
+        expected_version: u64,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<Option<BlobInfo>, RpcError> {
+        let _guard = InflightRpcGuard::new("bss", "get_blob_info");
+        let header_sz = size_of::<MessageHeader>();
+
+        let mut header = MessageHeader::default();
+        let request_id = self.gen_request_id();
+        header.id = request_id;
+        header.command = Command::GetBlobInfo;
+        header.volume_id = blob_guid.volume_id;
+        header.blob_id = blob_guid.blob_id.into_bytes();
+        header.version = expected_version;
+        header.size = header_sz as u32;
+        header.retry_count = retry_count as u8;
+        header.trace_id = trace_id.0;
+
+        let msg_frame = MessageFrame::new(header, Bytes::new());
+        let resp_frame = self
+            .send_request(msg_frame, timeout, Some(crate::OperationType::GetData))
+            .await
+            .map_err(|e| {
+                if !e.retryable() {
+                    error!(rpc=%"get_blob_info", %request_id, %blob_guid, error=?e, "bss rpc failed");
+                }
+                e
+            })?;
+        match check_response_errno(&resp_frame.header) {
+            Ok(()) => Ok(Some(BlobInfo {
+                total_size: resp_frame.header.commit_total_size,
+                block_count: resp_frame.header.commit_block_count,
+                blob_version: resp_frame.header.version,
+            })),
+            Err(RpcError::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// One sub-operation in a BssBatch RPC. Sub-ops in the same batch
@@ -760,10 +836,13 @@ pub enum BssBatchSubOp {
 
 impl BssBatchSubOp {
     fn volume_id(&self) -> u16 {
+        self.blob_guid().volume_id
+    }
+    pub(crate) fn blob_guid(&self) -> &DataBlobGuid {
         match self {
-            BssBatchSubOp::PutDataBlob { blob_guid, .. } => blob_guid.volume_id,
-            BssBatchSubOp::DeleteDataBlob { blob_guid, .. } => blob_guid.volume_id,
-            BssBatchSubOp::ReserveBlocks { blob_guid, .. } => blob_guid.volume_id,
+            BssBatchSubOp::PutDataBlob { blob_guid, .. } => blob_guid,
+            BssBatchSubOp::DeleteDataBlob { blob_guid, .. } => blob_guid,
+            BssBatchSubOp::ReserveBlocks { blob_guid, .. } => blob_guid,
         }
     }
     fn body_len(&self) -> usize {
@@ -787,6 +866,30 @@ impl BssBatchSubOp {
 #[derive(Debug)]
 pub struct BssBatchEntryResult {
     pub status: Result<(), RpcError>,
+}
+
+/// Authoritative blob commit state that rides in every BssBatch
+/// envelope. Describes the blob's `(total_size, block_count)` at
+/// the new `blob_version` after the batch lands. BSS publishes it
+/// once all sub-ops complete; `get_blob_info` reads it back.
+/// fs_server / api_server see only these plain fields.
+#[derive(Debug, Clone, Copy)]
+pub struct BlobCommitInfo {
+    pub blob_guid: DataBlobGuid,
+    pub blob_version: u64,
+    pub total_size: u64,
+    pub block_count: u32,
+}
+
+/// Response of a `get_blob_info` RPC: the blob's current
+/// `(total_size, block_count, blob_version)` as the BSS replica saw
+/// it. Returned `None` when the blob has no commit entry on this
+/// replica (new blob, or partition that missed the publish).
+#[derive(Debug, Clone, Copy)]
+pub struct BlobInfo {
+    pub total_size: u64,
+    pub block_count: u32,
+    pub blob_version: u64,
 }
 
 #[cfg(test)]

@@ -60,9 +60,16 @@ pub struct MessageHeader {
     pub is_root: u8,
     /// Fence token for fencing stale NSS instances
     pub fence_token: u64,
-    /// Reserved parts for padding
-    /// TODO: will add device_id, nss-active-id, for meta-blob use
-    pub reserve1: [u8; 24],
+    /// Commit envelope: file `total_size` after a BssBatch lands, or
+    /// the stored value returned by a GetBlobInfo response. Zero on
+    /// other commands.
+    pub commit_total_size: u64,
+    /// Commit envelope: `ceil(total_size / block_size)` after a
+    /// BssBatch lands, or the stored value returned by a GetBlobInfo
+    /// response. Zero on other commands.
+    pub commit_block_count: u32,
+    /// Reserved padding (was reserve1; carved 12 B for commit_*).
+    pub reserve1: [u8; 12],
     pub reserve2: [u8; 32],
 }
 
@@ -92,6 +99,14 @@ pub enum Command {
     /// handler, returns a response body of N (sub_header_with_errno,
     /// optional sub_body) records reporting per-entry status.
     BssBatch = 27,
+    /// Read the BSS-recorded commit info for a blob and return
+    /// `(total_size, block_count, blob_version)` in the response
+    /// header's `commit_total_size`, `commit_block_count`, and
+    /// `version` fields. Request carries the target `blob_id` and an
+    /// `expected version` (0 = any). No request or response body.
+    /// Used by fs_server's `get_blob_info` to size files on open and
+    /// to anchor lseek SEEK_HOLE.
+    GetBlobInfo = 28,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -130,7 +145,9 @@ impl Default for MessageHeader {
             skip_fence_token: 0,
             is_root: 0,
             fence_token: 0,
-            reserve1: [0u8; 24],
+            commit_total_size: 0,
+            commit_block_count: 0,
+            reserve1: [0u8; 12],
             reserve2: [0u8; 32],
         }
     }

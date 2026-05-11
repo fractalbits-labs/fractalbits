@@ -6,7 +6,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use metrics_wrapper::{counter, histogram};
 use rand::seq::{IndexedRandom, SliceRandom};
 use reed_solomon_simd::{decode as rs_decode, encode as rs_encode};
-use rpc_client_bss::{BssBatchSubOp, RpcClientBss};
+use rpc_client_bss::{BlobCommitInfo, BlobInfo, BssBatchSubOp, RpcClientBss};
 use rpc_client_common::RpcError;
 use std::{
     sync::{
@@ -37,18 +37,6 @@ type NodeReadResponse = (Arc<BssNode>, Result<(Bytes, u64), RpcError>);
 
 fn current_timestamp_nanos() -> u64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
-}
-
-/// Surface a DataVgError as the RpcError shape that batched callers
-/// expect (per-entry vector). `BssRpc` is preserved since the
-/// underlying transport already returned an `RpcError`; everything
-/// else collapses to `InternalResponseError` so callers don't have
-/// to unify two error enums in their per-entry paths.
-fn datavg_to_rpc_err(e: DataVgError) -> rpc_client_common::RpcError {
-    match e {
-        DataVgError::BssRpc(rpc) => rpc,
-        other => rpc_client_common::RpcError::InternalResponseError(other.to_string()),
-    }
 }
 
 /// Configuration for circuit breaker behavior
@@ -235,6 +223,73 @@ pub struct DataVgProxy {
     volumes: Vec<VolumeWithNodes>,
     round_robin_counter: AtomicU64,
     rpc_timeout: Duration,
+}
+
+/// Build a per-BSS-node sub-op list for an EC batch. Each input
+/// `PutDataBlob` is RS-encoded into `k+m` shards; shard `s` is sent
+/// to node `(s + rotation) % total`. The returned vector is indexed
+/// by absolute position in `volume.bss_nodes`. Delete / Reserve
+/// sub-ops aren't sharded -- they're replicated to every node
+/// identically. EC rotation depends on `blob_guid.blob_id`, and the
+/// batch is single-blob, so one rotation applies across all
+/// PutDataBlob sub-ops in the input.
+fn build_ec_per_node_subops(
+    sub_ops: &[BssBatchSubOp],
+    k: usize,
+    m: usize,
+    commit_blob_guid: DataBlobGuid,
+) -> Result<Vec<Vec<BssBatchSubOp>>, DataVgError> {
+    let total = k + m;
+    let rotation = ec_rotation(&commit_blob_guid.blob_id, total as u32);
+    let mut per_node: Vec<Vec<BssBatchSubOp>> = (0..total).map(|_| Vec::new()).collect();
+
+    for op in sub_ops {
+        match op {
+            BssBatchSubOp::PutDataBlob {
+                blob_guid,
+                block_number,
+                body,
+                body_checksum: _,
+                version,
+            } => {
+                // RS-encode this block into k+m shards.
+                let original_len = body.len();
+                let padded_len = ec_padded_len(original_len, k);
+                let shard_size = padded_len / k;
+                let mut padded = body.to_vec();
+                padded.resize(padded_len, 0u8);
+                let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total);
+                for i in 0..k {
+                    shards.push(padded[i * shard_size..(i + 1) * shard_size].to_vec());
+                }
+                let parity = rs_encode(k, m, &shards)
+                    .map_err(|e| DataVgError::Internal(format!("RS encode failed: {}", e)))?;
+                shards.extend(parity);
+
+                for (shard_idx, shard) in shards.into_iter().enumerate() {
+                    let node_idx = (shard_idx + rotation) % total;
+                    let shard_bytes = bytes::Bytes::from(shard);
+                    let checksum = xxhash_rust::xxh3::xxh3_64(&shard_bytes);
+                    per_node[node_idx].push(BssBatchSubOp::PutDataBlob {
+                        blob_guid: *blob_guid,
+                        block_number: *block_number,
+                        body: shard_bytes,
+                        body_checksum: checksum,
+                        version: *version,
+                    });
+                }
+            }
+            BssBatchSubOp::DeleteDataBlob { .. } | BssBatchSubOp::ReserveBlocks { .. } => {
+                // No body to shard -- replicate identically to every
+                // data BSS node so the per-block tombstone /
+                // reservation lands across the volume.
+                for slot in per_node.iter_mut() {
+                    slot.push(op.clone());
+                }
+            }
+        }
+    }
+    Ok(per_node)
 }
 
 impl DataVgProxy {
@@ -2488,12 +2543,24 @@ impl DataVgProxy {
     ///   provably cannot with the remaining responses -- and finishes
     ///   the rest in a background task.
     ///
-    /// EC volumes are not yet supported (each block targets specific
-    /// shards) and return `InitializationError`. Callers that operate
-    /// on EC volumes should fall back to the per-block path.
+    /// `commit` publishes the blob's authoritative state after the
+    /// batch lands -- `(total_size, block_count)` at `blob_version`.
+    /// BSS publishes it once all sub-ops resolve; `get_blob_info`
+    /// reads it back. Every batch publishes a commit; callers that
+    /// don't change file state still pass the current
+    /// `(total_size, block_count)` re-stamped at the new blob_version.
+    ///
+    /// EC volumes: each PutDataBlob sub-op is split into `k+m`
+    /// shards routed via `ec_rotation`; the per-node batch's
+    /// PutDataBlob sub-ops carry shard bodies. Delete / Reserve
+    /// sub-ops fan to every data BSS node identically (no body to
+    /// shard). The same envelope commit rides every per-node batch
+    /// so the commit lands replicated across all data nodes in the
+    /// volume. Quorum is `k+1`.
     pub async fn put_blocks_batched(
         &self,
         sub_ops: Vec<BssBatchSubOp>,
+        commit: BlobCommitInfo,
         trace_id: &TraceId,
     ) -> Result<Vec<Result<(), RpcError>>, DataVgError> {
         // BSS recv buffers are sized for one max-shard payload + one
@@ -2531,20 +2598,27 @@ impl DataVgProxy {
                 chunks.push(current);
             }
             if chunks.len() > 1 {
+                // Multi-chunk: every chunk carries the same envelope
+                // commit. Intermediate chunks publish a brief commit
+                // window that's immediately overwritten by the next
+                // chunk; readers might observe a partial state until
+                // the last chunk lands. Acceptable for now -- flushes
+                // of this size are rare and short.
                 let mut all_results: Vec<Result<(), RpcError>> =
                     Vec::with_capacity(chunks.iter().map(|c| c.len()).sum());
                 for chunk in chunks {
-                    let part = Box::pin(self.put_blocks_batched(chunk, trace_id)).await?;
+                    let part = Box::pin(self.put_blocks_batched(chunk, commit, trace_id)).await?;
                     all_results.extend(part);
                 }
                 return Ok(all_results);
             }
             // Single chunk -- fall through to the unchunked dispatch.
             let only = chunks.into_iter().next().unwrap();
-            return Box::pin(self.put_blocks_batched_one_chunk(only, trace_id)).await;
+            return Box::pin(self.put_blocks_batched_one_chunk(only, commit, trace_id)).await;
         }
 
-        self.put_blocks_batched_one_chunk(sub_ops, trace_id).await
+        self.put_blocks_batched_one_chunk(sub_ops, commit, trace_id)
+            .await
     }
 
     /// Inner dispatch for a single chunk that fits under the BSS
@@ -2554,30 +2628,27 @@ impl DataVgProxy {
     async fn put_blocks_batched_one_chunk(
         &self,
         sub_ops: Vec<BssBatchSubOp>,
+        commit: BlobCommitInfo,
         trace_id: &TraceId,
     ) -> Result<Vec<Result<(), RpcError>>, DataVgError> {
-        if sub_ops.is_empty() {
-            return Ok(Vec::new());
-        }
         let n = sub_ops.len();
-        let volume_id = match &sub_ops[0] {
-            BssBatchSubOp::PutDataBlob { blob_guid, .. } => blob_guid.volume_id,
-            BssBatchSubOp::DeleteDataBlob { blob_guid, .. } => blob_guid.volume_id,
-            BssBatchSubOp::ReserveBlocks { blob_guid, .. } => blob_guid.volume_id,
-        };
+        let volume_id = commit.blob_guid.volume_id;
         let volume = self.find_volume(volume_id).ok_or_else(|| {
             DataVgError::InitializationError(format!("Volume {volume_id} not found in DataVgProxy"))
         })?;
-        let write_quorum = match &volume.mode {
-            VolumeMode::Replicated { w, .. } => *w as usize,
-            VolumeMode::ErasureCoded { .. } => {
-                // EC volumes shard each block across data + parity
-                // shards using the existing per-block paths. The
-                // single-shard BssBatch dispatch doesn't map onto
-                // EC's per-shard layout, so fall back to per-entry
-                // serialised dispatch and aggregate results in
-                // input order.
-                return self.put_blocks_batched_ec_fallback(sub_ops, trace_id).await;
+        let (write_quorum, ec_dims) = match &volume.mode {
+            VolumeMode::Replicated { w, .. } => (*w as usize, None),
+            VolumeMode::ErasureCoded {
+                data_shards,
+                parity_shards,
+            } => {
+                // EC volumes shard each PutDataBlob across k+m data
+                // BSS nodes. Quorum is k+1. Per-node sub-ops carry
+                // shard bodies; the envelope commit is identical
+                // across nodes.
+                let k = *data_shards as usize;
+                let m = *parity_shards as usize;
+                (k + 1, Some((k, m)))
             }
         };
 
@@ -2616,15 +2687,35 @@ impl DataVgProxy {
         }
         let total_nodes = available_nodes.len();
 
+        // EC: per-node sub-op lists differ (each carries shards
+        //     destined for that node).
+        // Replicated: every node receives the same sub_ops vector.
+        // `available_nodes` is filtered for circuit-breaker; the
+        // per-node-subops vector is indexed by position in
+        // `volume.bss_nodes`, then we send only to the available
+        // subset. EC routing depends on absolute node position, so
+        // we walk the full volume.bss_nodes and skip unavailable
+        // ones.
+        let per_node_subops = match ec_dims {
+            None => None,
+            Some((k, m)) => Some(build_ec_per_node_subops(&sub_ops, k, m, commit.blob_guid)?),
+        };
+
         let mut futures = FuturesUnordered::new();
-        for node in &available_nodes {
+        for (node_idx, node) in volume.bss_nodes.iter().enumerate() {
+            if !node.is_available() {
+                continue;
+            }
             let node = node.clone();
-            let sub_ops = sub_ops.clone();
+            let node_subops = match &per_node_subops {
+                None => sub_ops.clone(),
+                Some(per_node) => per_node[node_idx].clone(),
+            };
             futures.push(async move {
                 let address = node.address.clone();
                 let result = node
                     .get_client()
-                    .put_bss_batch(sub_ops, Some(rpc_timeout), &trace_id, 0)
+                    .put_bss_batch(node_subops, commit, Some(rpc_timeout), &trace_id, 0)
                     .await;
                 (node, address, result)
             });
@@ -2747,57 +2838,65 @@ impl DataVgProxy {
         Ok(entry_results)
     }
 
-    /// EC-volume fallback for `put_blocks_batched`. Dispatches each
-    /// sub-op through the existing per-block path (`put_blob` /
-    /// `delete_blob` / `reserve_blob`) which already knows how to
-    /// route across data + parity shards. Results land in the same
-    /// order as `sub_ops`.
-    #[allow(clippy::needless_pass_by_value)]
-    async fn put_blocks_batched_ec_fallback(
+    /// Read the BSS-recorded commit info for a blob. Fans
+    /// `GetBlobInfo` to every available BSS node in the volume and
+    /// picks the response with the highest `blob_version`. For EC
+    /// volumes the commit is replicated (not sharded), so any data
+    /// node's reply suffices. Returns `Ok(None)` when no replica
+    /// has a commit recorded (new blob, or partition that missed
+    /// every publish).
+    pub async fn get_blob_info(
         &self,
-        sub_ops: Vec<BssBatchSubOp>,
+        blob_guid: DataBlobGuid,
+        expected_version: u64,
         trace_id: &TraceId,
-    ) -> Result<Vec<Result<(), RpcError>>, DataVgError> {
-        let mut results = Vec::with_capacity(sub_ops.len());
-        for op in sub_ops {
-            let result: Result<(), RpcError> = match op {
-                BssBatchSubOp::PutDataBlob {
-                    blob_guid,
-                    block_number,
-                    body,
-                    body_checksum: _,
-                    version,
-                } => self
-                    .put_blob(blob_guid, block_number, body, version, trace_id)
-                    .await
-                    .map_err(datavg_to_rpc_err),
-                BssBatchSubOp::DeleteDataBlob {
-                    blob_guid,
-                    block_number,
-                    version,
-                } => self
-                    .delete_blob(blob_guid, block_number, version, trace_id)
-                    .await
-                    .map_err(datavg_to_rpc_err),
-                BssBatchSubOp::ReserveBlocks {
-                    blob_guid,
-                    block_number,
-                    block_size,
-                    expected_version,
-                } => self
-                    .reserve_blob(
-                        blob_guid,
-                        block_number,
-                        block_size,
-                        expected_version,
-                        trace_id,
-                    )
-                    .await
-                    .map_err(datavg_to_rpc_err),
-            };
-            results.push(result);
+    ) -> Result<Option<BlobInfo>, DataVgError> {
+        let volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
+            DataVgError::InitializationError(format!(
+                "Volume {} not found in DataVgProxy",
+                blob_guid.volume_id
+            ))
+        })?;
+        let rpc_timeout = self.rpc_timeout;
+        let trace_id = *trace_id;
+
+        let mut futures = FuturesUnordered::new();
+        for node in &volume.bss_nodes {
+            if !node.is_available() {
+                continue;
+            }
+            let node = node.clone();
+            futures.push(async move {
+                let address = node.address.clone();
+                let result = node
+                    .get_client()
+                    .get_blob_info(blob_guid, expected_version, Some(rpc_timeout), &trace_id, 0)
+                    .await;
+                (node, address, result)
+            });
         }
-        Ok(results)
+
+        let mut best: Option<BlobInfo> = None;
+        while let Some((node, _address, result)) = futures.next().await {
+            match result {
+                Ok(Some(info)) => {
+                    node.record_success();
+                    best = Some(match best {
+                        None => info,
+                        Some(b) if info.blob_version > b.blob_version => info,
+                        Some(b) => b,
+                    });
+                }
+                Ok(None) => {
+                    node.record_success();
+                }
+                Err(e) => {
+                    node.record_failure();
+                    debug!("get_blob_info RPC error: {}", e);
+                }
+            }
+        }
+        Ok(best)
     }
 
     /// Enumerate the BSS-side block-level entries for `blob_guid`

@@ -77,30 +77,23 @@ async fn test_bss_batch_put_delete_reserve() {
     };
     let rpc_client = RpcClientBss::new_from_address(url.to_string(), Duration::from_secs(5));
 
-    // Build three sub-ops covering all supported per-entry commands so
-    // a single round-trip exercises the dispatcher's per-op fan-out.
-    let put_guid = DataBlobGuid {
+    // Single-blob batch with all three sub-op kinds at distinct
+    // block_numbers exercises the dispatcher's per-op fan-out.
+    // BssBatch is per-blob: every sub-op shares the envelope
+    // commit_blob_id.
+    let blob_guid = DataBlobGuid {
         blob_id: Uuid::now_v7(),
         volume_id: 1,
     };
     let put_body: Bytes = vec![0xab; 4096].into();
     let put_chk = xxhash_rust::xxh3::xxh3_64(&put_body);
 
-    let reserve_guid = DataBlobGuid {
-        blob_id: Uuid::now_v7(),
-        volume_id: 1,
-    };
-    let delete_guid = DataBlobGuid {
-        blob_id: Uuid::now_v7(),
-        volume_id: 1,
-    };
-
-    // Pre-populate the delete-target so the batch sub-Delete actually
-    // tombstones a real entry rather than getting NotFound.
+    // Pre-populate the delete-target block so the batch sub-Delete
+    // actually tombstones a real entry rather than getting NotFound.
     rpc_client
         .put_data_blob(
-            delete_guid,
-            0,
+            blob_guid,
+            1,
             Bytes::from(vec![0xcd; 4096]),
             xxhash_rust::xxh3::xxh3_64(&[0xcd; 4096]),
             1,
@@ -113,36 +106,37 @@ async fn test_bss_batch_put_delete_reserve() {
 
     let sub_ops = vec![
         BssBatchSubOp::PutDataBlob {
-            blob_guid: put_guid,
+            blob_guid,
             block_number: 0,
             body: put_body.clone(),
             body_checksum: put_chk,
-            version: 1,
+            version: 2,
         },
         BssBatchSubOp::DeleteDataBlob {
-            blob_guid: delete_guid,
-            block_number: 0,
+            blob_guid,
+            block_number: 1,
             version: 2,
         },
         BssBatchSubOp::ReserveBlocks {
-            blob_guid: reserve_guid,
-            block_number: 0,
+            blob_guid,
+            block_number: 2,
             block_size: 4096,
-            expected_version: 1,
+            expected_version: 2,
         },
     ];
 
+    let commit = rpc_client_bss::BlobCommitInfo {
+        blob_guid,
+        blob_version: 2,
+        total_size: 4096,
+        block_count: 1,
+    };
     let results = rpc_client
-        .put_bss_batch(sub_ops, None, &TraceId::new(), 0)
+        .put_bss_batch(sub_ops, commit, None, &TraceId::new(), 0)
         .await
         .expect("batch send");
 
     assert_eq!(results.len(), 3, "one result per sub-op");
-    // Sub[0] (Put) and sub[2] (Reserve) target fresh blobs and must succeed.
-    // Sub[1] (Delete) versions strictly above the seed version, so it
-    // either succeeds or returns VersionSkipped depending on FA delete
-    // semantics; we only assert the outer dispatch returned a per-entry
-    // result for it.
     assert!(
         results[0].status.is_ok(),
         "Put sub failed: {:?}",
@@ -158,7 +152,7 @@ async fn test_bss_batch_put_delete_reserve() {
     let mut readback = Bytes::new();
     rpc_client
         .get_data_blob(
-            put_guid,
+            blob_guid,
             0,
             &mut readback,
             put_body.len(),
@@ -184,29 +178,36 @@ async fn test_bss_batch_burst_puts() {
     };
     let rpc_client = RpcClientBss::new_from_address(url.to_string(), Duration::from_secs(10));
 
-    // Burst of 16 fresh-blob puts in one batch — stresses sub-blob-buf
-    // pool and per-sub response accumulation.
+    // Burst of 16 single-blob puts (distinct block_numbers) in one
+    // batch -- stresses sub-blob-buf pool and per-sub response
+    // accumulation. BssBatch is per-blob.
     const N: usize = 16;
+    let blob_guid = DataBlobGuid {
+        blob_id: Uuid::now_v7(),
+        volume_id: 1,
+    };
     let mut sub_ops: Vec<BssBatchSubOp> = Vec::with_capacity(N);
-    let mut expected: Vec<(DataBlobGuid, Bytes)> = Vec::with_capacity(N);
+    let mut expected: Vec<(u32, Bytes)> = Vec::with_capacity(N);
     for i in 0..N {
-        let guid = DataBlobGuid {
-            blob_id: Uuid::now_v7(),
-            volume_id: 1,
-        };
         let body: Bytes = vec![(i as u8).wrapping_mul(7); 4096].into();
         let chk = xxhash_rust::xxh3::xxh3_64(&body);
         sub_ops.push(BssBatchSubOp::PutDataBlob {
-            blob_guid: guid,
-            block_number: 0,
+            blob_guid,
+            block_number: i as u32,
             body: body.clone(),
             body_checksum: chk,
             version: 1,
         });
-        expected.push((guid, body));
+        expected.push((i as u32, body));
     }
+    let commit = rpc_client_bss::BlobCommitInfo {
+        blob_guid,
+        blob_version: 1,
+        total_size: (N as u64) * 4096,
+        block_count: N as u32,
+    };
     let results = rpc_client
-        .put_bss_batch(sub_ops, None, &TraceId::new(), 0)
+        .put_bss_batch(sub_ops, commit, None, &TraceId::new(), 0)
         .await
         .expect("burst batch send");
     assert_eq!(results.len(), N);
@@ -217,12 +218,12 @@ async fn test_bss_batch_burst_puts() {
     // Spot-check: read back two of the puts to verify data really
     // landed (not just acked with errno=0).
     for &idx in &[0usize, N - 1] {
-        let (guid, body) = &expected[idx];
+        let (block_num, body) = &expected[idx];
         let mut readback = Bytes::new();
         rpc_client
             .get_data_blob(
-                *guid,
-                0,
+                blob_guid,
+                *block_num,
                 &mut readback,
                 body.len(),
                 None,

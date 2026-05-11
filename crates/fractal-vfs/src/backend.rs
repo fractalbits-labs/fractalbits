@@ -17,7 +17,6 @@ use volume_group_proxy::DataVgProxy;
 use crate::config::Config;
 use crate::error::FsError;
 use data_types::object_layout::ObjectLayout;
-use data_types::parent_inode::{PARENT_INODE_BLOCK_NUMBER, ParentInodeMeta};
 /// Discovered configuration from RSS (shared across threads).
 pub struct BackendConfig {
     pub nss_address: String,
@@ -598,26 +597,28 @@ impl StorageBackend {
     }
 
     /// Send N block-mutation sub-ops (writes / deletes / reserves)
-    /// against a single Replicated volume as one batched RPC per
-    /// replica, with M-of-N quorum reduction per entry.
+    /// for a single blob as one batched RPC per replica (or per data
+    /// BSS node on EC volumes), with quorum reduction per entry.
+    ///
+    /// `commit` publishes the blob's authoritative
+    /// `(total_size, block_count)` at `blob_version`; BSS records it
+    /// once all sub-ops resolve. Every batch publishes a commit;
+    /// callers that don't change file size re-stamp the current
+    /// `(total_size, block_count)` at the new `blob_version`.
     ///
     /// Returns one `Result<(), FsError>` per input sub-op, in the same
     /// order. Per-entry failures are surfaced inside the vector; the
     /// outer `Result` only fails when the whole batch couldn't be
-    /// dispatched (e.g. transport, EC volume).
-    ///
-    /// Caller groups by volume_id before invoking. Today this is the
-    /// writeback worker's Stage B drainer (`flush_publish` and
-    /// `override_flush_blocks`); future paths can reuse it for any
-    /// burst of independent block mutations.
+    /// dispatched (e.g. transport, quorum unreachable).
     pub async fn flush_blocks_batched(
         &self,
         sub_ops: Vec<BssBatchSubOp>,
+        commit: rpc_client_bss::BlobCommitInfo,
         trace_id: &TraceId,
     ) -> Result<Vec<Result<(), FsError>>, FsError> {
         let entry_results = self
             .data_vg_proxy
-            .put_blocks_batched(sub_ops, trace_id)
+            .put_blocks_batched(sub_ops, commit, trace_id)
             .await?;
         Ok(entry_results
             .into_iter()
@@ -643,64 +644,22 @@ impl StorageBackend {
         Ok(entries)
     }
 
-    /// Write the parent inode meta record for `blob_guid` at the
-    /// given version. Goes through the same `put_blob` path as a
-    /// regular block write, but addresses the no-suffix key form via
-    /// the `PARENT_INODE_BLOCK_NUMBER` sentinel that the BSS server
-    /// recognises.
-    pub async fn write_parent_inode(
+    /// Read the BSS-internal commit info for `blob_guid`. Returns
+    /// the currently-recorded `(total_size, block_count, blob_version)`
+    /// as the BSS replica with the highest version sees it.
+    /// `expected_version` is the caller's last-known version (used
+    /// by version-aware fan-out); pass 0 when no prior is known.
+    /// Returns `Ok(None)` when no replica has a commit entry for the
+    /// blob (new blob, or partition that missed every publish).
+    pub async fn get_blob_info(
         &self,
         blob_guid: DataBlobGuid,
-        meta: ParentInodeMeta,
+        expected_version: u64,
         trace_id: &TraceId,
-    ) -> Result<(), FsError> {
-        let body = Bytes::copy_from_slice(&meta.to_bytes());
-        self.data_vg_proxy
-            .put_blob(
-                blob_guid,
-                PARENT_INODE_BLOCK_NUMBER,
-                body,
-                meta.version,
-                trace_id,
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// Read the parent inode meta record for `blob_guid`. Returns
-    /// `Ok(None)` when the parent inode does not exist (older blobs
-    /// written before parent-inode support, or a transient
-    /// missing-replica situation that the regular hole-tolerant read
-    /// path treats the same way).
-    ///
-    /// `blob_version` is the file-level `ObjectLayout.blob_version` of
-    /// the inode whose parent record we're fetching; it drives the
-    /// same read-strategy dispatch as ordinary block reads (fast path
-    /// at V<=1, fan-out + max-version + inline-repair at V>1).
-    pub async fn read_parent_inode(
-        &self,
-        blob_guid: DataBlobGuid,
-        blob_version: u64,
-        trace_id: &TraceId,
-    ) -> Result<Option<ParentInodeMeta>, FsError> {
-        match self
-            .read_block(
-                blob_guid,
-                blob_version,
-                PARENT_INODE_BLOCK_NUMBER,
-                ParentInodeMeta::WIRE_LEN,
-                trace_id,
-            )
-            .await
-        {
-            Ok((body, _)) => {
-                let meta = ParentInodeMeta::from_bytes(&body)
-                    .map_err(|e| FsError::Internal(format!("invalid ParentInodeMeta: {e}")))?;
-                Ok(Some(meta))
-            }
-            Err(FsError::DataVg(volume_group_proxy::DataVgError::BlockNotFound)) => Ok(None),
-            Err(FsError::Rpc(RpcError::NotFound)) => Ok(None),
-            Err(e) => Err(e),
-        }
+    ) -> Result<Option<rpc_client_bss::BlobInfo>, FsError> {
+        Ok(self
+            .data_vg_proxy
+            .get_blob_info(blob_guid, expected_version, trace_id)
+            .await?)
     }
 }
