@@ -24,6 +24,14 @@ pub enum DataVgError {
     #[error("Block not found on any replica")]
     BlockNotFound,
 
+    /// Two or more replicas reported the same `BlobMeta.version` but
+    /// disagree on body length or checksum. This is the divergence
+    /// case the inline-repair read path cannot resolve safely; the
+    /// caller must surface it for operator investigation rather than
+    /// silently picking one cohort.
+    #[error("Replicated data divergence: same version, different bytes")]
+    Corrupted,
+
     #[error("Internal error: {0}")]
     Internal(String),
 }

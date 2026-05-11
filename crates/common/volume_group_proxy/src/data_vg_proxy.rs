@@ -30,6 +30,11 @@ fn spawn_background<F: std::future::Future<Output = ()> + 'static>(fut: F) {
 
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
+/// Per-node response from a fan-out read. Bound at the type-alias
+/// layer so the multi-replica reader code doesn't blow past
+/// `clippy::type_complexity`.
+type NodeReadResponse = (Arc<BssNode>, Result<(Bytes, u64), RpcError>);
+
 fn current_timestamp_nanos() -> u64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
@@ -1236,6 +1241,249 @@ impl DataVgProxy {
         ))
     }
 
+    /// Read a block with strict version-aware semantics: fan out to
+    /// every available replica, pick the bytes at `max(stored_version)`,
+    /// and inline-repair laggers if max-version coverage is below read
+    /// quorum.
+    ///
+    /// This is the partition-rejoin-safe read variant: a replica that
+    /// missed a flush silently holds pre-bump bytes for the affected
+    /// blocks (same per-key version on every replica is impossible to
+    /// tell apart without comparing across replicas). Without
+    /// max-version selection, a random fast-path pick on the lagger
+    /// returns stale bytes. Mirrors
+    /// `core/nss_server/buffer_manager/blob_io.zig::MultiBssObjectReader`.
+    ///
+    /// Caller decides when to use this vs the cheaper `get_blob`:
+    /// today `backend::read_block` routes here when
+    /// `ObjectLayout.blob_version > 1` (the file has been overridden at
+    /// least once and a partition-rejoin window is possible).
+    pub async fn get_blob_with_quorum_check(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        content_len: usize,
+        body: &mut Bytes,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        let volume_id = blob_guid.volume_id;
+        let volume = self.find_volume(volume_id).ok_or_else(|| {
+            DataVgError::InitializationError(format!("Volume {} not found", volume_id))
+        })?;
+
+        // EC fan-out + strict-max-version filter. Per-read inline
+        // repair (re-encoding stale shards and writing them back to
+        // laggers) is a follow-up; bss_repair scans converge them
+        // asynchronously today.
+        if let VolumeMode::ErasureCoded { .. } = &volume.mode {
+            return self
+                .get_blob_ec_with_quorum_check(blob_guid, block_number, content_len, body, trace_id)
+                .await;
+        }
+
+        let start = Instant::now();
+        let blob_id = blob_guid.blob_id;
+        let read_quorum = match &volume.mode {
+            VolumeMode::Replicated { r, .. } => *r as usize,
+            VolumeMode::ErasureCoded { .. } => unreachable!(),
+        };
+
+        let available_nodes: Vec<_> = volume
+            .bss_nodes
+            .iter()
+            .filter(|node| {
+                let avail = node.is_available();
+                if !avail {
+                    counter!("circuit_breaker_skipped", "node" => node.address.clone(), "operation" => "get_quorum_check").increment(1);
+                }
+                avail
+            })
+            .cloned()
+            .collect();
+
+        if available_nodes.len() < read_quorum {
+            histogram!("datavg_get_blob_quorum_nanos", "result" => "insufficient_nodes")
+                .record(start.elapsed().as_nanos() as f64);
+            return Err(DataVgError::QuorumFailure(format!(
+                "Insufficient available nodes ({}/{}) for read quorum ({})",
+                available_nodes.len(),
+                volume.bss_nodes.len(),
+                read_quorum
+            )));
+        }
+
+        // Fan out reads to every available replica in parallel.
+        let mut read_futures = FuturesUnordered::new();
+        for bss_node in available_nodes.iter().cloned() {
+            let proxy = self;
+            read_futures.push(async move {
+                let result = proxy
+                    .get_blob_from_node_instance(
+                        &bss_node,
+                        blob_guid,
+                        block_number,
+                        content_len,
+                        trace_id,
+                        false, // not fast_path: allow retries on transient failures
+                    )
+                    .await;
+                (bss_node, result)
+            });
+        }
+
+        // Each entry: (node, Ok((bytes, version)) | Err(rpc_err)).
+        // Each underlying RPC carries its own per-request timeout
+        // (self.rpc_timeout), so a stuck replica fails its own future
+        // rather than blocking the fan-out indefinitely. We wait for
+        // every replica's response, then dispatch on quorum.
+        let mut responses: Vec<NodeReadResponse> = Vec::new();
+        let mut success_count: usize = 0;
+        let mut not_found_count: usize = 0;
+        let mut other_err_count: usize = 0;
+        while let Some((node, result)) = read_futures.next().await {
+            match &result {
+                Ok(_) => success_count += 1,
+                Err(RpcError::NotFound) => not_found_count += 1,
+                Err(_) => other_err_count += 1,
+            }
+            responses.push((node, result));
+        }
+
+        // Sparse-file hole: every responding replica agreed the
+        // block does not exist (no transient errors). Surface as
+        // BlockNotFound so the fs_server read path can map to zeros.
+        if success_count == 0 && other_err_count == 0 && not_found_count > 0 {
+            histogram!("datavg_get_blob_quorum_nanos", "result" => "block_not_found")
+                .record(start.elapsed().as_nanos() as f64);
+            return Err(DataVgError::BlockNotFound);
+        }
+
+        if success_count < read_quorum {
+            histogram!("datavg_get_blob_quorum_nanos", "result" => "quorum_failure")
+                .record(start.elapsed().as_nanos() as f64);
+            return Err(DataVgError::QuorumFailure(format!(
+                "Quorum read failed: {}/{} successful responses (need {})",
+                success_count,
+                available_nodes.len(),
+                read_quorum
+            )));
+        }
+
+        // Compute max_version across successful responses.
+        let mut max_version: u64 = 0;
+        for (_, res) in &responses {
+            if let Ok((_, v)) = res
+                && *v > max_version
+            {
+                max_version = *v;
+            }
+        }
+
+        // Cohort at max_version. Sanity check: same version on
+        // different replicas must agree on body length + content hash.
+        let max_cohort: Vec<&NodeReadResponse> = responses
+            .iter()
+            .filter(|(_, r)| matches!(r, Ok((_, v)) if *v == max_version))
+            .collect();
+
+        if max_cohort.is_empty() {
+            histogram!("datavg_get_blob_quorum_nanos", "result" => "max_cohort_empty")
+                .record(start.elapsed().as_nanos() as f64);
+            return Err(DataVgError::QuorumFailure(
+                "No replica reported max_version (post-filter)".to_string(),
+            ));
+        }
+
+        let (canon_bytes, _) = match &max_cohort[0].1 {
+            Ok(pair) => pair,
+            Err(_) => unreachable!("filter rejected Err"),
+        };
+        let canon_checksum = xxhash_rust::xxh3::xxh3_64(canon_bytes);
+        let canon_len = canon_bytes.len();
+        for (node, r) in max_cohort.iter().skip(1) {
+            if let Ok((b, _)) = r
+                && (b.len() != canon_len || xxhash_rust::xxh3::xxh3_64(b) != canon_checksum)
+            {
+                error!(
+                    "Data divergence at version={} on blob {}:{} (node={}): same version, different bytes",
+                    max_version, blob_id, block_number, node.address
+                );
+                return Err(DataVgError::Corrupted);
+            }
+        }
+
+        // Happy path: max-version cohort meets read quorum.
+        if max_cohort.len() >= read_quorum {
+            histogram!("datavg_get_blob_quorum_nanos", "result" => "quorum_at_max")
+                .record(start.elapsed().as_nanos() as f64);
+            *body = canon_bytes.clone();
+            return Ok(());
+        }
+
+        // Inline-repair: write the max-version bytes back to every
+        // available replica at version=max_version. Lagging replicas
+        // advance via bssOverwriteCheck (new > old -> overwrite);
+        // already-max replicas idempotent-skip.
+        warn!(
+            "get_blob_with_quorum_check: max_cohort {}/{} below read_quorum {} for blob {}:{} (max_version={}); inline-repair",
+            max_cohort.len(),
+            available_nodes.len(),
+            read_quorum,
+            blob_id,
+            block_number,
+            max_version
+        );
+
+        let canon_body = canon_bytes.clone();
+        let write_quorum = match &volume.mode {
+            VolumeMode::Replicated { w, .. } => *w as usize,
+            VolumeMode::ErasureCoded { .. } => unreachable!(),
+        };
+
+        let mut repair_futs = FuturesUnordered::new();
+        for node in available_nodes.iter().cloned() {
+            repair_futs.push(Self::put_blob_to_node(
+                node,
+                blob_guid,
+                block_number,
+                canon_body.clone(),
+                canon_checksum,
+                max_version,
+                self.rpc_timeout,
+                *trace_id,
+            ));
+        }
+
+        let mut repair_ok: usize = 0;
+        while let Some((node, address, result)) = repair_futs.next().await {
+            match result {
+                Ok(()) | Err(RpcError::VersionSkipped) => {
+                    node.record_success();
+                    repair_ok += 1;
+                    debug!("inline-repair write succeeded on {}", address);
+                }
+                Err(e) => {
+                    node.record_failure();
+                    warn!("inline-repair write failed on {}: {}", address, e);
+                }
+            }
+        }
+
+        if repair_ok < write_quorum {
+            histogram!("datavg_get_blob_quorum_nanos", "result" => "repair_quorum_failure")
+                .record(start.elapsed().as_nanos() as f64);
+            return Err(DataVgError::QuorumFailure(format!(
+                "Inline-repair failed to achieve write quorum ({}/{})",
+                repair_ok, write_quorum,
+            )));
+        }
+
+        histogram!("datavg_get_blob_quorum_nanos", "result" => "repaired")
+            .record(start.elapsed().as_nanos() as f64);
+        *body = canon_body;
+        Ok(())
+    }
+
     pub async fn delete_blob(
         &self,
         blob_guid: DataBlobGuid,
@@ -1587,6 +1835,39 @@ impl DataVgProxy {
         body: &mut Bytes,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
+        self.get_blob_ec_impl(blob_guid, block_number, content_len, body, trace_id, false)
+            .await
+    }
+
+    /// Version-aware EC read. Fans out to all k+m shards, prefers
+    /// the max-`BlobMeta.version` cohort for reconstruction, and
+    /// fails with `StaleVersion` if fewer than k shards at
+    /// max_version are available (rather than silently mixing
+    /// versions in the RS decode, which would yield garbage).
+    /// Inline repair of laggers via bss_repair scans; per-read
+    /// repair (re-encoding + writing back lagging shards) is a
+    /// follow-up.
+    async fn get_blob_ec_with_quorum_check(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        content_len: usize,
+        body: &mut Bytes,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        self.get_blob_ec_impl(blob_guid, block_number, content_len, body, trace_id, true)
+            .await
+    }
+
+    async fn get_blob_ec_impl(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        content_len: usize,
+        body: &mut Bytes,
+        trace_id: &TraceId,
+        strict_max_version: bool,
+    ) -> Result<(), DataVgError> {
         let start = Instant::now();
 
         // Empty body: nothing was stored, return empty
@@ -1616,8 +1897,12 @@ impl DataVgProxy {
         let padded_len = ec_padded_len(content_len, k);
         let shard_size = padded_len / k;
 
-        // Fetch the k data shards (indices 0..k) from their rotated nodes
+        // Fetch the k data shards (indices 0..k) from their rotated
+        // nodes. We track the BSS-stamped version per shard alongside
+        // the bytes so the strict_max_version path can reject stale
+        // shards before they reach the RS decoder.
         let mut shard_results: Vec<Option<Vec<u8>>> = vec![None; total];
+        let mut shard_versions: Vec<Option<u64>> = vec![None; total];
         let mut data_shards_received = 0;
         let mut data_shards_not_found = 0usize;
         let mut data_shards_other_err = 0usize;
@@ -1647,9 +1932,10 @@ impl DataVgProxy {
 
         while let Some((shard_idx, node_idx, result)) = fetch_futures.next().await {
             match result {
-                Ok((data, _version)) => {
+                Ok((data, version)) => {
                     ec_vol.bss_nodes[node_idx].record_success();
                     shard_results[shard_idx] = Some(data.to_vec());
+                    shard_versions[shard_idx] = Some(version);
                     data_shards_received += 1;
                 }
                 Err(RpcError::NotFound) => {
@@ -1737,9 +2023,10 @@ impl DataVgProxy {
         let mut parity_shards_other_err = 0usize;
         while let Some((shard_idx, node_idx, result)) = parity_futures.next().await {
             match result {
-                Ok((data, _version)) => {
+                Ok((data, version)) => {
                     ec_vol.bss_nodes[node_idx].record_success();
                     shard_results[shard_idx] = Some(data.to_vec());
+                    shard_versions[shard_idx] = Some(version);
                 }
                 Err(RpcError::NotFound) => {
                     parity_shards_not_found += 1;
@@ -1755,6 +2042,43 @@ impl DataVgProxy {
                         "EC parity shard {} fetch failed from {}: {}",
                         shard_idx, ec_vol.bss_nodes[node_idx].address, e
                     );
+                }
+            }
+        }
+
+        // Strict-max-version filter: reject shards at less than the
+        // observed max version. Mixing versions in an RS decode would
+        // produce garbage; failing loudly is strictly better than
+        // silent corruption. bss_repair scans converge the laggers
+        // asynchronously.
+        if strict_max_version {
+            let max_version = shard_versions.iter().filter_map(|v| *v).max().unwrap_or(0);
+            if max_version > 0 {
+                for (i, ver) in shard_versions.iter().enumerate() {
+                    if let Some(v) = ver
+                        && *v < max_version
+                    {
+                        debug!(
+                            "EC shard {} at version {} dropped (max_version={}); strict_max_version",
+                            i, v, max_version
+                        );
+                        shard_results[i] = None;
+                    }
+                }
+                let max_cohort = shard_versions
+                    .iter()
+                    .filter(|v| matches!(v, Some(x) if *x == max_version))
+                    .count();
+                if max_cohort < k {
+                    histogram!("datavg_get_blob_nanos", "result" => "ec_stale_version")
+                        .record(start.elapsed().as_nanos() as f64);
+                    warn!(
+                        "EC read: only {}/{} shards at max_version={}; need at least {} for decode",
+                        max_cohort, total, max_version, k
+                    );
+                    return Err(DataVgError::StaleVersion {
+                        expected: max_version,
+                    });
                 }
             }
         }

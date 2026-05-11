@@ -805,12 +805,7 @@ impl VfsCore {
         };
 
         // Check if fully cached
-        if !dc.is_complete(
-            blob_guid.blob_id,
-            blob_guid.volume_id,
-            layout.blob_version,
-            file_size,
-        ) {
+        if !dc.is_complete(blob_guid, file_size) {
             return (0, 0);
         }
 
@@ -820,8 +815,7 @@ impl VfsCore {
         };
 
         // Open the cache file and register as backing fd
-        let cache_path =
-            dc.cache_file_path(blob_guid.blob_id, blob_guid.volume_id, layout.blob_version);
+        let cache_path = dc.cache_file_path(blob_guid.blob_id, blob_guid.volume_id);
         let backing_file = match std::fs::File::open(&cache_path) {
             Ok(f) => f,
             Err(e) => {
@@ -884,28 +878,29 @@ impl VfsCore {
         blob_version: u64,
         block_num: u32,
         block_content_len: usize,
-        file_size: u64,
         trace_id: &TraceId,
     ) -> Result<Bytes, FsError> {
-        // Try disk cache
+        // Try disk cache. Same-instance reads under single-writer-per-
+        // inode trust the cache directly; cross-instance staleness is
+        // handled by reconcile_on_open at vfs_open time.
         if let Some(dc) = &self.disk_cache
-            && let Some(cached) = dc
-                .get(
-                    blob_guid.blob_id,
-                    blob_guid.volume_id,
-                    blob_version,
-                    block_num,
-                    file_size,
-                )
-                .await
+            && let Some(cached) = dc.get_block(blob_guid, block_num, block_content_len).await
         {
             return Ok(cached);
         }
 
-        // Cache miss: fetch from backend
-        let (data, checksum) = match self
+        // Cache miss: fetch from backend. The dispatch on blob_version
+        // (fast path at V<=1, fan-out + max-version + inline-repair at
+        // V>1) lives in backend.read_block.
+        let (data, _checksum) = match self
             .backend()
-            .read_block(blob_guid, block_num, block_content_len, trace_id)
+            .read_block(
+                blob_guid,
+                blob_version,
+                block_num,
+                block_content_len,
+                trace_id,
+            )
             .await
         {
             Ok(r) => r,
@@ -916,18 +911,11 @@ impl VfsCore {
             Err(e) => return Err(e),
         };
 
-        // Populate disk cache
+        // Populate disk cache.
         if let Some(dc) = &self.disk_cache {
-            dc.insert(
-                blob_guid.blob_id,
-                blob_guid.volume_id,
-                blob_version,
-                block_num,
-                file_size,
-                &data,
-                checksum,
-            )
-            .await;
+            let _ = dc
+                .insert_block(blob_guid, block_num, blob_version, &data)
+                .await;
         }
 
         Ok(data)
@@ -968,7 +956,6 @@ impl VfsCore {
                     layout.blob_version,
                     block_num,
                     block_content_len,
-                    file_size,
                     &trace_id,
                 )
                 .await?;
@@ -991,7 +978,6 @@ impl VfsCore {
                     layout.blob_version,
                     block_num,
                     block_content_len,
-                    file_size,
                     &trace_id,
                 )
                 .await?;
@@ -1070,7 +1056,6 @@ impl VfsCore {
                             part_obj.blob_version,
                             block_num,
                             block_content_len,
-                            part_size,
                             &trace_id,
                         )
                         .await?;
@@ -1106,21 +1091,14 @@ impl VfsCore {
     async fn read_block_cached_into(
         &self,
         blob_guid: data_types::DataBlobGuid,
-        blob_version: u64,
+        _blob_version: u64,
         block_num: u32,
-        file_size: u64,
+        block_content_len: usize,
         buf: &mut [u8],
     ) -> Option<usize> {
         if let Some(dc) = &self.disk_cache {
-            dc.get_into(
-                blob_guid.blob_id,
-                blob_guid.volume_id,
-                blob_version,
-                block_num,
-                file_size,
-                buf,
-            )
-            .await
+            dc.get_block_into(blob_guid, block_num, block_content_len, buf)
+                .await
         } else {
             None
         }
@@ -1174,7 +1152,7 @@ impl VfsCore {
                         blob_guid,
                         layout.blob_version,
                         block_num,
-                        file_size,
+                        block_content_len,
                         &mut buf[written..written + chunk_len],
                     )
                     .await
@@ -1192,7 +1170,7 @@ impl VfsCore {
                         blob_guid,
                         layout.blob_version,
                         block_num,
-                        file_size,
+                        block_content_len,
                         &mut tmp,
                     )
                     .await
@@ -1218,14 +1196,7 @@ impl VfsCore {
                 let bcl = std::cmp::min(block_size, file_size - bs) as usize;
 
                 let block_data = self
-                    .read_block_cached(
-                        blob_guid,
-                        layout.blob_version,
-                        bn,
-                        bcl,
-                        file_size,
-                        &trace_id,
-                    )
+                    .read_block_cached(blob_guid, layout.blob_version, bn, bcl, &trace_id)
                     .await?;
 
                 let ss = if bn == first_block {
@@ -1274,12 +1245,15 @@ impl VfsCore {
             let existing_blob_guid = wb.existing_blob_guid;
             let blocks = wb.blocks.clone();
             let eof_low_watermark = wb.eof_low_watermark;
+            let committed_blob_version =
+                handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
             drop(handle);
             return self
                 .read_dirty_handle(
                     file_size,
                     block_size,
                     existing_blob_guid,
+                    committed_blob_version,
                     &blocks,
                     eof_low_watermark,
                     offset,
@@ -1321,6 +1295,7 @@ impl VfsCore {
         file_size: u64,
         block_size: u32,
         existing_blob_guid: Option<data_types::DataBlobGuid>,
+        committed_blob_version: u64,
         blocks: &std::collections::BTreeMap<u32, BlockState>,
         eof_low_watermark: Option<u32>,
         offset: u64,
@@ -1373,6 +1348,7 @@ impl VfsCore {
                         // entry), so the committed length matches block_content_len.
                         self.lazy_load_block_for_flush(
                             existing_blob_guid,
+                            committed_blob_version,
                             b,
                             block_content_len,
                             block_content_len,
@@ -1422,6 +1398,7 @@ impl VfsCore {
         &self,
         blob_guid: data_types::DataBlobGuid,
         new_version: u64,
+        committed_blob_version: u64,
         block_size: u32,
         file_size: u64,
         committed_size: u64,
@@ -1596,6 +1573,7 @@ impl VfsCore {
             let existing = self
                 .lazy_load_block_for_flush(
                     Some(blob_guid),
+                    committed_blob_version,
                     last_block,
                     committed_content_len,
                     block_size_usize,
@@ -1617,9 +1595,14 @@ impl VfsCore {
     /// Lazy-load a single block from BSS at flush time. Returns zeros
     /// when the block doesn't exist (sparse-file hole) or when no
     /// existing blob is known. Other failures propagate.
+    ///
+    /// `committed_blob_version` is the file-level blob_version of the
+    /// committed bytes we're loading (pre-flush state), used by
+    /// `backend.read_block` to pick the right read strategy.
     async fn lazy_load_block_for_flush(
         &self,
         existing_blob_guid: Option<data_types::DataBlobGuid>,
+        committed_blob_version: u64,
         block_num: u32,
         committed_content_len: usize,
         fallback_content_len: usize,
@@ -1633,7 +1616,13 @@ impl VfsCore {
         }
         match self
             .backend()
-            .read_block(guid, block_num, committed_content_len, trace_id)
+            .read_block(
+                guid,
+                committed_blob_version,
+                block_num,
+                committed_content_len,
+                trace_id,
+            )
             .await
         {
             Ok((data, _)) => Ok(data),
@@ -1829,6 +1818,56 @@ impl VfsCore {
             }
         }
 
+        // Sync the local disk cache to the writer's just-published
+        // state: rewrites land at their natural offsets, deletes
+        // punch holes, and the file-level authoritative_blob_v in
+        // the cache header advances to match. Under the single-
+        // writer-per-inode policy this is safe to do without any
+        // additional locking — no other instance has a write in
+        // flight on this inode at this moment.
+        //
+        // Best-effort: a sync failure (e.g. ENOSPC) is logged and
+        // does not affect flush durability. The next read on an
+        // affected block cold-fetches from BSS and re-populates.
+        if let Some(dc) = &self.disk_cache
+            && let Ok(final_blob_guid) = layout.blob_guid()
+        {
+            let bsz_u64 = block_size as u64;
+            let rewrites: Vec<(u32, Bytes)> = blocks
+                .iter()
+                .filter_map(|(b, s)| match s {
+                    BlockState::Rewrite(bytes) => Some((*b, bytes.clone())),
+                    _ => None,
+                })
+                .collect();
+
+            let new_bc = file_size.div_ceil(bsz_u64) as u32;
+            let committed_bc = committed_size.div_ceil(bsz_u64) as u32;
+            let trim_lo = eof_low_watermark.map(|w| w.min(new_bc)).unwrap_or(new_bc);
+            let trim_hi = trim_upper.unwrap_or(committed_bc).max(committed_bc);
+
+            let mut deletes: Vec<u32> = (trim_lo..trim_hi)
+                .filter(|b| !matches!(blocks.get(b), Some(BlockState::Rewrite(_))))
+                .collect();
+            for (b, s) in blocks.iter() {
+                if matches!(s, BlockState::Delete) {
+                    deletes.push(*b);
+                }
+            }
+
+            if let Err(e) = dc
+                .sync_after_flush(final_blob_guid, layout.blob_version, &rewrites, &deletes)
+                .await
+            {
+                tracing::warn!(
+                    %final_blob_guid,
+                    blob_version = layout.blob_version,
+                    error = %e,
+                    "disk cache sync_after_flush failed (best-effort, continuing)"
+                );
+            }
+        }
+
         // Update inode table layout
         {
             let handle = self.file_handles.get(&fh_id);
@@ -1907,6 +1946,7 @@ impl VfsCore {
                 self.override_flush_blocks(
                     guid,
                     new_version,
+                    committed_blob_version,
                     block_size,
                     file_size,
                     committed_size,
@@ -2899,7 +2939,13 @@ impl VfsCore {
         // last block of a non-block-aligned shrink needs a synthesized
         // tail-zero `Rewrite`. Releases the DashMap guard before any
         // await; the lazy-load (if any) happens in phase 2.
-        let (block_size, committed_size, existing_blob_guid, tail_zero_target) = {
+        let (
+            block_size,
+            committed_size,
+            existing_blob_guid,
+            committed_blob_version,
+            tail_zero_target,
+        ) = {
             let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
             let block_size = handle
                 .layout
@@ -2912,6 +2958,8 @@ impl VfsCore {
                 .and_then(|l| l.size().ok())
                 .unwrap_or(0);
             let existing_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
+            let committed_blob_version =
+                handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
             let wb = handle.write_buf.get_or_insert_with(|| {
                 WriteBuffer::new(existing_blob_guid, committed_size, block_size)
             });
@@ -2968,6 +3016,7 @@ impl VfsCore {
                 block_size,
                 committed_size,
                 existing_blob_guid,
+                committed_blob_version,
                 tail_zero_target,
             )
         };
@@ -2992,6 +3041,7 @@ impl VfsCore {
                     };
                     self.lazy_load_block_for_flush(
                         existing_blob_guid,
+                        committed_blob_version,
                         last,
                         committed_content_len,
                         bsz_usize,
@@ -3138,12 +3188,33 @@ impl VfsCore {
         // blobs that pre-date parent-inode support, or a transient
         // missing-replica situation, return None and we fall back to
         // layout.size.
+        // Cross-instance staleness reconciliation: if the cache file's
+        // authoritative_blob_v lags the inode's blob_version, another
+        // instance has bumped the version since we last sync'd. Clear
+        // the cache file so subsequent reads cold-fetch from BSS.
+        // Done on every open (read or write) so read-only handles
+        // don't keep serving stale bytes.
+        if let Some(dc) = &self.disk_cache
+            && let Some(ref l) = layout
+            && let Ok(blob_guid) = l.blob_guid()
+            && let Err(e) = dc.reconcile_on_open(blob_guid, l.blob_version).await
+        {
+            tracing::warn!(
+                %blob_guid, error = %e,
+                "disk cache reconcile_on_open failed; continuing"
+            );
+        }
+
         let parent_size = if is_write {
             if let Some(ref l) = layout
                 && let Ok(blob_guid) = l.blob_guid()
             {
                 let trace_id = TraceId::new();
-                match self.backend().read_parent_inode(blob_guid, &trace_id).await {
+                match self
+                    .backend()
+                    .read_parent_inode(blob_guid, l.blob_version, &trace_id)
+                    .await
+                {
                     Ok(Some(meta)) => Some(meta.total_size),
                     Ok(None) => None,
                     Err(e) => {
@@ -3202,7 +3273,7 @@ impl VfsCore {
             && let Some(ref l) = layout
             && let Ok(blob_guid) = l.blob_guid()
         {
-            dc.touch_versioned(blob_guid.blob_id, blob_guid.volume_id, l.blob_version);
+            dc.touch_blob(blob_guid);
         }
 
         // Spawn a whole-blob prefetch when the open-time policy says
@@ -3230,12 +3301,7 @@ impl VfsCore {
                     keep_cache_hint,
                     &self.prefetch_policy,
                 )
-                && !dc.is_complete(
-                    blob_guid.blob_id,
-                    blob_guid.volume_id,
-                    l.blob_version,
-                    file_size,
-                )
+                && !dc.is_complete(blob_guid, file_size)
             {
                 let dc_arc = Arc::clone(dc);
                 let backend_cfg = Arc::clone(&self.backend_config);
@@ -3277,6 +3343,8 @@ impl VfsCore {
             let existing_blob_guid = wb.existing_blob_guid;
             let blocks = wb.blocks.clone();
             let eof_low_watermark = wb.eof_low_watermark;
+            let committed_blob_version =
+                handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
             drop(handle);
             let cap = std::cmp::min(size as u64, file_size.saturating_sub(offset)) as usize;
             let mut buf = vec![0u8; cap];
@@ -3285,6 +3353,7 @@ impl VfsCore {
                     file_size,
                     block_size,
                     existing_blob_guid,
+                    committed_blob_version,
                     &blocks,
                     eof_low_watermark,
                     offset,
@@ -3382,7 +3451,13 @@ impl VfsCore {
         // blob_guid for lazy-loading, current intents) without holding
         // the DashMap guard across awaits. Initialize the buffer in
         // place if missing.
-        let (block_size, existing_blob_guid, committed_size, blocks_to_load) = {
+        let (
+            block_size,
+            existing_blob_guid,
+            committed_size,
+            committed_blob_version,
+            blocks_to_load,
+        ) = {
             let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
             let bsize = handle
                 .layout
@@ -3395,6 +3470,8 @@ impl VfsCore {
                 .and_then(|l| l.size().ok())
                 .unwrap_or(0);
             let layout_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
+            let committed_blob_version =
+                handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
             let wb = handle
                 .write_buf
                 .get_or_insert_with(|| WriteBuffer::new(layout_blob_guid, committed_size, bsize));
@@ -3430,6 +3507,7 @@ impl VfsCore {
                 wb.block_size,
                 wb.existing_blob_guid,
                 committed_size,
+                committed_blob_version,
                 to_load,
             )
         };
@@ -3448,6 +3526,7 @@ impl VfsCore {
             let bytes = self
                 .lazy_load_block_for_flush(
                     existing_blob_guid,
+                    committed_blob_version,
                     b,
                     committed_content_len,
                     block_size as usize,
@@ -3566,7 +3645,7 @@ impl VfsCore {
 
         // Phase 1: snapshot enough state to compute the touched range
         // and decide which blocks need a lazy load for edge zeroing.
-        let (block_size, existing_blob_guid, committed_size, edge_loads) = {
+        let (block_size, existing_blob_guid, committed_size, committed_blob_version, edge_loads) = {
             let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
             let block_size = handle
                 .layout
@@ -3579,6 +3658,8 @@ impl VfsCore {
                 .and_then(|l| l.size().ok())
                 .unwrap_or(0);
             let layout_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
+            let committed_blob_version =
+                handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
             let wb = handle.write_buf.get_or_insert_with(|| {
                 WriteBuffer::new(layout_blob_guid, committed_size, block_size)
             });
@@ -3636,6 +3717,7 @@ impl VfsCore {
                 block_size,
                 wb.existing_blob_guid,
                 committed_size,
+                committed_blob_version,
                 edge_loads,
             )
         };
@@ -3655,6 +3737,7 @@ impl VfsCore {
                 let bytes = self
                     .lazy_load_block_for_flush(
                         existing_blob_guid,
+                        committed_blob_version,
                         b,
                         committed_content_len,
                         block_size as usize,
@@ -3788,6 +3871,7 @@ impl VfsCore {
             file_size_hint,
             block_size,
             existing_blob_guid,
+            layout_blob_version,
             blocks,
             pending_reservations,
             eof_low_watermark,
@@ -3805,11 +3889,13 @@ impl VfsCore {
                 .and_then(|l| l.size().ok())
                 .unwrap_or(0);
             let layout_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
+            let layout_blob_version = handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
             if let Some(ref wb) = handle.write_buf {
                 (
                     wb.file_size,
                     wb.block_size,
                     wb.existing_blob_guid,
+                    layout_blob_version,
                     wb.blocks.clone(),
                     wb.pending_reservations.clone(),
                     wb.eof_low_watermark,
@@ -3820,6 +3906,7 @@ impl VfsCore {
                     layout_size,
                     block_size,
                     layout_blob_guid,
+                    layout_blob_version,
                     std::collections::BTreeMap::new(),
                     std::collections::BTreeSet::new(),
                     None,
@@ -3834,7 +3921,11 @@ impl VfsCore {
         let trace_id = TraceId::new();
         let file_size = if !has_write_buffer {
             if let Some(guid) = existing_blob_guid {
-                match self.backend().read_parent_inode(guid, &trace_id).await {
+                match self
+                    .backend()
+                    .read_parent_inode(guid, layout_blob_version, &trace_id)
+                    .await
+                {
                     Ok(Some(meta)) => meta.total_size,
                     Ok(None) => file_size_hint,
                     Err(e) => {
@@ -5549,21 +5640,21 @@ async fn spawn_prefetch_task(
         // racing read), the cache hit short-circuits the BSS round
         // trip.
         if disk_cache
-            .get(
-                blob_guid.blob_id,
-                blob_guid.volume_id,
-                layout.blob_version,
-                block_num,
-                file_size,
-            )
+            .get_block(blob_guid, block_num, block_content_len)
             .await
             .is_some()
         {
             continue;
         }
 
-        let (data, checksum) = match backend
-            .read_block(blob_guid, block_num, block_content_len, &trace_id)
+        let (data, _checksum) = match backend
+            .read_block(
+                blob_guid,
+                layout.blob_version,
+                block_num,
+                block_content_len,
+                &trace_id,
+            )
             .await
         {
             Ok(r) => r,
@@ -5582,16 +5673,8 @@ async fn spawn_prefetch_task(
             }
         };
 
-        disk_cache
-            .insert(
-                blob_guid.blob_id,
-                blob_guid.volume_id,
-                layout.blob_version,
-                block_num,
-                file_size,
-                &data,
-                checksum,
-            )
+        let _ = disk_cache
+            .insert_block(blob_guid, block_num, layout.blob_version, &data)
             .await;
     }
 }

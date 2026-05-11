@@ -268,17 +268,43 @@ impl StorageBackend {
 
     /// Read a single block from a data blob via DataVgProxy.
     /// Returns `(data, xxh3_64_checksum)`.
+    ///
+    /// `blob_version` is the file-level `ObjectLayout.blob_version` and
+    /// drives the read strategy:
+    ///
+    /// - `<= 1`: never overridden. Only stored version anywhere is 1,
+    ///   so a stale replica returns `BlockNotFound` (the fallback loop
+    ///   handles that) and there are no version-mismatch reads to
+    ///   worry about. Use the existing single-replica fast path.
+    /// - `> 1`: has been overridden at least once. A
+    ///   partition-then-rejoin replica might silently hold pre-bump
+    ///   bytes for blocks the writer last wrote at an earlier version,
+    ///   so dispatch into the fan-out + max-version + inline-repair
+    ///   path. See `DataVgProxy::get_blob_with_quorum_check`.
     pub async fn read_block(
         &self,
         blob_guid: DataBlobGuid,
+        blob_version: u64,
         block_number: u32,
         content_len: usize,
         trace_id: &TraceId,
     ) -> Result<(Bytes, u64), FsError> {
         let mut body = Bytes::new();
-        self.data_vg_proxy
-            .get_blob(blob_guid, block_number, content_len, &mut body, trace_id)
-            .await?;
+        if blob_version <= 1 {
+            self.data_vg_proxy
+                .get_blob(blob_guid, block_number, content_len, &mut body, trace_id)
+                .await?;
+        } else {
+            self.data_vg_proxy
+                .get_blob_with_quorum_check(
+                    blob_guid,
+                    block_number,
+                    content_len,
+                    &mut body,
+                    trace_id,
+                )
+                .await?;
+        }
         let checksum = xxhash_rust::xxh3::xxh3_64(&body);
         Ok((body, checksum))
     }
@@ -646,14 +672,21 @@ impl StorageBackend {
     /// written before parent-inode support, or a transient
     /// missing-replica situation that the regular hole-tolerant read
     /// path treats the same way).
+    ///
+    /// `blob_version` is the file-level `ObjectLayout.blob_version` of
+    /// the inode whose parent record we're fetching; it drives the
+    /// same read-strategy dispatch as ordinary block reads (fast path
+    /// at V<=1, fan-out + max-version + inline-repair at V>1).
     pub async fn read_parent_inode(
         &self,
         blob_guid: DataBlobGuid,
+        blob_version: u64,
         trace_id: &TraceId,
     ) -> Result<Option<ParentInodeMeta>, FsError> {
         match self
             .read_block(
                 blob_guid,
+                blob_version,
                 PARENT_INODE_BLOCK_NUMBER,
                 ParentInodeMeta::WIRE_LEN,
                 trace_id,
