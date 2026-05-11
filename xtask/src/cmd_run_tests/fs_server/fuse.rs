@@ -382,6 +382,14 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
             "Disk Cache Survives Override (stable path + inline metadata)",
             test_disk_cache_survives_override
         );
+        // Skip if fio isn't on PATH — the test is opt-in to the host
+        // tooling rather than a hard dependency on the test fixture.
+        if run_cmd!(bash -c "command -v fio").is_ok() {
+            run_test!(
+                "Disk Cache: qemu-style fio random-write workload",
+                test_qemu_style_fio_workload
+            );
+        }
     }
 
     Ok(())
@@ -2588,6 +2596,111 @@ async fn test_disk_cache_survives_override(disk_cache: bool) -> CmdResult {
     println!(
         "{}",
         "SUCCESS: Disk cache survives override (stable path) passed".green()
+    );
+    Ok(())
+}
+
+/// qemu-style update workload: create a 64 MiB file (a tiny VM disk
+/// image), run a short `fio` random 4 KiB write workload against it,
+/// then verify both content integrity and the cache invariant that
+/// matters for this scheme: there is **one** cache file per blob, and
+/// it survives all the in-place overrides without accumulating any
+/// per-version siblings.
+///
+/// Pre-change behaviour would have produced one cache file per
+/// override-flush bump (every fio iteration that triggers a flush
+/// rolls `blob_version`), so the directory would balloon to N+1 files
+/// where N is the number of override flushes during the run. The
+/// stable-path scheme caps this at 1.
+async fn test_qemu_style_fio_workload(disk_cache: bool) -> CmdResult {
+    assert!(disk_cache, "this test requires disk cache");
+    let (_ctx, bucket) = setup_test_bucket().await;
+    let dc_path = disk_cache_path();
+    let _ = std::fs::remove_dir_all(&dc_path);
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let key = "qemu-style.img";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+
+    println!("  Step 2: Create a 64 MiB seed file (dd from /dev/urandom)");
+    let seed_size: u64 = 64 * 1024 * 1024;
+    run_cmd!(dd if=/dev/urandom of=$fuse_path bs=1M count=64 conv=fsync 2>/dev/null)?;
+    let stat0 = std::fs::metadata(&fuse_path).expect("stat seed");
+    assert_eq!(stat0.len(), seed_size, "seed file size");
+
+    println!("  Step 3: Snapshot pre-fio cache state");
+    let pre_count = std::fs::read_dir(&dc_path)
+        .map(|d| d.filter_map(|e| e.ok()).filter(|e| e.path().is_file()).count())
+        .unwrap_or(0);
+    println!("    pre-fio cache files: {}", pre_count);
+
+    println!("  Step 4: fio random 4 KiB writes for 10s");
+    let fio_output = run_fun!(
+        fio --name=qemu-style --filename=$fuse_path --rw=randwrite --bs=4k
+            --size=64M --iodepth=1 --numjobs=1 --runtime=10 --time_based
+            --minimal 2>&1
+    )?;
+    // The `--minimal` output is one CSV line per job; pick a couple of
+    // numbers out for the log so we have evidence the workload actually
+    // ran (some IOPS, non-zero bytes).
+    let fields: Vec<&str> = fio_output.split(';').collect();
+    if fields.len() > 30 {
+        // Field positions for minimal output are documented in fio(1).
+        // 7 = total bytes written (KB), 8 = bandwidth (KB/s),
+        // 49 = total IO time (msec) — best-effort label.
+        let bytes_written = fields.get(48).copied().unwrap_or("?");
+        let iops = fields.get(49).copied().unwrap_or("?");
+        println!("    fio: writes_KB={} iops_avg={}", bytes_written, iops);
+    } else {
+        println!("    fio: completed (minimal output had {} fields)", fields.len());
+    }
+
+    println!("  Step 5: Sync + verify file size unchanged");
+    run_cmd!(sync $fuse_path 2>/dev/null)?;
+    let stat1 = std::fs::metadata(&fuse_path).expect("stat post-fio");
+    assert_eq!(
+        stat1.len(),
+        seed_size,
+        "file size must be stable across the random-write workload"
+    );
+
+    println!("  Step 6: Read every block back and assert population");
+    let bytes = std::fs::read(&fuse_path).expect("read post-fio");
+    assert_eq!(bytes.len(), seed_size as usize, "read length");
+    let nonzero = bytes
+        .chunks(4096)
+        .filter(|b| b.iter().any(|&v| v != 0))
+        .count();
+    assert!(
+        nonzero > 1000,
+        "expected most 4 KiB blocks populated, got {}",
+        nonzero
+    );
+
+    println!("  Step 7: Cache stability — exactly one file per blob (stable-path invariant)");
+    let post_files: Vec<_> = std::fs::read_dir(&dc_path)
+        .expect("read disk cache dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    println!("    post-fio cache files: {:?}", post_files);
+    let result = if post_files.len() == 1 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "expected exactly 1 cache file under stable-path scheme; got {} ({:?})",
+            post_files.len(),
+            post_files,
+        )))
+    };
+    unmount_fuse()?;
+    result?;
+
+    println!(
+        "{}",
+        "SUCCESS: qemu-style fio workload + stable-path cache invariant".green()
     );
     Ok(())
 }
