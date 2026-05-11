@@ -640,7 +640,9 @@ fn generate_ec_volume_group_config(bss_count: u32) -> String {
 pub fn generate_bss_data_vg_config(bss_count: u32) -> String {
     match bss_count {
         1 => generate_data_vg_replicated_config(1, 1, 1, 1),
-        // 3-node clusters mirror deployment: replicated n=3, r=2, w=2
+        // 3 nodes, single replicated volume (N=3, R=W=2). Exercises the
+        // version-aware fan-out + inline-repair read path on a real
+        // multi-replica setup.
         3 => generate_data_vg_replicated_config(3, 3, 2, 2),
         6 => generate_ec_volume_group_config(6),
         _ => generate_data_vg_replicated_config(1, 1, 1, 1),
@@ -687,7 +689,8 @@ pub fn generate_bss_metadata_vg_config(bss_count: u32) -> String {
 
     match bss_count {
         1 => generate_metadata_vg_config(1, 1, 1, 1),
-        // 3-node clusters mirror deployment: replicated n=3, r=2, w=2
+        // 3 nodes, single metadata volume (N=3, R=W=2). Matches the
+        // 3-replica data vg topology above.
         3 => generate_metadata_vg_config(3, 3, 2, 2),
         6 => generate_metadata_vg_config(
             6,

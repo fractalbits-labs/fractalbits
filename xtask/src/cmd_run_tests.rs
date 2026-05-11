@@ -71,6 +71,10 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
     let test_fs_server = |disk_cache: bool| async move {
         fs_server::build_fs_server()?;
         fs_server::ensure_fuse_uring()?;
+
+        // Phase A: EC (k=4, m=2, 6 nodes). The bulk of the FUSE
+        // suite runs here; it's the default storage topology for the
+        // fs_server end-to-end tests.
         cmd_service::init_service(
             ServiceName::All,
             BuildMode::Debug,
@@ -81,11 +85,35 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
             },
         )?;
         cmd_service::start_service(ServiceName::All)?;
-        let result = fs_server::run_fs_server_tests(disk_cache).await;
+        let result_ec = fs_server::run_fs_server_tests(disk_cache, false).await;
         let _ = cmd_service::stop_service(ServiceName::FsServer);
         run_cmd! { ignore pkill -x fs_server 2>/dev/null; }?;
         cmd_service::stop_service(ServiceName::All)?;
-        result
+        result_ec?;
+
+        // Phase B: 3-replica replicated (N=3, R=W=2). Exercises the
+        // version-aware fan-out + inline-repair read path on a real
+        // multi-replica topology -- the partition-rejoin scenario
+        // (stop a node, override-flush, restart, read) is impossible
+        // to observe on the single-node default and pointless on EC
+        // (k+m shards survive a single drop via parity).
+        cmd_service::init_service(
+            ServiceName::All,
+            BuildMode::Debug,
+            &InitConfig {
+                data_blob_storage: DataBlobStorage::AllInBssSingleAz,
+                bss_count: 3,
+                ..Default::default()
+            },
+        )?;
+        cmd_service::start_service(ServiceName::All)?;
+        let result_3r = fs_server::run_fs_server_tests(disk_cache, true).await;
+        let _ = cmd_service::stop_service(ServiceName::FsServer);
+        run_cmd! { ignore pkill -x fs_server 2>/dev/null; }?;
+        cmd_service::stop_service(ServiceName::All)?;
+        result_3r?;
+
+        Ok(())
     };
 
     let test_nss_failover = |backend: RssBackend| async move {

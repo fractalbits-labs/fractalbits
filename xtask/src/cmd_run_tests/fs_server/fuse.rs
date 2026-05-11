@@ -178,6 +178,32 @@ fn stop_second_fuse(mut child: Child) {
     let _ = child.wait();
 }
 
+/// Entry point used by the 3-replica phase. Skips the broader FUSE
+/// suite and runs only the partition-rejoin regression -- a test
+/// that needs a real multi-replica topology to be observable.
+pub async fn run_partition_rejoin_test_only(disk_cache: bool) -> CmdResult {
+    info!("Running 3-replica partition-rejoin regression...");
+    println!(
+        "\n{}",
+        ">>> 3-replica phase: partition-rejoin only <<<".bold()
+    );
+    let dc_label = if disk_cache { " [disk-cache]" } else { "" };
+    println!(
+        "\n{}",
+        format!(
+            "=== Test: Override Survives BSS Partition-Rejoin{} ===",
+            dc_label
+        )
+        .bold()
+    );
+    test_override_survives_bss_partition_rejoin(disk_cache).await?;
+    println!(
+        "\n{}",
+        "=== 3-replica partition-rejoin PASSED ===".green().bold()
+    );
+    Ok(())
+}
+
 pub async fn run_fuse_tests_with_disk_cache(disk_cache_only: bool) -> CmdResult {
     info!("Running FUSE integration tests...");
 
@@ -2631,7 +2657,11 @@ async fn test_qemu_style_fio_workload(disk_cache: bool) -> CmdResult {
 
     println!("  Step 3: Snapshot pre-fio cache state");
     let pre_count = std::fs::read_dir(&dc_path)
-        .map(|d| d.filter_map(|e| e.ok()).filter(|e| e.path().is_file()).count())
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .count()
+        })
         .unwrap_or(0);
     println!("    pre-fio cache files: {}", pre_count);
 
@@ -2653,7 +2683,10 @@ async fn test_qemu_style_fio_workload(disk_cache: bool) -> CmdResult {
         let iops = fields.get(49).copied().unwrap_or("?");
         println!("    fio: writes_KB={} iops_avg={}", bytes_written, iops);
     } else {
-        println!("    fio: completed (minimal output had {} fields)", fields.len());
+        println!(
+            "    fio: completed (minimal output had {} fields)",
+            fields.len()
+        );
     }
 
     println!("  Step 5: Sync + verify file size unchanged");
@@ -2701,6 +2734,106 @@ async fn test_qemu_style_fio_workload(disk_cache: bool) -> CmdResult {
     println!(
         "{}",
         "SUCCESS: qemu-style fio workload + stable-path cache invariant".green()
+    );
+    Ok(())
+}
+
+/// Partition-rejoin regression. Exercises
+/// `DataVgProxy::get_blob_with_quorum_check` against a real
+/// 3-replica replicated volume:
+///
+/// 1. Create a file at V=1 (all 3 replicas in sync), fsync to drain
+///    the writeback queue to BSS.
+/// 2. Stop one BSS node (out of 3); the surviving 2 still satisfy
+///    write_quorum=2.
+/// 3. Override-flush the file at V=2; the 2 available nodes accept
+///    the new bytes, the stopped node retains its V=1 shard.
+/// 4. Restart the stopped node. It rejoins with stale V=1 bytes for
+///    the rewritten blocks.
+/// 5. Wipe the local disk cache (if enabled) so the read actually
+///    hits BSS, and read the file back.
+///
+/// Pre-fix behaviour: `get_blob` picks a random replica and trusts
+/// it. A 1/3 chance per read of returning the stale V=1 bytes from
+/// the rejoined node.
+///
+/// Post-fix behaviour: `get_blob_with_quorum_check` fans out to all
+/// 3 replicas, picks the max-version cohort (the two V=2 nodes),
+/// returns those bytes, and inline-repairs the lagging node by
+/// pushing V=2 bytes back. The test asserts the post-rejoin read
+/// returns the V=2 content.
+async fn test_override_survives_bss_partition_rejoin(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    let key = "partition-rejoin.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+
+    println!("  Step 1: Mount RW, create a 256 KiB file at V=1, fsync to drain to BSS");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let v1 = generate_test_data("partition-rejoin-v1", 256 * 1024);
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&fuse_path)
+            .expect("open for v1");
+        f.write_all(&v1).expect("write_all v1");
+        // sync_all forces the writeback flush to land in NSS+BSS
+        // before we stop node 0 in Step 2. std::fs::write does not
+        // fsync, and default-mode release-flush is async (a spawned
+        // task) that would be killed by the upcoming unmount.
+        f.sync_all().expect("sync_all v1");
+    }
+    let meta = std::fs::metadata(&fuse_path).expect("stat v1");
+    assert_eq!(meta.len(), v1.len() as u64, "v1 file_size after release");
+    unmount_fuse()?;
+
+    println!("  Step 2: Stop BSS node 0 (one of 3 replicas)");
+    run_cmd!(systemctl --user stop bss@0.service)?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    println!("  Step 3: Remount and override-flush at V=2 with node 0 down");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let v2 = generate_test_data("partition-rejoin-v2", 256 * 1024);
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&fuse_path)
+            .expect("open for override-write");
+        f.write_all(&v2).expect("write_all v2");
+        f.sync_all().expect("sync_all v2");
+    }
+    unmount_fuse()?;
+
+    println!("  Step 4: Restart BSS node 0 (rejoins with stale V=1 bytes)");
+    run_cmd!(systemctl --user start bss@0.service)?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    if disk_cache {
+        println!("  Step 5: Wipe the disk cache so reads actually hit BSS");
+        let _ = std::fs::remove_dir_all(disk_cache_path());
+    }
+
+    println!(
+        "  Step 6: Remount read-only and read; expect V=2 bytes regardless of which replica answers"
+    );
+    mount_fuse_ro(&bucket, disk_cache)?;
+    let post = std::fs::read(&fuse_path).expect("Failed post-rejoin read");
+    let read_ok = post == v2;
+    unmount_fuse()?;
+    if !read_ok {
+        return Err(std::io::Error::other(
+            "stale-replica regression: post-rejoin read did not return V=2 content",
+        ));
+    }
+
+    println!(
+        "{}",
+        "SUCCESS: Override survives BSS partition-rejoin (3-replica fan-out + inline-repair)"
+            .green()
     );
     Ok(())
 }

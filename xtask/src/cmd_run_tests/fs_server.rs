@@ -8,9 +8,13 @@ use test_common::*;
 pub const MOUNT_POINT: &str = "/tmp/fs_server_test";
 const BUCKET_NAME: &str = "test-file-server";
 
-pub async fn run_fs_server_tests(disk_cache: bool) -> CmdResult {
+pub async fn run_fs_server_tests(disk_cache: bool, partition_rejoin_only: bool) -> CmdResult {
     info!("Running fs_server integration tests...");
-    fuse::run_fuse_tests_with_disk_cache(disk_cache).await
+    if partition_rejoin_only {
+        fuse::run_partition_rejoin_test_only(disk_cache).await
+    } else {
+        fuse::run_fuse_tests_with_disk_cache(disk_cache).await
+    }
 }
 
 /// Build the fs_server binary using isolated COMPIO_TARGET_DIR
