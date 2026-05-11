@@ -1967,8 +1967,11 @@ impl DataVgProxy {
             return Err(DataVgError::BlockNotFound);
         }
 
-        if data_shards_received == k {
-            // All data shards received, concatenate directly (no RS decode needed)
+        if data_shards_received == k && !strict_max_version {
+            // All data shards received, concatenate directly (no RS decode needed).
+            // strict_max_version goes through the parity-aware path
+            // below so we can check parity versions and inline-repair
+            // any stale parity shards too.
             let mut result_data = Vec::new();
             for shard in shard_results.iter().take(k) {
                 result_data.extend_from_slice(shard.as_ref().unwrap());
@@ -2051,8 +2054,12 @@ impl DataVgProxy {
         // produce garbage; failing loudly is strictly better than
         // silent corruption. bss_repair scans converge the laggers
         // asynchronously.
+        // Computed for the strict_max_version path; visible to the
+        // inline-repair tail below so it can stamp shard writes at
+        // the right version.
+        let mut max_version: u64 = 0;
         if strict_max_version {
-            let max_version = shard_versions.iter().filter_map(|v| *v).max().unwrap_or(0);
+            max_version = shard_versions.iter().filter_map(|v| *v).max().unwrap_or(0);
             if max_version > 0 {
                 for (i, ver) in shard_versions.iter().enumerate() {
                     if let Some(v) = ver
@@ -2133,7 +2140,10 @@ impl DataVgProxy {
         let restored_original = rs_decode(k, m, original_shards, recovery_shards)
             .map_err(|e| DataVgError::Internal(format!("RS reconstruct failed: {}", e)))?;
 
-        // Concatenate data shards
+        // Concatenate data shards (padded; truncated to content_len
+        // before being handed to the caller). We keep the un-truncated
+        // form around so the inline-repair tail below can re-encode
+        // parity from it without reconstructing the padding.
         let mut result_data = Vec::with_capacity(k * shard_size);
         for (index, shard) in shards_for_rs.iter().take(k).enumerate() {
             if let Some(shard) = shard {
@@ -2147,8 +2157,75 @@ impl DataVgProxy {
                 )));
             }
         }
+        let padded_body = result_data.clone();
         result_data.truncate(content_len);
         *body = Bytes::from(result_data);
+
+        // EC inline-repair (strict_max_version only): if any shard
+        // came back at a version below `max_version`, re-encode the
+        // padded body into k+m shards and push the freshened bytes
+        // to those lagging shards' nodes at `version=max_version`.
+        // bssOverwriteCheck advances the lagger; the already-current
+        // shards idempotent-skip. Best-effort — we log failures and
+        // proceed; bss_repair scans converge anything we miss.
+        if strict_max_version {
+            let stale_indices: Vec<usize> = shard_versions
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| match v {
+                    Some(ver) if *ver < max_version => Some(i),
+                    _ => None,
+                })
+                .collect();
+            if !stale_indices.is_empty() && max_version > 0 {
+                // Re-split the padded body into k data shards, then
+                // run RS encode for parity. This mirrors put_blob_ec
+                // exactly so the shard layout matches what BSS
+                // already has at max_version.
+                let mut data_shards: Vec<Vec<u8>> = Vec::with_capacity(k);
+                for i in 0..k {
+                    data_shards.push(padded_body[i * shard_size..(i + 1) * shard_size].to_vec());
+                }
+                let parity = rs_encode(k, m, &data_shards)
+                    .map_err(|e| DataVgError::Internal(format!("RS encode failed: {}", e)))?;
+                let mut all_shards: Vec<Vec<u8>> = Vec::with_capacity(total);
+                all_shards.extend(data_shards);
+                all_shards.extend(parity);
+
+                let mut repair_futs = FuturesUnordered::new();
+                for shard_idx in stale_indices {
+                    let node_idx = (shard_idx + rotation) % total;
+                    if !ec_vol.bss_nodes[node_idx].is_available() {
+                        continue;
+                    }
+                    let node = ec_vol.bss_nodes[node_idx].clone();
+                    let shard_data = Bytes::from(all_shards[shard_idx].clone());
+                    let checksum = xxhash_rust::xxh3::xxh3_64(&shard_data);
+                    repair_futs.push(Self::put_blob_to_node(
+                        node,
+                        blob_guid,
+                        block_number,
+                        shard_data,
+                        checksum,
+                        max_version,
+                        self.rpc_timeout,
+                        *trace_id,
+                    ));
+                }
+                while let Some((node, address, result)) = repair_futs.next().await {
+                    match result {
+                        Ok(()) | Err(RpcError::VersionSkipped) => {
+                            node.record_success();
+                            debug!("EC inline-repair: shard write succeeded on {}", address);
+                        }
+                        Err(e) => {
+                            node.record_failure();
+                            warn!("EC inline-repair: shard write failed on {}: {}", address, e);
+                        }
+                    }
+                }
+            }
+        }
 
         histogram!("datavg_get_blob_nanos", "result" => "ec_degraded_success")
             .record(start.elapsed().as_nanos() as f64);
