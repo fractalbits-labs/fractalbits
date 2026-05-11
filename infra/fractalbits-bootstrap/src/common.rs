@@ -26,7 +26,6 @@ pub const BOOTSTRAP_CLUSTER_CONFIG: &str = "bootstrap_cluster.toml";
 pub const BOOTSTRAP_DONE_FILE: &str = "/opt/fractalbits/.bootstrap_done";
 pub const DDB_SERVICE_DISCOVERY_TABLE: &str = "fractalbits-service-discovery";
 pub const NETWORK_TUNING_SYS_CONFIG: &str = "99-network-tuning.conf";
-pub const STORAGE_TUNING_SYS_CONFIG: &str = "99-storage-tuning.conf";
 
 // DDB Service Discovery Keys
 pub const BSS_DATA_VG_CONFIG_KEY: &str = "bss-data-vg-config";
@@ -61,7 +60,6 @@ impl OsType {
 
 pub fn common_setup(target: DeployTarget) -> CmdResult {
     create_network_tuning_sysctl_file()?;
-    create_storage_tuning_sysctl_file()?;
     let os = OsType::detect();
     let perf_pkg = match os {
         OsType::Ubuntu => "linux-tools-generic",
@@ -609,36 +607,6 @@ net.core.default_qdisc = fq
         mkdir -p $ETC_PATH;
         echo $content > $ETC_PATH/$NETWORK_TUNING_SYS_CONFIG;
         ln -nsf $ETC_PATH/$NETWORK_TUNING_SYS_CONFIG /etc/sysctl.d/;
-        sysctl --system --quiet &> /dev/null;
-
-    }?;
-    Ok(())
-}
-
-fn create_storage_tuning_sysctl_file() -> CmdResult {
-    let content = r##"# Should be a symlink file in /etc/sysctl.d
-# VFS cache tuning for directory-heavy blob storage workloads
-# Keep directory/inode caches longer (default: 100, lower = keep longer)
-vm.vfs_cache_pressure = 10
-# Start async writeback earlier for predictable write latency (default: 10)
-vm.dirty_background_ratio = 5
-# Limit max dirty pages to prevent large flush stalls (default: 20)
-vm.dirty_ratio = 10
-# Reduce swapping to keep more file cache in memory (default: 60)
-vm.swappiness = 10
-# Disable periodic dirty-inode (lazytime timestamp) writeback.
-# With lazytime mount option, timestamps are only written to the journal when
-# the inode is flushed for another reason (e.g. fsync, data write), eliminating
-# journal commits that exist solely to record atime/mtime/ctime.
-# Requires kernel >= 6.19 (https://lkml.org/lkml/2026/1/2/673).
-#vm.dirtytime_expire_seconds = 0
-"##;
-
-    run_cmd! {
-        info "Applying storage tuning configs";
-        mkdir -p $ETC_PATH;
-        echo $content > $ETC_PATH/$STORAGE_TUNING_SYS_CONFIG;
-        ln -nsf $ETC_PATH/$STORAGE_TUNING_SYS_CONFIG /etc/sysctl.d/;
         sysctl --system --quiet &> /dev/null;
 
     }?;
