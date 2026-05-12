@@ -166,7 +166,7 @@ impl Orchestrator {
 
         info!("Formatting BSS storage at {:?}", working_dir);
         run_cmd! {
-            WORKING_DIR=$working_dir $bss_bin format --storage-alloc-mode sparse;
+            WORKING_DIR=$working_dir $bss_bin format --storage-alloc-mode sparse --storage-path $storage_file;
         }?;
 
         Ok(())
