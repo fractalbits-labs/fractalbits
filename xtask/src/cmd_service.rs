@@ -1682,11 +1682,18 @@ pub fn format_bss_instance(id: u32, build_mode: BuildMode) -> CmdResult {
     let format_log = "data/logs/bss_format.log";
     let working_dir = format!("data/bss{id}");
     let port = 8088 + id;
+
+    // Default to file mode with absolute path; allow override via BSS_STORAGE_PATH for
+    // device mode (e.g., /dev/disk/by-uuid/{uuid}).
+    let pwd = run_fun!(pwd)?;
+    let default_storage_path = format!("{pwd}/{working_dir}/local/storage/blobs.storage");
+    let storage_path = std::env::var("BSS_STORAGE_PATH").unwrap_or(default_storage_path);
+
     run_cmd! {
-        info "formatting bss_server instance $id";
+        info "formatting bss_server instance $id (storage_path=$storage_path)";
         WORKING_DIR=$working_dir
         SERVER_PORT=$port
-        $bss_binary format --storage-alloc-mode sparse |& ts -m $TS_FMT >>$format_log;
+        $bss_binary format --storage-alloc-mode sparse --storage-path $storage_path |& ts -m $TS_FMT >>$format_log;
     }?;
     Ok(())
 }
