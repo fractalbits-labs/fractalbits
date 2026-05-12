@@ -172,28 +172,6 @@ pub enum JournalType {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 #[clap(rename_all = "snake_case")]
-pub enum BssStorageAllocMode {
-    Sparse,
-    ReserveSpace,
-    #[default]
-    WriteZero,
-}
-
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    Default,
-    strum::AsRefStr,
-    clap::ValueEnum,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-#[clap(rename_all = "snake_case")]
 pub enum DataBlobStorage {
     #[default]
     AllInBssSingleAz,
@@ -302,14 +280,6 @@ pub struct ClusterGlobalConfig {
     /// Replaces per-node journal_uuid in NodeEntry for cloud deployments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_uuid: Option<String>,
-    #[serde(default)]
-    pub bss_storage_alloc_mode: BssStorageAllocMode,
-    #[serde(default = "default_bss_storage_write_zero_pct")]
-    pub bss_storage_write_zero_pct: u8,
-}
-
-fn default_bss_storage_write_zero_pct() -> u8 {
-    100
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

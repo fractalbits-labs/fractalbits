@@ -294,94 +294,24 @@ pub fn get_private_ip_from_config(config: &BootstrapConfig, instance_id: &str) -
     get_private_ip(config.global.deploy_target)
 }
 
-// https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/storage-twp.html
-pub fn format_local_nvme_disks(support_storage_twp: bool) -> CmdResult {
-    let nvme_disks = run_fun! {
-        nvme list | grep -v "Amazon Elastic Block Store" | grep -v "nvme_card-pd"
-            | awk r##"/nvme[0-9]n[0-9]/ {print $1}"##
-    }?;
-    let nvme_disks: &Vec<&str> = &nvme_disks.split("\n").collect();
-    let num_nvme_disks = nvme_disks.len();
-    if num_nvme_disks == 0 {
-        cmd_die!("Could not find any nvme disks");
-    }
-    if support_storage_twp {
-        assert_eq!(1, num_nvme_disks);
-    }
+const DATA_LOCAL_MNT: &str = "/data/local";
+const DATA_PARTITION_PERCENT: u32 = 90;
 
-    let mut fs_type = std::env::var("NVME_FS_TYPE").unwrap_or_else(|_| "ext4".to_string());
-    if num_nvme_disks == 1 {
-        if support_storage_twp {
-            fs_type = "ext4".to_string();
-        };
-
-        match fs_type.as_str() {
-            "ext4" => {
-                run_cmd! {
-                    info "Creating ext4 on local nvme disks: ${nvme_disks:?}";
-                    mkfs.ext4 -F -m 0 -T largefile4
-                        -E lazy_itable_init=0,lazy_journal_init=0
-                        -O extent,flex_bg $[nvme_disks] &>/dev/null;
-                }?;
-            }
-            "xfs" => {
-                run_cmd! {
-                    info "Creating XFS on local nvme disks: ${nvme_disks:?}";
-                    mkfs.xfs -f -q -b size=8192 $[nvme_disks];
-                }?;
-            }
-            _ => {
-                return Err(Error::other(format!(
-                    "Unsupported filesystem type: {fs_type}"
-                )));
-            }
-        }
-
-        let uuid = run_fun!(blkid -s UUID -o value $[nvme_disks])?;
-        create_mount_unit(
-            &format!("/dev/disk/by-uuid/{uuid}"),
-            DATA_LOCAL_MNT,
-            &fs_type,
-        )?;
-
-        run_cmd! {
-            info "Mounting $DATA_LOCAL_MNT via systemd with optimized options";
-            mkdir -p $DATA_LOCAL_MNT;
-            systemctl daemon-reload;
-            systemctl start data-local.mount;
-        }?;
-
-        return Ok(());
-    }
-
-    const DATA_LOCAL_MNT: &str = "/data/local";
-
-    run_cmd! {
-        info "Zeroing superblocks";
-        mdadm -q --zero-superblock $[nvme_disks];
-
-        info "Creating md0";
-        mdadm -q --create /dev/md0 --level=0 --raid-devices=${num_nvme_disks} $[nvme_disks];
-
-        info "Updating /etc/mdadm/mdadm.conf";
-        mkdir -p /etc/mdadm;
-        mdadm --detail --scan > /etc/mdadm/mdadm.conf;
-    }?;
-
-    match fs_type.as_str() {
+/// Format a partition/block device with the given filesystem type (ext4 or xfs).
+fn format_partition_with_fs(partition: &str, fs_type: &str) -> CmdResult {
+    match fs_type {
         "ext4" => {
-            let stripe_width = num_nvme_disks * 128;
             run_cmd! {
-                info "Creating ext4 on /dev/md0";
+                info "Formatting $partition with ext4";
                 mkfs.ext4 -F -m 0 -T largefile4
-                    -E lazy_itable_init=0,lazy_journal_init=0,stride=128,stripe_width=${stripe_width}
-                    -O extent,flex_bg /dev/md0 &>/dev/null;
+                    -E lazy_itable_init=0,lazy_journal_init=0
+                    -O extent,flex_bg $partition &>/dev/null;
             }?;
         }
         "xfs" => {
             run_cmd! {
-                info "Creating XFS on /dev/md0";
-                mkfs.xfs -q -b size=8192 -d su=1m,sw=1 /dev/md0;
+                info "Formatting $partition with xfs";
+                mkfs.xfs -f -q -b size=8192 $partition;
             }?;
         }
         _ => {
@@ -390,26 +320,96 @@ pub fn format_local_nvme_disks(support_storage_twp: bool) -> CmdResult {
             )));
         }
     }
+    Ok(())
+}
 
+/// Setup NVMe for raw device mode:
+/// - Single disk: partition /dev/nvme0n1 -> nvme0n1p1 (data 90%), nvme0n1p2 (metadata 10%)
+/// - Multiple disks: create RAID0 md0, then partition -> md0p1 (data), md0p2 (metadata)
+///
+/// Returns the UUID-based path for the data partition.
+pub fn setup_nvme_for_raw_device() -> Result<String, Error> {
+    let nvme_disks = run_fun! {
+        nvme list | grep -v "Amazon Elastic Block Store" | grep -v "nvme_card-pd"
+            | awk r##"/nvme[0-9]n[0-9]/ {print $1}"##
+    }?;
+    let nvme_disks: Vec<&str> = nvme_disks.split('\n').filter(|s| !s.is_empty()).collect();
+    let num_nvme_disks = nvme_disks.len();
+    if num_nvme_disks == 0 {
+        return Err(Error::other("No NVMe disks found"));
+    }
+
+    let nvme_disks = &nvme_disks;
+    let base_device = if num_nvme_disks == 1 {
+        nvme_disks[0].to_string()
+    } else {
+        // Multiple disks: create RAID0 first
+        run_cmd! {
+            info "Zeroing superblocks for RAID0";
+            mdadm -q --zero-superblock $[nvme_disks];
+
+            info "Creating md0 RAID0 with $num_nvme_disks disks";
+            mdadm -q --create /dev/md0 --level=0 --raid-devices=${num_nvme_disks} $[nvme_disks];
+
+            info "Updating /etc/mdadm/mdadm.conf";
+            mkdir -p /etc/mdadm;
+            mdadm --detail --scan > /etc/mdadm/mdadm.conf;
+        }?;
+        "/dev/md0".to_string()
+    };
+
+    // Partition the device
     run_cmd! {
-        info "Creating mount point directory";
-        mkdir -p $DATA_LOCAL_MNT;
+        info "Creating GPT partition table on $base_device";
+        parted -s $base_device mklabel gpt;
+
+        // Partition 1: 0% to 90% for raw data
+        parted -s $base_device mkpart primary 0% ${DATA_PARTITION_PERCENT}%;
+
+        // Partition 2: 90% to 100% for filesystem (metadata)
+        parted -s $base_device mkpart primary ${DATA_PARTITION_PERCENT}% 100%;
+
+        udevadm settle;
     }?;
 
-    let md0_uuid = run_fun!(blkid -s UUID -o value /dev/md0)?;
+    // Determine partition names
+    let data_partition = format!("{}p1", base_device);
+    let metadata_partition = format!("{}p2", base_device);
+
+    // Format metadata partition
+    let fs_type = std::env::var("NVME_FS_TYPE").unwrap_or_else(|_| "xfs".to_string());
+    format_partition_with_fs(&metadata_partition, &fs_type)?;
+
+    // Wait for udev to populate /dev/disk/by-uuid/ symlink for the freshly-mkfs'd partition.
+    run_cmd!(udevadm settle)?;
+
+    // Data partition is raw (no filesystem), so use PARTUUID; metadata uses filesystem UUID.
+    let data_partuuid = run_fun!(blkid -s PARTUUID -o value $data_partition)?;
+    let metadata_uuid = run_fun!(blkid -s UUID -o value $metadata_partition)?;
+
+    // Create mount unit for metadata partition
     create_mount_unit(
-        &format!("/dev/disk/by-uuid/{md0_uuid}"),
+        &format!("/dev/disk/by-uuid/{}", metadata_uuid.trim()),
         DATA_LOCAL_MNT,
         &fs_type,
     )?;
 
     run_cmd! {
-        info "Mounting $DATA_LOCAL_MNT via systemd with optimized options";
+        mkdir -p $DATA_LOCAL_MNT;
         systemctl daemon-reload;
         systemctl start data-local.mount;
     }?;
 
-    Ok(())
+    let data_path_by_uuid = format!("/dev/disk/by-partuuid/{}", data_partuuid.trim());
+    info!(
+        "Raw device setup: data={} ({}%), metadata={}p2 ({}%)",
+        data_path_by_uuid,
+        DATA_PARTITION_PERCENT,
+        base_device,
+        100 - DATA_PARTITION_PERCENT
+    );
+
+    Ok(data_path_by_uuid)
 }
 
 pub fn create_mount_unit(what: &str, mount_point: &str, fs_type: &str) -> CmdResult {

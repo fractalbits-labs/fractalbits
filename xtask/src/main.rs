@@ -18,7 +18,7 @@ use cmd_build::BuildMode;
 use cmd_lib::*;
 use strum::{AsRefStr, EnumString};
 use xtask_common::DeployTarget;
-pub use xtask_common::{BssStorageAllocMode, DataBlobStorage, DeployOS, JournalType, RssBackend};
+pub use xtask_common::{DataBlobStorage, DeployOS, JournalType, RssBackend};
 
 pub const TS_FMT: &str = "%b %d %H:%M:%.S";
 // Need to match with api_server's default config to make authentication work
@@ -356,22 +356,6 @@ pub enum DeployCommand {
             long_help = "GCP zone (overrides GCP_ZONE env var, default: us-central1-a)"
         )]
         gcp_zone: Option<String>,
-
-        #[clap(
-            long,
-            value_enum,
-            long_help = "BSS storage allocation mode (sparse, reserve_space, write_zero)",
-            default_value = "write_zero"
-        )]
-        bss_storage_alloc_mode: BssStorageAllocMode,
-
-        #[clap(
-            long,
-            long_help = "Percentage of BSS storage device to write zeros (0-100), only used when --bss-storage-alloc-mode=write_zero. Reduce for benchmarking to save format time.",
-            default_value = "100",
-            value_parser = clap::value_parser!(u8).range(0..=100)
-        )]
-        bss_storage_write_zero_pct: u8,
     },
 
     #[clap(about = "Destroy VPC infrastructure (including s3 builds bucket cleanup)")]
@@ -861,8 +845,6 @@ async fn main() -> CmdResult {
                 deploy_os,
                 gcp_project,
                 gcp_zone,
-                bss_storage_alloc_mode,
-                bss_storage_write_zero_pct,
             } => {
                 let vpc_config = cmd_deploy::VpcConfig {
                     template,
@@ -883,8 +865,6 @@ async fn main() -> CmdResult {
                     deploy_os,
                     gcp_project,
                     gcp_zone,
-                    bss_storage_alloc_mode,
-                    bss_storage_write_zero_pct,
                 };
                 match target {
                     CloudProvider::Aws => cmd_deploy::aws::create_vpc(vpc_config)?,

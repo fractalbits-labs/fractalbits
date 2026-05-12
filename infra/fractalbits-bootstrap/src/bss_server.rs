@@ -10,7 +10,6 @@ use xtask_common::stages::{
 
 const BLOB_DRAM_MEM_PERCENT: f64 = 0.8;
 const FA_JOURNAL_SEGMENT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
-const FLAG_STORAGE_SIZE_PERCENT: f64 = 0.9;
 
 struct BssConfiguredStage;
 
@@ -76,8 +75,10 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
     let meta_stack_testing = config.global.meta_stack_testing;
     let use_etcd = config.is_etcd_backend();
 
-    install_packages(&["nvme-cli", "mdadm"])?;
-    format_local_nvme_disks(false)?; // no twp support since experiment is done
+    install_packages(&["nvme-cli", "mdadm", "parted"])?;
+
+    // Always use raw device mode in cloud deployments
+    let data_partition = setup_nvme_for_raw_device()?;
 
     let mut binaries = vec![
         "bss_server",
@@ -129,11 +130,8 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
         BssConfiguredStage::wait_for_rss_initialized(&barrier)?;
     }
 
-    create_bss_config()?;
-    format_bss(
-        config.global.bss_storage_alloc_mode,
-        config.global.bss_storage_write_zero_pct,
-    )?;
+    create_bss_config(&data_partition)?;
+    format_bss(&data_partition)?;
     create_systemd_unit_file("bss", true)?;
 
     run_cmd! {
@@ -199,17 +197,16 @@ fn generate_initial_cluster(ips: &[String]) -> String {
         .join(",")
 }
 
-fn format_bss(alloc_mode: xtask_common::BssStorageAllocMode, write_zero_pct: u8) -> CmdResult {
-    let mode = alloc_mode.as_ref();
+fn format_bss(storage_path: &str) -> CmdResult {
     run_cmd! {
-        info "Running format for bss_server (storage_alloc_mode=${mode}, write_zero_pct=${write_zero_pct})";
-        ${BIN_PATH}bss_server format -c ${ETC_PATH}${BSS_SERVER_CONFIG} --storage-alloc-mode $mode --storage-write-zero-pct $write_zero_pct;
+        info "Running format for bss_server (storage_path=${storage_path})";
+        ${BIN_PATH}bss_server format -c ${ETC_PATH}${BSS_SERVER_CONFIG} --storage-path $storage_path;
     }?;
 
     Ok(())
 }
 
-fn create_bss_config() -> CmdResult {
+fn create_bss_config(data_partition: &str) -> CmdResult {
     // Get total memory in kilobytes from /proc/meminfo
     let total_mem_kb_str = run_fun!(cat /proc/meminfo | grep MemTotal | awk r"{print $2}")?;
     let total_mem_kb = total_mem_kb_str
@@ -226,17 +223,17 @@ fn create_bss_config() -> CmdResult {
 
     let fa_journal_segment_size = FA_JOURNAL_SEGMENT_SIZE;
 
-    // Get /data/local volume size in 1K blocks and compute flag_storage_size as 90% of it
-    let data_size_kb_str = run_fun!(df -k /data/local | awk r"NR==2 {print $2}")?;
-    let data_size_kb = data_size_kb_str.trim().parse::<u64>().map_err(|_| {
-        Error::other(format!(
-            "invalid /data/local volume size: {data_size_kb_str}"
-        ))
-    })?;
-    let flag_storage_size = (data_size_kb as f64 * 1024.0 * FLAG_STORAGE_SIZE_PERCENT) as u64;
+    // Raw device mode: get partition size directly, aligned to 4KB
+    let size_str = run_fun!(blockdev --getsize64 $data_partition)?;
+    let partition_size: u64 = size_str
+        .trim()
+        .parse()
+        .map_err(|_| Error::other(format!("invalid partition size: {size_str}")))?;
+    let flag_storage_size = (partition_size / 4096) * 4096;
     info!(
-        "/data/local volume size: {} KB, flag_storage_size: {} bytes ({} GB)",
-        data_size_kb,
+        "Raw device {}: partition_size={} bytes, flag_storage_size={} bytes ({} GB)",
+        data_partition,
+        partition_size,
         flag_storage_size,
         flag_storage_size / (1024 * 1024 * 1024)
     );
