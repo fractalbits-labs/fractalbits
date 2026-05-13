@@ -316,21 +316,18 @@ pub fn init_service(
         let metadata_vg = generate_bss_metadata_vg_config(init_config.bss_count);
         let journal_vg = generate_bss_journal_vg_config(init_config.bss_count);
 
-        // Compute shared_dir (relative to working_dir which is ./data/nss-0)
-        let shared_dir = format!("local/journal/{}", journal_uuid);
-
         let journal_config = generate_initial_journal_config(&journal_uuid, "nss-0");
 
         match build_mode {
             BuildMode::Debug => run_cmd! {
                 info "formatting nss_server with default configs";
-                SHARED_DIR=$shared_dir JOURNAL_CONFIG=$journal_config METADATA_VG_CONFIG=$metadata_vg JOURNAL_VG_CONFIG=$journal_vg
+                JOURNAL_CONFIG=$journal_config METADATA_VG_CONFIG=$metadata_vg JOURNAL_VG_CONFIG=$journal_vg
                     $nss_binary format --init_test_tree
                     |& ts -m $TS_FMT >$format_log;
             }?,
             BuildMode::Release => run_cmd! {
                 info "formatting nss_server for benchmarking";
-                SHARED_DIR=$shared_dir JOURNAL_CONFIG=$journal_config METADATA_VG_CONFIG=$metadata_vg JOURNAL_VG_CONFIG=$journal_vg
+                JOURNAL_CONFIG=$journal_config METADATA_VG_CONFIG=$metadata_vg JOURNAL_VG_CONFIG=$journal_vg
                     $nss_binary format --init_test_tree
                     |& ts -m $TS_FMT >$format_log;
             }?,
@@ -1270,14 +1267,12 @@ Environment="RUST_LOG=warn""##
         ServiceName::Nss => {
             managed_service = true;
             // Use template-based service with instance suffix (A or B)
-            // WORKING_DIR, SHARED_DIR, JOURNAL_CONFIG, and HEALTH_PORT are set based on instance
+            // WORKING_DIR, JOURNAL_CONFIG, and HEALTH_PORT are set based on instance
             env_settings += "\nEnvironment=\"WORKING_DIR=./nss-%i\"";
             env_settings += &format!("\nEnvironmentFile=-{pwd}/data/etc/nss.env");
             let nss_binary = resolve_binary_path("nss_server", build_mode);
-            // Read journal_uuid from shared file and compute SHARED_DIR
-            let shared_dir_prefix = "local/journal";
             format!(
-                r#"/bin/bash -c 'JOURNAL_UUID=$(cat ./etc/journal_uuid.txt); export SHARED_DIR="{shared_dir_prefix}/$JOURNAL_UUID"; if [ "%i" = "0" ]; then HEALTH_PORT=29999; else HEALTH_PORT=29998; fi; export HEALTH_PORT; if [ -n "$LOGS" ]; then {nss_binary} serve 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/nss-%i.log"; else exec {nss_binary} serve; fi'"#
+                r#"/bin/bash -c 'if [ "%i" = "0" ]; then HEALTH_PORT=29999; else HEALTH_PORT=29998; fi; export HEALTH_PORT; if [ -n "$LOGS" ]; then {nss_binary} serve 2>&1 | ts "[%%Y-%%m-%%d %%H:%%M:%%S]" >> "$LOGS/nss-%i.log"; else exec {nss_binary} serve; fi'"#
             )
         }
         ServiceName::NssRoleAgent => {
