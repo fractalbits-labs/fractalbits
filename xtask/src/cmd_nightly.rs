@@ -56,7 +56,6 @@ fn run_crash_recovery_test_nss(multi_bss: bool, initial_run: bool, log_dir: &str
     let journal_uuid = std::fs::read_to_string("data/etc/journal_uuid.txt")?
         .trim()
         .to_string();
-    let shared_dir = "local/journal/".to_string() + &journal_uuid;
     let metadata_vg_config = generate_bss_metadata_vg_config(init_config.bss_count);
     let journal_vg_config = generate_bss_journal_vg_config(init_config.bss_count);
     let journal_config = generate_initial_journal_config(&journal_uuid, "nss-0");
@@ -64,7 +63,7 @@ fn run_crash_recovery_test_nss(multi_bss: bool, initial_run: bool, log_dir: &str
     // Run NSS crash recovery test
     let result = run_cmd! {
         info "Running NSS crash_recovery_test with log $nightly_log ...";
-        METADATA_VG_CONFIG=$metadata_vg_config JOURNAL_VG_CONFIG=$journal_vg_config JOURNAL_CONFIG=$journal_config SHARED_DIR=$shared_dir
+        METADATA_VG_CONFIG=$metadata_vg_config JOURNAL_VG_CONFIG=$journal_vg_config JOURNAL_CONFIG=$journal_config
             $venv_python ./core/crash_recovery_test/main.py --mode nss --build-mode release &>$nightly_log;
     }
     .inspect_err(|_| {
