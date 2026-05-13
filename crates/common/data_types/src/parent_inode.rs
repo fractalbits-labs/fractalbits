@@ -33,8 +33,8 @@ pub const PARENT_INODE_BLOCK_NUMBER: u32 = u32::MAX;
 ///   ------  ----  -----
 ///   0       8     version           u64 (LE)
 ///   8       8     total_size        u64 (LE)
-///   16      4     block_count       u32 (LE) — ceil(total_size / block_size)
-///   20      4     _reserved         u32 (LE) — must be 0
+///   16      4     block_count       u32 (LE) -- ceil(total_size / block_size)
+///   20      4     _reserved         u32 (LE) -- must be 0
 ///
 /// The serialised body is always exactly 24 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

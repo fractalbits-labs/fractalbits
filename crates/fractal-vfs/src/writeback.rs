@@ -4,13 +4,16 @@
 //! inbound op updates `InodeTable` / `DirCache` immediately, upserts an
 //! intent into the queue, and returns success to the kernel. Worker tasks
 //! drain the queue: NSS namespace mutations batch into one `InodeBatch`
-//! RPC, BSS block writes batch into one `BssBatch`, and per-file commit
-//! ordering A->B->C->D is enforced by the per-inode pipeline.
+//! RPC, BSS block writes batch into one `BssBatch`. Per-file `Stage`
+//! transitions are validated against `is_valid_stage_transition` for
+//! bookkeeping (PublishLayout -> WriteBlocks -> CommitBlob -> RefreshSize);
+//! today only `PublishLayout` is actually driven by the worker, the BSS
+//! hops ship inline from `flush_publish` -- see `Stage` for details.
 //!
 //! Scope: exclusive-writer regular files, `create`, `mkdir`,
 //! regular-file `write`, `flush` / `release`, `fsync`, and post-create
-//! non-size `setattr`. One active remote generation per file. Stage A
-//! CAS conflict ⇒ fail/taint, no transparent rebase.
+//! non-size `setattr`. One active remote generation per file. PublishLayout
+//! CAS conflict -> fail/taint, no transparent rebase.
 //!
 //! This module owns the intent map, the generation counter, the stage
 //! enum, and the per-file pipeline state. Worker scheduling and FUSE op
@@ -67,19 +70,41 @@ pub enum IntentState {
     Failed,
 }
 
-/// Stage in the per-file commit pipeline. Workers pop batches by
-/// stage so cross-file batch density is preserved while per-file
-/// ordering A->B->C->D is enforced.
+/// Discrete units of work in the per-file commit pipeline. Workers
+/// pop batches by stage so cross-file batching is preserved.
+///
+/// Today only `PublishLayout` is driven by the writeback worker.
+/// `vfs.rs::flush_publish` runs the BSS hops inline -- per-block
+/// writes and the `ParentInode` commit ship atomically as one
+/// `BssBatch` envelope -- and then hands the NSS `PutInode` to this
+/// queue. The `WriteBlocks` / `CommitBlob` / `RefreshSize` variants
+/// exist for the planned migration where the writeback worker owns
+/// the BSS hops as well; `FileCommitStage` already tracks the full
+/// progression for per-cycle bookkeeping, but the B/C/D transitions
+/// are exercised only by tests today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Stage {
-    /// NSS CAS publishes new blob_version. Bumps `Generation`.
-    A,
-    /// BSS block writes at the published version.
-    B,
-    /// BSS parent inode update (commits new total_size).
-    C,
-    /// NSS lazy size update (best-effort).
-    D,
+    /// NSS `PutInode` of the new layout (carries new `blob_version`
+    /// and new `size`). CAS-guarded against the previously-known
+    /// layout bytes; conflicts surface as `FsError::CasConflict` to
+    /// the synchronous caller. The only stage the worker drives
+    /// today.
+    PublishLayout,
+    /// BSS per-block writes at the published version. Currently
+    /// performed inline by `flush_publish` via `BssBatch`; reserved
+    /// for the future worker-owned path.
+    WriteBlocks,
+    /// BSS parent-inode commit (publishes new `total_size`,
+    /// `block_count`, `blob_version`). Currently piggybacked on the
+    /// same `BssBatch` as `WriteBlocks`; reserved for the future
+    /// worker-owned path.
+    CommitBlob,
+    /// Best-effort NSS resync of `layout.size` from the BSS parent
+    /// inode. Useful when a non-flush path mutates only the BSS-side
+    /// size (truncate / fallocate-style extensions); unused on the
+    /// flush_publish path since `PublishLayout` already carries the
+    /// new size.
+    RefreshSize,
 }
 
 /// Inode operation captured by an `InodeIntent`. Initial scope only
@@ -180,7 +205,7 @@ pub struct InodeIntent {
     pub enqueued_at: Instant,
 }
 
-/// One block write queued for Stage B. Keyed by `(blob, block, gen)`.
+/// One block write queued for WriteBlocks. Keyed by `(blob, block, gen)`.
 #[derive(Debug, Clone)]
 pub struct BlockIntent {
     pub op: BlockOp,
@@ -191,7 +216,7 @@ pub struct BlockIntent {
     pub enqueued_at: Instant,
 }
 
-/// Stage C — BSS parent inode update. One per file per generation.
+/// CommitBlob -- BSS parent inode update. One per file per generation.
 #[derive(Debug, Clone)]
 pub struct ParentIntent {
     pub blob_id: DataBlobGuid,
@@ -207,18 +232,18 @@ pub struct ParentIntent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileCommitStage {
     Idle,
-    StageAQueued,
-    StageACommitted,
-    StageBInFlight { blocks_remaining: u32 },
-    StageBCommitted,
-    StageCQueued,
-    StageCCommitted,
-    StageDQueued,
+    PublishLayoutQueued,
+    PublishLayoutCommitted,
+    WriteBlocksInFlight { blocks_remaining: u32 },
+    WriteBlocksCommitted,
+    CommitBlobQueued,
+    CommitBlobCommitted,
+    RefreshSizeQueued,
     Done,
 }
 
 /// Per-cycle terminal size. `Building` accepts further writes;
-/// `Sealed` is frozen at Stage A issue and is what Stage C reads.
+/// `Sealed` is frozen at PublishLayout issue and is what CommitBlob reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalSize {
     Building { file_size: u64, block_count: u32 },
@@ -297,7 +322,7 @@ impl CyclePipelineState {
         // (full target) or backpressure (initial scope).
     }
 
-    /// Seal `terminal_size` at Stage A issue. Once sealed, future
+    /// Seal `terminal_size` at PublishLayout issue. Once sealed, future
     /// writes for this generation are rejected (initial scope:
     /// backpressured at the queue's enqueue layer).
     pub fn seal(&mut self) {
@@ -366,7 +391,7 @@ struct QueueInner {
     /// serves both phases.
     file_pipeline: HashMap<u64, BTreeMap<Generation, CyclePipelineState>>,
 
-    /// Active generation per inode — the gen new writes are routed to.
+    /// Active generation per inode -- the gen new writes are routed to.
     active_generation: HashMap<u64, Generation>,
 
     /// Dependency edges. `dep_predecessors[d]` is the set of intents
@@ -379,7 +404,7 @@ struct QueueInner {
     errseq: HashMap<u64, InodeErrorState>,
 
     /// Per-inode pending-data overlay. Populated as FUSE_WRITE
-    /// arrives; cleared as Stage B intents commit.
+    /// arrives; cleared as WriteBlocks intents commit.
     pending_overlay: HashMap<u64, PendingOverlay>,
 
     next_intent_id: u64,
@@ -405,7 +430,7 @@ pub enum CycleOutcome {
     InFlight,
     /// All stages reached `Done` cleanly.
     Committed,
-    /// CAS conflict on Stage A. Worker reported STATUS_CAS_CONFLICT.
+    /// CAS conflict on PublishLayout. Worker reported STATUS_CAS_CONFLICT.
     CasConflict,
     /// Any other terminal failure.
     Failed,
@@ -416,9 +441,9 @@ pub enum CycleOutcome {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FhErrSeq(pub u32);
 
-/// A Stage A intent the worker has popped and is about to ship to NSS.
+/// A PublishLayout intent the worker has popped and is about to ship to NSS.
 /// Carries everything needed to fire the RPC and to route the result
-/// back via `mark_stage_a_committed` / `mark_stage_a_failed`.
+/// back via `mark_publish_layout_committed` / `mark_publish_layout_failed`.
 #[derive(Debug, Clone)]
 pub struct DrainableInodeIntent {
     pub s3_key: S3Key,
@@ -446,7 +471,7 @@ pub enum OverlayBlockState {
 /// across every fh open on the inode so a reader on a different fh
 /// (same instance) sees the same bytes as the writer.
 ///
-/// The overlay shrinks as Stage B intents reach Committed and
+/// The overlay shrinks as WriteBlocks intents reach Committed and
 /// drops back to empty when the inode goes idle.
 #[derive(Debug, Default, Clone)]
 pub struct PendingOverlay {
@@ -488,24 +513,24 @@ fn is_valid_stage_transition(from: FileCommitStage, to: FileCommitStage) -> bool
     use FileCommitStage::*;
     matches!(
         (from, to),
-        (Idle, StageAQueued)
-            | (StageAQueued, StageACommitted)
-            | (StageACommitted, StageBInFlight { .. })
-            | (StageBInFlight { .. }, StageBInFlight { .. })
-            | (StageBInFlight { .. }, StageBCommitted)
-            | (StageBCommitted, StageCQueued)
-            | (StageCQueued, StageCCommitted)
-            | (StageCCommitted, StageDQueued)
-            | (StageDQueued, Done)
+        (Idle, PublishLayoutQueued)
+            | (PublishLayoutQueued, PublishLayoutCommitted)
+            | (PublishLayoutCommitted, WriteBlocksInFlight { .. })
+            | (WriteBlocksInFlight { .. }, WriteBlocksInFlight { .. })
+            | (WriteBlocksInFlight { .. }, WriteBlocksCommitted)
+            | (WriteBlocksCommitted, CommitBlobQueued)
+            | (CommitBlobQueued, CommitBlobCommitted)
+            | (CommitBlobCommitted, RefreshSizeQueued)
+            | (RefreshSizeQueued, Done)
             // Failed cycles can short-circuit to Done from any non-
-            // terminal stage. StageDQueued already routes to Done in
+            // terminal stage. RefreshSizeQueued already routes to Done in
             // the success path above.
-            | (StageAQueued, Done)
-            | (StageACommitted, Done)
-            | (StageBInFlight { .. }, Done)
-            | (StageBCommitted, Done)
-            | (StageCQueued, Done)
-            | (StageCCommitted, Done)
+            | (PublishLayoutQueued, Done)
+            | (PublishLayoutCommitted, Done)
+            | (WriteBlocksInFlight { .. }, Done)
+            | (WriteBlocksCommitted, Done)
+            | (CommitBlobQueued, Done)
+            | (CommitBlobCommitted, Done)
     )
 }
 
@@ -681,7 +706,7 @@ impl WritebackQueue {
 
     /// Open a new cycle for `inode` at `generation`, recording the
     /// cycle's initial size. Used by FUSE_CREATE and the write path
-    /// when the previous cycle's Stage A has reached its terminal
+    /// when the previous cycle's PublishLayout has reached its terminal
     /// stage (initial scope) or unconditionally (full target).
     pub fn open_cycle(&self, inode: u64, generation: Generation, file_size: u64, block_count: u32) {
         let mut inner = self.inner.lock().expect("writeback queue poisoned");
@@ -718,15 +743,15 @@ impl WritebackQueue {
     }
 
     /// Seal the cycle's `terminal_size` and advance its stage to
-    /// `StageAQueued`. Called when the worker picks up Stage A for
+    /// `PublishLayoutQueued`. Called when the worker picks up PublishLayout for
     /// this generation (Pending -> InFlight transition).
-    pub fn seal_cycle_for_stage_a(&self, inode: u64, generation: Generation) {
+    pub fn seal_cycle_for_publish_layout(&self, inode: u64, generation: Generation) {
         let mut inner = self.inner.lock().expect("writeback queue poisoned");
         if let Some(cycles) = inner.file_pipeline.get_mut(&inode)
             && let Some(cycle) = cycles.get_mut(&generation)
         {
             cycle.seal();
-            cycle.stage = FileCommitStage::StageAQueued;
+            cycle.stage = FileCommitStage::PublishLayoutQueued;
         }
     }
 
@@ -782,7 +807,7 @@ impl WritebackQueue {
             .insert((key.clone(), generation), intent);
         inner
             .intents_by_stage
-            .entry(Stage::A)
+            .entry(Stage::PublishLayout)
             .or_default()
             .insert(id);
         if let Some(parent) = parent_key {
@@ -793,8 +818,8 @@ impl WritebackQueue {
     }
 
     /// Upsert a `BlockIntent` keyed by `(blob, block, gen)`.
-    /// Coalesce rules: same key Pending ⇒ replace body+checksum in
-    /// place; same key InFlight ⇒ `BackpressureRequired` (the caller
+    /// Coalesce rules: same key Pending -> replace body+checksum in
+    /// place; same key InFlight -> `BackpressureRequired` (the caller
     /// blocks until the prior cycle's terminal stage).
     pub fn upsert_block_intent(
         &self,
@@ -857,7 +882,7 @@ impl WritebackQueue {
             .insert((blob_id, block_num, generation), intent);
         inner
             .intents_by_stage
-            .entry(Stage::B)
+            .entry(Stage::WriteBlocks)
             .or_default()
             .insert(id);
         inner.state.depth = inner.state.depth.saturating_add(1);
@@ -915,11 +940,11 @@ impl WritebackQueue {
         })
     }
 
-    /// Pop up to `max_batch` Pending Stage A intents whose dependencies
+    /// Pop up to `max_batch` Pending PublishLayout intents whose dependencies
     /// are satisfied, mark them InFlight, and return drainable
-    /// snapshots for the worker to ship. Each cycle whose Stage A is
-    /// in this batch is sealed and advanced to `StageAQueued`.
-    pub fn drain_stage_a(&self, max_batch: usize) -> Vec<DrainableInodeIntent> {
+    /// snapshots for the worker to ship. Each cycle whose PublishLayout is
+    /// in this batch is sealed and advanced to `PublishLayoutQueued`.
+    pub fn drain_publish_layout(&self, max_batch: usize) -> Vec<DrainableInodeIntent> {
         let mut inner = self.inner.lock().expect("writeback queue poisoned");
         let mut out = Vec::new();
 
@@ -1058,7 +1083,7 @@ impl WritebackQueue {
             out.push(drainable);
         }
 
-        // Promote each owning cycle to StageAQueued + sealed.
+        // Promote each owning cycle to PublishLayoutQueued + sealed.
         for d in &out {
             let mut to_advance: Vec<(u64, Generation)> = Vec::new();
             for (ino, cycles) in inner.file_pipeline.iter() {
@@ -1075,7 +1100,7 @@ impl WritebackQueue {
                     .and_then(|c| c.get_mut(&generation));
                 if let Some(cycle) = cycle {
                     cycle.seal();
-                    cycle.stage = FileCommitStage::StageAQueued;
+                    cycle.stage = FileCommitStage::PublishLayoutQueued;
                 }
             }
         }
@@ -1083,14 +1108,15 @@ impl WritebackQueue {
         out
     }
 
-    /// Apply a successful Stage A result. The intent is removed from
-    /// the queue and the depth counter decremented; the inode's cycle
-    /// is advanced through `StageACommitted` to `Done`. (Phase 1a has
-    /// no Stage B/C/D worker yet, so Stage A short-circuits directly
-    /// to `Done` for the create-only path. When Stage B work lands,
-    /// this routine stops at `StageACommitted` and the next stage
+    /// Apply a successful PublishLayout result. The intent is removed
+    /// from the queue and the depth counter decremented; the inode's
+    /// cycle is advanced through `PublishLayoutCommitted` to `Done`.
+    /// (Phase 1a has no WriteBlocks/CommitBlob/RefreshSize worker
+    /// yet, so PublishLayout short-circuits directly to `Done` for
+    /// the create-only path. When the WriteBlocks work lands, this
+    /// routine stops at `PublishLayoutCommitted` and the next stage
     /// driver picks up.)
-    pub fn mark_stage_a_committed(&self, key: &str, generation: Generation, inode: u64) {
+    pub fn mark_publish_layout_committed(&self, key: &str, generation: Generation, inode: u64) {
         let mut inner = self.inner.lock().expect("writeback queue poisoned");
         let removed = inner
             .inode_intents
@@ -1105,22 +1131,22 @@ impl WritebackQueue {
             .get_mut(&inode)
             .and_then(|c| c.get_mut(&generation))
         {
-            if cycle.stage == FileCommitStage::StageAQueued {
-                cycle.stage = FileCommitStage::StageACommitted;
+            if cycle.stage == FileCommitStage::PublishLayoutQueued {
+                cycle.stage = FileCommitStage::PublishLayoutCommitted;
             }
-            if cycle.stage == FileCommitStage::StageACommitted {
+            if cycle.stage == FileCommitStage::PublishLayoutCommitted {
                 cycle.stage = FileCommitStage::Done;
             }
             cycle.outcome = CycleOutcome::Committed;
         }
     }
 
-    /// Apply a failed Stage A result. `is_cas_conflict` distinguishes
+    /// Apply a failed PublishLayout result. `is_cas_conflict` distinguishes
     /// a CAS conflict (the only failure mode where the caller needs to
     /// reopen) from generic failure. Either way the cycle short-
     /// circuits to `Done`, the inode is tainted, and errseq is bumped
     /// so any open fh's next fsync surfaces EIO.
-    pub fn mark_stage_a_failed(
+    pub fn mark_publish_layout_failed(
         &self,
         key: &str,
         generation: Generation,
@@ -1157,7 +1183,7 @@ impl WritebackQueue {
 
     /// Read the cycle's terminal outcome. Used by async-CAS wrappers
     /// that enqueue + wait + need to surface the right errno
-    /// (CasConflict ⇒ ESTALE, anything else ⇒ EIO).
+    /// (CasConflict -> ESTALE, anything else -> EIO).
     pub fn cycle_outcome(&self, inode: u64, generation: Generation) -> CycleOutcome {
         let inner = self.inner.lock().expect("writeback queue poisoned");
         inner
@@ -1168,10 +1194,12 @@ impl WritebackQueue {
             .unwrap_or(CycleOutcome::InFlight)
     }
 
-    /// Advance a cycle's pipeline stage. The transitions follow the
-    /// ordered A->B->C->D walk; out-of-order advances are rejected via
-    /// `Result` so callers can surface a programmer error (rather than
-    /// silently violating the per-file ordering invariant).
+    /// Advance a cycle's pipeline stage. Transitions are validated
+    /// against `is_valid_stage_transition` (PublishLayout ->
+    /// WriteBlocks -> CommitBlob -> RefreshSize, or short-circuit to
+    /// `Done`); out-of-order advances are rejected via `Result` so
+    /// callers can surface a programmer error rather than silently
+    /// violating the per-file ordering invariant.
     pub fn advance_stage(
         &self,
         inode: u64,
@@ -1197,8 +1225,8 @@ impl WritebackQueue {
     /// Move a cycle straight to `Done` regardless of where it
     /// currently is. Used by the async-flush spawn handler when the
     /// background flush finishes -- the existing flush body collapses
-    /// Stage A/B/C into one synchronous unit, so the queue records a
-    /// single Pending → InFlight → Done arc rather than per-stage
+    /// PublishLayout/WriteBlocks/CommitBlob into one synchronous unit, so the queue records a
+    /// single Pending -> InFlight -> Done arc rather than per-stage
     /// transitions.
     pub fn advance_to_done(&self, inode: u64, generation: Generation) {
         let mut inner = self.inner.lock().expect("writeback queue poisoned");
@@ -1250,7 +1278,7 @@ impl WritebackQueue {
         inner.errseq.get(&inode).map(|e| e.errseq).unwrap_or(0)
     }
 
-    /// `true` iff a Stage A failure (CAS conflict / unknown outcome
+    /// `true` iff a PublishLayout failure (CAS conflict / unknown outcome
     /// / max-inflight expiry) has tainted this inode. Tainted inodes
     /// must close-and-reopen to observe the remote winner; further
     /// writes on the existing handle continue to surface EIO.
@@ -1271,7 +1299,7 @@ impl WritebackQueue {
 
     /// Add an ancestor / predecessor dependency edge from `dependent`
     /// to `predecessor`. The dep tracker holds entries until the
-    /// predecessor reaches `Committed`; a worker scanning Stage A can
+    /// predecessor reaches `Committed`; a worker scanning PublishLayout can
     /// skip a Pending intent whose `unmet_deps > 0`.
     pub fn add_dep(&self, dependent: IntentId, predecessor: IntentId) {
         let mut inner = self.inner.lock().expect("writeback queue poisoned");
@@ -1355,7 +1383,7 @@ impl WritebackQueue {
         let mut inner = self.inner.lock().expect("writeback queue poisoned");
         let mut out = Vec::new();
         match stage {
-            Stage::A => {
+            Stage::PublishLayout => {
                 let keys: Vec<_> = inner
                     .inode_intents
                     .iter()
@@ -1368,7 +1396,7 @@ impl WritebackQueue {
                     out.push(IntentSnapshot::Inode(intent.clone()));
                 }
             }
-            Stage::B => {
+            Stage::WriteBlocks => {
                 let keys: Vec<_> = inner
                     .block_intents
                     .iter()
@@ -1409,7 +1437,7 @@ impl QueueInner {
 /// coalescable combination here.
 fn coalesce_inode_pending(existing: &mut InodeOp, new: &InodeOp) -> CoalesceOutcome {
     match (&mut *existing, new) {
-        // PutInode + PutInode (same key) ⇒ replace the layout in
+        // PutInode + PutInode (same key) -> replace the layout in
         // place (latest wins). Uncommon because FUSE_CREATE is
         // unique per path, but the create-then-close flow hits it:
         // vfs_create early-publishes a placeholder (`expected=None`,
@@ -1446,10 +1474,10 @@ fn coalesce_inode_pending(existing: &mut InodeOp, new: &InodeOp) -> CoalesceOutc
             };
             CoalesceOutcome::ReplacedInPlace
         }
-        // PutInode + SetAttr ⇒ Merged. The worker applies the attr
-        // mutation when it ships Stage A.
+        // PutInode + SetAttr -> Merged. The worker applies the attr
+        // mutation when it ships PublishLayout.
         (InodeOp::PutInode { .. }, InodeOp::SetAttr { .. }) => CoalesceOutcome::Merged,
-        // SetAttr + SetAttr ⇒ field-merge.
+        // SetAttr + SetAttr -> field-merge.
         (
             InodeOp::SetAttr {
                 attrs: existing_attrs,
@@ -1514,7 +1542,7 @@ mod tests {
         let q = WritebackQueue::new();
         q.open_cycle(1, Generation(0), 100, 1);
         q.note_write(1, Generation(0), 200, 2, FhId(11));
-        q.seal_cycle_for_stage_a(1, Generation(0));
+        q.seal_cycle_for_publish_layout(1, Generation(0));
 
         let st = q.cycle_state(1, Generation(0)).unwrap();
         assert!(st.terminal_size.is_sealed());
@@ -1554,11 +1582,11 @@ mod tests {
             FhId(1),
         );
         assert_eq!(r2, CoalesceOutcome::ReplacedInPlace);
-        // Depth unchanged — coalesced.
+        // Depth unchanged -- coalesced.
         assert_eq!(q.depth(), 1);
 
         // The new body wins.
-        let popped = q.pop_pending_for_stage(Stage::B);
+        let popped = q.pop_pending_for_stage(Stage::WriteBlocks);
         assert_eq!(popped.len(), 1);
         match &popped[0] {
             IntentSnapshot::Block(b) => match &b.op {
@@ -1608,7 +1636,7 @@ mod tests {
             0,
             FhId(1),
         );
-        // Two distinct intents — different generations.
+        // Two distinct intents -- different generations.
         assert_eq!(q.depth(), 2);
     }
 
@@ -1624,8 +1652,8 @@ mod tests {
             0,
             FhId(1),
         );
-        // Pop pending → InFlight.
-        let _ = q.pop_pending_for_stage(Stage::B);
+        // Pop pending -> InFlight.
+        let _ = q.pop_pending_for_stage(Stage::WriteBlocks);
 
         let r = q.upsert_block_intent(
             blob,
@@ -1711,7 +1739,7 @@ mod tests {
         assert_eq!(q.depth(), 1);
 
         // The merged entry must carry both fields.
-        let popped = q.pop_pending_for_stage(Stage::A);
+        let popped = q.pop_pending_for_stage(Stage::PublishLayout);
         assert_eq!(popped.len(), 1);
         match &popped[0] {
             IntentSnapshot::Inode(InodeIntent {
@@ -1760,7 +1788,7 @@ mod tests {
         let blob = dummy_blob();
         q.upsert_block_intent(blob, 0, Generation(0), Bytes::from_static(b"a"), 0, FhId(1));
         q.upsert_block_intent(blob, 0, Generation(0), Bytes::from_static(b"b"), 0, FhId(2));
-        let popped = q.pop_pending_for_stage(Stage::B);
+        let popped = q.pop_pending_for_stage(Stage::WriteBlocks);
         match &popped[0] {
             IntentSnapshot::Block(b) => {
                 assert!(b.fhs.contains(&FhId(1)));
@@ -1776,22 +1804,22 @@ mod tests {
         Uuid::from_u128(0)
     }
 
-    // ── Stage advancement ───────────────────────────────────────────
+    // -- Stage advancement -------------------------------------------
 
     #[test]
-    fn stage_advance_walks_a_b_c_d_in_order() {
+    fn stage_advance_walks_all_stages_in_order() {
         let q = WritebackQueue::new();
         q.open_cycle(1, Generation(0), 0, 0);
         let g = Generation(0);
 
-        q.advance_stage(1, g, FileCommitStage::StageAQueued)
+        q.advance_stage(1, g, FileCommitStage::PublishLayoutQueued)
             .unwrap();
-        q.advance_stage(1, g, FileCommitStage::StageACommitted)
+        q.advance_stage(1, g, FileCommitStage::PublishLayoutCommitted)
             .unwrap();
         q.advance_stage(
             1,
             g,
-            FileCommitStage::StageBInFlight {
+            FileCommitStage::WriteBlocksInFlight {
                 blocks_remaining: 4,
             },
         )
@@ -1800,18 +1828,18 @@ mod tests {
         q.advance_stage(
             1,
             g,
-            FileCommitStage::StageBInFlight {
+            FileCommitStage::WriteBlocksInFlight {
                 blocks_remaining: 0,
             },
         )
         .unwrap();
-        q.advance_stage(1, g, FileCommitStage::StageBCommitted)
+        q.advance_stage(1, g, FileCommitStage::WriteBlocksCommitted)
             .unwrap();
-        q.advance_stage(1, g, FileCommitStage::StageCQueued)
+        q.advance_stage(1, g, FileCommitStage::CommitBlobQueued)
             .unwrap();
-        q.advance_stage(1, g, FileCommitStage::StageCCommitted)
+        q.advance_stage(1, g, FileCommitStage::CommitBlobCommitted)
             .unwrap();
-        q.advance_stage(1, g, FileCommitStage::StageDQueued)
+        q.advance_stage(1, g, FileCommitStage::RefreshSizeQueued)
             .unwrap();
         q.advance_stage(1, g, FileCommitStage::Done).unwrap();
 
@@ -1825,17 +1853,17 @@ mod tests {
         q.open_cycle(1, Generation(0), 0, 0);
         let g = Generation(0);
         // Skipping A->C is rejected.
-        let bad = q.advance_stage(1, g, FileCommitStage::StageCQueued);
+        let bad = q.advance_stage(1, g, FileCommitStage::CommitBlobQueued);
         assert!(matches!(
             bad,
             Err(StageAdvanceError::InvalidTransition { .. })
         ));
         // After legitimate A->A_committed, advancing back to A is rejected.
-        q.advance_stage(1, g, FileCommitStage::StageAQueued)
+        q.advance_stage(1, g, FileCommitStage::PublishLayoutQueued)
             .unwrap();
-        q.advance_stage(1, g, FileCommitStage::StageACommitted)
+        q.advance_stage(1, g, FileCommitStage::PublishLayoutCommitted)
             .unwrap();
-        let reverse = q.advance_stage(1, g, FileCommitStage::StageAQueued);
+        let reverse = q.advance_stage(1, g, FileCommitStage::PublishLayoutQueued);
         assert!(matches!(
             reverse,
             Err(StageAdvanceError::InvalidTransition { .. })
@@ -1845,22 +1873,22 @@ mod tests {
     #[test]
     fn stage_advance_missing_cycle_errors() {
         let q = WritebackQueue::new();
-        let r = q.advance_stage(1, Generation(0), FileCommitStage::StageAQueued);
+        let r = q.advance_stage(1, Generation(0), FileCommitStage::PublishLayoutQueued);
         assert_eq!(r, Err(StageAdvanceError::CycleMissing));
     }
 
     #[test]
     fn failed_cycle_can_short_circuit_to_done_from_any_stage() {
         for from in [
-            FileCommitStage::StageAQueued,
-            FileCommitStage::StageACommitted,
-            FileCommitStage::StageBInFlight {
+            FileCommitStage::PublishLayoutQueued,
+            FileCommitStage::PublishLayoutCommitted,
+            FileCommitStage::WriteBlocksInFlight {
                 blocks_remaining: 1,
             },
-            FileCommitStage::StageBCommitted,
-            FileCommitStage::StageCQueued,
-            FileCommitStage::StageCCommitted,
-            FileCommitStage::StageDQueued,
+            FileCommitStage::WriteBlocksCommitted,
+            FileCommitStage::CommitBlobQueued,
+            FileCommitStage::CommitBlobCommitted,
+            FileCommitStage::RefreshSizeQueued,
         ] {
             assert!(
                 is_valid_stage_transition(from, FileCommitStage::Done),
@@ -1870,7 +1898,7 @@ mod tests {
         }
     }
 
-    // ── Fsync barrier ───────────────────────────────────────────────
+    // -- Fsync barrier -----------------------------------------------
 
     #[test]
     fn fsync_barrier_returns_max_dirty_generation() {
@@ -1880,7 +1908,7 @@ mod tests {
         // cycle on the same inode (full-target shape).
         q.open_cycle(7, Generation(5), 200, 2);
         // Mark cycle 2 as Done so it should not factor into the barrier.
-        q.advance_stage(7, Generation(2), FileCommitStage::StageAQueued)
+        q.advance_stage(7, Generation(2), FileCommitStage::PublishLayoutQueued)
             .unwrap();
         q.advance_stage(7, Generation(2), FileCommitStage::Done)
             .unwrap();
@@ -1895,7 +1923,7 @@ mod tests {
         assert_eq!(q.fsync_barrier(99), None);
     }
 
-    // ── Errseq + taint ──────────────────────────────────────────────
+    // -- Errseq + taint ----------------------------------------------
 
     #[test]
     fn record_failure_bumps_errseq_and_taints() {
@@ -1926,7 +1954,7 @@ mod tests {
         assert!(!q.is_tainted(3));
     }
 
-    // ── Dependency DAG ──────────────────────────────────────────────
+    // -- Dependency DAG ----------------------------------------------
 
     #[test]
     fn dep_tracker_unblocks_dependent_after_predecessor_commits() {
@@ -1981,7 +2009,7 @@ mod tests {
         assert!(q.transitive_dependent_closure(IntentId(42)).is_empty());
     }
 
-    // ── Pending-data overlay ────────────────────────────────────────
+    // -- Pending-data overlay ----------------------------------------
 
     #[test]
     fn overlay_records_writes_and_grows_file_size() {
@@ -2040,7 +2068,7 @@ mod tests {
         assert!(ov.lookup_block(7).is_none()); // Delete is not a Bytes lookup hit
     }
 
-    // ── Sync drains ─────────────────────────────────────────────────
+    // -- Sync drains -------------------------------------------------
 
     #[test]
     fn cycles_at_or_below_drained_reports_correctly() {
@@ -2054,7 +2082,7 @@ mod tests {
 
         // Mark gen 0 + 1 Done; barrier=1 should drain.
         for g in [Generation(0), Generation(1)] {
-            q.advance_stage(1, g, FileCommitStage::StageAQueued)
+            q.advance_stage(1, g, FileCommitStage::PublishLayoutQueued)
                 .unwrap();
             q.advance_stage(1, g, FileCommitStage::Done).unwrap();
         }
@@ -2076,10 +2104,10 @@ mod tests {
         assert!(!q.is_enqueue_blocked());
     }
 
-    // ── Stage A drainer ────────────────────────────────────────────
+    // -- PublishLayout drainer --------------------------------------------
 
     #[test]
-    fn drain_stage_a_pops_pending_and_seals_the_cycle() {
+    fn drain_publish_layout_pops_pending_and_seals_the_cycle() {
         let q = WritebackQueue::new();
         // Open a cycle for inode 42 at gen 0.
         q.open_cycle(42, Generation(0), 0, 0);
@@ -2097,23 +2125,23 @@ mod tests {
         );
         assert_eq!(r, CoalesceOutcome::Inserted);
 
-        let drained = q.drain_stage_a(64);
+        let drained = q.drain_publish_layout(64);
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].s3_key, "/foo");
         assert_eq!(drained[0].generation, Generation(0));
         assert!(drained[0].fhs.contains(&FhId(7)));
 
-        // Cycle must now be sealed and at StageAQueued.
+        // Cycle must now be sealed and at PublishLayoutQueued.
         let st = q.cycle_state(42, Generation(0)).unwrap();
-        assert_eq!(st.stage, FileCommitStage::StageAQueued);
+        assert_eq!(st.stage, FileCommitStage::PublishLayoutQueued);
         assert!(st.terminal_size.is_sealed());
 
         // Re-draining is a no-op (intent is now InFlight).
-        assert_eq!(q.drain_stage_a(64).len(), 0);
+        assert_eq!(q.drain_publish_layout(64).len(), 0);
     }
 
     #[test]
-    fn mark_stage_a_committed_drives_cycle_to_done() {
+    fn mark_publish_layout_committed_drives_cycle_to_done() {
         let q = WritebackQueue::new();
         q.open_cycle(7, Generation(0), 0, 0);
         q.upsert_inode_intent(
@@ -2128,11 +2156,11 @@ mod tests {
             },
             FhId(1),
         );
-        let drained = q.drain_stage_a(8);
+        let drained = q.drain_publish_layout(8);
         assert_eq!(drained.len(), 1);
         assert_eq!(q.depth(), 1);
 
-        q.mark_stage_a_committed("/x", Generation(0), 7);
+        q.mark_publish_layout_committed("/x", Generation(0), 7);
 
         // Depth must drop and the cycle advance to Done.
         assert_eq!(q.depth(), 0);
@@ -2141,7 +2169,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_stage_a_failed_taints_inode_and_bumps_errseq() {
+    fn mark_publish_layout_failed_taints_inode_and_bumps_errseq() {
         let q = WritebackQueue::new();
         q.open_cycle(9, Generation(0), 0, 0);
         q.upsert_inode_intent(
@@ -2156,9 +2184,9 @@ mod tests {
             },
             FhId(2),
         );
-        let _ = q.drain_stage_a(8);
+        let _ = q.drain_publish_layout(8);
 
-        q.mark_stage_a_failed("/y", Generation(0), 9, false);
+        q.mark_publish_layout_failed("/y", Generation(0), 9, false);
 
         assert_eq!(q.depth(), 0);
         assert!(q.is_tainted(9));
@@ -2172,9 +2200,9 @@ mod tests {
         let q = WritebackQueue::new();
         q.open_cycle(1, Generation(0), 0, 0);
         q.open_cycle(1, Generation(1), 0, 0);
-        q.advance_stage(1, Generation(0), FileCommitStage::StageAQueued)
+        q.advance_stage(1, Generation(0), FileCommitStage::PublishLayoutQueued)
             .unwrap();
-        q.advance_stage(1, Generation(1), FileCommitStage::StageAQueued)
+        q.advance_stage(1, Generation(1), FileCommitStage::PublishLayoutQueued)
             .unwrap();
 
         let abandoned = q.abandon_cycles_below(1, Generation(1));

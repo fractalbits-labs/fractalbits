@@ -567,7 +567,7 @@ impl VfsCore {
         if self.read_write { 0o755 } else { 0o555 }
     }
 
-    // ── Attribute builders ──
+    // -- Attribute builders --
 
     fn make_file_attr(&self, ino: u64, layout: &ObjectLayout) -> Result<VfsAttr, FsError> {
         let size = layout.size()?;
@@ -775,7 +775,7 @@ impl VfsCore {
         }
     }
 
-    // ── Passthrough helpers ──
+    // -- Passthrough helpers --
 
     /// Try to set up passthrough for a file handle. Returns (open_flags, backing_id)
     /// if passthrough is activated, or (0, 0) otherwise.
@@ -862,7 +862,7 @@ impl VfsCore {
         }
     }
 
-    // ── Cache helpers ──
+    // -- Cache helpers --
 
     /// Read a block, checking disk cache first. On miss, fetches from backend
     /// and populates disk cache.
@@ -921,7 +921,7 @@ impl VfsCore {
         Ok(data)
     }
 
-    // ── Read helpers ──
+    // -- Read helpers --
 
     async fn read_normal(
         &self,
@@ -1084,7 +1084,7 @@ impl VfsCore {
         Ok(result.freeze())
     }
 
-    // ── Zero-copy read helpers (direct-to-buffer) ──
+    // -- Zero-copy read helpers (direct-to-buffer) --
 
     /// Read a cached block directly into `buf`. Returns bytes written on hit,
     /// or `None` on cache miss (caller should fall back to the Bytes path).
@@ -1375,7 +1375,7 @@ impl VfsCore {
         Ok(written.min(actual_len))
     }
 
-    // ── Write helpers ──
+    // -- Write helpers --
 
     /// Override-style flush: write only the Rewrite intents to the
     /// existing blob_guid at `new_version`, then delete blocks past the
@@ -1838,7 +1838,7 @@ impl VfsCore {
         // punch holes, and the file-level authoritative_blob_v in
         // the cache header advances to match. Under the single-
         // writer-per-inode policy this is safe to do without any
-        // additional locking — no other instance has a write in
+        // additional locking -- no other instance has a write in
         // flight on this inode at this moment.
         //
         // Best-effort: a sync failure (e.g. ENOSPC) is logged and
@@ -2150,7 +2150,7 @@ impl VfsCore {
             .map_err(FsError::from)?
             .into();
 
-        // Stage A routes through the writeback queue so multiple
+        // PublishLayout routes through the writeback queue so multiple
         // concurrent flushes coalesce into one InodeBatch RPC
         // instead of N round-trips.
         //
@@ -2373,7 +2373,7 @@ impl VfsCore {
         Ok(entries)
     }
 
-    // ── Public VFS operations ──
+    // -- Public VFS operations --
 
     pub fn vfs_init(&self) {
         if let Some(dc) = &self.disk_cache {
@@ -3212,6 +3212,9 @@ impl VfsCore {
                 && let Ok(blob_guid) = l.blob_guid()
             {
                 let trace_id = TraceId::new();
+                // vg_proxy::get_blob_info enforces R+W>N quorum and
+                // surfaces stale/quorum-failure responses as `Err`,
+                // so an `Ok(Some)` here is already version-checked.
                 match self
                     .backend()
                     .get_blob_info(blob_guid, l.blob_version, &trace_id)
@@ -3921,6 +3924,9 @@ impl VfsCore {
         // parent inode if available. Same policy as the read path --
         // no per-handle cache.
         let trace_id = TraceId::new();
+        // vg_proxy::get_blob_info enforces R+W>N quorum and surfaces
+        // stale/quorum-failure responses as `Err`, so an `Ok(Some)`
+        // here is already version-checked.
         let file_size = if !has_write_buffer {
             if let Some(guid) = existing_blob_guid {
                 match self
@@ -4867,7 +4873,7 @@ impl VfsCore {
         // *after* FUSE_RELEASE returns to the kernel. If unlink
         // arrives in that window, has_pending_intent_for_key says
         // "no Pending intent", we delete from NSS, and the spawned
-        // flush then puts the file back — pjdfstest sees EEXIST on
+        // flush then puts the file back -- pjdfstest sees EEXIST on
         // the next iteration's mkdir at the same name.
         // drain_inode_to_barrier waits for the cycle (which is
         // open_cycle'd synchronously inside fuse_server::release
@@ -5705,7 +5711,7 @@ fn spawn_writeback_metrics_exporter(queue: Arc<WritebackQueue>) {
 }
 
 /// Long-running writeback worker. Polls the queue every `poll_ms`,
-/// drains pending Stage A intents, and fires one batched
+/// drains pending PublishLayout intents, and fires one batched
 /// `InodeBatch` RPC per drain window. Spawned at FUSE init; runs
 /// until the process exits.
 fn spawn_writeback_worker(
@@ -5728,17 +5734,17 @@ fn spawn_writeback_worker(
         loop {
             compio_runtime::time::sleep(poll_dur).await;
 
-            // Drain a batch of Stage A intents. The drainer flips them
+            // Drain a batch of PublishLayout intents. The drainer flips them
             // to InFlight before returning so concurrent enqueues fall
             // into the next-cycle / backpressure path.
-            let drained = queue.drain_stage_a(1024);
+            let drained = queue.drain_publish_layout(1024);
             if drained.is_empty() {
                 continue;
             }
 
             // Build one batched RPC for the whole drain set. Each
             // intent maps to one InodeBatchEntry; the worker uses the
-            // unconditional Put path for every entry today (Stage A on
+            // unconditional Put path for every entry today (PublishLayout on
             // the symlink / vfs_create paths is always the initial
             // publish, never a CAS). Adding CAS support is one extra
             // field on the entry once vfs_release flush moves into
@@ -5846,7 +5852,12 @@ fn spawn_writeback_worker(
                     );
                     for intent in &drained {
                         let inode = intent.inode;
-                        queue.mark_stage_a_failed(&intent.s3_key, intent.generation, inode, false);
+                        queue.mark_publish_layout_failed(
+                            &intent.s3_key,
+                            intent.generation,
+                            inode,
+                            false,
+                        );
                     }
                 }
                 Ok(results) if results.len() != drained.len() => {
@@ -5857,7 +5868,12 @@ fn spawn_writeback_worker(
                     );
                     for intent in &drained {
                         let inode = intent.inode;
-                        queue.mark_stage_a_failed(&intent.s3_key, intent.generation, inode, false);
+                        queue.mark_publish_layout_failed(
+                            &intent.s3_key,
+                            intent.generation,
+                            inode,
+                            false,
+                        );
                     }
                 }
                 Ok(results) => {
@@ -5867,7 +5883,7 @@ fn spawn_writeback_worker(
                             .unwrap_or(nss_codec::BatchEntryStatus::StatusUnspecified);
                         match status {
                             nss_codec::BatchEntryStatus::StatusOk => {
-                                queue.mark_stage_a_committed(
+                                queue.mark_publish_layout_committed(
                                     &intent.s3_key,
                                     intent.generation,
                                     inode,
@@ -5877,9 +5893,9 @@ fn spawn_writeback_worker(
                                 tracing::warn!(
                                     key = %intent.s3_key,
                                     generation = intent.generation.0,
-                                    "writeback Stage A CAS conflict"
+                                    "writeback PublishLayout CAS conflict"
                                 );
-                                queue.mark_stage_a_failed(
+                                queue.mark_publish_layout_failed(
                                     &intent.s3_key,
                                     intent.generation,
                                     inode,
@@ -5892,9 +5908,9 @@ fn spawn_writeback_worker(
                                     generation = intent.generation.0,
                                     status = ?status,
                                     error = %result.error_message,
-                                    "writeback Stage A entry failed"
+                                    "writeback PublishLayout entry failed"
                                 );
-                                queue.mark_stage_a_failed(
+                                queue.mark_publish_layout_failed(
                                     &intent.s3_key,
                                     intent.generation,
                                     inode,

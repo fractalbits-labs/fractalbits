@@ -323,7 +323,7 @@ macro_rules! bss_rpc_retry {
 /// Callers supply the expressions for refresh/get-client so the retry logic
 /// itself lives in exactly one place, independent of whether the caller caches
 /// NSS clients per routing_key (api_server) or holds a single client
-/// (fs_server). Do not invoke directly — use `nss_rpc_retry!`.
+/// (fs_server). Do not invoke directly -- use `nss_rpc_retry!`.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __nss_rpc_retry_body {
@@ -384,7 +384,7 @@ macro_rules! __nss_rpc_retry_body {
                 $crate::rpc_sleep(backoff).await;
                 refresh_attempt = refresh_attempt.saturating_add(1);
 
-                // Retry with same address — NSS may have recovered without an
+                // Retry with same address -- NSS may have recovered without an
                 // address change (e.g., nss_role_agent briefly restarted on
                 // the same port).
                 let same_addr_result =
@@ -415,10 +415,10 @@ macro_rules! __nss_rpc_retry_body {
 /// asking the caller to refresh the NSS address from RSS.
 ///
 /// Two forms:
-/// - 5-arg (multi-NSS): `(client, method(args), app, routing_key, trace_id)` —
+/// - 5-arg (multi-NSS): `(client, method(args), app, routing_key, trace_id)` --
 ///   caller's `app` exposes `get_nss_rpc_client(&RoutingKey)` and
 ///   `try_refresh_nss_address(&RoutingKey, &TraceId)`. Used by api_server.
-/// - 4-arg (single-NSS): `(client, method(args), app, trace_id)` — caller's
+/// - 4-arg (single-NSS): `(client, method(args), app, trace_id)` -- caller's
 ///   `app` exposes `get_nss_rpc_client()` and `try_refresh_nss_address(&TraceId)`.
 ///   Used by fs_server.
 ///

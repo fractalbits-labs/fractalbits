@@ -358,7 +358,7 @@ impl StorageBackend {
     /// Batched inode mutations -- ship N entries in one RPC. Server
     /// processes entries in order; per-entry results come back in
     /// `InodeBatchResponse.results`. Used by the writeback worker to
-    /// drain Stage A as one RPC instead of N round-trips.
+    /// drain PublishLayout as one RPC instead of N round-trips.
     pub async fn inode_batch(
         &self,
         entries: Vec<nss_codec::InodeBatchEntry>,

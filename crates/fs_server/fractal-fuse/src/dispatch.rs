@@ -525,7 +525,7 @@ enum DispatchResult {
     Readdirplus(Vec<DirectoryEntryPlus>, u32),
     Readlink(ReplyReadlink),
     Lseek(u64),
-    /// `(reply, requested_size)` — the requested_size is needed so we can
+    /// `(reply, requested_size)` -- the requested_size is needed so we can
     /// surface ERANGE if the data exceeds the caller's buffer.
     Xattr(ReplyXattr, u32),
     Lock(ReplyLock),

@@ -14,14 +14,14 @@ use crate::slice_mut::SliceMut;
 use lru::LruCache;
 use uuid::Uuid;
 
-// ── On-disk layout ────────────────────────────────────────────────
+// -- On-disk layout ------------------------------------------------
 //
 // Each blob has a single sparse cache file at
 // `{cache_dir}/{blob_id_simple}_{vol}` independent of `blob_version`.
 //
 // Region map:
 //
-//   [0, META_OFFSET)                  data region — block bytes at
+//   [0, META_OFFSET)                  data region -- block bytes at
 //                                     natural offsets (block * block_size).
 //
 //   [META_OFFSET, META_OFFSET+32)     CacheHeader (file-level state, see
@@ -155,7 +155,7 @@ const EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 const HIGH_WATERMARK: f64 = 0.95;
 const LOW_WATERMARK: f64 = 0.90;
 
-// ── In-memory LRU tracker ──────────────────────────────────────────
+// -- In-memory LRU tracker ------------------------------------------
 
 /// Mutable inner state of the cache tracker, protected by a Mutex.
 struct TrackerInner {
@@ -249,7 +249,7 @@ impl CacheTracker {
     }
 }
 
-// ── DiskCache ──────────────────────────────────────────────────────
+// -- DiskCache ------------------------------------------------------
 
 /// Local NVMe disk cache for block data.
 ///
@@ -358,7 +358,7 @@ impl DiskCache {
     }
 
     /// Read a cached block. Returns None on miss (block never cached,
-    /// or checksum mismatch — both treated identically by callers).
+    /// or checksum mismatch -- both treated identically by callers).
     ///
     /// The cache always stores blocks at `self.block_size` bytes
     /// (zero-padded by writers; BSS pads identically on the
@@ -521,7 +521,7 @@ impl DiskCache {
         bytes: &[u8],
     ) -> io::Result<()> {
         if block_version == 0 {
-            // Sentinel value — refuse to store as a "cached" entry.
+            // Sentinel value -- refuse to store as a "cached" entry.
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "block_version=0 is reserved as the not-cached sentinel",
@@ -545,7 +545,7 @@ impl DiskCache {
         // Ensure the header exists (one-time per file). If the file
         // is brand new the header read returns None; write a fresh
         // one. If the header is malformed, we treat that as
-        // corruption and rewrite — the per-block xxhash gate keeps
+        // corruption and rewrite -- the per-block xxhash gate keeps
         // any leftover bytes from being trusted.
         let header_present = read_header(&file).await.is_some();
         if !header_present {
@@ -790,7 +790,7 @@ impl DiskCache {
         }
         // Data extent looks complete. Validate per-block metadata too:
         // a block with bytes on disk but a stale (sentinel) metadata
-        // entry is not "complete" — passthrough would serve bytes the
+        // entry is not "complete" -- passthrough would serve bytes the
         // cache can no longer attest to.
         let block_count = content_length.div_ceil(self.block_size) as u32;
         for block in 0..block_count {
@@ -844,7 +844,7 @@ impl DiskCache {
     }
 }
 
-// ── On-disk helpers ────────────────────────────────────────────────
+// -- On-disk helpers ------------------------------------------------
 
 async fn read_header(file: &File) -> Option<CacheHeader> {
     let buf = vec![0u8; HEADER_SIZE as usize];
@@ -893,7 +893,7 @@ async fn clear_block_meta(file: &File, block: u32) -> io::Result<()> {
     // sparse-aware FALLOC_FL_PUNCH_HOLE; on FS that supports it this
     // is exactly what we want (returns zeros on read = sentinel
     // BlockMeta). For broader portability we could fall back to
-    // pwrite of zeros — for ext4/xfs (which DiskCache::verify_filesystem
+    // pwrite of zeros -- for ext4/xfs (which DiskCache::verify_filesystem
     // already requires), this works.
     let fd = std::os::fd::AsRawFd::as_raw_fd(file);
     let off = block_meta_offset(block) as i64;

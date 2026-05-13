@@ -1106,7 +1106,7 @@ impl DataVgProxy {
                     if let Some(expected) = expected_version
                         && returned_version != expected
                     {
-                        // Don't penalise the node — it answered correctly,
+                        // Don't penalise the node -- it answered correctly,
                         // just hasn't received the latest version yet.
                         warn!(
                             "Fast path read from {} returned version {} but expected {}, falling back",
@@ -2221,7 +2221,7 @@ impl DataVgProxy {
         // padded body into k+m shards and push the freshened bytes
         // to those lagging shards' nodes at `version=max_version`.
         // bssOverwriteCheck advances the lagger; the already-current
-        // shards idempotent-skip. Best-effort — we log failures and
+        // shards idempotent-skip. Best-effort -- we log failures and
         // proceed; bss_repair scans converge anything we miss.
         if strict_max_version {
             let stale_indices: Vec<usize> = shard_versions
@@ -2838,13 +2838,34 @@ impl DataVgProxy {
         Ok(entry_results)
     }
 
-    /// Read the BSS-recorded commit info for a blob. Fans
-    /// `GetBlobInfo` to every available BSS node in the volume and
-    /// picks the response with the highest `blob_version`. For EC
-    /// volumes the commit is replicated (not sharded), so any data
-    /// node's reply suffices. Returns `Ok(None)` when no replica
-    /// has a commit recorded (new blob, or partition that missed
-    /// every publish).
+    /// Read the BSS-recorded commit info for a blob with quorum
+    /// semantics: fan `GetBlobInfo` to every available node, wait for
+    /// at least `read_quorum` non-error replies, then return the
+    /// highest-versioned `Ok(Some)` response among them.
+    ///
+    /// `read_quorum` is sized so reader and writer quorums must
+    /// overlap (`R + W > N`), guaranteeing at least one response from
+    /// a replica that saw the latest commit:
+    ///
+    /// * `Replicated { r, .. }`: use the configured `r`.
+    /// * `ErasureCoded { parity_shards, .. }`: parity_shards + 1
+    ///   (the commit is replicated to every data + parity shard, so
+    ///   any single response with a successful write must overlap a
+    ///   parity+1-sized read).
+    ///
+    /// Returns:
+    ///
+    /// * `Ok(Some(info))` -- quorum reached, `info.blob_version
+    ///   >= expected_version`. Authoritative for the caller.
+    /// * `Ok(None)` -- quorum reached, no replica has any commit for
+    ///   this blob (new blob, or never published). `expected_version`
+    ///   is `0` in the common case here.
+    /// * `Err(StaleVersion)` -- quorum reached but every responder is
+    ///   older than `expected_version`. The freshest replicas are in
+    ///   the unreachable subset; the caller should not commit to a
+    ///   stale answer.
+    /// * `Err(QuorumFailure)` -- too few replicas were reachable /
+    ///   answered. Same caller policy as `StaleVersion`.
     pub async fn get_blob_info(
         &self,
         blob_guid: DataBlobGuid,
@@ -2857,30 +2878,49 @@ impl DataVgProxy {
                 blob_guid.volume_id
             ))
         })?;
+
+        let read_quorum: usize = match &volume.mode {
+            VolumeMode::Replicated { r, .. } => *r as usize,
+            VolumeMode::ErasureCoded { parity_shards, .. } => (*parity_shards as usize) + 1,
+        };
+
+        let available_nodes: Vec<_> = volume
+            .bss_nodes
+            .iter()
+            .filter(|node| node.is_available())
+            .cloned()
+            .collect();
+
+        if available_nodes.len() < read_quorum {
+            return Err(DataVgError::QuorumFailure(format!(
+                "get_blob_info: only {}/{} nodes available (need {})",
+                available_nodes.len(),
+                volume.bss_nodes.len(),
+                read_quorum
+            )));
+        }
+
         let rpc_timeout = self.rpc_timeout;
         let trace_id = *trace_id;
 
         let mut futures = FuturesUnordered::new();
-        for node in &volume.bss_nodes {
-            if !node.is_available() {
-                continue;
-            }
-            let node = node.clone();
+        for node in available_nodes {
             futures.push(async move {
-                let address = node.address.clone();
                 let result = node
                     .get_client()
                     .get_blob_info(blob_guid, expected_version, Some(rpc_timeout), &trace_id, 0)
                     .await;
-                (node, address, result)
+                (node, result)
             });
         }
 
         let mut best: Option<BlobInfo> = None;
-        while let Some((node, _address, result)) = futures.next().await {
+        let mut answered: usize = 0;
+        while let Some((node, result)) = futures.next().await {
             match result {
                 Ok(Some(info)) => {
                     node.record_success();
+                    answered += 1;
                     best = Some(match best {
                         None => info,
                         Some(b) if info.blob_version > b.blob_version => info,
@@ -2889,6 +2929,7 @@ impl DataVgProxy {
                 }
                 Ok(None) => {
                     node.record_success();
+                    answered += 1;
                 }
                 Err(e) => {
                     node.record_failure();
@@ -2896,6 +2937,24 @@ impl DataVgProxy {
                 }
             }
         }
+
+        if answered < read_quorum {
+            return Err(DataVgError::QuorumFailure(format!(
+                "get_blob_info: only {}/{} replicas answered (need {})",
+                answered,
+                volume.bss_nodes.len(),
+                read_quorum
+            )));
+        }
+
+        if let Some(info) = &best
+            && info.blob_version < expected_version
+        {
+            return Err(DataVgError::StaleVersion {
+                expected: expected_version,
+            });
+        }
+
         Ok(best)
     }
 
