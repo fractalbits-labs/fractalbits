@@ -320,13 +320,13 @@ pub fn init_service(
 
         match build_mode {
             BuildMode::Debug => run_cmd! {
-                info "formatting nss_server with default configs";
+                info "Formatting nss_server with default configs";
                 JOURNAL_CONFIG=$journal_config METADATA_VG_CONFIG=$metadata_vg JOURNAL_VG_CONFIG=$journal_vg
                     $nss_binary format --init_test_tree
                     |& ts -m $TS_FMT >$format_log;
             }?,
             BuildMode::Release => run_cmd! {
-                info "formatting nss_server for benchmarking";
+                info "Formatting nss_server for benchmarking";
                 JOURNAL_CONFIG=$journal_config METADATA_VG_CONFIG=$metadata_vg JOURNAL_VG_CONFIG=$journal_vg
                     $nss_binary format --init_test_tree
                     |& ts -m $TS_FMT >$format_log;
@@ -728,9 +728,11 @@ pub fn start_bss_instance(id: u32) -> CmdResult {
     let service_name = format!("bss@{}", id);
     run_cmd!(systemctl --user start $service_name.service)?;
 
-    // Wait for service to be ready
+    // Wait for service to be ready. Startup is dominated by journal replay,
+    // which scans the full pre-allocated journal file (~1 GiB) even on a
+    // fresh format -- 30s is too tight, so match the NSS budget.
     let port = 8088 + id;
-    wait_for_port_ready(port as u16, 30)?;
+    wait_for_port_ready(port as u16, 120)?;
 
     info!("BSS instance {} (port {}) started successfully", id, port);
     Ok(())
@@ -1685,7 +1687,7 @@ pub fn format_bss_instance(id: u32, build_mode: BuildMode) -> CmdResult {
     let storage_path = std::env::var("BSS_STORAGE_PATH").unwrap_or(default_storage_path);
 
     run_cmd! {
-        info "formatting bss_server instance $id (storage_path=$storage_path)";
+        info "Formatting bss_server instance $id (storage_path=$storage_path)";
         WORKING_DIR=$working_dir
         SERVER_PORT=$port
         $bss_binary format --storage-alloc-mode sparse --storage-path $storage_path |& ts -m $TS_FMT >>$format_log;
