@@ -3,8 +3,9 @@
 use bytes::Bytes;
 use data_types::{Bucket, DataBlobGuid, DataVgInfo, RoutingKey, TraceId};
 use file_ops::{
-    ListEntry, blob_blocks_to_delete, mpu_get_part_prefix, parse_delete_inode, parse_get_inode,
-    parse_get_inode_with_bytes, parse_list_inodes, parse_mpu_parts, parse_put_inode,
+    GetInodeAnyOk, ListEntry, blob_blocks_to_delete, mpu_get_part_prefix, parse_delete_inode,
+    parse_get_inode, parse_get_inode_any, parse_get_inode_with_bytes, parse_list_inodes,
+    parse_mpu_parts, parse_put_inode,
 };
 use rpc_client_bss::BssBatchSubOp;
 use rpc_client_common::RpcError;
@@ -181,6 +182,30 @@ impl StorageBackend {
         .await?;
 
         Ok(parse_get_inode(resp)?)
+    }
+
+    /// Combined file/dir lookup. `key` is the bare path with no trailing
+    /// slash; NSS server-side probes both `/foo` and `/foo/` and the
+    /// response says which (if any) matched. One round trip instead of
+    /// two for the common FUSE_LOOKUP-on-miss path.
+    pub async fn get_inode_any(
+        &self,
+        key: &str,
+        trace_id: &TraceId,
+    ) -> Result<GetInodeAnyOk, FsError> {
+        let resp = nss_rpc_retry!(
+            self.nss_client.borrow(),
+            get_inode_any(
+                &self.root_blob_name,
+                key,
+                Some(self.config.rpc_request_timeout()),
+                trace_id
+            ),
+            self,
+            trace_id
+        )
+        .await?;
+        Ok(parse_get_inode_any(resp)?)
     }
 
     /// Variant of [`Self::get_inode`] that also returns the raw stored

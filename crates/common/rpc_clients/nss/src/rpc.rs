@@ -197,6 +197,48 @@ impl RpcClient {
         Ok(resp)
     }
 
+    /// Combined file/dir-form lookup. Pass `key` *without* a trailing
+    /// slash; NSS probes both `/foo` and `/foo/` server-side and the
+    /// response says which (if any) matched.
+    pub async fn get_inode_any(
+        &self,
+        root_blob_name: &str,
+        key: &str,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<GetInodeAnyResponse, RpcError> {
+        let _guard = InflightRpcGuard::new("nss", "get_inode_any");
+        let body = GetInodeAnyRequest {
+            root_blob_name: root_blob_name.to_string(),
+            key: key.to_string(),
+        };
+
+        let mut header = MessageHeader::default();
+        let request_id = self.gen_request_id();
+        header.id = request_id;
+        header.command = Command::GetInodeAny;
+        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
+        header.retry_count = retry_count as u8;
+        header.set_trace_id(trace_id);
+
+        let body_bytes = encode_protobuf(body, trace_id)?;
+        header.set_body_checksum(&body_bytes);
+        let frame = MessageFrame::new(header, body_bytes);
+        let resp_frame = self
+            .send_request(frame, timeout, crate::NssOperation::GetInodeAny)
+            .await
+            .map_err(|e| {
+                if !e.retryable() {
+                    error!(rpc=%"get_inode_any", %request_id, %root_blob_name, %key, error=?e, "nss rpc failed");
+                }
+                e
+            })?;
+        let resp: GetInodeAnyResponse =
+            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        Ok(resp)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn list_inodes(
         &self,

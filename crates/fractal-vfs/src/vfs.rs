@@ -44,6 +44,34 @@ pub struct VfsAttr {
     pub blksize: u32,
 }
 
+impl VfsAttr {
+    /// Synthetic `VfsAttr` for a negative-dentry FUSE_LOOKUP reply.
+    /// `ino == 0` is the FUSE protocol sentinel for "name does not
+    /// exist"; combined with a non-zero entry TTL the kernel caches
+    /// the absence and skips future LOOKUPs for the same name. The
+    /// other fields are zeros -- the kernel reads only `nodeid` for
+    /// negative entries.
+    pub fn negative_dentry() -> Self {
+        Self {
+            ino: 0,
+            size: 0,
+            blocks: 0,
+            atime_secs: 0,
+            mtime_secs: 0,
+            ctime_secs: 0,
+            atime_ns_part: 0,
+            mtime_ns_part: 0,
+            ctime_ns_part: 0,
+            mode: 0,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VfsDirEntry {
     pub ino: u64,
@@ -2160,7 +2188,7 @@ impl VfsCore {
         // flush must CAS against. The override-vs-replace distinction
         // (which gates the old-blob cleanup logic below) is
         // independent of the CAS-or-not decision.
-        tracing::warn!(
+        tracing::debug!(
             key = %s3_key,
             is_override,
             has_expected = expected_layout_bytes.is_some(),
@@ -2435,14 +2463,25 @@ impl VfsCore {
 
         let trace_id = TraceId::new();
 
-        // Drain any Pending writeback intent for the file key before
-        // reading NSS so a chmod / mknod / create that the worker
-        // hasn't yet committed isn't observed as stale.
+        // Drain any Pending writeback intent for either encoding form
+        // before reading NSS so a chmod / mknod / create / mkdir that
+        // the worker hasn't yet committed isn't observed as stale.
+        let dir_key = format!("{}/", full_key);
         self.wait_for_lookup_drain(&full_key).await;
+        self.wait_for_lookup_drain(&dir_key).await;
 
-        // Try as file first
-        match self.backend().get_inode(&full_key, &trace_id).await {
-            Ok(layout) => {
+        // Single NSS RPC probes both file-form (/foo) and directory-form
+        // (/foo/) keys server-side and tells us which (if any) exists.
+        // Halves the round-trip count vs the two sequential probes this
+        // path used to do.
+        let any = match self.backend().get_inode_any(&full_key, &trace_id).await {
+            Ok(any) => Some(any),
+            Err(FsError::NotFound) => None,
+            Err(e) => return Err(e),
+        };
+
+        let dir_layout = match any {
+            Some(file_ops::GetInodeAnyOk::File(layout, _bytes)) => {
                 if !layout.is_fs_visible() {
                     return Err(FsError::NotFound);
                 }
@@ -2477,24 +2516,11 @@ impl VfsCore {
                 self.apply_atime_override(ino, &mut attr);
                 return Ok(attr);
             }
-            Err(FsError::NotFound) => {}
-            Err(e) => return Err(e),
-        }
-
-        // Try as directory
-        let dir_key = format!("{}/", full_key);
-        // Same drain for the dir key: chmod-on-directory in default
-        // mode publishes the Directory layout asynchronously; if the
-        // entry was forgotten between chmod and lookup we'd otherwise
-        // see the pre-chmod posix on the next stat.
-        self.wait_for_lookup_drain(&dir_key).await;
-        let dir_layout = match self.backend().get_inode(&dir_key, &trace_id).await {
-            Ok(layout) => Some(layout),
             // mkdir hasn't drained yet: fall through and let
             // list_inodes confirm existence; entry.posix stays at
             // whatever vfs_mkdir's seed_posix put there.
-            Err(FsError::NotFound) => None,
-            Err(e) => return Err(e),
+            Some(file_ops::GetInodeAnyOk::Directory(layout, _bytes)) => Some(layout),
+            None => None,
         };
 
         let entries = self

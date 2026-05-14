@@ -21,6 +21,11 @@ enum Command {
   // SetAttr op. Cross-batch ordering uses depends_on_index for the
   // mkdir-then-creat patterns the writeback queue collapses.
   InodeBatch = 24;
+  // Single RPC that probes both the file-form key (/foo) and the
+  // directory-form key (/foo/) server-side and returns whichever
+  // exists -- or NotFound. Eliminates the two sequential GetInode
+  // round trips fs_server otherwise issues for every FUSE_LOOKUP.
+  GetInodeAny = 25;
 }
 
 // PutInode
@@ -71,6 +76,28 @@ message GetInodeResponse {
     google.protobuf.Empty err_not_found = 2;
     google.protobuf.Empty err_no_such_root_blob = 3;
     string err_other = 4;
+  }
+}
+
+// GetInodeAny: probe both the file-form (/foo) and the directory-form
+// (/foo/) keys in one RPC. Caller passes the bare path with NO trailing
+// slash; NSS internally appends both forms. Response disambiguates
+// which form (if any) was found.
+message GetInodeAnyRequest {
+  string root_blob_name = 1;
+  string key = 2;
+}
+
+message GetInodeAnyResponse {
+  oneof result {
+    Hit file = 1;            // matched the file-form key (/foo)
+    Hit directory = 2;       // matched the directory-form key (/foo/)
+    google.protobuf.Empty err_not_found = 3;
+    google.protobuf.Empty err_no_such_root_blob = 4;
+    string err_other = 5;
+  }
+  message Hit {
+    bytes value = 1;
   }
 }
 

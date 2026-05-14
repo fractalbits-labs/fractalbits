@@ -1,9 +1,9 @@
 use bytes::Bytes;
 use data_types::object_layout::ObjectLayout;
 use nss_codec::{
-    DeleteInodeResponse, GetInodeResponse, ListInodesResponse, PutInodeCasResponse,
-    PutInodeResponse, delete_inode_response, get_inode_response, list_inodes_response,
-    put_inode_cas_response, put_inode_response,
+    DeleteInodeResponse, GetInodeAnyResponse, GetInodeResponse, ListInodesResponse,
+    PutInodeCasResponse, PutInodeResponse, delete_inode_response, get_inode_any_response,
+    get_inode_response, list_inodes_response, put_inode_cas_response, put_inode_response,
 };
 
 #[derive(Debug)]
@@ -80,6 +80,37 @@ pub fn parse_get_inode_with_bytes(
     let layout = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&object_bytes)
         .map_err(|e| NssError::Deserialization(e.to_string()))?;
     Ok((layout, object_bytes))
+}
+
+/// Result of a combined file/dir lookup: which form (if any) matched.
+pub enum GetInodeAnyOk {
+    /// File-form (`/foo`) was found.
+    File(ObjectLayout, Bytes),
+    /// Directory-form (`/foo/`) was found.
+    Directory(ObjectLayout, Bytes),
+}
+
+pub fn parse_get_inode_any(resp: GetInodeAnyResponse) -> Result<GetInodeAnyOk, NssError> {
+    let result = resp.result.unwrap();
+    let (bytes, is_dir) = match result {
+        get_inode_any_response::Result::File(hit) => (hit.value, false),
+        get_inode_any_response::Result::Directory(hit) => (hit.value, true),
+        get_inode_any_response::Result::ErrNotFound(()) => return Err(NssError::NotFound),
+        get_inode_any_response::Result::ErrNoSuchRootBlob(()) => {
+            return Err(NssError::NoSuchRootBlob);
+        }
+        get_inode_any_response::Result::ErrOther(e) => {
+            tracing::error!("NSS get_inode_any error: {e}");
+            return Err(NssError::Internal(e));
+        }
+    };
+    let layout = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&bytes)
+        .map_err(|e| NssError::Deserialization(e.to_string()))?;
+    Ok(if is_dir {
+        GetInodeAnyOk::Directory(layout, bytes)
+    } else {
+        GetInodeAnyOk::File(layout, bytes)
+    })
 }
 
 pub fn parse_list_inodes(resp: ListInodesResponse) -> Result<ListInodesResult, NssError> {

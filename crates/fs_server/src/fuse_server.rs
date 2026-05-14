@@ -51,16 +51,27 @@ impl Filesystem for FuseServer {
 
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FsResult<ReplyEntry> {
         let name_str = name.to_str().ok_or(libc::EINVAL)?;
-        let attr = self
-            .vfs
-            .vfs_lookup(parent, name_str)
-            .await
-            .map_err(fs_err)?;
-        Ok(ReplyEntry {
-            ttl: TTL,
-            attr: to_file_attr(&attr),
-            generation: 0,
-        })
+        match self.vfs.vfs_lookup(parent, name_str).await {
+            Ok(attr) => Ok(ReplyEntry {
+                ttl: TTL,
+                attr: to_file_attr(&attr),
+                generation: 0,
+            }),
+            // Negative-dentry caching: tell the kernel "this name does
+            // not exist" with `nodeid = 0` and a non-zero entry TTL so
+            // the next LOOKUP for the same (parent, name) -- e.g.
+            // tar's CREATE-precheck -- is served from the dentry cache
+            // and never reaches us. The CREATE itself is the only
+            // userspace round trip. Safe in 1W:NR: only the writer
+            // mutates the namespace, and the writer invalidates the
+            // local dentry cache on every CREATE/MKDIR success.
+            Err(FsError::NotFound) => Ok(ReplyEntry {
+                ttl: TTL,
+                attr: to_file_attr(&VfsAttr::negative_dentry()),
+                generation: 0,
+            }),
+            Err(e) => Err(fs_err(e)),
+        }
     }
 
     fn forget(&self, _req: Request, inode: u64, nlookup: u64) {

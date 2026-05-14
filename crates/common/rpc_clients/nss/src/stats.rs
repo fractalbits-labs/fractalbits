@@ -33,7 +33,7 @@ impl OperationType {
             NssOperation::PutInode | NssOperation::PutInodeCas | NssOperation::InodeBatch => {
                 OperationType::PutInode
             }
-            NssOperation::GetInode => OperationType::GetInode,
+            NssOperation::GetInode | NssOperation::GetInodeAny => OperationType::GetInode,
             NssOperation::DeleteInode => OperationType::DeleteInode,
             NssOperation::ListInodes
             | NssOperation::CreateRootInode
@@ -52,6 +52,9 @@ pub enum NssOperation {
     /// returns per-entry results.
     InodeBatch,
     GetInode,
+    /// Single RPC that probes both file-form (/foo) and directory-form
+    /// (/foo/) keys server-side and returns whichever matches.
+    GetInodeAny,
     ListInodes,
     DeleteInode,
     CreateRootInode,
