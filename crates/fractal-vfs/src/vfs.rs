@@ -5867,85 +5867,157 @@ fn spawn_writeback_worker(
                 }
             }
 
-            let batch_result = backend.inode_batch(batch_entries, &trace_id).await;
+            // Split into sub-batches capped at MAX_BATCH_WIRE_BYTES so a
+            // single InodeBatch never exceeds NSS's 128 KiB per-connection
+            // recv_buf (`core/nss_server/net_worker.zig`, recv_buf_size).
+            // When that buffer overflows, NSS silently marks the connection
+            // closed; every in-flight RPC on the multiplexed connection then
+            // drains with ConnectionClosed and the retry path slams NSS in
+            // unison. See `bug-nss-connection-storm-disk-cache.md`.
+            //
+            // Sub-batches are processed sequentially. Cross-batch dependency
+            // edges (a child whose parent landed in an earlier sub-batch)
+            // are dropped: the parent's commit has already been awaited and
+            // marked-committed-or-failed by the time the child's sub-batch
+            // is sent. Same-batch edges are preserved by remapping indices.
+            const MAX_BATCH_WIRE_BYTES: usize = 100 * 1024;
+            let total_entries = batch_entries.len();
+            let mut split_boundaries: Vec<usize> = Vec::new();
+            let mut start = 0usize;
+            let mut acc = 0usize;
+            for (i, entry) in batch_entries.iter().enumerate() {
+                let enc = prost::Message::encoded_len(entry);
+                // Always include at least one entry per sub-batch so a single
+                // pathologically-large entry still ships (NSS will then close
+                // the connection; that's the existing failure mode, not a
+                // regression introduced here).
+                if i > start && acc + enc > MAX_BATCH_WIRE_BYTES {
+                    split_boundaries.push(i);
+                    start = i;
+                    acc = 0;
+                }
+                acc += enc;
+            }
+            split_boundaries.push(total_entries);
 
-            match batch_result {
-                Err(e) => {
-                    tracing::warn!(
-                        n_entries = drained.len(),
-                        error = %e,
-                        "writeback InodeBatch RPC failed"
-                    );
-                    for intent in &drained {
-                        let inode = intent.inode;
-                        queue.mark_publish_layout_failed(
-                            &intent.s3_key,
-                            intent.generation,
-                            inode,
-                            false,
-                        );
-                    }
+            if split_boundaries.len() > 1 {
+                tracing::debug!(
+                    sub_batches = split_boundaries.len(),
+                    n_entries = total_entries,
+                    "writeback InodeBatch split for wire-size cap"
+                );
+            }
+
+            // Iterate sub-batches in order. We drain `batch_entries` from the
+            // front and slice into `drained` in parallel.
+            let mut entry_iter = batch_entries.into_iter();
+            let mut prev_boundary = 0usize;
+            for boundary in split_boundaries {
+                let sub_len = boundary - prev_boundary;
+                let mut sub_entries: Vec<nss_codec::InodeBatchEntry> = Vec::with_capacity(sub_len);
+                for _ in 0..sub_len {
+                    sub_entries.push(entry_iter.next().expect("split index aligned"));
                 }
-                Ok(results) if results.len() != drained.len() => {
-                    tracing::warn!(
-                        sent = drained.len(),
-                        got = results.len(),
-                        "writeback InodeBatch result count mismatch"
-                    );
-                    for intent in &drained {
-                        let inode = intent.inode;
-                        queue.mark_publish_layout_failed(
-                            &intent.s3_key,
-                            intent.generation,
-                            inode,
-                            false,
-                        );
-                    }
+                // Remap depends_on_index to local indices; drop edges that
+                // point into an earlier sub-batch (parent already settled).
+                let base = prev_boundary;
+                for entry in &mut sub_entries {
+                    entry.depends_on_index = entry
+                        .depends_on_index
+                        .iter()
+                        .filter_map(|idx| {
+                            let i = *idx as usize;
+                            if i >= base && i < boundary {
+                                Some((i - base) as u32)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                 }
-                Ok(results) => {
-                    for (intent, result) in drained.iter().zip(results.iter()) {
-                        let inode = intent.inode;
-                        let status = nss_codec::BatchEntryStatus::try_from(result.status)
-                            .unwrap_or(nss_codec::BatchEntryStatus::StatusUnspecified);
-                        match status {
-                            nss_codec::BatchEntryStatus::StatusOk => {
-                                queue.mark_publish_layout_committed(
-                                    &intent.s3_key,
-                                    intent.generation,
-                                    inode,
-                                );
-                            }
-                            nss_codec::BatchEntryStatus::StatusCasConflict => {
-                                tracing::warn!(
-                                    key = %intent.s3_key,
-                                    generation = intent.generation.0,
-                                    "writeback PublishLayout CAS conflict"
-                                );
-                                queue.mark_publish_layout_failed(
-                                    &intent.s3_key,
-                                    intent.generation,
-                                    inode,
-                                    true,
-                                );
-                            }
-                            _ => {
-                                tracing::warn!(
-                                    key = %intent.s3_key,
-                                    generation = intent.generation.0,
-                                    status = ?status,
-                                    error = %result.error_message,
-                                    "writeback PublishLayout entry failed"
-                                );
-                                queue.mark_publish_layout_failed(
-                                    &intent.s3_key,
-                                    intent.generation,
-                                    inode,
-                                    false,
-                                );
+
+                let batch_result = backend.inode_batch(sub_entries, &trace_id).await;
+                let sub_drained = &drained[prev_boundary..boundary];
+
+                match batch_result {
+                    Err(e) => {
+                        tracing::warn!(
+                            n_entries = sub_drained.len(),
+                            error = %e,
+                            "writeback InodeBatch RPC failed"
+                        );
+                        for intent in sub_drained {
+                            let inode = intent.inode;
+                            queue.mark_publish_layout_failed(
+                                &intent.s3_key,
+                                intent.generation,
+                                inode,
+                                false,
+                            );
+                        }
+                    }
+                    Ok(results) if results.len() != sub_drained.len() => {
+                        tracing::warn!(
+                            sent = sub_drained.len(),
+                            got = results.len(),
+                            "writeback InodeBatch result count mismatch"
+                        );
+                        for intent in sub_drained {
+                            let inode = intent.inode;
+                            queue.mark_publish_layout_failed(
+                                &intent.s3_key,
+                                intent.generation,
+                                inode,
+                                false,
+                            );
+                        }
+                    }
+                    Ok(results) => {
+                        for (intent, result) in sub_drained.iter().zip(results.iter()) {
+                            let inode = intent.inode;
+                            let status = nss_codec::BatchEntryStatus::try_from(result.status)
+                                .unwrap_or(nss_codec::BatchEntryStatus::StatusUnspecified);
+                            match status {
+                                nss_codec::BatchEntryStatus::StatusOk => {
+                                    queue.mark_publish_layout_committed(
+                                        &intent.s3_key,
+                                        intent.generation,
+                                        inode,
+                                    );
+                                }
+                                nss_codec::BatchEntryStatus::StatusCasConflict => {
+                                    tracing::warn!(
+                                        key = %intent.s3_key,
+                                        generation = intent.generation.0,
+                                        "writeback PublishLayout CAS conflict"
+                                    );
+                                    queue.mark_publish_layout_failed(
+                                        &intent.s3_key,
+                                        intent.generation,
+                                        inode,
+                                        true,
+                                    );
+                                }
+                                _ => {
+                                    tracing::warn!(
+                                        key = %intent.s3_key,
+                                        generation = intent.generation.0,
+                                        status = ?status,
+                                        error = %result.error_message,
+                                        "writeback PublishLayout entry failed"
+                                    );
+                                    queue.mark_publish_layout_failed(
+                                        &intent.s3_key,
+                                        intent.generation,
+                                        inode,
+                                        false,
+                                    );
+                                }
                             }
                         }
                     }
                 }
+                prev_boundary = boundary;
             }
         }
     })
