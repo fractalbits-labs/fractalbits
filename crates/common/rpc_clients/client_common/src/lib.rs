@@ -38,6 +38,25 @@ pub async fn rpc_sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
 }
 
+/// Half-jitter helper: returns a uniformly random duration in
+/// [base_ms/2, base_ms). When `base_ms <= 1`, returns 1 ms (we never
+/// want a zero sleep on a retry path). Lives in a function rather than
+/// inline in the retry macros so callers of the macros don't need
+/// `rand` in their own Cargo.toml.
+///
+/// "Half jitter" (vs full jitter) keeps a floor under the sleep so the
+/// expected wait still grows exponentially with the backoff, while
+/// breaking the lockstep that arises when an entire multiplexed
+/// connection's worth of in-flight RPCs all retry on the same
+/// connection-drop tick.
+pub fn jitter_backoff(base_ms: u64) -> Duration {
+    use rand::RngExt;
+    let lo = base_ms / 2;
+    let range = base_ms.saturating_sub(lo).max(1);
+    let ms = lo + rand::rng().random_range(0..range);
+    Duration::from_millis(ms.max(1))
+}
+
 #[cfg(feature = "metrics")]
 use metrics_wrapper::{Gauge, counter, gauge, histogram};
 
@@ -259,7 +278,7 @@ macro_rules! rpc_retry {
     ($rpc_type:expr, $client:expr, $method:ident($($args:expr),*)) => {
         async {
             let mut retries = 3;
-            let mut backoff = std::time::Duration::from_millis(2);
+            let mut backoff_ms = 2u64;
             let mut retry_count = 0u32;
             loop {
                 match $client.$method($($args,)* retry_count).await {
@@ -270,8 +289,11 @@ macro_rules! rpc_retry {
                         if e.retryable() && retries > 0 {
                             retries -= 1;
                             retry_count += 1;
-                            $crate::rpc_sleep(backoff).await;
-                            backoff = backoff.saturating_mul(2);
+                            // Half jitter to break the lockstep that arises when
+                            // an entire multiplexed connection's worth of
+                            // in-flight RPCs all retry on the same disconnect.
+                            $crate::rpc_sleep($crate::jitter_backoff(backoff_ms)).await;
+                            backoff_ms = backoff_ms.saturating_mul(2);
                         } else {
                             if e.retryable() {
                                 ::tracing::error!(
@@ -344,15 +366,22 @@ macro_rules! __nss_rpc_retry_body {
                     refresh_attempt = 0;
                 }
 
-                // Exponential backoff: 200ms, 400ms, 800ms, 1000ms (capped)
-                let backoff_ms = std::cmp::min(200 * (1u64 << refresh_attempt.min(3)), 1000);
+                // Exponential backoff with half jitter: pick uniformly from
+                // [base/2, base) where base = min(200 * 2^min(n,3), 1000) ms.
+                // Half jitter breaks the lockstep that arises when a whole
+                // multiplexed NSS connection's worth of in-flight RPCs all
+                // enter this loop on the same disconnect, then retry NSS in
+                // unison after each backoff -- which can knock NSS over again
+                // mid-recovery.
+                let base_ms = std::cmp::min(200u64 * (1u64 << refresh_attempt.min(3)), 1000);
+                let backoff = $crate::jitter_backoff(base_ms);
                 ::tracing::debug!(
                     "NSS failover: waiting {}ms before retry (attempt {}, elapsed {}ms)",
-                    backoff_ms,
+                    backoff.as_millis(),
                     refresh_attempt + 1,
                     failover_start.elapsed().as_millis()
                 );
-                $crate::rpc_sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                $crate::rpc_sleep(backoff).await;
                 refresh_attempt = refresh_attempt.saturating_add(1);
 
                 // Retry with same address — NSS may have recovered without an
