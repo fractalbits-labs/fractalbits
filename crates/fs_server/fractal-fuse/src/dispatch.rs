@@ -28,7 +28,7 @@ pub async fn dispatch<F: Filesystem>(fs: &F, entry: &mut RingEntry) -> Option<()
     match opcode {
         FUSE_FORGET => {
             let arg: &fuse_forget_in = header.op_in_as();
-            fs.forget(req, nodeid, arg.nlookup);
+            fs.forget(req, nodeid, arg.nlookup).await;
             return None;
         }
         FUSE_BATCH_FORGET => {
@@ -45,7 +45,7 @@ pub async fn dispatch<F: Filesystem>(fs: &F, entry: &mut RingEntry) -> Option<()
                 let one = unsafe { &*(payload.as_ptr().add(offset) as *const fuse_forget_one) };
                 inodes.push((one.nodeid, one.nlookup));
             }
-            fs.batch_forget(req, &inodes);
+            fs.batch_forget(req, &inodes).await;
             return None;
         }
         _ => {}

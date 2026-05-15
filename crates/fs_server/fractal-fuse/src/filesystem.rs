@@ -55,17 +55,29 @@ pub trait Filesystem: Send + Sync + 'static {
     /// `nlookup` is the number of references to drop. The filesystem should
     /// not return errors; after this call, the inode may be evicted if no
     /// references remain.
-    fn forget(&self, req: Request, inode: Inode, nlookup: u64) {
+    fn forget(
+        &self,
+        req: Request,
+        inode: Inode,
+        nlookup: u64,
+    ) -> impl std::future::Future<Output = ()> {
         let _ = (req, inode, nlookup);
+        async {}
     }
 
     /// Release multiple inode references in a single call.
     ///
     /// Each element in `inodes` is an `(inode, nlookup)` pair. The default
     /// implementation delegates to `forget` for each entry.
-    fn batch_forget(&self, req: Request, inodes: &[(Inode, u64)]) {
-        for &(inode, nlookup) in inodes {
-            self.forget(req, inode, nlookup);
+    fn batch_forget(
+        &self,
+        req: Request,
+        inodes: &[(Inode, u64)],
+    ) -> impl std::future::Future<Output = ()> {
+        async move {
+            for &(inode, nlookup) in inodes {
+                self.forget(req, inode, nlookup).await;
+            }
         }
     }
 

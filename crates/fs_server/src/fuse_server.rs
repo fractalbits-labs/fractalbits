@@ -67,7 +67,7 @@ impl Filesystem for FuseServer {
         })
     }
 
-    fn forget(&self, _req: Request, inode: u64, nlookup: u64) {
+    async fn forget(&self, _req: Request, inode: u64, nlookup: u64) {
         self.vfs.vfs_forget(inode, nlookup);
     }
 
