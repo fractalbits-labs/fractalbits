@@ -36,6 +36,7 @@
 
           # Build tools
           pkg-config
+          protobuf
 
           # System libraries
           openssl
