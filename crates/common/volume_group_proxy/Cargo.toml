@@ -18,7 +18,7 @@ rand.workspace = true
 rpc_client_bss.workspace = true
 rpc_client_common.workspace = true
 data_types.workspace = true
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["full"] }
 compio-runtime = { workspace = true, optional = true }
 tracing.workspace = true
 uuid.workspace = true
