@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -140,31 +141,36 @@ impl Session {
             let handle = thread::Builder::new()
                 .name(format!("fuse-q{}", queue_id))
                 .spawn(move || {
-                    let mut cpus = HashSet::new();
-                    cpus.insert(queue_id);
+                    if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                        let mut cpus = HashSet::new();
+                        cpus.insert(queue_id);
 
-                    let rt = Runtime::builder()
-                        .thread_affinity(cpus)
-                        .build()
-                        .expect("cannot create compio runtime");
+                        let rt = Runtime::builder()
+                            .thread_affinity(cpus)
+                            .build()
+                            .expect("cannot create compio runtime");
 
-                    rt.block_on(async {
-                        match run_queue(
-                            fuse_raw_fd,
-                            queue_id as u16,
-                            queue_depth,
-                            max_payload,
-                            fs,
-                            shutdown,
-                        )
-                        .await
-                        {
-                            Ok(queue_connected) => {
-                                connected.fetch_and(queue_connected, Ordering::Relaxed);
+                        rt.block_on(async {
+                            match run_queue(
+                                fuse_raw_fd,
+                                queue_id as u16,
+                                queue_depth,
+                                max_payload,
+                                fs,
+                                &shutdown,
+                            )
+                            .await
+                            {
+                                Ok(queue_connected) => {
+                                    connected.fetch_and(queue_connected, Ordering::Relaxed);
+                                }
+                                Err(e) => error!("queue {} failed: {}", queue_id, e),
                             }
-                            Err(e) => error!("queue {} failed: {}", queue_id, e),
-                        }
-                    });
+                        })
+                    })) {
+                        error!("ring thread panicked: {:?}", e);
+                        shutdown.cancel();
+                    }
                 })?;
             threads.push(handle);
         }
@@ -190,7 +196,7 @@ async fn run_queue<F: Filesystem>(
     queue_depth: u16,
     max_payload: usize,
     fs: Arc<F>,
-    shutdown: CancellationToken,
+    shutdown: &CancellationToken,
 ) -> io::Result<bool> {
     // Register fuse fd with this thread's io_uring
     register_files(&[fuse_raw_fd])?;
@@ -225,7 +231,10 @@ async fn run_queue<F: Filesystem>(
                 connected = false;
             }
             Ok(Err(e)) => error!("entry task failed: {}", e),
-            Err(e) => error!("entry task panicked: {:?}", e),
+            Err(e) => {
+                error!("entry task panicked: {:?}", e);
+                shutdown.cancel();
+            }
         }
     }
 
