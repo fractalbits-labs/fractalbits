@@ -16,7 +16,7 @@ pin-project-lite.workspace = true
 regex.workspace = true
 rlimit.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["full"] }
 uuid.workspace = true
 clap.workspace = true
 xxhash-rust.workspace = true

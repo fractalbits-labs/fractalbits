@@ -93,8 +93,7 @@ pub fn build_bench_rpc() -> CmdResult {
     let build_envs = get_build_envs();
     run_cmd! {
         info "Building benchmark tool `rewrk_rpc` ...";
-        cd crates/bench_rpc;
-        $[build_envs] cargo build --release;
+        $[build_envs] cargo build -p rewrk_rpc --release;
     }
 }
 
