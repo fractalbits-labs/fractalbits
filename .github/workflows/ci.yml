@@ -65,6 +65,26 @@ jobs:
         sudo dmesg | grep -E "oom|killed|Out of memory|memory" -i || true
         free -h
 
+    - name: Collect debug logs on failure
+      if: failure()
+      run: |
+        mkdir -p ci-debug
+        journalctl --user --no-pager -n 5000 > ci-debug/journal-user.log 2>&1 || true
+        sudo dmesg > ci-debug/dmesg.log 2>&1 || true
+        cp -r data/logs ci-debug/ 2>/dev/null || true
+        cp -r data/etc ci-debug/ 2>/dev/null || true
+        find data -name 'core.*' -exec cp {} ci-debug/ \; 2>/dev/null || true
+        tar czf ci-debug-${{ matrix.arch }}.tar.gz ci-debug
+
+    - name: Upload debug logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ci-debug-${{ matrix.arch }}
+        path: ci-debug-${{ matrix.arch }}.tar.gz
+        if-no-files-found: ignore
+        retention-days: 7
+
   docker:
     strategy:
       fail-fast: false
@@ -115,6 +135,28 @@ jobs:
 
     - name: Run Docker tests
       run: cargo xtask precheckin --docker=only
+
+    - name: Collect debug logs on failure
+      if: failure()
+      run: |
+        mkdir -p ci-debug
+        journalctl --user --no-pager -n 5000 > ci-debug/journal-user.log 2>&1 || true
+        sudo dmesg > ci-debug/dmesg.log 2>&1 || true
+        docker ps -a > ci-debug/docker-ps.log 2>&1 || true
+        docker logs fractalbits-dev > ci-debug/docker-fractalbits-dev.log 2>&1 || true
+        cp -r data/logs ci-debug/ 2>/dev/null || true
+        cp -r data/etc ci-debug/ 2>/dev/null || true
+        find data -name 'core.*' -exec cp {} ci-debug/ \; 2>/dev/null || true
+        tar czf ci-debug-docker-${{ matrix.arch }}.tar.gz ci-debug
+
+    - name: Upload debug logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ci-debug-docker-${{ matrix.arch }}
+        path: ci-debug-docker-${{ matrix.arch }}.tar.gz
+        if-no-files-found: ignore
+        retention-days: 7
 
     - name: Log in to Container Registry
       if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.arch == 'x86_64'
