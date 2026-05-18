@@ -15,7 +15,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 #[cfg(feature = "tokio-runtime")]
@@ -240,7 +240,7 @@ impl DataVgProxy {
         rpc_connection_timeout: Duration,
         cb_config: CircuitBreakerConfig,
     ) -> Result<Self, DataVgError> {
-        info!(
+        debug!(
             "Initializing DataVgProxy with {} volumes, circuit breaker config: {:?}",
             data_vg_info.volumes.len(),
             cb_config
@@ -335,7 +335,7 @@ impl DataVgProxy {
                 parity_shards,
             } = &mode
             {
-                info!(
+                debug!(
                     "EC volume {} initialized: k={}, m={}, {} nodes",
                     volume_id,
                     data_shards,
