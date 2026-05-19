@@ -8,6 +8,16 @@ use aws_sdk_s3::{
 use rstest::rstest;
 use test_common::{Context, assert_bytes_eq, context};
 
+// Per-chunk overhead added by aws-sdk-s3 >= 1.81 when the SDK defaults to
+// sigv4 signed chunked streaming (STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER):
+//   ";chunk-signature=" (17) + 64-hex digest = 81 bytes per chunk header.
+// A single-data-chunk PUT has two chunk headers (the data chunk and the
+// terminating zero-length chunk), so the data section grows by 2 * 81 = 162.
+const STREAMING_CHUNK_SIG_OVERHEAD: usize = 2 * (b";chunk-signature=".len() + 64);
+// Trailer signature line appended after the trailer headers:
+//   "x-amz-trailer-signature:" (24) + 64-hex + "\r\n" (2) = 90 bytes.
+const STREAMING_TRAILER_SIG_LEN: usize = b"x-amz-trailer-signature:".len() + 64 + b"\r\n".len();
+
 // The test structure is identical for all supported checksum algorithms
 #[allow(clippy::too_many_arguments)]
 async fn test_checksum(
@@ -87,6 +97,8 @@ async fn test_crc32_checksum(#[case] streaming: bool) {
 
     let expected_encoded_content_length = if streaming {
         b"B\r\nHello world\r\n0\r\nx-amz-checksum-crc32:i9aeUg==\r\n\r\n".len()
+            + STREAMING_CHUNK_SIG_OVERHEAD
+            + STREAMING_TRAILER_SIG_LEN
     } else {
         b"Hello world".len()
     };
@@ -118,6 +130,8 @@ async fn test_crc32c_checksum(#[case] streaming: bool) {
 
     let expected_encoded_content_length = if streaming {
         b"B\r\nHello world\r\n0\r\nx-amz-checksum-crc32c:crUfeA==\r\n\r\n".len()
+            + STREAMING_CHUNK_SIG_OVERHEAD
+            + STREAMING_TRAILER_SIG_LEN
     } else {
         b"Hello world".len()
     };
@@ -148,6 +162,8 @@ async fn test_sha1_checksum(#[case] streaming: bool) {
 
     let expected_encoded_content_length = if streaming {
         b"B\r\nHello world\r\n0\r\nx-amz-checksum-sha1:e1AsOh9IyGCa4hLN+2Od7jlnP14=\r\n\r\n".len()
+            + STREAMING_CHUNK_SIG_OVERHEAD
+            + STREAMING_TRAILER_SIG_LEN
     } else {
         b"Hello world".len()
     };
@@ -178,6 +194,8 @@ async fn test_sha256_checksum(#[case] streaming: bool) {
 
     let expected_encoded_content_length = if streaming {
         b"B\r\nHello world\r\n0\r\nx-amz-checksum-sha256:ZOyIygCyaOW6GjVnihtTFtIS9PNmskdyMlNKiuyjfzw=\r\n\r\n".len()
+            + STREAMING_CHUNK_SIG_OVERHEAD
+            + STREAMING_TRAILER_SIG_LEN
     } else {
         b"Hello world".len()
     };
@@ -211,6 +229,8 @@ async fn test_crc64nvme_checksum(#[case] streaming: bool) {
 
     let expected_encoded_content_length = if streaming {
         b"B\r\nHello world\r\n0\r\nx-amz-checksum-crc64nvme:OOJZ0D8xKts=\r\n\r\n".len()
+            + STREAMING_CHUNK_SIG_OVERHEAD
+            + STREAMING_TRAILER_SIG_LEN
     } else {
         b"Hello world".len()
     };
