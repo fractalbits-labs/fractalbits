@@ -1262,7 +1262,7 @@ Environment="RUST_LOG=warn""##
         ServiceName::Bss => {
             // Create template for BSS services using %i placeholder
             // Use bash arithmetic to calculate port dynamically: 8088 + instance_id
-            env_settings += "\nEnvironment=\"WORKING_DIR=./bss%i\"";
+            env_settings += "\nEnvironment=\"WORKING_DIR=./bss-%i\"";
             let bss_binary = resolve_binary_path("bss_server", build_mode);
             format!("/bin/bash -c 'SERVER_PORT=$((8088 + %i)) {bss_binary} serve'")
         }
@@ -1690,7 +1690,7 @@ fn reset_observer_leader_fence(backend: RssBackend) -> CmdResult {
 pub fn format_bss_instance(id: u32, build_mode: BuildMode) -> CmdResult {
     let bss_binary = resolve_binary_path("bss_server", build_mode);
     let format_log = "data/logs/bss_format.log";
-    let working_dir = format!("data/bss{id}");
+    let working_dir = format!("data/bss-{id}");
     let port = 8088 + id;
 
     // Default to file mode with absolute path; allow override via BSS_STORAGE_PATH for

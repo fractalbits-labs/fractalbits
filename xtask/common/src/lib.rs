@@ -547,9 +547,9 @@ pub fn check_port_ready(port: u16) -> bool {
 
 /// Create directories for BSS server
 pub fn create_bss_dirs(data_dir: &Path, bss_id: u32) -> CmdResult {
-    info!("Creating directories for bss{} server", bss_id);
+    info!("Creating directories for bss-{} server", bss_id);
 
-    let bss_dir = data_dir.join(format!("bss{}", bss_id));
+    let bss_dir = data_dir.join(format!("bss-{}", bss_id));
     fs::create_dir_all(bss_dir.join("local/stats"))?;
     fs::create_dir_all(bss_dir.join("local/journal"))?;
     fs::create_dir_all(bss_dir.join("local/storage"))?;

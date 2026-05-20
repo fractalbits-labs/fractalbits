@@ -154,7 +154,7 @@ impl Orchestrator {
 
     fn format_bss(&self) -> Result<()> {
         let bss_bin = self.bin_dir.join("bss_server");
-        let working_dir = self.data_dir.join("bss0");
+        let working_dir = self.data_dir.join("bss-0");
 
         // Skip formatting if both storage engine and state files exist.
         let storage_file = working_dir.join("local/storage/blobs.storage");
@@ -175,7 +175,7 @@ impl Orchestrator {
     fn start_bss(&mut self) -> Result<()> {
         let mut child = Command::new(self.bin_dir.join("bss_server"))
             .arg("serve")
-            .env("WORKING_DIR", self.data_dir.join("bss0"))
+            .env("WORKING_DIR", self.data_dir.join("bss-0"))
             .env("SERVER_PORT", "8088")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
