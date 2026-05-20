@@ -212,6 +212,11 @@ StartLimitBurst=3
             "Restart=on-failure\nRestartSec=5",
         )
     };
+    // SyslogIdentifier overrides systemd's default journal tag, which is
+    // otherwise derived from the ExecStart program name. Without this, nss
+    // entries show up as `bash[pid]` (it launches via `/bin/bash -c`), and
+    // rss shows up as `root_server`. Pin the tag to the service name so
+    // `journalctl -t nss` / `-t rss` work as expected.
     let systemd_unit_content = format!(
         r##"[Unit]
 Description={service_name} Service
@@ -224,6 +229,7 @@ BindsTo={requires}
 {scheduling}
 {auto_restart}
 LimitNOFILE=65536
+SyslogIdentifier={service_name}
 {coredump_setting}WorkingDirectory={working_dir}{env_settings}
 ExecStart={exec_start}
 
