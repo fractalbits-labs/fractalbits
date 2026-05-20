@@ -1439,6 +1439,18 @@ StartLimitBurst=100
         env_settings += &format!("\nEnvironment=\"LLVM_PROFILE_FILE={}\"", profile_file);
     }
 
+    // SyslogIdentifier overrides systemd's default journal tag, which is
+    // otherwise derived from the ExecStart program name. Without this, bss/nss
+    // entries show up as `bash[pid]` because they launch via `/bin/bash -c`,
+    // and rss shows up as `root_server`. Template units use `%i` so each
+    // instance is distinguishable in the journal.
+    let syslog_identifier = match service {
+        ServiceName::Bss => "bss-%i".to_string(),
+        ServiceName::Nss => "nss-%i".to_string(),
+        ServiceName::NssRoleAgent => "nss_role_agent-%i".to_string(),
+        _ => service_name.to_string(),
+    };
+
     let systemd_unit_content = format!(
         r##"[Unit]
 Description={service_name} Service
@@ -1450,6 +1462,7 @@ Description={service_name} Service
 TimeoutStopSec=5
 LimitNOFILE=1000000
 LimitCORE=infinity
+SyslogIdentifier={syslog_identifier}
 WorkingDirectory={working_dir}{env_settings}
 ExecStart={exec_start}
 SuccessExitStatus=143
