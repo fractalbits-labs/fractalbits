@@ -1934,12 +1934,12 @@ mod tests {
             "volumes": [{
                 "volume_id": 32768,
                 "bss_nodes": [
-                    {"node_id":"bss0","ip":"127.0.0.1","port":8088},
-                    {"node_id":"bss1","ip":"127.0.0.1","port":8089},
-                    {"node_id":"bss2","ip":"127.0.0.1","port":8090},
-                    {"node_id":"bss3","ip":"127.0.0.1","port":8091},
-                    {"node_id":"bss4","ip":"127.0.0.1","port":8092},
-                    {"node_id":"bss5","ip":"127.0.0.1","port":8093}
+                    {"node_id":"bss-0","ip":"127.0.0.1","port":8088},
+                    {"node_id":"bss-1","ip":"127.0.0.1","port":8089},
+                    {"node_id":"bss-2","ip":"127.0.0.1","port":8090},
+                    {"node_id":"bss-3","ip":"127.0.0.1","port":8091},
+                    {"node_id":"bss-4","ip":"127.0.0.1","port":8092},
+                    {"node_id":"bss-5","ip":"127.0.0.1","port":8093}
                 ],
                 "mode": {"type":"erasure_coded","data_shards":4,"parity_shards":2}
             }]
@@ -1965,7 +1965,7 @@ mod tests {
     #[test]
     fn parse_replicated_config_json() {
         let json = r#"{
-            "volumes": [{"volume_id":1,"bss_nodes":[{"node_id":"bss0","ip":"127.0.0.1","port":8088}],"mode":{"type":"replicated","n":1,"r":1,"w":1}}]
+            "volumes": [{"volume_id":1,"bss_nodes":[{"node_id":"bss-0","ip":"127.0.0.1","port":8088}],"mode":{"type":"replicated","n":1,"r":1,"w":1}}]
         }"#;
 
         let info: DataVgInfo = serde_json::from_str(json).unwrap();
@@ -1979,12 +1979,12 @@ mod tests {
             "volumes": [{
                 "volume_id": 32768,
                 "bss_nodes": [
-                    {"node_id":"bss0","ip":"127.0.0.1","port":18088},
-                    {"node_id":"bss1","ip":"127.0.0.1","port":18089},
-                    {"node_id":"bss2","ip":"127.0.0.1","port":18090},
-                    {"node_id":"bss3","ip":"127.0.0.1","port":18091},
-                    {"node_id":"bss4","ip":"127.0.0.1","port":18092},
-                    {"node_id":"bss5","ip":"127.0.0.1","port":18093}
+                    {"node_id":"bss-0","ip":"127.0.0.1","port":18088},
+                    {"node_id":"bss-1","ip":"127.0.0.1","port":18089},
+                    {"node_id":"bss-2","ip":"127.0.0.1","port":18090},
+                    {"node_id":"bss-3","ip":"127.0.0.1","port":18091},
+                    {"node_id":"bss-4","ip":"127.0.0.1","port":18092},
+                    {"node_id":"bss-5","ip":"127.0.0.1","port":18093}
                 ],
                 "mode": {"type":"erasure_coded","data_shards":4,"parity_shards":2}
             }]
@@ -2005,8 +2005,8 @@ mod tests {
             "volumes": [{
                 "volume_id": 32768,
                 "bss_nodes": [
-                    {"node_id":"bss0","ip":"127.0.0.1","port":18088},
-                    {"node_id":"bss1","ip":"127.0.0.1","port":18089}
+                    {"node_id":"bss-0","ip":"127.0.0.1","port":18088},
+                    {"node_id":"bss-1","ip":"127.0.0.1","port":18089}
                 ],
                 "mode": {"type":"erasure_coded","data_shards":4,"parity_shards":2}
             }]
@@ -2025,12 +2025,12 @@ mod tests {
             "volumes": [{
                 "volume_id": 65535,
                 "bss_nodes": [
-                    {"node_id":"bss0","ip":"127.0.0.1","port":18088},
-                    {"node_id":"bss1","ip":"127.0.0.1","port":18089},
-                    {"node_id":"bss2","ip":"127.0.0.1","port":18090},
-                    {"node_id":"bss3","ip":"127.0.0.1","port":18091},
-                    {"node_id":"bss4","ip":"127.0.0.1","port":18092},
-                    {"node_id":"bss5","ip":"127.0.0.1","port":18093}
+                    {"node_id":"bss-0","ip":"127.0.0.1","port":18088},
+                    {"node_id":"bss-1","ip":"127.0.0.1","port":18089},
+                    {"node_id":"bss-2","ip":"127.0.0.1","port":18090},
+                    {"node_id":"bss-3","ip":"127.0.0.1","port":18091},
+                    {"node_id":"bss-4","ip":"127.0.0.1","port":18092},
+                    {"node_id":"bss-5","ip":"127.0.0.1","port":18093}
                 ],
                 "mode": {"type":"erasure_coded","data_shards":4,"parity_shards":2}
             }]
@@ -2049,8 +2049,8 @@ mod tests {
             "volumes": [{
                 "volume_id": 32768,
                 "bss_nodes": [
-                    {"node_id":"bss0","ip":"127.0.0.1","port":18088},
-                    {"node_id":"bss1","ip":"127.0.0.1","port":18089}
+                    {"node_id":"bss-0","ip":"127.0.0.1","port":18088},
+                    {"node_id":"bss-1","ip":"127.0.0.1","port":18089}
                 ],
                 "mode": {"type":"erasure_coded","data_shards":0,"parity_shards":2}
             }]
@@ -2069,10 +2069,10 @@ mod tests {
             "volumes": [{
                 "volume_id": 32768,
                 "bss_nodes": [
-                    {"node_id":"bss0","ip":"127.0.0.1","port":18088},
-                    {"node_id":"bss1","ip":"127.0.0.1","port":18089},
-                    {"node_id":"bss2","ip":"127.0.0.1","port":18090},
-                    {"node_id":"bss3","ip":"127.0.0.1","port":18091}
+                    {"node_id":"bss-0","ip":"127.0.0.1","port":18088},
+                    {"node_id":"bss-1","ip":"127.0.0.1","port":18089},
+                    {"node_id":"bss-2","ip":"127.0.0.1","port":18090},
+                    {"node_id":"bss-3","ip":"127.0.0.1","port":18091}
                 ],
                 "mode": {"type":"erasure_coded","data_shards":4,"parity_shards":0}
             }]
@@ -2103,19 +2103,19 @@ mod tests {
                 {
                     "volume_id": 1,
                     "bss_nodes": [
-                        {"node_id":"bss0","ip":"127.0.0.1","port":18088}
+                        {"node_id":"bss-0","ip":"127.0.0.1","port":18088}
                     ],
                     "mode": {"type":"replicated","n":1,"r":1,"w":1}
                 },
                 {
                     "volume_id": 32768,
                     "bss_nodes": [
-                        {"node_id":"bss0","ip":"127.0.0.1","port":18088},
-                        {"node_id":"bss1","ip":"127.0.0.1","port":18089},
-                        {"node_id":"bss2","ip":"127.0.0.1","port":18090},
-                        {"node_id":"bss3","ip":"127.0.0.1","port":18091},
-                        {"node_id":"bss4","ip":"127.0.0.1","port":18092},
-                        {"node_id":"bss5","ip":"127.0.0.1","port":18093}
+                        {"node_id":"bss-0","ip":"127.0.0.1","port":18088},
+                        {"node_id":"bss-1","ip":"127.0.0.1","port":18089},
+                        {"node_id":"bss-2","ip":"127.0.0.1","port":18090},
+                        {"node_id":"bss-3","ip":"127.0.0.1","port":18091},
+                        {"node_id":"bss-4","ip":"127.0.0.1","port":18092},
+                        {"node_id":"bss-5","ip":"127.0.0.1","port":18093}
                     ],
                     "mode": {"type":"erasure_coded","data_shards":4,"parity_shards":2}
                 }

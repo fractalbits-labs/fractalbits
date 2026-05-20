@@ -447,8 +447,8 @@ async fn test_degraded_scan_continues_with_quorum() -> TestResult {
     );
     assert_eq!(
         report.volume_reports[0].failed_nodes,
-        vec!["bss2".to_string()],
-        "expected node bss2 to be recorded as failed"
+        vec!["bss-2".to_string()],
+        "expected node bss-2 to be recorded as failed"
     );
 
     start_bss_instance(2).await?;
@@ -524,11 +524,11 @@ async fn delete_blob_from_node(
 fn install_test_data_vg_config(volumes: TestVolumes) -> CmdResult {
     let data_vg_config = format!(
         r#"{{"volumes":[
-{{"volume_id":{},"bss_nodes":[{{"node_id":"bss0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}},
-{{"volume_id":{},"bss_nodes":[{{"node_id":"bss0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}},
-{{"volume_id":{},"bss_nodes":[{{"node_id":"bss0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}},
-{{"volume_id":{},"bss_nodes":[{{"node_id":"bss0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}},
-{{"volume_id":{},"bss_nodes":[{{"node_id":"bss0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}}
+{{"volume_id":{},"bss_nodes":[{{"node_id":"bss-0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss-1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss-2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}},
+{{"volume_id":{},"bss_nodes":[{{"node_id":"bss-0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss-1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss-2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}},
+{{"volume_id":{},"bss_nodes":[{{"node_id":"bss-0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss-1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss-2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}},
+{{"volume_id":{},"bss_nodes":[{{"node_id":"bss-0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss-1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss-2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}},
+{{"volume_id":{},"bss_nodes":[{{"node_id":"bss-0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss-1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss-2","ip":"127.0.0.1","port":8090}}],"mode":{{"type":"replicated","n":3,"r":2,"w":2}}}}
 ]}}"#,
         volumes.scan,
         volumes.split_brain,
@@ -735,10 +735,10 @@ fn new_meta_test_volumes() -> MetaTestVolumes {
 fn install_test_metadata_vg_config(volumes: MetaTestVolumes) -> CmdResult {
     let metadata_vg_config = format!(
         r#"{{"volumes":[
-{{"volume_id":{},"bss_nodes":[{{"node_id":"bss0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss2","ip":"127.0.0.1","port":8090}}]}},
-{{"volume_id":{},"bss_nodes":[{{"node_id":"bss0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss2","ip":"127.0.0.1","port":8090}}]}},
-{{"volume_id":{},"bss_nodes":[{{"node_id":"bss0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss2","ip":"127.0.0.1","port":8090}}]}},
-{{"volume_id":{},"bss_nodes":[{{"node_id":"bss0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss2","ip":"127.0.0.1","port":8090}}]}}
+{{"volume_id":{},"bss_nodes":[{{"node_id":"bss-0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss-1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss-2","ip":"127.0.0.1","port":8090}}]}},
+{{"volume_id":{},"bss_nodes":[{{"node_id":"bss-0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss-1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss-2","ip":"127.0.0.1","port":8090}}]}},
+{{"volume_id":{},"bss_nodes":[{{"node_id":"bss-0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss-1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss-2","ip":"127.0.0.1","port":8090}}]}},
+{{"volume_id":{},"bss_nodes":[{{"node_id":"bss-0","ip":"127.0.0.1","port":8088}},{{"node_id":"bss-1","ip":"127.0.0.1","port":8089}},{{"node_id":"bss-2","ip":"127.0.0.1","port":8090}}]}}
 ],"quorum":{{"n":3,"r":2,"w":2}}}}"#,
         volumes.version_skew, volumes.missing_blob, volumes.anomaly, volumes.tombstone,
     );
@@ -1190,7 +1190,7 @@ fn install_test_ec_data_vg_config(volumes: EcTestVolumes) -> CmdResult {
     let node_list = (0..EC_TOTAL as u16)
         .map(|i| {
             format!(
-                r#"{{"node_id":"bss{i}","ip":"127.0.0.1","port":{}}}"#,
+                r#"{{"node_id":"bss-{i}","ip":"127.0.0.1","port":{}}}"#,
                 8088 + i
             )
         })

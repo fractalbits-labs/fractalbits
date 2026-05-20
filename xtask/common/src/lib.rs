@@ -591,7 +591,7 @@ fn generate_data_vg_replicated_config(bss_count: u32, n: u32, r: u32, w: u32) ->
         let nodes: Vec<String> = (start_idx..end_idx)
             .map(|i| {
                 format!(
-                    r#"{{"node_id":"bss{i}","ip":"127.0.0.1","port":{}}}"#,
+                    r#"{{"node_id":"bss-{i}","ip":"127.0.0.1","port":{}}}"#,
                     8088 + i
                 )
             })
@@ -617,7 +617,7 @@ fn generate_ec_volume_group_config(bss_count: u32) -> String {
     let nodes: Vec<String> = (0..total_shards)
         .map(|i| {
             format!(
-                r#"{{"node_id":"bss{i}","ip":"127.0.0.1","port":{}}}"#,
+                r#"{{"node_id":"bss-{i}","ip":"127.0.0.1","port":{}}}"#,
                 8088 + i
             )
         })
@@ -656,7 +656,7 @@ pub fn generate_metadata_vg_config(bss_count: u32, n: u32, r: u32, w: u32) -> St
         let nodes: Vec<String> = (start_idx..end_idx)
             .map(|i| {
                 format!(
-                    r#"{{"node_id":"bss{i}","ip":"127.0.0.1","port":{}}}"#,
+                    r#"{{"node_id":"bss-{i}","ip":"127.0.0.1","port":{}}}"#,
                     8088 + i
                 )
             })
@@ -771,7 +771,7 @@ mod tests {
         let nodes = parsed["volumes"][0]["bss_nodes"].as_array().unwrap();
 
         for (i, node) in nodes.iter().enumerate() {
-            assert_eq!(node["node_id"].as_str().unwrap(), format!("bss{}", i));
+            assert_eq!(node["node_id"].as_str().unwrap(), format!("bss-{}", i));
             assert_eq!(node["ip"].as_str().unwrap(), "127.0.0.1");
             assert_eq!(node["port"].as_u64().unwrap(), 8088 + i as u64);
         }
