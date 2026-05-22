@@ -24,7 +24,7 @@ On-prem deployment uses:
 ### On Deployment Machine
 
 1. SSH access to all cluster nodes
-2. Rust toolchain (1.88+) with `cargo` installed
+2. Rust toolchain (1.91+) with `cargo` installed
 3. Docker with buildx plugin (for building multi-architecture images)
 
 ## Step 1: Build Bootstrap Artifacts

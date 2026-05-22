@@ -81,6 +81,22 @@ just repo init
 just build
 ```
 
+### Update
+
+After pulling new changes from upstream, refresh the prebuilt binaries to the
+latest published revision:
+
+```bash
+# Pull latest main-repo changes
+git pull --rebase # or other git commands to fetch the latest main repo changes
+
+# Refresh prebuilt binaries (shallow re-clone of the prebuilt repo)
+just prebuilt update
+```
+
+`just prebuilt update` removes `prebuilt/` and shallow-clones the tip of the
+prebuilt repo (the latest published prebuilt binaries).
+
 ### Run Services
 
 Initialize and start all services locally:
@@ -251,7 +267,7 @@ We're actively working on expanding S3 API coverage. See our [Roadmap](docs/ROAD
 - 🐛 **Bug Reports**: [GitHub Issues](https://github.com/fractalbits-labs/fractalbits/issues)
 - 💬 **Discussions**: [GitHub Discussions](https://github.com/fractalbits-labs/fractalbits/discussions)
 - 👥 **Slack**: [Join FractalBits Community](https://join.slack.com/t/fractalbitscommunity/shared_invite/zt-3j9b3iw0l-NFSW3cjo~DEF~jqfBp1mzA)
-- 📧 **Email**: thomas@fractalbits.com (for private inquiries)
+- 📧 **Email**: founders@fractalbits.com (for private inquiries)
 
 ---
 

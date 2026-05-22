@@ -7,9 +7,9 @@ This guide covers the prerequisites and setup required for developing FractalBit
 ### System Requirements
 
 - **Linux** kernel 5.19+ (for io_uring support), ubuntu 24.04+ recommended
-- [**Rust**](https://rust-lang.org/learn/get-started/) tool chain 1.88+
+- [**Rust**](https://rust-lang.org/learn/get-started/) tool chain 1.91+
 - **Disk Space**: At least 20GB+ free space for development (data and builds)
-- **Memory**: 8GB+ recommended, or it might trigger OOM killer, depending on your OS configuration
+- **Memory**: 16GB+ recommended, or it might trigger OOM killer, depending on your OS configuration
 
 ### Required Dependencies
 
