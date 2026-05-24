@@ -27,7 +27,7 @@ impl ServicesReadyStage {
     }
 }
 
-pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
+pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Api)?;
     // Complete instances-ready stage
     InstancesReadyStage::complete(&barrier)?;
@@ -53,11 +53,6 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
 
     info!("Creating directories for api_server");
     run_cmd!(mkdir -p "/data/local/stats")?;
-
-    if for_bench {
-        // Try to download tools for micro-benchmarking
-        let _ = download_binaries(config, &["rewrk_rpc"]);
-    }
 
     if config.global.deploy_target == DeployTarget::Aws {
         create_ena_irq_affinity_service()?;

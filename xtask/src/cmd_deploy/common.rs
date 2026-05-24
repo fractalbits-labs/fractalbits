@@ -102,7 +102,6 @@ pub(super) const RUST_BINS: &[&str] = &[
     "api_server",
     "nss_role_agent",
     "rss_admin",
-    "rewrk_rpc",
 ];
 
 pub(super) const ZIG_BINS: &[&str] = &[

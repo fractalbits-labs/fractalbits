@@ -76,11 +76,7 @@ impl NssJournalReadyStage {
     }
 }
 
-pub fn bootstrap(
-    config: &BootstrapConfig,
-    journal_uuid: Option<&str>,
-    for_bench: bool,
-) -> CmdResult {
+pub fn bootstrap(config: &BootstrapConfig, journal_uuid: Option<&str>) -> CmdResult {
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Nss)?;
 
     // Resolve journal_uuid: prefer CLI/NodeEntry value, fall back to global config
@@ -103,10 +99,6 @@ pub fn bootstrap(
 
     // Complete instances-ready stage
     InstancesReadyStage::complete_with_metadata(&barrier, instances_ready_meta)?;
-
-    if for_bench {
-        let _ = download_binaries(config, &["rewrk_rpc"]);
-    }
 
     let mut binaries = vec!["nss_server", "nss_role_agent"];
     if config.is_etcd_backend() {
