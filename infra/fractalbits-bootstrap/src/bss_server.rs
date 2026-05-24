@@ -66,12 +66,11 @@ impl EtcdNodesRegisteredStage {
     }
 }
 
-pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
+pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Bss)?;
     // Complete instances-ready stage
     InstancesReadyStage::complete(&barrier)?;
 
-    let for_bench = for_bench || config.global.for_bench;
     let meta_stack_testing = config.global.meta_stack_testing;
     let use_etcd = config.is_etcd_backend();
 
@@ -100,10 +99,6 @@ pub fn bootstrap(config: &BootstrapConfig, for_bench: bool) -> CmdResult {
         mkdir -p "/data/local/storage";
         mkdir -p "/data/local/storage/meta_blobs";
     }?;
-
-    if meta_stack_testing || for_bench {
-        let _ = download_binaries(config, &["rewrk_rpc"]); // i3, i3en may not compile rewrk_rpc tool
-    }
 
     create_logrotate_for_stats()?;
     if config.global.deploy_target == DeployTarget::Aws {

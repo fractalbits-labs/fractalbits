@@ -93,15 +93,15 @@ fn generic_bootstrap_with_args(cli_args: CliArgs) -> CmdResult {
             "root_server"
         }
         ServiceType::NssServer { journal_uuid } => {
-            nss_server::bootstrap(&config, journal_uuid.as_deref(), for_bench)?;
+            nss_server::bootstrap(&config, journal_uuid.as_deref())?;
             "nss_server"
         }
         ServiceType::ApiServer => {
-            api_server::bootstrap(&config, for_bench)?;
+            api_server::bootstrap(&config)?;
             "api_server"
         }
         ServiceType::BssServer => {
-            bss_server::bootstrap(&config, for_bench)?;
+            bss_server::bootstrap(&config)?;
             "bss_server"
         }
         ServiceType::GuiServer => {

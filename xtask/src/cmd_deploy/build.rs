@@ -162,6 +162,7 @@ fn build_rust_for_target(
         "fractalbits-bootstrap",
         "fractal-s3",
         "data_blob_resync_server",
+        "rewrk_rpc",
     ]
     .iter()
     .flat_map(|pkg| vec!["--exclude".to_string(), pkg.to_string()])
