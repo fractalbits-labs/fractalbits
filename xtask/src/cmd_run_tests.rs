@@ -68,11 +68,9 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         cmd_service::stop_service(ServiceName::All)
     };
 
-    let test_fs_server = |run_fuse: bool, run_nfs: bool, disk_cache: bool| async move {
+    let test_fs_server = |disk_cache: bool| async move {
         fs_server::build_fs_server()?;
-        if run_fuse {
-            fs_server::ensure_fuse_uring()?;
-        }
+        fs_server::ensure_fuse_uring()?;
         cmd_service::init_service(
             ServiceName::All,
             BuildMode::Debug,
@@ -83,7 +81,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
             },
         )?;
         cmd_service::start_service(ServiceName::All)?;
-        let result = fs_server::run_fs_server_tests(run_fuse, run_nfs, disk_cache).await;
+        let result = fs_server::run_fs_server_tests(disk_cache).await;
         let _ = cmd_service::stop_service(ServiceName::FsServer);
         run_cmd! { ignore pkill -x fs_server 2>/dev/null; }?;
         cmd_service::stop_service(ServiceName::All)?;
@@ -137,19 +135,9 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         TestType::BssNodeFailure => test_bss_node_failure().await,
         TestType::BssRepair => test_bss_repair().await,
         TestType::NssFailover => test_nss_failover(RssBackend::Etcd).await,
-        TestType::FsServer {
-            fuse,
-            nfs,
-            disk_cache_only,
-        } => {
-            let (run_fuse, run_nfs) = match (fuse, nfs) {
-                (false, false) => (true, true),
-                other => other,
-            };
-            test_fs_server(run_fuse, run_nfs, disk_cache_only).await
-        }
+        TestType::FsServer { disk_cache_only } => test_fs_server(disk_cache_only).await,
         TestType::All => {
-            test_fs_server(true, true, false).await?;
+            test_fs_server(false).await?;
             test_bss_node_failure().await?;
             test_bss_repair().await?;
             test_nss_failover(RssBackend::Etcd).await?;
