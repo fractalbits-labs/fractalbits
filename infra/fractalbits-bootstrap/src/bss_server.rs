@@ -9,7 +9,7 @@ use xtask_common::stages::{
 };
 
 const BLOB_DRAM_MEM_PERCENT: f64 = 0.8;
-const FA_JOURNAL_SEGMENT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+const FA_JOURNAL_SEGMENT_SIZE: u64 = 1600 * 1024 * 1024; // 1.6GB
 
 struct BssConfiguredStage;
 

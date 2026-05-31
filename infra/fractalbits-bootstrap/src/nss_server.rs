@@ -232,9 +232,6 @@ fn create_nss_config(journal_uuid: &str) -> CmdResult {
     // Calculate total memory for blob_dram_kilo_bytes
     let blob_dram_kilo_bytes = (total_mem_kb as f64 * BLOB_DRAM_MEM_PERCENT) as u64;
 
-    // 4GB journal segment size for quorum journal
-    let fa_journal_segment_size: u64 = 4 * 1024 * 1024 * 1024;
-
     let num_cores = num_cpus()?;
     let net_worker_thread_count = num_cores / 2;
     let fa_thread_dataop_count = num_cores / 2;
@@ -250,7 +247,6 @@ net_worker_thread_count = {net_worker_thread_count}
 fa_thread_count = {fa_thread_count}
 fa_thread_dataop_count = {fa_thread_dataop_count}
 blob_dram_kilo_bytes = {blob_dram_kilo_bytes}
-fa_journal_segment_size = {fa_journal_segment_size}
 log_level = "info"
 {journal_uuid_line}"##
     );

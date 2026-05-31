@@ -279,7 +279,7 @@ fn initialize_observer_state(
 
     // Initialize journal config in service discovery with running_nss_id set to nss_id
     if let Some(journal_uuid) = shared_journal_uuid {
-        let journal_size: u64 = 4 * 1024 * 1024 * 1024; // 4GB for cloud deployment
+        let journal_size: u64 = 3200 * 1024 * 1024; // 3.2GB for cloud deployment
         let journal_config_json = format!(
             r#"[{{"journal_uuid":"{}","device_id":1,"journal_size":{},"version":1,"running_nss_id":"{}"}}]"#,
             journal_uuid, journal_size, nss_id
