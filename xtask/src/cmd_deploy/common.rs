@@ -104,13 +104,7 @@ pub(super) const RUST_BINS: &[&str] = &[
     "rss_admin",
 ];
 
-pub(super) const ZIG_BINS: &[&str] = &[
-    "nss_server",
-    "bss_server",
-    "nss_tool",
-    "bss_tool",
-    "test_bss_storage_engine",
-];
+pub(super) const ZIG_BINS: &[&str] = &["nss_server", "bss_server"];
 
 /// Get the cloud storage bootstrap bucket name.
 /// - AWS: `fractalbits-bootstrap-{region}-{account}` (real S3)
