@@ -79,12 +79,7 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     // Always use raw device mode in cloud deployments
     let data_partition = setup_nvme_for_raw_device()?;
 
-    let mut binaries = vec![
-        "bss_server",
-        "test_bss_storage_engine",
-        "nss_tool",
-        "bss_tool",
-    ];
+    let mut binaries = vec!["bss_server"];
     if use_etcd {
         binaries.push("etcdctl");
     }
