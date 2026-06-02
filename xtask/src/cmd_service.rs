@@ -309,7 +309,6 @@ pub fn init_service(
         init_all_bss(init_config.bss_count)?;
         start_service(ServiceName::Bss)?;
 
-        let format_log = "data/logs/format.log";
         let journal_uuid = get_or_create_shared_journal_uuid()?;
         create_dirs_for_nss_server(&journal_uuid)?;
         let nss_binary = resolve_binary_path("nss_server", build_mode);
@@ -321,15 +320,23 @@ pub fn init_service(
         match build_mode {
             BuildMode::Debug => run_cmd! {
                 info "Formatting nss_server with default configs";
+                free -m;
+                info "Dropping caches at first";
+                sudo bash -c "echo 3 > /proc/sys/vm/drop_caches";
+                free -m;
+                df -h;
                 JOURNAL_CONFIG=$journal_config METADATA_VG_CONFIG=$metadata_vg JOURNAL_VG_CONFIG=$journal_vg
-                    $nss_binary format --init_test_tree
-                    |& ts -m $TS_FMT >$format_log;
+                    $nss_binary format
             }?,
             BuildMode::Release => run_cmd! {
                 info "Formatting nss_server for benchmarking";
+                free -m;
+                info "Dropping caches at first";
+                sudo bash -c "echo 3 > /proc/sys/vm/drop_caches";
+                free -m;
+                df -h;
                 JOURNAL_CONFIG=$journal_config METADATA_VG_CONFIG=$metadata_vg JOURNAL_VG_CONFIG=$journal_vg
-                    $nss_binary format --init_test_tree
-                    |& ts -m $TS_FMT >$format_log;
+                    $nss_binary format
             }?,
         }
 

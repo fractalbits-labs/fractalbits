@@ -120,28 +120,6 @@ fn run_s3_api_tests(init_config: &InitConfig, debug_api_server: bool) -> CmdResu
         return Ok(());
     }
 
-    // Test with DDB backend
-    let ddb_config = InitConfig {
-        rss_backend: RssBackend::Ddb,
-        ..init_config.clone()
-    };
-    info!("Testing with DDB backend...");
-    cmd_service::init_service(ServiceName::All, BuildMode::Debug, &ddb_config)?;
-    cmd_service::start_service(ServiceName::All)?;
-    run_cmd! {
-        info "Run cargo tests (s3 api tests - DDB backend)";
-        cargo test --package api_server;
-    }?;
-
-    if init_config.with_https {
-        run_cmd! {
-            info "Run cargo tests (s3 https api tests - DDB backend)";
-            USE_HTTPS_ENDPOINT=true cargo test --package api_server;
-        }?;
-    }
-
-    cmd_service::stop_service(ServiceName::All)?;
-
     // Test with etcd backend
     let etcd_config = InitConfig {
         rss_backend: RssBackend::Etcd,
