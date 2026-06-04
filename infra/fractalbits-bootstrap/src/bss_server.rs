@@ -90,9 +90,9 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     info!("Creating directories for bss_server");
     run_cmd! {
         mkdir -p "/data/local/stats";
-        mkdir -p "/data/local/journal";
+        mkdir -p "/data/local/state";
+        mkdir -p "/data/local/state/meta_blobs";
         mkdir -p "/data/local/storage";
-        mkdir -p "/data/local/storage/meta_blobs";
     }?;
 
     create_logrotate_for_stats()?;
@@ -230,7 +230,6 @@ fn create_bss_config(data_partition: &str) -> CmdResult {
 
     let config_content = format!(
         r##"working_dir = "/data"
-shared_dir = "local/journal"
 server_port = 8088
 health_port = 19998
 net_worker_thread_count = {net_worker_thread_count}

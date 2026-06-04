@@ -158,7 +158,7 @@ impl Orchestrator {
 
         // Skip formatting if both storage engine and state files exist.
         let storage_file = working_dir.join("local/storage/blobs.storage");
-        let state_file = working_dir.join("local/journal/bss.state");
+        let state_file = working_dir.join("local/state/bss.state");
         if storage_file.exists() && state_file.exists() {
             info!("BSS data already formatted, skipping format_bss");
             return Ok(());
