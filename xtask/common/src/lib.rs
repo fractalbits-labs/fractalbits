@@ -551,25 +551,27 @@ pub fn create_bss_dirs(data_dir: &Path, bss_id: u32) -> CmdResult {
 
     let bss_dir = data_dir.join(format!("bss-{}", bss_id));
     fs::create_dir_all(bss_dir.join("local/stats"))?;
-    fs::create_dir_all(bss_dir.join("local/journal"))?;
+    // local/state holds journal, state log, ckpt and meta_blobs; local/storage
+    // holds only blobs.storage (may be a separate/raw device).
+    fs::create_dir_all(bss_dir.join("local/state"))?;
+    fs::create_dir_all(bss_dir.join("local/state/meta_blobs"))?;
     fs::create_dir_all(bss_dir.join("local/storage"))?;
-    fs::create_dir_all(bss_dir.join("local/storage/meta_blobs"))?;
 
     Ok(())
 }
 
 /// Create directories for NSS server
-/// Create NSS directories. Journal at data/<dir_name>/local/journal/<journal_uuid>/
+/// Create NSS directories. Journal at data/<dir_name>/local/state/<journal_uuid>/
 pub fn create_nss_dirs(data_dir: &Path, dir_name: &str, journal_uuid: Option<&str>) -> CmdResult {
     info!("Creating directories for {} server", dir_name);
 
     let nss_dir = data_dir.join(dir_name);
 
-    // Always create local/journal directory (needed for fbs.state and unit tests)
-    fs::create_dir_all(nss_dir.join("local/journal"))?;
+    // Always create local/state directory (needed for fbs.state and unit tests)
+    fs::create_dir_all(nss_dir.join("local/state"))?;
 
     if let Some(uuid) = journal_uuid {
-        let journal_dir = nss_dir.join("local/journal").join(uuid);
+        let journal_dir = nss_dir.join("local/state").join(uuid);
         fs::create_dir_all(&journal_dir)?;
         info!("Created journal directory: {:?}", journal_dir);
     }

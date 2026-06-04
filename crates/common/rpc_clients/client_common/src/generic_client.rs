@@ -499,7 +499,7 @@ where
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "compio-runtime")))]
     pub(crate) async fn new_internal_tokio(
         stream: tokio::net::TcpStream,
     ) -> Result<Self, RpcError> {
