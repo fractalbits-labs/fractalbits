@@ -31,6 +31,7 @@ exclude = [
     "crates/fs_server/src",
     "crates/fs_server/fractal-fuse/src",
     "crates/fs_server/fractal-fuse/examples",
+    "crates/fs_server/fractal-fuse/tests",
     "crates/fractal-vfs/src",
     "crates/fractal-s3/demo",
     "crates/fractal-s3/src",
