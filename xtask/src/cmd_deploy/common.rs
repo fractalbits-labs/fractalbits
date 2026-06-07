@@ -73,7 +73,7 @@ pub(super) const AWS_CPU_TARGETS: &[ArchTarget] = &[
         rust_target: "aarch64-unknown-linux-gnu",
         rust_cpu: "neoverse-n2",
         zig_target: "aarch64-linux-gnu",
-        zig_cpu: "neoverse_n2",
+        zig_cpu: "neoverse_n2+aes+sha2",
         cpu_name: "neoverse-n2",
     },
     // x86_64: Broadwell (i3)
