@@ -34,10 +34,7 @@ pub fn upload_to_aws(deploy_target: DeployTarget) -> CmdResult {
         DeployTarget::Aws => {
             // AWS: sync shared binaries to s3://{bucket}/{arch}/
             // and CPU-specific binaries to s3://{bucket}/{arch}/{cpu}/
-            let cpu_targets = [
-                ("x86_64", vec!["broadwell", "skylake"]),
-                ("aarch64", vec!["neoverse-n1", "neoverse-n2"]),
-            ];
+            let cpu_targets = [("aarch64", vec!["neoverse-n1", "neoverse-n2"])];
 
             for (arch, cpus) in cpu_targets {
                 // Sync shared binaries (bootstrap, etcd, warp) from generic
@@ -168,10 +165,7 @@ echo "=== Bootstrap completed at $(date) ==="
         DeployTarget::Aws => {
             // AWS: sync generic (for bootstrap/etcd/warp) to s3://{bucket}/{arch}/
             // and CPU-specific binaries to s3://{bucket}/{arch}/{cpu}/
-            let cpu_targets = [
-                ("x86_64", vec!["broadwell", "skylake"]),
-                ("aarch64", vec!["neoverse-n1", "neoverse-n2"]),
-            ];
+            let cpu_targets = [("aarch64", vec!["neoverse-n1", "neoverse-n2"])];
 
             for (arch, cpus) in cpu_targets {
                 // Sync shared binaries (bootstrap, etcd, warp) from generic to s3://{bucket}/{arch}/

@@ -76,24 +76,6 @@ pub(super) const AWS_CPU_TARGETS: &[ArchTarget] = &[
         zig_cpu: "neoverse_n2+aes+sha2",
         cpu_name: "neoverse-n2",
     },
-    // x86_64: Broadwell (i3)
-    ArchTarget {
-        arch: "x86_64",
-        rust_target: "x86_64-unknown-linux-gnu",
-        rust_cpu: "broadwell",
-        zig_target: "x86_64-linux-gnu",
-        zig_cpu: "broadwell",
-        cpu_name: "broadwell",
-    },
-    // x86_64: Skylake (i3en)
-    ArchTarget {
-        arch: "x86_64",
-        rust_target: "x86_64-unknown-linux-gnu",
-        rust_cpu: "skylake",
-        zig_target: "x86_64-linux-gnu",
-        zig_cpu: "skylake",
-        cpu_name: "skylake",
-    },
 ];
 
 pub(super) const RUST_BINS: &[&str] = &[
