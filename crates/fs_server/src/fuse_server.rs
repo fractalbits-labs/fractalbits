@@ -435,7 +435,7 @@ impl Filesystem for FuseServer {
             let _ = queue.advance_stage(
                 ino,
                 generation,
-                crate::writeback::FileCommitStage::PublishLayoutQueued,
+                fractal_vfs::writeback::FileCommitStage::PublishLayoutQueued,
             );
             let vfs = self.vfs.clone();
             compio_runtime::spawn(async move {
