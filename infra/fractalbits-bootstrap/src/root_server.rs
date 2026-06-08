@@ -17,6 +17,9 @@ const DATA_VG_QUORUM_W: usize = 2;
 const META_DATA_VG_QUORUM_N: usize = 6;
 const META_DATA_VG_QUORUM_R: usize = 4;
 const META_DATA_VG_QUORUM_W: usize = 4;
+const JOURNAL_VG_QUORUM_N: usize = 3;
+const JOURNAL_VG_QUORUM_R: usize = 2;
+const JOURNAL_VG_QUORUM_W: usize = 2;
 
 const BOOTSTRAP_GRACE_PERIOD_SECS: u64 = 300;
 
@@ -472,12 +475,23 @@ fn initialize_bss_volume_groups(
         metadata_vg_quorum_w,
     );
 
-    // Journal VG uses the same topology as metadata VG
+    let (journal_vg_quorum_n, journal_vg_quorum_r, journal_vg_quorum_w) = match total_bss_nodes {
+        1 => (1, 1, 1),
+        n if n % JOURNAL_VG_QUORUM_N == 0 => (
+            JOURNAL_VG_QUORUM_N,
+            JOURNAL_VG_QUORUM_R,
+            JOURNAL_VG_QUORUM_W,
+        ),
+        _ => cmd_die!(
+            "Unsupported number of bss nodes (1 or $JOURNAL_VG_QUORUM_N}*k ): $total_bss_nodes"
+        ),
+    };
+
     let bss_journal_vg_config_json = build_metadata_volume_group_config(
         &bss_addresses,
-        metadata_vg_quorum_n,
-        metadata_vg_quorum_r,
-        metadata_vg_quorum_w,
+        journal_vg_quorum_n,
+        journal_vg_quorum_r,
+        journal_vg_quorum_w,
     );
 
     if config.is_etcd_backend() {
