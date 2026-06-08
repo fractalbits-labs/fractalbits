@@ -193,11 +193,8 @@ Environment="RUST_LOG=info""##
         }
         _ => unreachable!(),
     };
-    // Only bss runs on nodes with local NVMe disks; other services have no suitable
-    // coredump destination, so skip LimitCORE=infinity for them.
-    let coredump_enabled = service_name == "bss";
-    let coredump_setting = if coredump_enabled {
-        "LimitCORE=infinity\n"
+    let memory_setting = if service_name == "bss" || service_name == "nss" {
+        "MemoryMax=95%\n"
     } else {
         ""
     };
@@ -230,7 +227,7 @@ BindsTo={requires}
 {auto_restart}
 LimitNOFILE=65536
 SyslogIdentifier={service_name}
-{coredump_setting}WorkingDirectory={working_dir}{env_settings}
+{memory_setting}WorkingDirectory={working_dir}{env_settings}
 ExecStart={exec_start}
 
 [Install]

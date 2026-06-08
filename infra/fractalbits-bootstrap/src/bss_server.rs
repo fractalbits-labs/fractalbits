@@ -85,8 +85,6 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     }
     download_binaries(config, &binaries)?;
 
-    create_coredump_config()?;
-
     info!("Creating directories for bss_server");
     run_cmd! {
         mkdir -p "/data/local/stats";
