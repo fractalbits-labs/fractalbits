@@ -247,6 +247,7 @@ net_worker_thread_count = {net_worker_thread_count}
 fa_thread_count = {fa_thread_count}
 fa_thread_dataop_count = {fa_thread_dataop_count}
 blob_dram_kilo_bytes = {blob_dram_kilo_bytes}
+cpu_count = {num_cores}
 log_level = "info"
 {journal_uuid_line}"##
     );

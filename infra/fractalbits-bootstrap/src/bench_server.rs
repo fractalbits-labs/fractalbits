@@ -17,20 +17,39 @@ struct WorkloadConfig {
     mixed_concurrent_ops: usize,
 }
 
-const WORKLOAD_CONFIGS: &[WorkloadConfig] = &[
-    WorkloadConfig {
-        size_kb: 4,
-        put_concurrent_ops: 96,
-        get_concurrent_ops: 96,
-        mixed_concurrent_ops: 96,
-    },
-    WorkloadConfig {
-        size_kb: 64,
-        put_concurrent_ops: 12,
-        get_concurrent_ops: 12,
-        mixed_concurrent_ops: 12,
-    },
-];
+// Round a queue depth up to the nearest multiple of 4, floored at 4.
+fn round_up_to_4(n: usize) -> usize {
+    n.div_ceil(4).max(1) * 4
+}
+
+// Per-client queue depth derived from cluster size. The /3 on puts is 3-way
+// replication, dropped for a single bss.
+//
+//   4KB put = (80 * bss_count * 6 / 3) / bench_clients
+//   4KB get = (96 * bss_count * 6)     / bench_clients
+//   mixed   = average of put and get
+//   64KB    = 4KB depth / 8
+fn workload_configs(bss_count: usize, bench_clients: usize) -> Vec<WorkloadConfig> {
+    let bench = bench_clients.max(1);
+    let put_replication = if bss_count == 1 { 1 } else { 3 };
+    let put_4k = (80 * bss_count * 6 / put_replication) / bench;
+    let get_4k = (96 * bss_count * 6) / bench;
+    let mixed_4k = (put_4k + get_4k) / 2;
+    vec![
+        WorkloadConfig {
+            size_kb: 4,
+            put_concurrent_ops: round_up_to_4(put_4k),
+            get_concurrent_ops: round_up_to_4(get_4k),
+            mixed_concurrent_ops: round_up_to_4(mixed_4k),
+        },
+        WorkloadConfig {
+            size_kb: 64,
+            put_concurrent_ops: round_up_to_4(put_4k / 8),
+            get_concurrent_ops: round_up_to_4(get_4k / 8),
+            mixed_concurrent_ops: round_up_to_4(mixed_4k / 8),
+        },
+    ]
+}
 
 pub fn bootstrap(
     config: &BootstrapConfig,
@@ -64,7 +83,9 @@ pub fn bootstrap(
         warp_client_ips.push_str(&format!("  - {ip}:7761\n"));
     }
 
-    for wl_config in WORKLOAD_CONFIGS {
+    let bss_count = config.global.num_bss_nodes.unwrap_or(1);
+    let workload_configs = workload_configs(bss_count, bench_client_num);
+    for wl_config in &workload_configs {
         create_put_workload_config(
             &warp_client_ips,
             region,
