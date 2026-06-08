@@ -237,6 +237,7 @@ blob_dram_kilo_bytes = {blob_dram_kilo_bytes}
 io_concurrency = 256
 flag_storage_size = {flag_storage_size}
 fa_journal_segment_size = {fa_journal_segment_size}
+cpu_count = {num_cores}
 log_level = "info"
 "##
     );

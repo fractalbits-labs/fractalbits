@@ -347,40 +347,57 @@ fn build_ui() -> CmdResult {
     Ok(())
 }
 
+// Pinned warp release and the sha256 of each per-arch tarball, vendored from
+// the release's checksums.txt so the build doesn't fetch it at runtime (the
+// release CDN has been flaky). Bump these together when upgrading.
+const WARP_VERSION: &str = "v1.3.0";
+const WARP_CHECKSUMS: &[(&str, &str)] = &[
+    (
+        "warp_Linux_x86_64.tar.gz",
+        "e406bf04136ac1545b2a61d8d2b01823ec6e5f039d1af1b762a585e210a1b245",
+    ),
+    (
+        "warp_Linux_arm64.tar.gz",
+        "13f9c319dfeeefc0324c0a9d4d24bfea8eab82e3a2e80e0cc5390c6db6250ed4",
+    ),
+];
+
 fn download_warp_binaries() -> CmdResult {
     for arch in ["x86_64", "aarch64"] {
         let linux_arch = if arch == "aarch64" { "arm64" } else { "x86_64" };
 
-        let warp_version = "v1.3.0";
         let warp_file = format!("warp_Linux_{linux_arch}.tar.gz");
         let warp_path = format!("third_party/minio/{warp_file}");
 
         let base_url = "https://github.com/minio/warp/releases/download";
-        let download_url = format!("{base_url}/{warp_version}/{warp_file}");
-        let checksums_url = format!("{base_url}/{warp_version}/checksums.txt");
+        let download_url = format!("{base_url}/{WARP_VERSION}/{warp_file}");
+        let expected_sha = WARP_CHECKSUMS
+            .iter()
+            .find(|(f, _)| *f == warp_file)
+            .map(|(_, sha)| *sha)
+            .expect("warp checksum present for arch");
+        let checksum_line = format!("{expected_sha}  {warp_path}");
 
-        // Check if already downloaded
-        if !Path::new(&warp_path).exists() {
+        // Re-download unless a cached tarball already matches the pinned
+        // checksum. `-f` makes curl fail on HTTP errors instead of silently
+        // writing an error page to the file, and `--retry` rides out transient
+        // failures.
+        let cached_ok = Path::new(&warp_path).exists()
+            && run_cmd!(echo $checksum_line | sha256sum -c --quiet 2>/dev/null).is_ok();
+        if !cached_ok {
             run_cmd! {
                 info "Downloading warp binary for $linux_arch";
                 mkdir -p third_party/minio;
-                curl -sL -o $warp_path $download_url;
+                curl -fsSL --retry 3 --retry-delay 2 -o $warp_path $download_url;
             }?;
         }
 
-        run_cmd! {
-            cd third_party/minio;
-            info "Verifying warp binary checksum for $linux_arch";
-            curl -sL -o warp_checksums.txt $checksums_url;
-            grep $warp_file warp_checksums.txt | sha256sum -c --quiet;
-            rm -f warp_checksums.txt;
-        }?;
-
-        // Extract warp to generic directory
         let deploy_dir = format!("prebuilt/deploy/generic/{}", arch);
         run_cmd! {
+            info "Verifying warp binary checksum for $linux_arch";
+            echo $checksum_line | sha256sum -c --quiet;
             info "Extracting warp binary to $deploy_dir for $linux_arch";
-            tar -xzf third_party/minio/$warp_file -C $deploy_dir warp;
+            tar -xzf $warp_path -C $deploy_dir warp;
         }?;
     }
 
