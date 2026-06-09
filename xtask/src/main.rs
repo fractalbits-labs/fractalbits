@@ -566,7 +566,7 @@ pub enum ServiceCommand {
 
         #[clap(
             long,
-            long_help = "number of BSS services to create (must be 1 or 6)",
+            long_help = "number of BSS services to create (must be 1, 3, or 6)",
             default_value = "1"
         )]
         bss_count: u32,
@@ -784,8 +784,8 @@ async fn main() -> CmdResult {
                 nss_disable_restart_limit,
                 rss_backend,
             } => {
-                if bss_count != 1 && bss_count != 6 {
-                    cmd_die!("bss_count must be either 1 or 6, got $bss_count");
+                if bss_count != 1 && bss_count != 3 && bss_count != 6 {
+                    cmd_die!("bss_count must be 1, 3, or 6, got $bss_count");
                 }
                 let init_config = InitConfig {
                     for_gui,
