@@ -9,42 +9,45 @@
 
 ## Overview
 
-FractalBits is an S3-compatible object storage system designed for high performance and low latency. Using our custom-built storage engine, it delivers up to **1 million 4K read IOPS** for single bucket with p99 latency ~5ms, at significantly lower cost than AWS S3 Express One Zone. Unlike standard S3, FractalBits provides native **atomic rename support for both objects and directories**.
+FractalBits is an S3-compatible object storage system designed for high performance and low latency. Using our custom-built storage engine, it delivers up to **1 Million 4K-object reads per second** for a single bucket with P99 latency ~5ms, at significantly lower cost than AWS S3 Express One Zone. Unlike standard S3, FractalBits provides native **atomic rename support for both objects and directories**.
 
-The **Fractal ART** (Adaptive Radix Tree) storage engine uses a full-path name approach that avoids the heavy distributed transactions required by traditional inode-based systems, achieving superior scalability while still providing directory semantics including atomic rename, etc. This makes FractalBits ideal for AI training pipelines and data analytics workflows that require atomic operations for managing datasets and checkpoints.
+The **Fractal ART** (Adaptive Radix Tree) storage engine serves two roles: as the **metadata** engine it uses a full-path name approach that avoids the heavy distributed transactions required by traditional inode-based systems, achieving superior scalability while still providing directory semantics including atomic rename. As the **local data** engine it is SSD-optimized with a low-overhead I/O path, so performance scales directly with the underlying NVMe hardware. This makes FractalBits ideal for AI training pipelines and data analytics workflows that require atomic operations for managing datasets and checkpoints.
 
-Built with Rust for the API gateway and control plane, and per core io_uring for asynchronous I/O for the performance-critical storage engine and data plane. This combination enables hundreds of thousands of operations per second while maintaining ultra low latency.
+Built with Rust for the API gateway and control plane, and io_uring for asynchronous I/O for the performance-critical storage engine and data plane. This combination enables millions of operations per second while maintaining low latency.
 
 **Key Highlights:**
-- 🚀 **~1M IOPS** (4KB objects) for single bucket with p99 latency ~5ms
-- 🔄 **Atomic rename support** for both objects and directories - native capability that standard S3 lacks
-- ⚡ **Fractal ART** full-path storage engine for superior performance and scalability
-- 💰 **Cost-efficient** - significantly lower cost than AWS S3 Express One Zone for small object workloads
-- 🌐 **5-minute Bring Your Own Cloud (BYOC)** - to **any** AWS/GCP region with `just deploy`
+
+- **~1M Objects/s** (4KB objects) for single bucket with P99 latency ~5ms
+- **Atomic rename support** for both objects and directories - native capability that standard S3 lacks
+- **Fractal ART metadata engine** - full-path approach for high-performance metadata with atomic rename semantics
+- **Fractal ART data engine** - low-overhead SSD-optimized I/O path that scales with the underlying NVMe hardware
+- **Cost-efficient** - significantly lower cost than AWS S3 Express One Zone for small object workloads
+- **5-minute Bring Your Own Cloud (BYOC)** - to **any** AWS/GCP region with `just deploy`
 
 ## Performance Benchmarks
 
 FractalBits delivers exceptional performance that exceeds AWS S3 Express One Zone:
 
 ### GET Workload
-| Metric | Value |
-|--------|-------|
-| IOPS | 982552.31 |
-| Throughput | 3838.09 MiB/s |
+
+| Metric      | Value  |
+| ----------- | ------ |
+| Obj/s       | 980K   |
 | Avg Latency | 2.9 ms |
 | P99 Latency | 5.3 ms |
 
 ![GET 4K Performance](docs/screenshots/get_4k.png)
-*Benchmark screenshot showing GET performance with 4KB objects reaching ~1M IOPS*
+*Benchmark screenshot showing GET performance with 4KB objects reaching ~1M Objects/s*
 
 ### PUT Workload
-| Metric | Value |
-|--------|-------|
-| IOPS | 333308 obj/s |
-| Throughput | 1301.98 MiB/s |
+
+| Metric      | Value  |
+| ----------- | ------ |
+| Obj/s       | 333K   |
 | Avg Latency | 4.4 ms |
 
 **Benchmark Configuration:**
+
 - Object size: 4 KiB
 - Instance types: 14 c8g.xlarge (API), 6 i8g.2xlarge (BSS), 1 r7g.4xlarge (NSS)
 - Cost: ~$8/hour based on AWS on-demand EC2 instance pricing
@@ -117,6 +120,7 @@ journalctl --user -u api_server
 ```
 
 Services will be available at:
+
 - **API Server**: `http://localhost:8080` (S3 API endpoint)
 
 ### Basic Usage Example
