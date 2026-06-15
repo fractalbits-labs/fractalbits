@@ -270,7 +270,7 @@ We're actively working on expanding S3 API coverage. See our [Roadmap](docs/ROAD
 - 📖 **Documentation**: See [docs/](docs/) directory
 - 🐛 **Bug Reports**: [GitHub Issues](https://github.com/fractalbits-labs/fractalbits/issues)
 - 💬 **Discussions**: [GitHub Discussions](https://github.com/fractalbits-labs/fractalbits/discussions)
-- 👥 **Slack**: [Join FractalBits Community](https://join.slack.com/t/fractalbitscommunity/shared_invite/zt-3j9b3iw0l-NFSW3cjo~DEF~jqfBp1mzA)
+- 👥 **Discord**: [Join FractalBits Community](https://discord.com/invite/tXRq5H3urv)
 - 📧 **Email**: founders@fractalbits.com (for private inquiries)
 
 ---
