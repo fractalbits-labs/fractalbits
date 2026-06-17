@@ -515,7 +515,6 @@ pub struct InitConfig {
     pub data_blob_storage: DataBlobStorage,
     pub with_https: bool,
     pub bss_count: u32,
-    pub nss_disable_restart_limit: bool,
     pub rss_backend: RssBackend,
     pub fs_server: FsServerConfig,
 }
@@ -538,7 +537,6 @@ impl Default for InitConfig {
             data_blob_storage: Default::default(),
             with_https: false,
             bss_count: 1,
-            nss_disable_restart_limit: false,
             rss_backend: RssBackend::Etcd,
             fs_server: Default::default(),
         }
@@ -570,9 +568,6 @@ pub enum ServiceCommand {
             default_value = "1"
         )]
         bss_count: u32,
-
-        #[clap(long, long_help = "disable restart limit for NSS role agent")]
-        nss_disable_restart_limit: bool,
 
         #[clap(long, value_enum, default_value = "etcd")]
         rss_backend: RssBackend,
@@ -781,7 +776,6 @@ async fn main() -> CmdResult {
                 data_blob_storage,
                 with_https,
                 bss_count,
-                nss_disable_restart_limit,
                 rss_backend,
             } => {
                 if bss_count != 1 && bss_count != 3 && bss_count != 6 {
@@ -792,7 +786,6 @@ async fn main() -> CmdResult {
                     data_blob_storage,
                     with_https,
                     bss_count,
-                    nss_disable_restart_limit,
                     rss_backend,
                     fs_server: Default::default(),
                 };
