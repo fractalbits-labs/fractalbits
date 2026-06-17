@@ -129,12 +129,12 @@ anyhow = "1.0.102"
 regex = "1.12.3"
 core_affinity = "0.8"
 urlencoding = "2"
-compio-runtime = { version = "0.11", features = ["time"] }
-compio-net = "0.11"
-compio-io = "0.9"
+compio-runtime = { version = "0.12", features = ["time"] }
+compio-net = "0.12"
+compio-io = "0.10"
 compio-buf = "0.8"
-compio-fs = "0.11"
-compio-macros = "0.1"
+compio-fs = "0.12"
+compio-macros = "0.2"
 libc = "0.2"
 nix = { version = "0.31", features = ["fs"] }
 firestore = "0.43"
