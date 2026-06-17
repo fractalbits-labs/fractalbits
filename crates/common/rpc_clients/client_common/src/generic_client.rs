@@ -306,7 +306,7 @@ where
     }
 
     async fn send_task(
-        mut writer: compio_net::OwnedWriteHalf<compio_net::TcpStream>,
+        mut writer: compio_net::TcpStream,
         mut receiver: Receiver<ZcMessageFrame<Header>>,
         socket_fd: RawFd,
         rpc_type: &'static str,
@@ -375,7 +375,7 @@ where
     }
 
     async fn receive_task(
-        mut reader: compio_net::OwnedReadHalf<compio_net::TcpStream>,
+        mut reader: compio_net::TcpStream,
         requests: &RequestMap<Header>,
         socket_fd: RawFd,
         rpc_type: &'static str,
