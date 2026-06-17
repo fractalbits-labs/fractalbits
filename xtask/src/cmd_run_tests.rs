@@ -96,7 +96,6 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
                 rss_backend: backend,
                 data_blob_storage: DataBlobStorage::AllInBssSingleAz,
                 bss_count: 1,
-                nss_disable_restart_limit: true,
                 ..Default::default()
             },
         )?;
