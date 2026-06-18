@@ -55,6 +55,7 @@ pub fn bootstrap(
     config: &BootstrapConfig,
     api_server_endpoint: String,
     bench_client_num: usize,
+    use_nlb: bool,
 ) -> CmdResult {
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Bench)?;
     InstancesReadyStage::complete(&barrier)?;
@@ -83,13 +84,35 @@ pub fn bootstrap(
         warp_client_ips.push_str(&format!("  - {ip}:7761\n"));
     }
 
+    // warp_host: benchmark target. cli_endpoint: single host for bucket setup /
+    // readiness probe. Default targets API server IPs directly; --use-nlb uses
+    // the NLB.
+    let (warp_host, cli_endpoint) = if use_nlb {
+        (api_server_endpoint.clone(), api_server_endpoint.clone())
+    } else {
+        let num_api_servers = config.global.num_api_servers.unwrap_or(1);
+        let api_ips = get_service_ips_with_backend(config, "api-server", num_api_servers);
+        let first = api_ips
+            .first()
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("no api-server IPs discovered"))?;
+        // Comma-separated list; warp round-robins across them.
+        let warp_host = api_ips
+            .iter()
+            .map(|ip| format!("{ip}:80"))
+            .collect::<Vec<_>>()
+            .join(",");
+        (warp_host, first)
+    };
+    info!("Bench warp target host(s): {warp_host}; CLI endpoint: {cli_endpoint}");
+
     let bss_count = config.global.num_bss_nodes.unwrap_or(1);
     let workload_configs = workload_configs(bss_count, bench_client_num);
     for wl_config in &workload_configs {
         create_put_workload_config(
             &warp_client_ips,
             region,
-            &api_server_endpoint,
+            &warp_host,
             "2m",
             wl_config.size_kb,
             wl_config.put_concurrent_ops,
@@ -97,7 +120,7 @@ pub fn bootstrap(
         create_get_workload_config(
             &warp_client_ips,
             region,
-            &api_server_endpoint,
+            &warp_host,
             "2m",
             wl_config.size_kb,
             wl_config.get_concurrent_ops,
@@ -105,26 +128,20 @@ pub fn bootstrap(
         create_mixed_workload_config(
             &warp_client_ips,
             region,
-            &api_server_endpoint,
+            &warp_host,
             "2m",
             wl_config.size_kb,
             wl_config.mixed_concurrent_ops,
         )?;
     }
 
-    info!(
-        "Waiting for api_server endpoint {} to be ready",
-        api_server_endpoint
-    );
-    while !check_port_ready(&api_server_endpoint, 80) {
+    info!("Waiting for api_server endpoint {cli_endpoint} to be ready");
+    while !check_port_ready(&cli_endpoint, 80) {
         std::thread::sleep(Duration::from_secs(1));
     }
-    info!(
-        "api_server endpoint {}:80 is reachable",
-        api_server_endpoint
-    );
+    info!("api_server endpoint {cli_endpoint}:80 is reachable");
 
-    create_bench_start_script(region, &api_server_endpoint)?;
+    create_bench_start_script(region, &cli_endpoint)?;
 
     BenchServicesReadyStage::complete(&barrier)?;
 
