@@ -126,7 +126,12 @@ fn generic_bootstrap_with_args(cli_args: CliArgs) -> CmdResult {
             } else {
                 config.global.num_bench_clients.unwrap_or(1)
             };
-            bench_server::bootstrap(&config, api_endpoint.to_string(), actual_bench_client_num)?;
+            bench_server::bootstrap(
+                &config,
+                api_endpoint.to_string(),
+                actual_bench_client_num,
+                cli_args.use_nlb,
+            )?;
             "bench_server"
         }
         ServiceType::BenchClient => {
