@@ -9,7 +9,7 @@
 
 ## Overview
 
-FractalBits is an S3-compatible object storage system designed for high performance and low latency. Using our custom-built storage engine, it delivers up to **1 Million 4K-object reads per second** for a single bucket with P99 latency ~5ms, at significantly lower cost than AWS S3 Express One Zone. Unlike standard S3, FractalBits provides native **atomic rename support for both objects and directories**.
+FractalBits is an S3-compatible object storage system designed for high performance and low latency. Using our custom-built storage engine, it delivers more than **1.3 Million 4K-object reads per second** for a single bucket with P99 latency ~3ms, at significantly lower cost than AWS S3 Express One Zone — without relying on EBS, avoiding its extra cost and operational complexity. Unlike standard S3, FractalBits provides native **atomic rename support for both objects and directories**.
 
 The **Fractal ART** (Adaptive Radix Tree) storage engine serves two roles: as the **metadata** engine it uses a full-path name approach that avoids the heavy distributed transactions required by traditional inode-based systems, achieving superior scalability while still providing directory semantics including atomic rename. As the **local data** engine it is SSD-optimized with a low-overhead I/O path, so performance scales directly with the underlying NVMe hardware. This makes FractalBits ideal for AI training pipelines and data analytics workflows that require atomic operations for managing datasets and checkpoints.
 
@@ -17,7 +17,7 @@ Built with Rust for the API gateway and control plane, and io_uring for asynchro
 
 **Key Highlights:**
 
-- **~1M Objects/s** (4KB objects) for single bucket with P99 latency ~5ms
+- **>1.3M Objects/s** (4KB objects) for single bucket with P99 latency ~3ms
 - **Atomic rename support** for both objects and directories - native capability that standard S3 lacks
 - **Fractal ART metadata engine** - full-path approach for high-performance metadata with atomic rename semantics
 - **Fractal ART data engine** - low-overhead SSD-optimized I/O path that scales with the underlying NVMe hardware
@@ -30,27 +30,35 @@ FractalBits delivers exceptional performance that exceeds AWS S3 Express One Zon
 
 ### GET Workload
 
-| Metric      | Value  |
-| ----------- | ------ |
-| Obj/s       | 980K   |
-| Avg Latency | 2.9 ms |
-| P99 Latency | 5.3 ms |
+| Metric      | Value   |
+| ----------- | ------- |
+| Obj/s       | 1.3M    |
+| Throughput  | 5.2 GiB/s |
+| Avg Latency | 1.6 ms  |
+| P90 Latency | 2.1 ms  |
+| P99 Latency | 3.4 ms  |
 
 ![GET 4K Performance](docs/screenshots/get_4k.png)
-*Benchmark screenshot showing GET performance with 4KB objects reaching ~1M Objects/s*
+*Benchmark screenshot showing GET performance with 4KB objects exceeding 1.3M Objects/s*
+
+> This throughput is served by a **single r7g.4xlarge metadata node**, demonstrating the efficiency of the full-path Fractal ART metadata engine.
 
 ### PUT Workload
 
-| Metric      | Value  |
-| ----------- | ------ |
-| Obj/s       | 333K   |
-| Avg Latency | 4.4 ms |
+| Metric      | Value     |
+| ----------- | --------- |
+| Obj/s       | 270K      |
+| Throughput  | 1.0 GiB/s |
+| Avg Latency | 3.2 ms    |
+| P90 Latency | 4.3 ms    |
+| P99 Latency | 10.9 ms   |
 
 **Benchmark Configuration:**
 
 - Object size: 4 KiB
-- Instance types: 14 c8g.xlarge (API), 6 i8g.2xlarge (BSS), 1 r7g.4xlarge (NSS)
-- Cost: ~$8/hour based on AWS on-demand EC2 instance pricing
+- Dataset: hundreds of millions of objects in a single bucket
+- Instance types: 18 c8g.xlarge (API), 6 i8g.2xlarge (BSS), 1 r7g.4xlarge (NSS)
+- Cost: ~$8/hour at full AWS on-demand EC2 pricing (a conservative upper bound; reserved instances are lower)
 - Replication: 3-way data blob quorum, 6-way metadata blob quorum
 - AWS Region: us-west-2
 - Workload: warp-based S3 load testing
