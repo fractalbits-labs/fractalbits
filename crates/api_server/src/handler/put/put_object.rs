@@ -25,7 +25,7 @@ use crate::{
         common::{
             buffer_payload_with_capacity,
             checksum::{self, ChecksumAlgorithm, ChecksumValue},
-            extract_metadata_headers,
+            extract_metadata_headers, reject_trailing_slash_key,
             request::extract::extract_authentication,
             s3_error::S3Error,
             signature::ChunkSignatureContext,
@@ -75,6 +75,12 @@ fn split_chunks_into_blocks(
 }
 
 pub async fn put_object_handler(ctx: ObjectRequestContext) -> Result<HttpResponse, S3Error> {
+    // POSIX FS compatibility: object keys must not end with '/'. Reject up front
+    // before touching the bucket / blob backend. Multipart part uploads route
+    // through here with a synthetic "key#part" key that never ends with '/', so
+    // this only rejects genuine trailing-slash user keys.
+    reject_trailing_slash_key(&ctx.key)?;
+
     // Debug: log all request headers to understand what's being sent
     tracing::debug!("PUT object request headers:");
     for (name, value) in ctx.request.headers().iter() {

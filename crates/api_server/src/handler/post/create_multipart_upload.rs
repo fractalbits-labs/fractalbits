@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::handler::{
     ObjectRequestContext,
     common::{
+        reject_trailing_slash_key,
         response::xml::{Xml, XmlnsS3},
         s3_error::S3Error,
     },
@@ -43,6 +44,11 @@ struct InitiateMultipartUploadResult {
 pub async fn create_multipart_upload_handler(
     ctx: ObjectRequestContext,
 ) -> Result<actix_web::HttpResponse, S3Error> {
+    // POSIX FS compatibility: object keys must not end with '/'. Reject the
+    // multipart upload at initiation so no Mpu inode is ever created for such a
+    // key.
+    reject_trailing_slash_key(&ctx.key)?;
+
     let bucket = ctx.resolve_bucket().await?;
     let routing_key = &bucket.routing_key;
     let timestamp = SystemTime::now()
