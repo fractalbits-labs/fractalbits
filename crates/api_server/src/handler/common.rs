@@ -136,6 +136,23 @@ pub async fn list_raw_objects(
     Ok(res)
 }
 
+/// Reject object keys that end with '/'.
+///
+/// A trailing slash makes the key look like a directory entry, which cannot be
+/// represented as a regular file in a POSIX filesystem namespace. We refuse such
+/// keys on the object write paths (PutObject / CreateMultipartUpload) so the
+/// keyspace stays compatible with a future POSIX FS backend.
+///
+/// Note: `key` carries a leading '/' in our internal representation, so the bare
+/// root key "/" (an empty S3 key, never a valid object key) is rejected here as
+/// well.
+pub fn reject_trailing_slash_key(key: &str) -> Result<(), S3Error> {
+    if key.ends_with('/') {
+        return Err(S3Error::KeyUnsupported);
+    }
+    Ok(())
+}
+
 pub fn mpu_parse_part_number(mpu_key: &str) -> Result<u32, S3Error> {
     let part_str = mpu_key
         .split('#')
@@ -227,4 +244,36 @@ pub fn object_headers(
 pub fn gen_etag() -> String {
     let random: [u8; 16] = rand::random();
     hex::encode(random)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reject_trailing_slash_key_rejects_dir_like_keys() {
+        // Keys carry a leading '/' internally; a trailing '/' is a directory-like
+        // key and is rejected for POSIX FS compatibility.
+        assert!(matches!(
+            reject_trailing_slash_key("/foo/"),
+            Err(S3Error::KeyUnsupported)
+        ));
+        assert!(matches!(
+            reject_trailing_slash_key("/foo/bar/"),
+            Err(S3Error::KeyUnsupported)
+        ));
+        // Bare root key (empty S3 key) is rejected as well.
+        assert!(matches!(
+            reject_trailing_slash_key("/"),
+            Err(S3Error::KeyUnsupported)
+        ));
+    }
+
+    #[test]
+    fn reject_trailing_slash_key_allows_regular_keys() {
+        assert!(reject_trailing_slash_key("/foo").is_ok());
+        assert!(reject_trailing_slash_key("/foo/bar").is_ok());
+        // Multipart synthetic part keys never end with '/'.
+        assert!(reject_trailing_slash_key("/foo#1").is_ok());
+    }
 }
