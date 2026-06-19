@@ -14,7 +14,7 @@ use crate::disk_cache::DiskCache;
 use crate::error::FsError;
 use crate::inode::{EntryType, InodeTable, ROOT_INODE};
 use data_types::object_layout::{
-    MpuState, ObjectCoreMetaData, ObjectLayout, ObjectMetaData, ObjectState,
+    MpuState, ObjectCoreMetaData, ObjectLayout, ObjectMetaData, ObjectState, SymlinkData,
 };
 pub const TTL: Duration = Duration::from_secs(1);
 pub const DEFAULT_BLOCK_SIZE: u32 = 128 * 1024;
@@ -253,14 +253,24 @@ impl VfsCore {
     fn make_file_attr(&self, ino: u64, layout: &ObjectLayout) -> Result<VfsAttr, FsError> {
         let size = layout.size()?;
         let ts = layout.timestamp / 1000;
+        // Symlinks share the regular-file attribute path but report
+        // S_IFLNK + 0 blocks. The kernel uses the mode bit to decide
+        // whether to call FUSE_READLINK or FUSE_OPEN on a lookup.
+        let is_symlink = layout.is_symlink();
         Ok(VfsAttr {
             ino,
             size,
-            blocks: size.div_ceil(512),
+            blocks: if is_symlink { 0 } else { size.div_ceil(512) },
             atime_secs: ts,
             mtime_secs: ts,
             ctime_secs: ts,
-            mode: file_mode(self.file_perm()),
+            mode: if is_symlink {
+                // POSIX convention: symlink permission bits are
+                // typically 0777 and ignored by the kernel.
+                symlink_mode(0o777)
+            } else {
+                file_mode(self.file_perm())
+            },
             nlink: 1,
             uid: 0,
             gid: 0,
@@ -1471,6 +1481,108 @@ impl VfsCore {
         Ok((attr, fh))
     }
 
+    /// Create a symbolic link at `(parent, name)` whose body is
+    /// `target`. The layout is published to NSS via an unconditional
+    /// `put_inode` (this is a brand-new entry), no BSS blob is
+    /// allocated, and the parent dir cache is invalidated so the new
+    /// name shows up in listings. Existing entries at the same name
+    /// fail the create with `AlreadyExists`.
+    pub async fn vfs_symlink(
+        &self,
+        parent: u64,
+        name: &str,
+        target: &[u8],
+    ) -> Result<VfsAttr, FsError> {
+        self.check_write_enabled()?;
+
+        let prefix = self.dir_prefix(parent).ok_or(FsError::NotFound)?;
+        let key = format!("{}{}", prefix, name);
+
+        let trace_id = TraceId::new();
+
+        // Reject if a name already exists at this path.
+        match self.backend().get_inode(&key, &trace_id).await {
+            Ok(_) => return Err(FsError::AlreadyExists),
+            Err(FsError::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let layout = ObjectLayout {
+            version_id: ObjectLayout::gen_version_id(),
+            block_size: DEFAULT_BLOCK_SIZE,
+            timestamp,
+            blob_version: 0,
+            state: ObjectState::Symlink(SymlinkData {
+                target: target.to_vec(),
+                core_meta_data: ObjectCoreMetaData {
+                    size: target.len() as u64,
+                    etag: String::new(),
+                    headers: vec![],
+                    checksum: None,
+                },
+            }),
+        };
+
+        let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())
+            .map_err(FsError::from)?
+            .into();
+
+        self.backend()
+            .put_inode(&key, layout_bytes, &trace_id)
+            .await?;
+
+        let (ino, _) = self
+            .inodes
+            .lookup_or_insert(&key, EntryType::File, Some(layout.clone()));
+
+        // Invalidate dir cache so the new symlink shows up in listings.
+        self.dir_cache.invalidate(&prefix);
+
+        self.make_file_attr(ino, &layout)
+    }
+
+    /// Return the bytes a `readlink(2)` should hand back. Returns
+    /// `InvalidArgument` (EINVAL) when the inode is not a symlink,
+    /// matching the `readlink(2)` errno for non-symlink targets.
+    pub async fn vfs_readlink(&self, inode: u64) -> Result<Vec<u8>, FsError> {
+        let entry = self.inodes.get(inode).ok_or(FsError::NotFound)?;
+
+        if entry.entry_type != EntryType::File {
+            return Err(FsError::InvalidArg);
+        }
+
+        // Fast path: the cached layout is a Symlink.
+        if let Some(layout) = entry.layout.as_ref()
+            && let Some(target) = layout.symlink_target()
+        {
+            return Ok(target.to_vec());
+        }
+
+        // Cold path: re-fetch from NSS. This handles the case where
+        // the inode entry was created by lookup but the layout was
+        // dropped (memory pressure / eviction).
+        let key = entry.s3_key.clone();
+        drop(entry);
+
+        let trace_id = TraceId::new();
+        let layout = self.backend().get_inode(&key, &trace_id).await?;
+
+        if let Some(target) = layout.symlink_target() {
+            // Cache the layout for future lookups on this inode.
+            if let Some(mut e) = self.inodes.get_mut(inode) {
+                e.layout = Some(layout.clone());
+            }
+            Ok(target.to_vec())
+        } else {
+            Err(FsError::InvalidArg)
+        }
+    }
+
     pub async fn vfs_unlink(&self, parent: u64, name: &str) -> Result<(), FsError> {
         self.check_write_enabled()?;
 
@@ -1914,4 +2026,8 @@ fn file_mode(perm: u16) -> u32 {
 
 fn dir_mode(perm: u16) -> u32 {
     libc::S_IFDIR | perm as u32
+}
+
+fn symlink_mode(perm: u16) -> u32 {
+    libc::S_IFLNK | perm as u32
 }

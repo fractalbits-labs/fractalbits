@@ -37,6 +37,9 @@ pub enum FsError {
     #[error("invalid object state")]
     InvalidState,
 
+    #[error("invalid argument")]
+    InvalidArg,
+
     #[error("deserialization error: {0}")]
     Deserialize(String),
 
@@ -64,6 +67,7 @@ impl From<FsError> for io::Error {
             }
             FsError::DataVg(_) => io::Error::from_raw_os_error(libc::EIO),
             FsError::InvalidState => io::Error::from_raw_os_error(libc::EINVAL),
+            FsError::InvalidArg => io::Error::from_raw_os_error(libc::EINVAL),
             FsError::Deserialize(_) => io::Error::from_raw_os_error(libc::EIO),
             FsError::Internal(_) => io::Error::from_raw_os_error(libc::EIO),
         }

@@ -229,6 +229,10 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     run_test!("Large File Write", test_large_file_write);
     run_test!("Mkdir and Rmdir", test_mkdir_rmdir);
     run_test!("Unlink", test_unlink);
+    run_test!(
+        "Symlink (create / readlink / lstat / unlink)",
+        test_symlink_basic
+    );
     run_test!("Rename", test_rename);
     run_test!("Unlink with Open Handle", test_unlink_open_handle);
     run_test!("Overwrite Existing File", test_overwrite_existing);
@@ -675,6 +679,87 @@ async fn test_unlink(disk_cache: bool) -> CmdResult {
 
     unmount_fuse()?;
     println!("{}", "SUCCESS: Unlink test passed".green());
+    Ok(())
+}
+
+/// Exercise symlink create / readlink / lstat / unlink end-to-end. The
+/// kernel routes `symlink(2)` -> `FUSE_SYMLINK` -> our `vfs_symlink`,
+/// stores a layout with `ObjectState::Symlink`, and a subsequent
+/// `readlink(2)` round-trips the original target bytes back through
+/// `vfs_readlink`. `lstat` must report the link mode (S_IFLNK) and the
+/// target byte count as the size.
+async fn test_symlink_basic(disk_cache: bool) -> CmdResult {
+    use std::os::unix::fs::FileTypeExt;
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: symlink(target, link)");
+    let link_path = format!("{}/my-link", MOUNT_POINT);
+    let target = "../etc/hostname";
+    std::os::unix::fs::symlink(target, &link_path)
+        .expect("failed to create symlink via FUSE_SYMLINK");
+    println!("    Created: my-link -> {}", target);
+
+    println!("  Step 3: readlink should round-trip the target verbatim");
+    let resolved = std::fs::read_link(&link_path).expect("read_link failed");
+    assert_eq!(
+        resolved.to_str().expect("non-utf8 target"),
+        target,
+        "readlink(my-link) returned wrong target"
+    );
+
+    println!("  Step 4: lstat reports S_IFLNK and size = target.len()");
+    let meta = std::fs::symlink_metadata(&link_path).expect("symlink_metadata failed");
+    assert!(
+        meta.file_type().is_symlink(),
+        "lstat did not report a symlink: file_type = {:?}",
+        meta.file_type()
+    );
+    assert_eq!(
+        meta.len(),
+        target.len() as u64,
+        "symlink lstat size mismatch: expected {}, got {}",
+        target.len(),
+        meta.len()
+    );
+    // Also assert the type is NOT a regular file or block device.
+    assert!(
+        !meta.file_type().is_file(),
+        "symlink reported as regular file"
+    );
+    assert!(
+        !meta.file_type().is_block_device(),
+        "symlink reported as block device"
+    );
+
+    println!("  Step 5: unlink the symlink (no blob to clean up)");
+    std::fs::remove_file(&link_path).expect("failed to unlink symlink");
+    assert!(
+        std::fs::symlink_metadata(&link_path).is_err(),
+        "symlink still resolves after unlink"
+    );
+
+    println!("  Step 6: same name is reusable after unlink");
+    std::os::unix::fs::symlink("/tmp/another", &link_path)
+        .expect("failed to recreate symlink with same name");
+    let resolved2 = std::fs::read_link(&link_path).expect("read_link after recreate failed");
+    assert_eq!(resolved2.to_str().unwrap(), "/tmp/another");
+
+    println!("  Step 7: symlinks coexist with regular files in the same dir");
+    let regular = format!("{}/sibling.txt", MOUNT_POINT);
+    std::fs::write(&regular, b"hello").expect("regular write failed");
+    let regular_meta = std::fs::metadata(&regular).expect("metadata regular");
+    assert!(regular_meta.file_type().is_file());
+    assert_eq!(regular_meta.len(), 5);
+
+    // Cleanup
+    let _ = std::fs::remove_file(&link_path);
+    let _ = std::fs::remove_file(&regular);
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: symlink basic test passed".green());
     Ok(())
 }
 
