@@ -25,15 +25,18 @@ fn round_up_to_4(n: usize) -> usize {
 // Per-client queue depth derived from cluster size. The /3 on puts is 3-way
 // replication, dropped for a single bss.
 //
-//   4KB put = (80 * bss_count * 6 / 3) / bench_clients
-//   4KB get = (96 * bss_count * 6)     / bench_clients
+//   4KB put = (72 * bss_count * 6 / 3) / bench_clients
+//   4KB get = (72 * bss_count * 6)     / bench_clients
 //   mixed   = average of put and get
 //   64KB    = 4KB depth / 8
+//
+// For 6 nodes this yields total queue depths of 2592 for read and 864 for
+// write (read = 3x write, matching the 3-way replication factor).
 fn workload_configs(bss_count: usize, bench_clients: usize) -> Vec<WorkloadConfig> {
     let bench = bench_clients.max(1);
     let put_replication = if bss_count == 1 { 1 } else { 3 };
-    let put_4k = (80 * bss_count * 6 / put_replication) / bench;
-    let get_4k = (96 * bss_count * 6) / bench;
+    let put_4k = (72 * bss_count * 6 / put_replication) / bench;
+    let get_4k = (72 * bss_count * 6) / bench;
     let mixed_4k = (put_4k + get_4k) / 2;
     vec![
         WorkloadConfig {

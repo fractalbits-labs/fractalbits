@@ -242,16 +242,8 @@ fn build_zig(zig_build_opt: &str, build_dir: &str, zig_extra_build: &[String]) -
     info!("Building Zig projects for all arch targets (generic + AWS CPU-specific)");
     let build_envs = cmd_build::get_build_envs();
 
-    // Build for generic (on-prem settings: atomic_write_size=4096, sampling_ratio=4)
-    let generic_atomic_write_size = 4096;
-    let generic_sampling_ratio = 4;
-
-    let mut zig_build_with_defaults = vec![
-        format!("journal_atomic_write_size={}", generic_atomic_write_size),
-        format!("journal_sampling_ratio={}", generic_sampling_ratio),
-    ];
-    zig_build_with_defaults.extend(zig_extra_build.iter().cloned());
-    let zig_extra_opts: Vec<String> = zig_build_with_defaults
+    // Build for generic (on-prem) targets.
+    let zig_extra_opts: Vec<String> = zig_extra_build
         .iter()
         .map(|opt| format!("-D{}", opt))
         .collect();
@@ -278,16 +270,8 @@ fn build_zig(zig_build_opt: &str, build_dir: &str, zig_extra_build: &[String]) -
         copy_zig_binaries_to_generic(target, &zig_out_dir)?;
     }
 
-    // Build for AWS CPU targets (aws settings: atomic_write_size=16384, sampling_ratio=1)
-    let aws_atomic_write_size = 16384;
-    let aws_sampling_ratio = 1;
-
-    let mut zig_build_with_defaults = vec![
-        format!("journal_atomic_write_size={}", aws_atomic_write_size),
-        format!("journal_sampling_ratio={}", aws_sampling_ratio),
-    ];
-    zig_build_with_defaults.extend(zig_extra_build.iter().cloned());
-    let zig_extra_opts: Vec<String> = zig_build_with_defaults
+    // Build for AWS CPU-specific targets.
+    let zig_extra_opts: Vec<String> = zig_extra_build
         .iter()
         .map(|opt| format!("-D{}", opt))
         .collect();
