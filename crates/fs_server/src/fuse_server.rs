@@ -153,10 +153,15 @@ impl Filesystem for FuseServer {
     }
 
     async fn flush(&self, _req: Request, _inode: u64, fh: u64, _lock_owner: u64) -> FsResult<()> {
-        self.vfs.vfs_flush(fh).await.map_err(fs_err)
+        // FUSE_FLUSH fires on every close(2). It is not a durability
+        // request -- POSIX only requires errors-on-close to propagate --
+        // so use the no-drain variant to keep writeback cycles async and
+        // avoid serialising create-heavy workloads against the worker.
+        self.vfs.vfs_flush_no_drain(fh).await.map_err(fs_err)
     }
 
     async fn fsync(&self, _req: Request, _inode: u64, fh: u64, _datasync: bool) -> FsResult<()> {
+        // fsync(2) is a durability request: drain the writeback barrier.
         self.vfs.vfs_flush(fh).await.map_err(fs_err)
     }
 

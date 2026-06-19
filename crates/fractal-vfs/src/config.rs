@@ -29,13 +29,12 @@ impl WritebackMode {
     }
 }
 
-/// Writeback knobs. All fields have safe defaults that keep the queue
-/// in strict mode until the workload validation gate passes.
+/// Writeback knobs. The cache is on by default; set `mode = "strict"`
+/// to fall back to the fully synchronous write-through path.
 #[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 pub struct WritebackConfig {
-    /// Mode string; `strict` (default) or `default`. Loose mode is
-    /// not exposed today.
+    /// Mode string; `default` (the default, writeback on) or `strict`.
     #[serde(default = "default_writeback_mode")]
     pub mode: String,
     #[serde(default = "default_max_batch_size")]
@@ -53,7 +52,7 @@ pub struct WritebackConfig {
 }
 
 fn default_writeback_mode() -> String {
-    "strict".to_string()
+    "default".to_string()
 }
 fn default_max_batch_size() -> u32 {
     1024
@@ -206,6 +205,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FS_SERVER_WORKER_THREADS") {
             self.worker_threads = v.parse().unwrap_or(self.worker_threads);
+        }
+        if let Ok(v) = std::env::var("FS_SERVER_WRITEBACK_MODE") {
+            self.writeback.mode = v;
         }
     }
 }

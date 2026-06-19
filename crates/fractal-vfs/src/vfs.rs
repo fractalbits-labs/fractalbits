@@ -5,14 +5,16 @@ use rkyv::api::high::to_bytes_in;
 use std::cell::Cell;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::backend::{BackendConfig, StorageBackend};
 use crate::cache::{DirCache, DirEntry};
+use crate::config::WritebackMode;
 use crate::disk_cache::DiskCache;
 use crate::error::FsError;
 use crate::inode::{EntryType, InodeTable, ROOT_INODE};
+use crate::writeback::{InodeOp as WbInodeOp, WritebackQueue};
 use data_types::object_layout::{
     MpuState, ObjectCoreMetaData, ObjectLayout, ObjectMetaData, ObjectState, SymlinkData,
 };
@@ -93,6 +95,20 @@ pub struct VfsCore {
     passthrough_enabled: bool,
     passthrough_max_object_size: u64,
     prefetch_policy: crate::prefetch::PrefetchPolicy,
+    /// Writeback queue. Always present, but only consulted when
+    /// `writeback_mode` is `Default`. Worker is spawned lazily on
+    /// the first FUSE op (the FUSE adapter's `init()` trait method
+    /// is dead in this codebase; the session handles FUSE_INIT
+    /// itself, so we spawn from inside the compio runtime when
+    /// the first op arrives).
+    writeback: Arc<WritebackQueue>,
+    writeback_mode: WritebackMode,
+    /// `max_batch_wait_ms` from the writeback config; the drainer
+    /// polls this often.
+    writeback_poll_ms: u32,
+    /// One-shot guard for the writeback worker. Flipped by
+    /// `ensure_writeback_worker` on first FUSE op.
+    writeback_worker_started: AtomicBool,
     fuse_dev_fd: Option<Arc<OwnedFd>>,
     // Tracks blob data for unlinked files that still have open handles.
     // Cleanup is deferred until the last handle is released.
@@ -140,6 +156,9 @@ impl VfsCore {
         let passthrough_max_object_size =
             config.passthrough_max_object_size_gb * 1024 * 1024 * 1024;
         let prefetch_policy = crate::prefetch::PrefetchPolicy::from_config(config);
+        let writeback_mode = config.writeback.parsed_mode();
+        let writeback_poll_ms = config.writeback.max_batch_wait_ms.max(1);
+        let writeback = Arc::new(WritebackQueue::new());
 
         Self {
             backend_config,
@@ -152,6 +171,10 @@ impl VfsCore {
             passthrough_enabled,
             passthrough_max_object_size,
             prefetch_policy,
+            writeback,
+            writeback_mode,
+            writeback_poll_ms,
+            writeback_worker_started: AtomicBool::new(false),
             fuse_dev_fd: None,
             deferred_blob_cleanup: DashMap::new(),
             inode_write_owner: DashMap::new(),
@@ -1092,10 +1115,50 @@ impl VfsCore {
         if let Some(dc) = &self.disk_cache {
             dc.spawn_evictor();
         }
+        // Note: in this codebase the FUSE adapter's `init()` trait
+        // method is unused; the session handles FUSE_INIT inline.
+        // The writeback worker is spawned lazily by the first
+        // `ensure_writeback_worker_started()` call from inside a
+        // running compio runtime.
         tracing::info!("Filesystem initialized");
     }
 
+    /// Spawn the writeback worker the first time it's needed. Cheap
+    /// fast path: a relaxed atomic load + branch in steady state. The
+    /// `compare_exchange` only fires once per process.
+    fn ensure_writeback_worker_started(&self) {
+        if self.writeback_mode != WritebackMode::Default {
+            return;
+        }
+        if self.writeback_worker_started.load(Ordering::Relaxed) {
+            return;
+        }
+        if self
+            .writeback_worker_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        spawn_writeback_worker(
+            Arc::clone(&self.backend_config),
+            Arc::clone(&self.writeback),
+            self.writeback_poll_ms,
+        );
+        tracing::info!(poll_ms = self.writeback_poll_ms, "writeback worker started");
+    }
+
     pub fn vfs_destroy(&self) {
+        // Block new enqueues; the worker keeps draining whatever is
+        // already InFlight / Pending until the queue depth hits 0 or
+        // the host process exits.
+        if self.writeback_mode == WritebackMode::Default {
+            self.writeback.set_enqueue_blocked(true);
+            tracing::info!(
+                queue_depth = self.writeback.depth(),
+                "writeback enqueue blocked at destroy; draining residual"
+            );
+        }
         tracing::info!("Filesystem destroyed");
     }
 
@@ -1394,7 +1457,77 @@ impl VfsCore {
     }
 
     pub async fn vfs_flush(&self, fh: u64) -> Result<(), FsError> {
+        self.ensure_writeback_worker_started();
+        self.flush_write_buffer(fh).await?;
+
+        // Default-mode writeback drain: if this fh's inode has any
+        // queued cycles at gen <= barrier, wait for them to commit
+        // before returning. Surfaces deferred EIO if any cycle failed.
+        // No-op in strict mode (the queue is always empty there) and
+        // for inodes with no dirty cycles.
+        //
+        // This is the durability barrier used by fsync(2) / O_SYNC. The
+        // close(2) -> FUSE_FLUSH path uses `vfs_flush_no_drain` instead:
+        // POSIX close only requires error propagation, not durability,
+        // and blocking every close on a worker tick erases the
+        // writeback win on create-heavy workloads (tar -xf, cp -r).
+        if self.writeback_mode == WritebackMode::Default
+            && let Some(handle) = self.file_handles.get(&fh)
+        {
+            let inode = handle.ino;
+            drop(handle);
+            self.drain_inode_to_barrier(inode).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Variant of `vfs_flush` for the FUSE_FLUSH (close-on-fd) path: it
+    /// publishes the buffered write data synchronously (so write errors
+    /// still surface at close) but does not wait on the writeback
+    /// barrier. The placeholder/metadata cycle stays queued and the
+    /// worker drains it on its next tick; any deferred error propagates
+    /// on the next open/fsync of the same path.
+    pub async fn vfs_flush_no_drain(&self, fh: u64) -> Result<(), FsError> {
+        self.ensure_writeback_worker_started();
         self.flush_write_buffer(fh).await
+    }
+
+    /// Drain every writeback cycle for `inode` whose generation is
+    /// at or below the barrier captured at entry. Returns when every
+    /// cycle has reached `Done` (success or short-circuit on failure).
+    /// Surfaces deferred `EIO` if any drained cycle failed.
+    pub async fn drain_inode_to_barrier(&self, inode: u64) -> Result<(), FsError> {
+        let barrier = match self.writeback.fsync_barrier(inode) {
+            Some(b) => b,
+            None => return Ok(()), // idle inode
+        };
+
+        // Poll loop: the worker drains every poll_ms; pick a
+        // sub-multiple so we don't oversleep. 5ms is small enough that
+        // a typical drain latency is bounded by one worker tick.
+        let poll_dur = Duration::from_millis(5);
+        let timeout_secs = self.backend_config.config.rpc_request_timeout_seconds * 4;
+        let deadline = SystemTime::now() + Duration::from_secs(timeout_secs);
+        loop {
+            if self.writeback.cycles_at_or_below_drained(inode, barrier) {
+                break;
+            }
+            if SystemTime::now() > deadline {
+                tracing::warn!(inode, barrier = barrier.0, "writeback drain timeout");
+                return Err(FsError::Internal("writeback drain".to_string()));
+            }
+            compio_runtime::time::sleep(poll_dur).await;
+        }
+
+        // Surface a deferred error if the drained cycles tainted the
+        // inode. The FUSE layer will translate to EIO; the application
+        // is expected to close-and-reopen on the remote winner.
+        if self.writeback.is_tainted(inode) {
+            return Err(FsError::Internal("writeback drain".to_string()));
+        }
+
+        Ok(())
     }
 
     pub async fn vfs_release(&self, fh: u64) -> Result<(), FsError> {
@@ -1494,6 +1627,7 @@ impl VfsCore {
         target: &[u8],
     ) -> Result<VfsAttr, FsError> {
         self.check_write_enabled()?;
+        self.ensure_writeback_worker_started();
 
         let prefix = self.dir_prefix(parent).ok_or(FsError::NotFound)?;
         let key = format!("{}{}", prefix, name);
@@ -1532,13 +1666,42 @@ impl VfsCore {
             .map_err(FsError::from)?
             .into();
 
-        self.backend()
-            .put_inode(&key, layout_bytes, &trace_id)
-            .await?;
-
         let (ino, _) = self
             .inodes
             .lookup_or_insert(&key, EntryType::File, Some(layout.clone()));
+
+        match self.writeback_mode {
+            WritebackMode::Strict => {
+                // Strict path: synchronous publish, return on completion.
+                self.backend()
+                    .put_inode(&key, layout_bytes, &trace_id)
+                    .await?;
+            }
+            WritebackMode::Default => {
+                // Writeback path: open a fresh cycle for this inode and
+                // enqueue the PutInode intent. The worker drains it
+                // asynchronously; vfs_fsync (or implicit on next
+                // syncfs) waits for the cycle to commit.
+                use crate::writeback::{FhId, Generation};
+                let generation = Generation(0);
+                self.writeback
+                    .open_cycle(ino, generation, layout_bytes.len() as u64, 0);
+                let _outcome = self.writeback.upsert_inode_intent(
+                    key.clone(),
+                    generation,
+                    WbInodeOp::PutInode {
+                        parent_key: prefix.clone(),
+                        name: name.to_string(),
+                        layout_bytes,
+                    },
+                    // No fh is allocated for symlinks (the kernel does
+                    // not call open() on the link itself); use a
+                    // sentinel FhId so error routing can still walk the
+                    // owner set.
+                    FhId(0),
+                );
+            }
+        }
 
         // Invalidate dir cache so the new symlink shows up in listings.
         self.dir_cache.invalidate(&prefix);
@@ -2008,6 +2171,98 @@ async fn spawn_prefetch_task(
             )
             .await;
     }
+}
+
+/// Long-running writeback worker. Polls the queue every `poll_ms`,
+/// drains pending Stage A intents, and fires NSS `put_inode` for each.
+/// Spawned at FUSE init when `WritebackMode::Default` is configured;
+/// runs until the process exits.
+///
+/// Phase 1a uses single-op RPCs (one `put_inode` per intent) so it can
+/// land without protocol-layer changes. Cross-file batching via a
+/// dedicated `InodeBatch` RPC is the natural follow-up.
+fn spawn_writeback_worker(
+    backend_cfg: Arc<BackendConfig>,
+    queue: Arc<WritebackQueue>,
+    poll_ms: u32,
+) {
+    let poll_dur = Duration::from_millis(poll_ms.max(1) as u64);
+    compio_runtime::spawn(async move {
+        // Build a per-task StorageBackend; each compio thread initializes
+        // its own NSS / BSS clients lazily.
+        let backend = match StorageBackend::new(&backend_cfg) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "writeback worker: failed to init backend; aborting");
+                return;
+            }
+        };
+
+        loop {
+            compio_runtime::time::sleep(poll_dur).await;
+
+            // Drain a batch of Stage A intents. The drainer flips them
+            // to InFlight before returning so concurrent enqueues fall
+            // into the next-cycle / backpressure path.
+            let drained = queue.drain_stage_a(1024);
+            if drained.is_empty() {
+                continue;
+            }
+
+            for intent in drained {
+                let trace_id = TraceId::new();
+                // Phase 1a only handles `PutInode` and `SetAttr`; the
+                // FUSE op rewires only enqueue these variants today.
+                let result = match &intent.op {
+                    WbInodeOp::PutInode { layout_bytes, .. } => backend
+                        .put_inode(&intent.s3_key, layout_bytes.clone(), &trace_id)
+                        .await
+                        .map(|_old| ()),
+                    WbInodeOp::SetAttr { .. } => {
+                        // No SetAttr enqueue path lands in Phase 1a.
+                        // Treat as no-op success; future scope adds the
+                        // PutInodeCas path that applies attr mutations
+                        // to the layout.
+                        Ok(())
+                    }
+                };
+
+                let inode = inode_for_intent(&queue, &intent);
+                match result {
+                    Ok(_) => {
+                        queue.mark_stage_a_committed(&intent.s3_key, intent.generation, inode);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            key = %intent.s3_key,
+                            generation = intent.generation.0,
+                            error = %e,
+                            "writeback Stage A failed"
+                        );
+                        queue.mark_stage_a_failed(&intent.s3_key, intent.generation, inode);
+                    }
+                }
+            }
+        }
+    })
+    .detach();
+}
+
+/// Best-effort inode lookup for a drained intent. The queue keys
+/// pipeline cycles by inode number, but the drainable carries the
+/// generation only -- so we ask the queue for any inode whose
+/// active_generation matches. In Phase 1a this is unambiguous because
+/// each cycle is on its own inode.
+fn inode_for_intent(
+    queue: &WritebackQueue,
+    intent: &crate::writeback::DrainableInodeIntent,
+) -> u64 {
+    // The active-generation lookup returns Generation(0) for unknown
+    // inodes; we walk every inode the queue knows about and match on
+    // generation. The set is small in practice (one file per cycle in
+    // Phase 1a). When the worker is widened to handle many files at
+    // once, this lookup gets a dedicated index.
+    queue.inode_for_generation(intent.generation).unwrap_or(0)
 }
 
 /// Extract the parent prefix from an s3_key.

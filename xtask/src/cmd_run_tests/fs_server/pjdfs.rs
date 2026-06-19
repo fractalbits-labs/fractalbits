@@ -156,8 +156,9 @@ fn mount_fuse_default(bucket: &str) -> CmdResult {
     }?;
     run_cmd!(mkdir -p $mount_point)?;
 
-    let mut cfg = fs_cfg(bucket);
-    cfg.mode = "default".to_string();
+    // writeback_mode left empty so fs_server uses its config default
+    // (writeback on), exercising the cache-by-default path.
+    let cfg = fs_cfg(bucket);
     cmd_service::init_service(
         ServiceName::FsServer,
         crate::cmd_build::BuildMode::Debug,
