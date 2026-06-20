@@ -1153,20 +1153,25 @@ impl VfsCore {
             };
             let new_version = base_version + 1;
 
-            // Write data blocks in place at the new version. Each block is
-            // zero-padded to a full block_size on disk so the EC shard size
-            // is a constant block_size/k regardless of the logical content
-            // length: a non-block-aligned shrink (16 -> 8 bytes) otherwise
-            // changes the shard size, and a reader using a different size
-            // view hits BSS's length check ("body N < expected M"). The
-            // reader requests the logical length and the EC path truncates
-            // the reconstructed block back down. Tail-block waste is up to
-            // block_size - 1 bytes per file.
+            // Write data blocks in place at the new version. Override
+            // writes (new_version > 1) zero-pad every block to a full
+            // block_size on disk so the EC shard size is a constant
+            // block_size/k regardless of the logical content length: a
+            // non-block-aligned shrink (16 -> 8 bytes) otherwise changes the
+            // shard size, and a reader using a different size view either
+            // hits BSS's length check or mis-reconstructs on the EC degraded
+            // path. Override reads (blob_version > 1, see read_block_cached)
+            // request the full block_size and truncate locally. The initial
+            // flush (new_version == 1) is NOT padded -- its content length
+            // never changes, so it's read at the exact logical length and
+            // padding would only desync that read. Tail-block waste on
+            // overridden files is up to block_size - 1 bytes.
+            let pad_blocks = new_version > 1;
             for block_i in 0..new_num_blocks {
                 let start = block_i * block_size;
                 let end = std::cmp::min(start + block_size, data.len());
                 let chunk = data.slice(start..end);
-                let padded = if chunk.len() < block_size {
+                let body = if pad_blocks && chunk.len() < block_size {
                     let mut buf = BytesMut::with_capacity(block_size);
                     buf.extend_from_slice(&chunk);
                     buf.resize(block_size, 0);
@@ -1175,7 +1180,7 @@ impl VfsCore {
                     chunk
                 };
                 self.backend()
-                    .write_block(blob_guid, block_i as u32, padded, new_version, &trace_id)
+                    .write_block(blob_guid, block_i as u32, body, new_version, &trace_id)
                     .await?;
             }
 
