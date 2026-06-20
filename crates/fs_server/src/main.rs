@@ -82,6 +82,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fs_name("fractalbits")
         .read_only(!read_write)
         .allow_other(cfg.allow_other)
+        // When allow_other is on (e.g. the pjdfstest harness mounts as
+        // the daemon user but drives the suite as root), turn on the
+        // kernel's default_permissions check so it enforces the mode /
+        // uid / gid bits we report. Without it the kernel skips access
+        // gating and the cross-user EPERM / EACCES contract can't be
+        // exercised.
+        .default_permissions(cfg.allow_other)
         .write_back(read_write && !cfg.passthrough_enabled)
         .passthrough(cfg.passthrough_enabled);
 

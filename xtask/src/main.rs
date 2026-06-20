@@ -532,6 +532,12 @@ pub struct FsServerConfig {
     /// `FS_SERVER_WRITEBACK_MODE` env var. Empty string = use the
     /// fs_server config default (`strict`).
     pub writeback_mode: String,
+    /// When true, fs_server gets `FS_SERVER_ALLOW_OTHER=true` so users
+    /// other than the mounting daemon (notably root, when the
+    /// pjdfstest harness drives the suite via `sudo`) can reach the
+    /// FUSE mount. The host's `/etc/fuse.conf` must have
+    /// `user_allow_other` enabled for this to take effect.
+    pub allow_other: bool,
 }
 
 impl Default for InitConfig {

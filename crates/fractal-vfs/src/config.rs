@@ -209,6 +209,9 @@ impl Config {
         if let Ok(v) = std::env::var("FS_SERVER_WRITEBACK_MODE") {
             self.writeback.mode = v;
         }
+        if let Ok(v) = std::env::var("FS_SERVER_ALLOW_OTHER") {
+            self.allow_other = v.parse().unwrap_or(self.allow_other);
+        }
     }
 }
 

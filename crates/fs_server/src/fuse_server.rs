@@ -20,9 +20,9 @@ fn to_file_attr(va: &VfsAttr) -> FileAttr {
         ino: va.ino,
         size: va.size,
         blocks: va.blocks,
-        atime: Timestamp::new(va.atime_secs, 0),
-        mtime: Timestamp::new(va.mtime_secs, 0),
-        ctime: Timestamp::new(va.ctime_secs, 0),
+        atime: Timestamp::new(va.atime_secs, va.atime_ns_part),
+        mtime: Timestamp::new(va.mtime_secs, va.mtime_ns_part),
+        ctime: Timestamp::new(va.ctime_secs, va.ctime_ns_part),
         mode: va.mode,
         nlink: va.nlink,
         uid: va.uid,
@@ -83,25 +83,148 @@ impl Filesystem for FuseServer {
 
     async fn setattr(
         &self,
-        _req: Request,
+        req: Request,
         inode: u64,
         fh: Option<u64>,
         set_attr: SetAttr,
     ) -> FsResult<ReplyAttr> {
-        if let Some(new_size) = set_attr.size {
-            let fh_id = fh.ok_or(libc::ENOSYS)?;
-            let attr = self
-                .vfs
-                .vfs_setattr_size(inode, fh_id, new_size)
-                .await
-                .map_err(fs_err)?;
-            return Ok(ReplyAttr {
-                ttl: TTL,
-                attr: to_file_attr(&attr),
-            });
+        // POSIX setattr permission rules. We don't pass the FUSE
+        // `default_permissions` flag, so the kernel forwards every
+        // setattr regardless of caller privilege and we enforce the
+        // EPERM contract ourselves. root (uid 0) bypasses the whole
+        // block.
+        if req.uid != 0 {
+            let cur = self.vfs.vfs_getattr(inode, fh).await.map_err(fs_err)?;
+            let is_owner = cur.uid == req.uid;
+            // chmod by a non-owner is EPERM. In writeback-cache mode the
+            // kernel never forwards a suid-clear-on-write as a setattr
+            // (the cache absorbs the write), so there is no kernel-driven
+            // mode change to exempt here -- the open() handler does the
+            // anticipatory clear instead.
+            if set_attr.mode.is_some() && !is_owner {
+                return Err(libc::EPERM);
+            }
+            // Only root may change the owning uid.
+            if let Some(new_uid) = set_attr.uid
+                && new_uid != cur.uid
+            {
+                return Err(libc::EPERM);
+            }
+            // chgrp to a different gid requires ownership.
+            if let Some(new_gid) = set_attr.gid
+                && new_gid != cur.gid
+                && !is_owner
+            {
+                return Err(libc::EPERM);
+            }
+            // A non-owner setting a specific atime/mtime needs write
+            // permission on the file (the legitimate UTIME_NOW path the
+            // kernel already filtered for write access). The fh-bearing
+            // case came from a fd that passed the open-time check, so
+            // accept it.
+            if (set_attr.atime.is_some() || set_attr.mtime.is_some()) && !is_owner && fh.is_none() {
+                let mode = cur.mode;
+                let has_write = if cur.uid == req.uid {
+                    mode & libc::S_IWUSR != 0
+                } else if cur.gid == req.gid {
+                    mode & libc::S_IWGRP != 0
+                } else {
+                    mode & libc::S_IWOTH != 0
+                };
+                if !has_write {
+                    return Err(libc::EPERM);
+                }
+            }
         }
 
-        // For other setattr calls, just return current attr
+        // Apply size first so the dirty-handle path in vfs_getattr sees
+        // the updated buffer size. truncate(2) is path-based with no fh,
+        // so open the inode internally and release after the update.
+        if let Some(new_size) = set_attr.size {
+            match fh {
+                Some(fh_id) => {
+                    self.vfs
+                        .vfs_setattr_size(inode, fh_id, new_size)
+                        .await
+                        .map_err(fs_err)?;
+                }
+                None => {
+                    let internal_fh = self
+                        .vfs
+                        .vfs_open(inode, libc::O_WRONLY as u32)
+                        .await
+                        .map_err(fs_err)?;
+                    let size_res = self
+                        .vfs
+                        .vfs_setattr_size(inode, internal_fh, new_size)
+                        .await;
+                    let release_res = self.vfs.vfs_release(internal_fh).await;
+                    size_res.map_err(fs_err)?;
+                    release_res.map_err(fs_err)?;
+                }
+            }
+        }
+
+        // POSIX: a successful non-root chown that changes uid or gid
+        // clears S_ISUID and (for group-executable files) S_ISGID. The
+        // kernel does not lift this up to us here, so detect the chown
+        // locally and inject the cleared mode into the same posix call.
+        let mut effective_mode = set_attr.mode;
+        let needs_suid_clear = effective_mode.is_none()
+            && req.uid != 0
+            && (set_attr.uid.is_some() || set_attr.gid.is_some());
+        if needs_suid_clear {
+            let cur = self.vfs.vfs_getattr(inode, fh).await.map_err(fs_err)?;
+            let mut m = cur.mode;
+            if m & libc::S_ISUID != 0 {
+                m &= !libc::S_ISUID;
+            }
+            if m & libc::S_ISGID != 0 && m & libc::S_IXGRP != 0 {
+                m &= !libc::S_ISGID;
+            }
+            if m != cur.mode {
+                effective_mode = Some(m);
+            }
+        }
+
+        let needs_posix = effective_mode.is_some()
+            || set_attr.uid.is_some()
+            || set_attr.gid.is_some()
+            || set_attr.atime.is_some()
+            || set_attr.mtime.is_some()
+            || set_attr.ctime.is_some();
+        if needs_posix {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let resolve_time = |t: Option<SetAttrTime>| -> Option<u64> {
+                t.map(|st| match st {
+                    SetAttrTime::Now => now_ns,
+                    SetAttrTime::Specific(ts) => {
+                        ts.sec.saturating_mul(1_000_000_000) + ts.nsec as u64
+                    }
+                })
+            };
+            let ctime_ns = set_attr
+                .ctime
+                .map(|ts| ts.sec.saturating_mul(1_000_000_000) + ts.nsec as u64);
+            self.vfs
+                .vfs_setattr_posix(
+                    inode,
+                    effective_mode,
+                    set_attr.uid,
+                    set_attr.gid,
+                    resolve_time(set_attr.atime),
+                    resolve_time(set_attr.mtime),
+                    ctime_ns,
+                )
+                .await
+                .map_err(fs_err)?;
+        }
+
+        // Reply through vfs_getattr so the size field reflects an
+        // in-flight write buffer.
         let attr = self.vfs.vfs_getattr(inode, fh).await.map_err(fs_err)?;
         Ok(ReplyAttr {
             ttl: TTL,
@@ -109,8 +232,38 @@ impl Filesystem for FuseServer {
         })
     }
 
-    async fn open(&self, _req: Request, inode: u64, flags: u32) -> FsResult<ReplyOpen> {
+    async fn open(&self, req: Request, inode: u64, flags: u32) -> FsResult<ReplyOpen> {
         let fh = self.vfs.vfs_open(inode, flags).await.map_err(fs_err)?;
+
+        // POSIX: a write(2) by a non-owner clears S_ISUID and (for
+        // group-executable files) S_ISGID. With FUSE_WRITEBACK_CACHE the
+        // cache absorbs the write and the kill never reaches userspace,
+        // so anticipate it at open(O_WRONLY|O_RDWR|O_APPEND|O_TRUNC)
+        // time: clear the bits now if the caller is non-root, non-owner,
+        // and the file carries them.
+        let write_flags = libc::O_WRONLY as u32
+            | libc::O_RDWR as u32
+            | libc::O_APPEND as u32
+            | libc::O_TRUNC as u32;
+        if req.uid != 0 && (flags & write_flags) != 0 {
+            let attr = self
+                .vfs
+                .vfs_getattr(inode, Some(fh))
+                .await
+                .map_err(fs_err)?;
+            let has_setuid = attr.mode & libc::S_ISUID != 0;
+            let has_setgid_exec = attr.mode & libc::S_ISGID != 0 && attr.mode & libc::S_IXGRP != 0;
+            if attr.uid != req.uid && (has_setuid || has_setgid_exec) {
+                let new_mode = attr.mode & !(libc::S_ISUID | libc::S_ISGID);
+                if let Err(e) = self
+                    .vfs
+                    .vfs_setattr_posix(inode, Some(new_mode), None, None, None, None, None)
+                    .await
+                {
+                    tracing::warn!(inode, error = %e, "open: kill_suidgid setattr failed");
+                }
+            }
+        }
 
         // Try passthrough for fully-cached read-only files
         let (open_flags, backing_id) = if flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) == 0
@@ -181,16 +334,19 @@ impl Filesystem for FuseServer {
 
     async fn create(
         &self,
-        _req: Request,
+        req: Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
+        mode: u32,
         _flags: u32,
     ) -> FsResult<ReplyCreate> {
         let name_str = name.to_str().ok_or(libc::EINVAL)?;
+        // Seed the new inode from the kernel's create() args: the
+        // requesting uid/gid become owner/group and the (umask-applied)
+        // mode becomes the inode mode.
         let (attr, fh) = self
             .vfs
-            .vfs_create(parent, name_str)
+            .vfs_create(parent, name_str, mode, req.uid, req.gid)
             .await
             .map_err(fs_err)?;
         Ok(ReplyCreate {
@@ -207,9 +363,52 @@ impl Filesystem for FuseServer {
         self.vfs.vfs_unlink(parent, name_str).await.map_err(fs_err)
     }
 
+    async fn mknod(
+        &self,
+        req: Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        rdev: u32,
+    ) -> FsResult<ReplyEntry> {
+        use data_types::object_layout::{PosixAttrs, SpecialKind};
+        let name_str = name.to_str().ok_or(libc::EINVAL)?;
+        // Pick the kind from the S_IFMT bits. Only fifo / block / char /
+        // socket round-trip here; mknod(S_IFREG) is legal POSIX but we
+        // don't map it onto the create-for-write path today.
+        let kind = match mode & libc::S_IFMT {
+            x if x == libc::S_IFIFO => SpecialKind::Fifo,
+            x if x == libc::S_IFBLK => SpecialKind::BlockDevice,
+            x if x == libc::S_IFCHR => SpecialKind::CharDevice,
+            x if x == libc::S_IFSOCK => SpecialKind::Socket,
+            _ => return Err(libc::EINVAL),
+        };
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let init_posix = PosixAttrs {
+            mode,
+            uid: req.uid,
+            gid: req.gid,
+            mtime_ns: now_ns,
+            ctime_ns: now_ns,
+        };
+        let attr = self
+            .vfs
+            .vfs_mknod(parent, name_str, kind, rdev, init_posix)
+            .await
+            .map_err(fs_err)?;
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr: to_file_attr(&attr),
+            generation: 0,
+        })
+    }
+
     async fn symlink(
         &self,
-        _req: Request,
+        req: Request,
         parent: u64,
         name: &OsStr,
         link: &OsStr,
@@ -220,7 +419,7 @@ impl Filesystem for FuseServer {
         let target_bytes = link.as_encoded_bytes();
         let attr = self
             .vfs
-            .vfs_symlink(parent, name_str, target_bytes)
+            .vfs_symlink(parent, name_str, target_bytes, req.uid, req.gid)
             .await
             .map_err(fs_err)?;
         Ok(ReplyEntry {
@@ -237,14 +436,20 @@ impl Filesystem for FuseServer {
 
     async fn mkdir(
         &self,
-        _req: Request,
+        req: Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
+        mode: u32,
         _umask: u32,
     ) -> FsResult<ReplyEntry> {
         let name_str = name.to_str().ok_or(libc::EINVAL)?;
-        let attr = self.vfs.vfs_mkdir(parent, name_str).await.map_err(fs_err)?;
+        // The kernel already applied umask; mode arrives without
+        // file-type bits.
+        let attr = self
+            .vfs
+            .vfs_mkdir(parent, name_str, mode, req.uid, req.gid)
+            .await
+            .map_err(fs_err)?;
         Ok(ReplyEntry {
             ttl: TTL,
             attr: to_file_attr(&attr),

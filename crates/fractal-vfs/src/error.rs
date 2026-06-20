@@ -13,6 +13,9 @@ pub enum FsError {
     #[error("directory not empty")]
     NotEmpty,
 
+    #[error("file name too long")]
+    NameTooLong,
+
     #[error("is a directory")]
     IsDir,
 
@@ -53,6 +56,7 @@ impl From<FsError> for io::Error {
             FsError::NotFound => io::Error::from_raw_os_error(libc::ENOENT),
             FsError::AlreadyExists => io::Error::from_raw_os_error(libc::EEXIST),
             FsError::NotEmpty => io::Error::from_raw_os_error(libc::ENOTEMPTY),
+            FsError::NameTooLong => io::Error::from_raw_os_error(libc::ENAMETOOLONG),
             FsError::IsDir => io::Error::from_raw_os_error(libc::EISDIR),
             FsError::NotDir => io::Error::from_raw_os_error(libc::ENOTDIR),
             FsError::ReadOnly => io::Error::from_raw_os_error(libc::EROFS),

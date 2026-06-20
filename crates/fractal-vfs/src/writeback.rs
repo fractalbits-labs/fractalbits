@@ -162,6 +162,12 @@ pub enum BlockOp {
 #[derive(Debug, Clone)]
 pub struct InodeIntent {
     pub op: InodeOp,
+    /// Owning inode. Carried explicitly so the worker can route a
+    /// drained intent's commit back to the right cycle without a
+    /// generation-based reverse lookup. Generations are not globally
+    /// unique: the metadata publish path opens every cycle at
+    /// `Generation(0)`.
+    pub inode: u64,
     pub generation: Generation,
     pub deps: Vec<IntentId>,
     pub state: IntentState,
@@ -391,6 +397,7 @@ pub struct FhErrSeq(pub u32);
 #[derive(Debug, Clone)]
 pub struct DrainableInodeIntent {
     pub s3_key: S3Key,
+    pub inode: u64,
     pub generation: Generation,
     pub op: InodeOp,
     pub fhs: Vec<FhId>,
@@ -683,6 +690,7 @@ impl WritebackQueue {
     pub fn upsert_inode_intent(
         &self,
         key: S3Key,
+        inode: u64,
         generation: Generation,
         op: InodeOp,
         fh: FhId,
@@ -716,6 +724,7 @@ impl WritebackQueue {
         };
         let intent = InodeIntent {
             op,
+            inode,
             generation,
             deps: Vec::new(),
             state: IntentState::Pending,
@@ -818,6 +827,25 @@ impl WritebackQueue {
             .depth
     }
 
+    /// `true` if a not-yet-committed child create exists under
+    /// `parent_key`. Directory emptiness checks use this before
+    /// consulting NSS: a successful FUSE create has already made the
+    /// child visible to the caller, even when the default-mode
+    /// writeback worker has not published the child layout yet.
+    pub fn has_pending_child_put_inode_for_parent(&self, parent_key: &str) -> bool {
+        let inner = self.inner.lock().expect("writeback queue poisoned");
+        inner.inode_intents.values().any(|intent| {
+            matches!(intent.state, IntentState::Pending | IntentState::InFlight)
+                && matches!(
+                    &intent.op,
+                    InodeOp::PutInode {
+                        parent_key: intent_parent,
+                        ..
+                    } if intent_parent == parent_key
+                )
+        })
+    }
+
     /// Pop up to `max_batch` Pending Stage A intents whose dependencies
     /// are satisfied, mark them InFlight, and return drainable
     /// snapshots for the worker to ship. Each cycle whose Stage A is
@@ -844,6 +872,7 @@ impl WritebackQueue {
             }
             let drainable = DrainableInodeIntent {
                 s3_key: key.0.clone(),
+                inode: intent.inode,
                 generation: key.1,
                 op: intent.op.clone(),
                 fhs: intent.fhs.clone(),
@@ -1378,6 +1407,7 @@ mod tests {
         let key = "/a/b".to_string();
         let r1 = q.upsert_inode_intent(
             key.clone(),
+            1,
             Generation(0),
             InodeOp::PutInode {
                 parent_key: "/a".to_string(),
@@ -1391,6 +1421,7 @@ mod tests {
 
         let r2 = q.upsert_inode_intent(
             key.clone(),
+            1,
             Generation(0),
             InodeOp::PutInode {
                 parent_key: "/a".to_string(),
@@ -1409,6 +1440,7 @@ mod tests {
         let key = "/foo".to_string();
         let r1 = q.upsert_inode_intent(
             key.clone(),
+            2,
             Generation(0),
             InodeOp::SetAttr {
                 key: key.clone(),
@@ -1423,6 +1455,7 @@ mod tests {
 
         let r2 = q.upsert_inode_intent(
             key.clone(),
+            2,
             Generation(0),
             InodeOp::SetAttr {
                 key: key.clone(),
@@ -1811,6 +1844,7 @@ mod tests {
         q.open_cycle(42, Generation(0), 0, 0);
         let r = q.upsert_inode_intent(
             "/foo".to_string(),
+            42,
             Generation(0),
             InodeOp::PutInode {
                 parent_key: "/".to_string(),
@@ -1842,6 +1876,7 @@ mod tests {
         q.open_cycle(7, Generation(0), 0, 0);
         q.upsert_inode_intent(
             "/x".to_string(),
+            7,
             Generation(0),
             InodeOp::PutInode {
                 parent_key: "/".to_string(),
@@ -1868,6 +1903,7 @@ mod tests {
         q.open_cycle(9, Generation(0), 0, 0);
         q.upsert_inode_intent(
             "/y".to_string(),
+            9,
             Generation(0),
             InodeOp::PutInode {
                 parent_key: "/".to_string(),
@@ -1885,6 +1921,71 @@ mod tests {
         assert_eq!(q.errseq(9), 1);
         let st = q.cycle_state(9, Generation(0)).unwrap();
         assert_eq!(st.stage, FileCommitStage::Done);
+    }
+
+    #[test]
+    fn pending_child_putinode_marks_parent_nonempty() {
+        let q = WritebackQueue::new();
+        q.open_cycle(10, Generation(0), 0, 0);
+        q.upsert_inode_intent(
+            "/dir/child".to_string(),
+            10,
+            Generation(0),
+            InodeOp::PutInode {
+                parent_key: "/dir/".to_string(),
+                name: "child".to_string(),
+                layout_bytes: Bytes::from_static(b"child"),
+            },
+            FhId(1),
+        );
+
+        assert!(q.has_pending_child_put_inode_for_parent("/dir/"));
+        assert!(!q.has_pending_child_put_inode_for_parent("/other/"));
+    }
+
+    #[test]
+    fn inflight_child_putinode_marks_parent_nonempty_until_commit() {
+        let q = WritebackQueue::new();
+        q.open_cycle(11, Generation(0), 0, 0);
+        q.upsert_inode_intent(
+            "/dir/child".to_string(),
+            11,
+            Generation(0),
+            InodeOp::PutInode {
+                parent_key: "/dir/".to_string(),
+                name: "child".to_string(),
+                layout_bytes: Bytes::from_static(b"child"),
+            },
+            FhId(1),
+        );
+
+        let drained = q.drain_stage_a(8);
+        assert_eq!(drained.len(), 1);
+        assert!(q.has_pending_child_put_inode_for_parent("/dir/"));
+
+        q.mark_stage_a_committed("/dir/child", Generation(0), 11);
+
+        assert!(!q.has_pending_child_put_inode_for_parent("/dir/"));
+    }
+
+    #[test]
+    fn pending_directory_marker_does_not_make_itself_nonempty() {
+        let q = WritebackQueue::new();
+        q.open_cycle(12, Generation(0), 0, 0);
+        q.upsert_inode_intent(
+            "/dir/".to_string(),
+            12,
+            Generation(0),
+            InodeOp::PutInode {
+                parent_key: "/".to_string(),
+                name: "dir".to_string(),
+                layout_bytes: Bytes::from_static(b"dir"),
+            },
+            FhId(1),
+        );
+
+        assert!(!q.has_pending_child_put_inode_for_parent("/dir/"));
+        assert!(q.has_pending_child_put_inode_for_parent("/"));
     }
 
     #[test]

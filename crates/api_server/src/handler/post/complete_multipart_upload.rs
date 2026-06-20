@@ -283,6 +283,7 @@ pub async fn complete_multipart_upload_handler(
         etag: etag.clone(),
         headers,
         checksum: expected_checksum,
+        ..Default::default()
     }));
     let new_object_bytes: Bytes = to_bytes_in::<_, Error>(&object, Vec::new())?.into();
     let nss_client = ctx.app.get_nss_rpc_client(routing_key).await?;

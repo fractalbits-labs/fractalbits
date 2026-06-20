@@ -162,11 +162,15 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
                     }
                 }
             },
-            // Symlinks are an FS-only concept and have no associated
+            // Symlinks, special files (fifo / device / socket) and
+            // directory inodes are FS-only concepts with no associated
             // blob to clean up; the namespace-level delete above is
             // sufficient. Indirect entries are schema-only today and
             // should never reach this handler.
-            ObjectState::Symlink(_) | ObjectState::Indirect(_) => {}
+            ObjectState::Symlink(_)
+            | ObjectState::Special(_)
+            | ObjectState::Directory(_)
+            | ObjectState::Indirect(_) => {}
         }
     }
 

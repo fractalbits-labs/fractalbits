@@ -458,6 +458,7 @@ async fn put_object_streaming_internal(
                 etag: etag.clone(),
                 headers,
                 checksum: calculated_checksum,
+                ..Default::default()
             },
         }),
     };
@@ -675,6 +676,7 @@ async fn put_object_with_no_trailer(
                 etag: etag.clone(),
                 headers,
                 checksum: calculated_checksum,
+                ..Default::default()
             },
         }),
     };

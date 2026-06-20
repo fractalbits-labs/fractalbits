@@ -181,6 +181,7 @@ pub fn create_dir_marker_layout() -> ObjectLayout {
                 etag: String::new(),
                 headers: vec![],
                 checksum: None,
+                ..Default::default()
             },
         }),
     }

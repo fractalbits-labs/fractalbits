@@ -144,6 +144,12 @@ fn fs_cfg(bucket: &str) -> FsServerConfig {
         read_write: true,
         disk_cache_enabled: false,
         disk_cache_path: disk_cache_path(),
+        // pjdfstest forks and `setuid(65534)` to verify the cross-user
+        // EPERM contract, so the suite must run as root (via sudo).
+        // FUSE only lets a different user reach the mount if it was
+        // mounted with `allow_other`, and the host needs
+        // `user_allow_other` in /etc/fuse.conf for that to take effect.
+        allow_other: true,
         ..Default::default()
     }
 }
@@ -228,16 +234,31 @@ pub async fn run_pjdfstest(subdir: Option<&str>) -> CmdResult {
         Some(s) => format!("{}/tests/{}", pjd_dir.display(), s),
         None => format!("{}/tests", pjd_dir.display()),
     };
-    println!("  running prove against {prove_target}");
 
-    // Prepend the pjdfstest dir to PATH so the .t scripts find the
-    // binary; run prove from the test root so it creates files there.
+    // pjdfstest's whole point is to fork + `setuid(65534)` and verify
+    // the cross-user EPERM contract; running it as the unprivileged
+    // user just hides those tests behind "EPERM expected, got 0". So
+    // run the suite as root via `sudo -E`, which preserves the env
+    // (the PATH we prepend with the pjdfstest binary dir) across the
+    // privilege change. The caller must have passwordless sudo for
+    // this session (`sudo -v` once is enough), and the host's
+    // /etc/fuse.conf must have `user_allow_other` so the allow_other
+    // mount is reachable from root.
     let path_env = std::env::var("PATH").unwrap_or_default();
     let prove_env = vec![format!("PATH={bin_dir}:{path_env}")];
+    let verbose = std::env::var("PJDFS_VERBOSE").is_ok();
+    println!("  running prove (as root, via sudo) against {prove_target}");
 
-    let prove_result = run_cmd! {
-        cd $test_root;
-        $[prove_env] prove -r $prove_target;
+    let prove_result = if verbose {
+        run_cmd! {
+            cd $test_root;
+            $[prove_env] sudo -E prove -v -r $prove_target;
+        }
+    } else {
+        run_cmd! {
+            cd $test_root;
+            $[prove_env] sudo -E prove -r $prove_target;
+        }
     };
 
     unmount()?;
