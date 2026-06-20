@@ -1064,7 +1064,13 @@ impl VfsCore {
                 Some(wb) if wb.dirty => wb,
                 _ => return Ok(()),
             };
-            (s3_key, ino, wb.data.split().freeze())
+            // Take the buffered bytes and clear `dirty` under the same guard
+            // so a concurrent flush of the same fh sees a clean buffer and
+            // early-returns, rather than racing in to publish an empty
+            // (already-drained) buffer over the real data.
+            let data = wb.data.split().freeze();
+            wb.dirty = false;
+            (s3_key, ino, data)
         };
 
         // If the name was unlinked while the fd stayed open, the
@@ -1089,70 +1095,132 @@ impl VfsCore {
         let posix = self.inodes.get(ino).map(|e| e.posix).unwrap_or_default();
 
         let trace_id = TraceId::new();
-        let blob_guid = self.backend().create_blob_guid();
         let block_size = DEFAULT_BLOCK_SIZE as usize;
-
-        // Write data blocks
-        let num_blocks = if data.is_empty() {
+        let new_size = data.len() as u64;
+        let new_num_blocks = if data.is_empty() {
             0
         } else {
             data.len().div_ceil(block_size)
         };
-        for block_i in 0..num_blocks {
-            let start = block_i * block_size;
-            let end = std::cmp::min(start + block_size, data.len());
-            let chunk = data.slice(start..end);
-            self.backend()
-                .write_block(blob_guid, block_i as u32, chunk, 1, &trace_id)
-                .await?;
-        }
 
-        // Build ObjectLayout
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let layout = ObjectLayout {
-            version_id: ObjectLayout::gen_version_id(),
-            block_size: DEFAULT_BLOCK_SIZE,
-            timestamp,
-            blob_version: 1,
-            state: ObjectState::Normal(ObjectMetaData {
-                blob_guid,
-                core_meta_data: ObjectCoreMetaData {
-                    size: data.len() as u64,
-                    etag: blob_guid.blob_id.simple().to_string(),
-                    headers: vec![],
-                    checksum: None,
-                    posix,
-                },
-            }),
+        // Override flush (V1 sparse-override): instead of allocating a fresh
+        // blob and deleting the old one on every flush -- which races a
+        // concurrent flush into publishing a layout that points at
+        // just-deleted blocks (STATUS_DELETED -> EIO after remount) -- we
+        // reuse the file's *stable* blob_guid, bump `blob_version`, write
+        // blocks in place at the new version, and CAS-publish the layout.
+        // The CAS guard (`expected_old` = the bytes we believe are in NSS)
+        // means a stale or cross-instance publish loses the race instead of
+        // clobbering the winner; on conflict we re-read and retry against
+        // the winning snapshot. Old blocks are never blindly deleted -- only
+        // blocks past a shrunk EOF are trimmed, at the bumped version.
+        let mut base_layout: Option<ObjectLayout> =
+            self.file_handles.get(&fh_id).and_then(|h| h.layout.clone());
+
+        const MAX_CAS_RETRIES: u32 = 5;
+        let mut attempt: u32 = 0;
+        let final_layout = loop {
+            attempt += 1;
+
+            // Derive the override base: a Normal layout contributes its
+            // stable blob_guid + version for in-place override; anything
+            // else (or no prior layout) starts a fresh blob at version 1.
+            let (blob_guid, base_version, old_num_blocks, expected_old) = match base_layout
+                .as_ref()
+                .and_then(|l| l.blob_guid().ok().map(|g| (g, l)))
+            {
+                Some((g, l)) => {
+                    let bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(l, Vec::new())
+                        .map_err(FsError::from)?
+                        .into();
+                    let old_bc = l
+                        .size()
+                        .ok()
+                        .map(|s| s.div_ceil(block_size as u64) as usize)
+                        .unwrap_or(0);
+                    (g, l.blob_version, old_bc, bytes)
+                }
+                None => (self.backend().create_blob_guid(), 0, 0, Bytes::new()),
+            };
+            let new_version = base_version + 1;
+
+            // Write data blocks in place at the new version.
+            for block_i in 0..new_num_blocks {
+                let start = block_i * block_size;
+                let end = std::cmp::min(start + block_size, data.len());
+                let chunk = data.slice(start..end);
+                self.backend()
+                    .write_block(blob_guid, block_i as u32, chunk, new_version, &trace_id)
+                    .await?;
+            }
+
+            // Build + serialize the new layout at the bumped version.
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let layout = ObjectLayout {
+                version_id: ObjectLayout::gen_version_id(),
+                block_size: DEFAULT_BLOCK_SIZE,
+                timestamp,
+                blob_version: new_version,
+                state: ObjectState::Normal(ObjectMetaData {
+                    blob_guid,
+                    core_meta_data: ObjectCoreMetaData {
+                        size: new_size,
+                        etag: blob_guid.blob_id.simple().to_string(),
+                        headers: vec![],
+                        checksum: None,
+                        posix,
+                    },
+                }),
+            };
+            let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())
+                .map_err(FsError::from)?
+                .into();
+
+            // CAS-publish: only lands if NSS still holds `expected_old`.
+            match self
+                .backend()
+                .put_inode_cas(&s3_key, layout_bytes, expected_old, &trace_id)
+                .await
+            {
+                Ok(_prev) => {
+                    // Trim blocks past the (possibly shrunk) EOF. Same stable
+                    // guid, deleted at the bumped version so the guard drops
+                    // the now-orphaned tail blocks.
+                    for block_i in new_num_blocks..old_num_blocks {
+                        self.backend()
+                            .delete_block(blob_guid, block_i as u32, new_version, &trace_id)
+                            .await;
+                    }
+                    break layout;
+                }
+                Err(FsError::CasConflict) => {
+                    if attempt >= MAX_CAS_RETRIES {
+                        tracing::warn!(
+                            key = %s3_key,
+                            "flush_write_buffer: CAS still conflicting after retries"
+                        );
+                        return Err(FsError::CasConflict);
+                    }
+                    // Re-read the winning state and retry the override on top
+                    // of it (bumping from its version).
+                    match self.backend().get_inode(&s3_key, &trace_id).await {
+                        Ok(cur) => base_layout = Some(cur),
+                        Err(FsError::NotFound) => base_layout = None,
+                        Err(e) => return Err(e),
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         };
 
-        // Serialize layout
-        let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())
-            .map_err(FsError::from)?
-            .into();
-
-        // Put inode in NSS, get old object bytes
-        let old_bytes = self
-            .backend()
-            .put_inode(&s3_key, layout_bytes, &trace_id)
-            .await?;
-
-        // Delete old blob blocks if there was a previous version
-        if !old_bytes.is_empty()
-            && let Ok(old_layout) =
-                rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
-        {
-            self.backend()
-                .delete_blob_blocks(&old_layout, &trace_id)
-                .await;
-        }
-
-        // Update file handle with new layout and clear dirty flag
+        // Update file handle with new layout and clear dirty flag. The
+        // freshly published bytes become the next flush's CAS guard.
         if let Some(mut handle) = self.file_handles.get_mut(&fh_id) {
-            handle.layout = Some(layout.clone());
+            handle.layout = Some(final_layout.clone());
             if let Some(ref mut wb) = handle.write_buf {
                 wb.dirty = false;
             }
@@ -1164,7 +1232,7 @@ impl VfsCore {
             if let Some(handle) = handle
                 && let Some(mut entry) = self.inodes.get_mut(handle.ino)
             {
-                entry.layout = Some(layout);
+                entry.layout = Some(final_layout);
             }
         }
 

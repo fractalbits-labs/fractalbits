@@ -504,6 +504,34 @@ impl StorageBackend {
         }
     }
 
+    /// Delete a single data block at a specific version. Used by the
+    /// override flush to trim blocks past a shrunk EOF: the block lives on
+    /// the file's stable blob_guid, and deleting it at the bumped
+    /// `blob_version` lets BSS's version-guarded delete drop the older
+    /// block. Best-effort; logs and swallows errors like
+    /// `delete_blob_blocks`.
+    pub async fn delete_block(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        version: u64,
+        trace_id: &TraceId,
+    ) {
+        if let Err(e) = self
+            .data_vg_proxy
+            .delete_blob(blob_guid, block_number, version, trace_id)
+            .await
+        {
+            tracing::warn!(
+                %blob_guid,
+                block_number,
+                version,
+                error = %e,
+                "Failed to delete trimmed blob block"
+            );
+        }
+    }
+
     /// Delete blob blocks for a given ObjectLayout. Fire-and-forget: logs
     /// warnings on failure but does not return errors.
     pub async fn delete_blob_blocks(&self, layout: &ObjectLayout, trace_id: &TraceId) {
