@@ -2526,9 +2526,45 @@ impl VfsCore {
                 self.touch_parent_times(new_parent);
             }
         } else {
-            self.backend()
-                .rename_file(&src_key, &dst_key, &trace_id)
+            // Drain pending writeback on src AND dst before the NSS
+            // rename so we operate on the post-flush layout and a queued
+            // publish can't resurrect either name after the atomic
+            // replace (create+close returns to userspace before the
+            // close-time publish lands in NSS; rename/09.t / 10.t fire
+            // the rename immediately after).
+            if let Some(ino) = self.inodes.find_ino_by_key(&src_key, EntryType::File) {
+                let _ = self.drain_inode_to_barrier(ino).await;
+            }
+            let dst_ino_before = self.inodes.find_ino_by_key(&dst_key, EntryType::File);
+            if let Some(ino) = dst_ino_before {
+                let _ = self.drain_inode_to_barrier(ino).await;
+            }
+
+            // POSIX rename(2) atomically replaces an existing
+            // regular-file dst. NSS does the swap via
+            // `force_overwrite=true` and hands back the prior dst value
+            // so we can GC the orphaned blob.
+            let old_bytes = self
+                .backend()
+                .rename_file(&src_key, &dst_key, true, &trace_id)
                 .await?;
+
+            // GC the blob backing the now-orphaned dst value (if any).
+            if !old_bytes.is_empty()
+                && let Ok(old_layout) =
+                    rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
+            {
+                self.backend()
+                    .delete_blob_blocks(&old_layout, &trace_id)
+                    .await;
+            }
+
+            // Drop the replaced dst's stale name mapping so a lookup
+            // resolves to the renamed src inode (and a still-open dst fd
+            // won't republish the deleted name).
+            if let Some(dst_ino) = dst_ino_before {
+                self.inodes.remove_name_mapping(dst_ino);
+            }
 
             // Update inode s3_key if cached (read-only lookup, no refcount leak)
             if let Some(ino) = self.inodes.find_ino_by_key(&src_key, EntryType::File) {

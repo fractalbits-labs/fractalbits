@@ -324,19 +324,24 @@ impl StorageBackend {
     }
 
     /// Rename an object (file) in NSS.
+    /// Rename a file (object) in NSS. When `force_overwrite` is set and
+    /// the destination already exists, NSS atomically replaces it and
+    /// returns the prior dst value (otherwise empty) so the caller can
+    /// GC the now-orphaned blob.
     pub async fn rename_file(
         &self,
         src_key: &str,
         dst_key: &str,
+        force_overwrite: bool,
         trace_id: &TraceId,
-    ) -> Result<(), FsError> {
+    ) -> Result<Bytes, FsError> {
         let result = nss_rpc_retry!(
             self.nss_client.borrow(),
             rename_object(
                 &self.root_blob_name,
                 src_key,
                 dst_key,
-                false,
+                force_overwrite,
                 Some(self.config.rpc_request_timeout()),
                 trace_id
             ),
@@ -346,7 +351,7 @@ impl StorageBackend {
         .await;
 
         match result {
-            Ok(()) => Ok(()),
+            Ok(old_bytes) => Ok(old_bytes),
             Err(RpcError::NotFound) => Err(FsError::NotFound),
             Err(RpcError::AlreadyExists) => Err(FsError::AlreadyExists),
             Err(e) => Err(e.into()),

@@ -325,7 +325,7 @@ impl RpcClient {
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
-    ) -> Result<(), RpcError> {
+    ) -> Result<Bytes, RpcError> {
         let mut nss_src_path = src_path.to_string();
         nss_src_path.push('\0');
         let mut nss_dst_path = dst_path.to_string();
@@ -362,7 +362,10 @@ impl RpcClient {
         let resp: RenameResponse =
             PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
         match resp.result.unwrap() {
-            nss_codec::rename_response::Result::Ok(_) => Ok(()),
+            // On a force_overwrite that replaced an existing dst, `ok`
+            // carries the prior dst value so the caller can GC the
+            // now-orphaned blob; on a non-overwriting rename it is empty.
+            nss_codec::rename_response::Result::Ok(old_value) => Ok(old_value),
             nss_codec::rename_response::Result::ErrSrcNonexisted(_) => Err(RpcError::NotFound),
             nss_codec::rename_response::Result::ErrDstExisted(_) => Err(RpcError::AlreadyExists),
             nss_codec::rename_response::Result::ErrNoSuchRootBlob(_) => {
