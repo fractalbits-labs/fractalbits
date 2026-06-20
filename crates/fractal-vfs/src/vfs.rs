@@ -639,17 +639,26 @@ impl VfsCore {
             return Ok(cached);
         }
 
-        // Cache miss: fetch from backend
-        let (data, checksum) = self
+        // Cache miss: fetch from backend. Override (blob_version > 1) blocks
+        // are zero-padded to a full block_size on disk, so the EC shard size
+        // is block_size/k -- request the full block_size (otherwise the EC
+        // read derives a smaller shard size from the logical length and
+        // filters out the padded shards), then truncate to the logical
+        // content length. Non-override blocks are stored at their exact
+        // length and read as-is.
+        let read_len = if blob_version > 1 {
+            (DEFAULT_BLOCK_SIZE as usize).max(block_content_len)
+        } else {
+            block_content_len
+        };
+        let (mut data, mut checksum) = self
             .backend()
-            .read_block(
-                blob_guid,
-                blob_version,
-                block_num,
-                block_content_len,
-                trace_id,
-            )
+            .read_block(blob_guid, blob_version, block_num, read_len, trace_id)
             .await?;
+        if data.len() > block_content_len {
+            data = data.slice(0..block_content_len);
+            checksum = xxhash_rust::xxh3::xxh3_64(&data);
+        }
 
         // Populate disk cache
         if let Some(dc) = &self.disk_cache {
@@ -1144,13 +1153,29 @@ impl VfsCore {
             };
             let new_version = base_version + 1;
 
-            // Write data blocks in place at the new version.
+            // Write data blocks in place at the new version. Each block is
+            // zero-padded to a full block_size on disk so the EC shard size
+            // is a constant block_size/k regardless of the logical content
+            // length: a non-block-aligned shrink (16 -> 8 bytes) otherwise
+            // changes the shard size, and a reader using a different size
+            // view hits BSS's length check ("body N < expected M"). The
+            // reader requests the logical length and the EC path truncates
+            // the reconstructed block back down. Tail-block waste is up to
+            // block_size - 1 bytes per file.
             for block_i in 0..new_num_blocks {
                 let start = block_i * block_size;
                 let end = std::cmp::min(start + block_size, data.len());
                 let chunk = data.slice(start..end);
+                let padded = if chunk.len() < block_size {
+                    let mut buf = BytesMut::with_capacity(block_size);
+                    buf.extend_from_slice(&chunk);
+                    buf.resize(block_size, 0);
+                    buf.freeze()
+                } else {
+                    chunk
+                };
                 self.backend()
-                    .write_block(blob_guid, block_i as u32, chunk, new_version, &trace_id)
+                    .write_block(blob_guid, block_i as u32, padded, new_version, &trace_id)
                     .await?;
             }
 
@@ -3205,12 +3230,20 @@ async fn spawn_prefetch_task(
             continue;
         }
 
-        let (data, checksum) = match backend
+        // Override (blob_version > 1) blocks are padded to block_size on
+        // disk; request the full block so the EC shard size matches, then
+        // truncate to the logical content length (mirrors read_block_cached).
+        let read_len = if layout.blob_version > 1 {
+            (DEFAULT_BLOCK_SIZE as usize).max(block_content_len)
+        } else {
+            block_content_len
+        };
+        let (mut data, mut checksum) = match backend
             .read_block(
                 blob_guid,
                 layout.blob_version,
                 block_num,
-                block_content_len,
+                read_len,
                 &trace_id,
             )
             .await
@@ -3229,6 +3262,10 @@ async fn spawn_prefetch_task(
                 return;
             }
         };
+        if data.len() > block_content_len {
+            data = data.slice(0..block_content_len);
+            checksum = xxhash_rust::xxh3::xxh3_64(&data);
+        }
 
         disk_cache
             .insert(

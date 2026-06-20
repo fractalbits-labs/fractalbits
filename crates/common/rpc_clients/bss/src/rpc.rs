@@ -284,9 +284,15 @@ impl RpcClient {
         check_response_errno(&resp_frame.header)?;
         let version = resp_frame.header.version;
         *body = resp_frame.body;
-        if content_len != body.len() {
+        // Block-size padding (override flush) stores every block at full
+        // block_size, so a reader that knows the logical content length
+        // gets a body that is >= what it asked for and clamps locally.
+        // Strict equality would reject that padded view; only a body
+        // strictly shorter than requested is a real underread (BSS lost
+        // bytes). content_len == 0 means "give me whatever you have".
+        if content_len != 0 && body.len() < content_len {
             return Err(RpcError::InternalResponseError(format!(
-                "BSS returned body length {} but client expected {}",
+                "BSS returned body length {} but client expected at least {}",
                 body.len(),
                 content_len
             )));
