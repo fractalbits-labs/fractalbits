@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use data_types::object_layout::{ObjectLayout, ObjectState, PosixAttrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 pub const ROOT_INODE: u64 = 1;
 
@@ -72,6 +73,11 @@ pub struct InodeEntry {
     /// which matches POSIX's latitude and is enough for the
     /// stat-immediately-after contract.
     pub atime_ns: u64,
+    /// `Some(uuid)` once this inode has been promoted to a hardlink:
+    /// its real layout lives in the `#hardlink/<uuid>` `InodeRecord`,
+    /// and `layout` caches the resolved real layout (never an
+    /// `Indirect` redirect). `None` for an ordinary single-named file.
+    pub inode_id: Option<Uuid>,
     refcount: AtomicU64,
 }
 
@@ -86,6 +92,7 @@ impl InodeEntry {
             posix,
             name_removed: false,
             atime_ns: 0,
+            inode_id: None,
             refcount: AtomicU64::new(1),
         }
     }
@@ -135,6 +142,7 @@ impl InodeTable {
                 posix: PosixAttrs::default(),
                 name_removed: false,
                 atime_ns: 0,
+                inode_id: None,
                 refcount: AtomicU64::new(u64::MAX), // root never gets forgotten
             },
         );
@@ -210,6 +218,23 @@ impl InodeTable {
             // deleted name.
             entry.name_removed = true;
         }
+    }
+
+    /// Register an additional name -> inode mapping without disturbing
+    /// the inode's primary `s3_key`. Used by `vfs_link` so a hardlink's
+    /// new name resolves to the same inode (and the same `inode_id`
+    /// resolution cache) as the original.
+    pub fn add_alias(&self, s3_key: &str, entry_type: EntryType, ino: u64) {
+        self.key_to_ino
+            .insert((s3_key.to_string(), entry_type), ino);
+    }
+
+    /// Drop a single name -> inode mapping without touching the
+    /// `InodeEntry` (so the inode and its other hardlink aliases stay
+    /// live). Used by `vfs_unlink` when one of several hardlink names
+    /// goes away but the inode still has links.
+    pub fn remove_alias(&self, s3_key: &str, entry_type: EntryType) {
+        self.key_to_ino.remove(&(s3_key.to_string(), entry_type));
     }
 
     /// Update the s3_key for an inode (used during rename).

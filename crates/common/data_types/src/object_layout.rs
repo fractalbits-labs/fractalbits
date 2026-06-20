@@ -315,14 +315,42 @@ pub struct DirectoryData {
     pub posix: PosixAttrs,
 }
 
-/// Schema-only placeholder for hardlink indirection. A name whose
-/// layout has `state == Indirect(entry)` is a redirect: the real
-/// layout lives at a separate inode-keyed entry. No VFS handler
-/// constructs or follows these today; reserved for a future
-/// lazy-promotion hardlink implementation.
+/// Hardlink indirection. A name whose layout has
+/// `state == Indirect(entry)` is a redirect: the real layout lives at
+/// the `#hardlink/<inode_id>` keyspace entry. The other `ObjectLayout`
+/// fields on a redirect (`timestamp`, `version_id`, `block_size`,
+/// `blob_version`) are sentinel placeholders; the authoritative values
+/// live in the `InodeRecord`.
 #[derive(Debug, Archive, Deserialize, Serialize, PartialEq, Clone)]
 pub struct IndirectEntry {
     pub inode_id: Uuid,
+}
+
+/// The `#hardlink/<inode_id>` keyspace entry that backs every
+/// `ObjectState::Indirect` redirect. Holds the real `ObjectLayout`
+/// (whose `state` is one of `Normal | Mpu | Symlink | Special` -- never
+/// `Indirect`), the persisted link count, and an `orphan_since`
+/// timestamp set when `nlink` drops to zero while open file handles
+/// keep the inode alive.
+///
+/// `#` is encoding-reserved (every user-facing s3_key starts with
+/// `/`), so the keyspace cannot collide with a path-derived name.
+#[derive(Debug, Archive, Deserialize, Serialize, PartialEq, Clone)]
+pub struct InodeRecord {
+    pub layout: ObjectLayout,
+    pub nlink: u32,
+    /// Wall-clock nanoseconds since the Unix epoch when `nlink` first
+    /// reached 0; `None` while the inode still has at least one name.
+    /// Reserved for scan/repair orphan finalisation; the inline GC at
+    /// `vfs_unlink` covers the common single-instance case.
+    pub orphan_since: Option<u64>,
+}
+
+impl InodeRecord {
+    /// Build the `#hardlink/<inode_id>` NSS key for an inode.
+    pub fn key_for(inode_id: Uuid) -> String {
+        format!("#hardlink/{inode_id}")
+    }
 }
 
 #[derive(

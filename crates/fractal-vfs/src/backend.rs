@@ -15,7 +15,7 @@ use volume_group_proxy::DataVgProxy;
 
 use crate::config::Config;
 use crate::error::FsError;
-use data_types::object_layout::ObjectLayout;
+use data_types::object_layout::{InodeRecord, ObjectLayout};
 /// Discovered configuration from RSS (shared across threads).
 pub struct BackendConfig {
     pub nss_address: String,
@@ -298,6 +298,71 @@ impl StorageBackend {
         .await?;
 
         Ok(parse_put_inode(resp)?)
+    }
+
+    /// Fetch the `InodeRecord` backing a hardlink-promoted inode from
+    /// its `#hardlink/<inode_id>` NSS key. Uses the raw `get_inode` RPC
+    /// (rather than `get_inode`, which deserialises as `ObjectLayout`)
+    /// so the bytes can be decoded as an `InodeRecord` instead.
+    pub async fn get_inode_record(
+        &self,
+        inode_id: uuid::Uuid,
+        trace_id: &TraceId,
+    ) -> Result<InodeRecord, FsError> {
+        let key = InodeRecord::key_for(inode_id);
+        let resp = nss_rpc_retry!(
+            self.nss_client.borrow(),
+            get_inode(
+                &self.root_blob_name,
+                &key,
+                Some(self.config.rpc_request_timeout()),
+                trace_id
+            ),
+            self,
+            trace_id
+        )
+        .await?;
+        let bytes = match resp.result {
+            Some(nss_codec::get_inode_response::Result::Ok(b)) => b,
+            Some(nss_codec::get_inode_response::Result::ErrNotFound(()))
+            | Some(nss_codec::get_inode_response::Result::ErrNoSuchRootBlob(())) => {
+                return Err(FsError::NotFound);
+            }
+            Some(nss_codec::get_inode_response::Result::ErrOther(e)) => {
+                return Err(FsError::Internal(e));
+            }
+            None => return Err(FsError::Internal("empty GetInodeResponse".into())),
+        };
+        rkyv::from_bytes::<InodeRecord, rkyv::rancor::Error>(&bytes)
+            .map_err(|e| FsError::Internal(format!("InodeRecord deserialization: {e}")))
+    }
+
+    /// Persist the `InodeRecord` for a hardlink-promoted inode at its
+    /// `#hardlink/<inode_id>` NSS key.
+    pub async fn put_inode_record(
+        &self,
+        inode_id: uuid::Uuid,
+        record: &InodeRecord,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        let key = InodeRecord::key_for(inode_id);
+        let bytes: Bytes = rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(record, Vec::new())
+            .map_err(FsError::from)?
+            .into();
+        self.put_inode(&key, bytes, trace_id).await?;
+        Ok(())
+    }
+
+    /// Delete the `InodeRecord` for a hardlink inode whose last name was
+    /// removed (nlink reached 0).
+    pub async fn delete_inode_record(
+        &self,
+        inode_id: uuid::Uuid,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        let key = InodeRecord::key_for(inode_id);
+        self.delete_inode(&key, trace_id).await?;
+        Ok(())
     }
 
     /// Delete an inode from NSS. Returns the previous object bytes, or None

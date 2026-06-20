@@ -434,6 +434,26 @@ impl Filesystem for FuseServer {
         Ok(ReplyReadlink { data })
     }
 
+    async fn link(
+        &self,
+        _req: Request,
+        inode: u64,
+        new_parent: u64,
+        new_name: &OsStr,
+    ) -> FsResult<ReplyEntry> {
+        let name_str = new_name.to_str().ok_or(libc::EINVAL)?;
+        let attr = self
+            .vfs
+            .vfs_link(inode, new_parent, name_str)
+            .await
+            .map_err(fs_err)?;
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr: to_file_attr(&attr),
+            generation: 0,
+        })
+    }
+
     async fn mkdir(
         &self,
         req: Request,
