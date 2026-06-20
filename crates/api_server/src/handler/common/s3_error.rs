@@ -952,6 +952,12 @@ impl From<file_ops::NssError> for S3Error {
                 tracing::error!("NssError::Deserialization: {e}");
                 Self::InternalError
             }
+            // The S3 write path never issues put_inode_cas, so a CAS conflict
+            // is not expected here; surface it as an internal error.
+            file_ops::NssError::CasConflict(_) => {
+                tracing::error!("NssError::CasConflict on S3 path (unexpected)");
+                Self::InternalError
+            }
         }
     }
 }

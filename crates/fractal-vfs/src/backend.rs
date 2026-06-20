@@ -5,6 +5,7 @@ use data_types::{Bucket, DataBlobGuid, DataVgInfo, RoutingKey, TraceId};
 use file_ops::{
     ListEntry, blob_blocks_to_delete, create_dir_marker_layout, mpu_get_part_prefix,
     parse_delete_inode, parse_get_inode, parse_list_inodes, parse_mpu_parts, parse_put_inode,
+    parse_put_inode_cas,
 };
 use rpc_client_common::RpcError;
 use rpc_client_common::nss_rpc_retry;
@@ -300,6 +301,37 @@ impl StorageBackend {
         Ok(parse_put_inode(resp)?)
     }
 
+    /// Compare-and-swap publish: installs `value` at `key` only if the bytes
+    /// currently stored match `expected_old_value` byte-for-byte (pass an
+    /// empty `Bytes` to require absence). Returns the previous value bytes on
+    /// success, or `FsError::CasConflict` when the guard fails -- the
+    /// override-flush path uses that typed error to forward-retry against the
+    /// winning snapshot instead of clobbering it.
+    pub async fn put_inode_cas(
+        &self,
+        key: &str,
+        value: Bytes,
+        expected_old_value: Bytes,
+        trace_id: &TraceId,
+    ) -> Result<Bytes, FsError> {
+        let resp = nss_rpc_retry!(
+            self.nss_client.borrow(),
+            put_inode_cas(
+                &self.root_blob_name,
+                key,
+                value.clone(),
+                expected_old_value.clone(),
+                Some(self.config.rpc_request_timeout()),
+                trace_id
+            ),
+            self,
+            trace_id
+        )
+        .await?;
+
+        Ok(parse_put_inode_cas(resp)?)
+    }
+
     /// Fetch the `InodeRecord` backing a hardlink-promoted inode from
     /// its `#hardlink/<inode_id>` NSS key. Uses the raw `get_inode` RPC
     /// (rather than `get_inode`, which deserialises as `ObjectLayout`)
@@ -346,9 +378,10 @@ impl StorageBackend {
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
         let key = InodeRecord::key_for(inode_id);
-        let bytes: Bytes = rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(record, Vec::new())
-            .map_err(FsError::from)?
-            .into();
+        let bytes: Bytes =
+            rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(record, Vec::new())
+                .map_err(FsError::from)?
+                .into();
         self.put_inode(&key, bytes, trace_id).await?;
         Ok(())
     }

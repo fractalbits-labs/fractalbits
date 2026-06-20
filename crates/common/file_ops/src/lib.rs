@@ -1,8 +1,9 @@
 use bytes::Bytes;
 use data_types::object_layout::ObjectLayout;
 use nss_codec::{
-    DeleteInodeResponse, GetInodeResponse, ListInodesResponse, PutInodeResponse,
-    delete_inode_response, get_inode_response, list_inodes_response, put_inode_response,
+    DeleteInodeResponse, GetInodeResponse, ListInodesResponse, PutInodeCasResponse,
+    PutInodeResponse, delete_inode_response, get_inode_response, list_inodes_response,
+    put_inode_cas_response, put_inode_response,
 };
 
 #[derive(Debug)]
@@ -16,6 +17,10 @@ pub enum NssError {
     NoSuchRootBlob,
     Internal(String),
     Deserialization(String),
+    /// A `put_inode_cas` guard failed: the value currently stored under the
+    /// key did not match the caller's `expected_old_value`. Carries the bytes
+    /// NSS actually holds so the caller can rebuild from the winning snapshot.
+    CasConflict(Bytes),
 }
 
 impl std::fmt::Display for NssError {
@@ -26,6 +31,9 @@ impl std::fmt::Display for NssError {
             NssError::NoSuchRootBlob => write!(f, "root blob does not exist"),
             NssError::Internal(e) => write!(f, "internal error: {e}"),
             NssError::Deserialization(e) => write!(f, "deserialization error: {e}"),
+            NssError::CasConflict(b) => {
+                write!(f, "cas conflict (current value is {} bytes)", b.len())
+            }
         }
     }
 }
@@ -110,6 +118,25 @@ pub fn parse_put_inode(resp: PutInodeResponse) -> Result<Bytes, NssError> {
         put_inode_response::Result::ErrNoSuchRootBlob(()) => Err(NssError::NoSuchRootBlob),
         put_inode_response::Result::ErrOther(e) => {
             tracing::error!("NSS put_inode error: {e}");
+            Err(NssError::Internal(e))
+        }
+    }
+}
+
+/// Parse a PutInodeCas response.
+///
+/// - `Ok(prev)` -> the put landed; `prev` is the previous stored value
+///   (empty if there was none).
+/// - `Err(CasConflict(current))` -> the guard failed; `current` is the bytes
+///   NSS actually has so the caller can rebuild its in-memory state from a
+///   definitive winner snapshot rather than guessing.
+/// - `Err(Internal(string))` -> server-side internal error.
+pub fn parse_put_inode_cas(resp: PutInodeCasResponse) -> Result<Bytes, NssError> {
+    match resp.result.unwrap() {
+        put_inode_cas_response::Result::Ok(res) => Ok(res),
+        put_inode_cas_response::Result::Conflict(current) => Err(NssError::CasConflict(current)),
+        put_inode_cas_response::Result::Err(e) => {
+            tracing::error!("NSS put_inode_cas error: {e}");
             Err(NssError::Internal(e))
         }
     }

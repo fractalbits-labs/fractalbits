@@ -48,6 +48,9 @@ pub enum FsError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("cas conflict: stored value changed under the put_inode_cas guard")]
+    CasConflict,
 }
 
 impl From<FsError> for io::Error {
@@ -74,6 +77,11 @@ impl From<FsError> for io::Error {
             FsError::InvalidArg => io::Error::from_raw_os_error(libc::EINVAL),
             FsError::Deserialize(_) => io::Error::from_raw_os_error(libc::EIO),
             FsError::Internal(_) => io::Error::from_raw_os_error(libc::EIO),
+            // A CAS conflict means the inode was rewritten underneath this
+            // publish (another writer / instance won). The override-flush
+            // path catches this typed variant and forward-retries; if it
+            // ever escapes to the kernel, ESTALE is the honest answer.
+            FsError::CasConflict => io::Error::from_raw_os_error(libc::ESTALE),
         }
     }
 }
@@ -107,6 +115,10 @@ impl From<file_ops::NssError> for FsError {
             file_ops::NssError::AlreadyExists => FsError::AlreadyExists,
             file_ops::NssError::Internal(msg) => FsError::Internal(msg),
             file_ops::NssError::Deserialization(msg) => FsError::Deserialize(msg),
+            // The override flush path uses the typed CasConflict variant to
+            // distinguish a lost CAS race (retry) from a hard failure; the
+            // winning value bytes are dropped here and re-read on retry.
+            file_ops::NssError::CasConflict(_) => FsError::CasConflict,
         }
     }
 }
