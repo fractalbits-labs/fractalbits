@@ -245,13 +245,29 @@ impl StorageBackend {
     pub async fn read_block(
         &self,
         blob_guid: DataBlobGuid,
+        blob_version: u64,
         block_number: u32,
         content_len: usize,
         trace_id: &TraceId,
     ) -> Result<(Bytes, u64), FsError> {
         let mut body = Bytes::new();
+        // For overridden blobs (blob_version > 1) enforce a read-side version
+        // check so a lagging replica can't serve a pre-override block; the
+        // initial-create version (<= 1) reads without arbitration as before.
+        let expected_version = if blob_version > 1 {
+            Some(blob_version)
+        } else {
+            None
+        };
         self.data_vg_proxy
-            .get_blob(blob_guid, block_number, content_len, &mut body, trace_id)
+            .get_blob_with_version(
+                blob_guid,
+                block_number,
+                content_len,
+                expected_version,
+                &mut body,
+                trace_id,
+            )
             .await?;
         let checksum = xxhash_rust::xxh3::xxh3_64(&body);
         Ok((body, checksum))
@@ -262,16 +278,19 @@ impl StorageBackend {
         self.data_vg_proxy.create_data_blob_guid()
     }
 
-    /// Write a single block to a data blob via DataVgProxy.
+    /// Write a single block to a data blob via DataVgProxy at a specific
+    /// version. Override-style flush passes the bumped `blob_version`;
+    /// initial-create passes `1`.
     pub async fn write_block(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
         body: Bytes,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
         self.data_vg_proxy
-            .put_blob(blob_guid, block_number, body, trace_id)
+            .put_blob(blob_guid, block_number, body, version, trace_id)
             .await?;
         Ok(())
     }
@@ -488,10 +507,11 @@ impl StorageBackend {
     /// Delete blob blocks for a given ObjectLayout. Fire-and-forget: logs
     /// warnings on failure but does not return errors.
     pub async fn delete_blob_blocks(&self, layout: &ObjectLayout, trace_id: &TraceId) {
+        let version = layout.blob_version;
         for (blob_guid, block_number) in blob_blocks_to_delete(layout) {
             if let Err(e) = self
                 .data_vg_proxy
-                .delete_blob(blob_guid, block_number, trace_id)
+                .delete_blob(blob_guid, block_number, version, trace_id)
                 .await
             {
                 tracing::warn!(

@@ -568,6 +568,7 @@ impl DataVgProxy {
         bss_node: Arc<BssNode>,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         rpc_timeout: Duration,
         trace_id: TraceId,
     ) -> (Arc<BssNode>, String, Result<(), RpcError>) {
@@ -586,6 +587,7 @@ impl DataVgProxy {
                     .delete_data_blob(
                         blob_guid,
                         block_number,
+                        version,
                         Some(rpc_timeout),
                         &trace_id,
                         retry_count,
@@ -630,6 +632,7 @@ impl DataVgProxy {
         blob_guid: DataBlobGuid,
         block_number: u32,
         body: Bytes,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
         let selected_volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
@@ -641,7 +644,7 @@ impl DataVgProxy {
 
         if let VolumeMode::ErasureCoded { .. } = &selected_volume.mode {
             return self
-                .put_blob_ec(blob_guid, block_number, body, trace_id)
+                .put_blob_ec(blob_guid, block_number, body, version, trace_id)
                 .await;
         }
 
@@ -706,6 +709,7 @@ impl DataVgProxy {
                 block_number,
                 body.clone(),
                 body_checksum,
+                version,
                 rpc_timeout,
                 trace_id,
             ));
@@ -780,6 +784,7 @@ impl DataVgProxy {
         blob_guid: DataBlobGuid,
         block_number: u32,
         chunks: Vec<Bytes>,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
         let selected_volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
@@ -796,7 +801,13 @@ impl DataVgProxy {
                 combined.extend_from_slice(chunk);
             }
             return self
-                .put_blob_ec(blob_guid, block_number, Bytes::from(combined), trace_id)
+                .put_blob_ec(
+                    blob_guid,
+                    block_number,
+                    Bytes::from(combined),
+                    version,
+                    trace_id,
+                )
                 .await;
         }
 
@@ -867,6 +878,7 @@ impl DataVgProxy {
                 block_number,
                 chunks.clone(),
                 body_checksum,
+                version,
                 rpc_timeout,
                 trace_id,
             ));
@@ -936,12 +948,14 @@ impl DataVgProxy {
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn put_blob_to_node(
         bss_node: Arc<BssNode>,
         blob_guid: DataBlobGuid,
         block_number: u32,
         body: Bytes,
         body_checksum: u64,
+        version: u64,
         rpc_timeout: Duration,
         trace_id: TraceId,
     ) -> (Arc<BssNode>, String, Result<(), RpcError>) {
@@ -955,6 +969,7 @@ impl DataVgProxy {
                 block_number,
                 body,
                 body_checksum,
+                version,
                 Some(rpc_timeout),
                 &trace_id,
                 0,
@@ -968,12 +983,14 @@ impl DataVgProxy {
         (bss_node, address, result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn put_blob_to_node_vectored(
         bss_node: Arc<BssNode>,
         blob_guid: DataBlobGuid,
         block_number: u32,
         chunks: Vec<Bytes>,
         body_checksum: u64,
+        version: u64,
         rpc_timeout: Duration,
         trace_id: TraceId,
     ) -> (Arc<BssNode>, String, Result<(), RpcError>) {
@@ -987,6 +1004,7 @@ impl DataVgProxy {
                 block_number,
                 chunks,
                 body_checksum,
+                version,
                 Some(rpc_timeout),
                 &trace_id,
                 0,
@@ -1253,6 +1271,7 @@ impl DataVgProxy {
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
         let volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
@@ -1260,7 +1279,9 @@ impl DataVgProxy {
         })?;
 
         if let VolumeMode::ErasureCoded { .. } = &volume.mode {
-            return self.delete_blob_ec(blob_guid, block_number, trace_id).await;
+            return self
+                .delete_blob_ec(blob_guid, block_number, version, trace_id)
+                .await;
         }
 
         let start = Instant::now();
@@ -1305,6 +1326,7 @@ impl DataVgProxy {
                 bss_node.clone(),
                 blob_guid,
                 block_number,
+                version,
                 rpc_timeout,
                 trace_id,
             ));
@@ -1382,6 +1404,7 @@ impl DataVgProxy {
         blob_guid: DataBlobGuid,
         block_number: u32,
         body: Bytes,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
         let start = Instant::now();
@@ -1476,6 +1499,7 @@ impl DataVgProxy {
                 block_number,
                 shard_data,
                 checksum,
+                version,
                 rpc_timeout,
                 trace_id,
             ));
@@ -1753,6 +1777,7 @@ impl DataVgProxy {
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
         let start = Instant::now();
@@ -1807,6 +1832,7 @@ impl DataVgProxy {
                 node.clone(),
                 blob_guid,
                 block_number,
+                version,
                 rpc_timeout,
                 trace_id,
             ));

@@ -79,7 +79,7 @@ impl S3HybridSingleAzStorage {
             // Small blob or EC-routed blob - store in DataVgProxy
             let blob_guid = DataBlobGuid { blob_id, volume_id };
             self.data_vg_proxy
-                .put_blob(blob_guid, block_number, body, trace_id)
+                .put_blob(blob_guid, block_number, body, 1, trace_id)
                 .await?;
         } else {
             // Large blob - store in S3 (volume_id doesn't matter for S3 storage, but we'll use S3_VOLUME for metadata consistency)
@@ -117,7 +117,7 @@ impl S3HybridSingleAzStorage {
         if is_small || Volume::is_ec_volume_id(volume_id) {
             let blob_guid = DataBlobGuid { blob_id, volume_id };
             self.data_vg_proxy
-                .put_blob_vectored(blob_guid, block_number, chunks, trace_id)
+                .put_blob_vectored(blob_guid, block_number, chunks, 1, trace_id)
                 .await?;
         } else {
             let s3_key = blob_key(blob_id, block_number);
@@ -207,7 +207,7 @@ impl S3HybridSingleAzStorage {
             BlobLocation::DataVgProxy => {
                 // Small blob - delete from DataVgProxy
                 self.data_vg_proxy
-                    .delete_blob(blob_guid, block_number, trace_id)
+                    .delete_blob(blob_guid, block_number, 1, trace_id)
                     .await?;
             }
             BlobLocation::S3 => {

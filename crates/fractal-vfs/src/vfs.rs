@@ -642,7 +642,13 @@ impl VfsCore {
         // Cache miss: fetch from backend
         let (data, checksum) = self
             .backend()
-            .read_block(blob_guid, block_num, block_content_len, trace_id)
+            .read_block(
+                blob_guid,
+                blob_version,
+                block_num,
+                block_content_len,
+                trace_id,
+            )
             .await?;
 
         // Populate disk cache
@@ -1097,7 +1103,7 @@ impl VfsCore {
             let end = std::cmp::min(start + block_size, data.len());
             let chunk = data.slice(start..end);
             self.backend()
-                .write_block(blob_guid, block_i as u32, chunk, &trace_id)
+                .write_block(blob_guid, block_i as u32, chunk, 1, &trace_id)
                 .await?;
         }
 
@@ -2557,8 +2563,7 @@ impl VfsCore {
             self.deferred_blob_cleanup.insert(ino, old_bytes);
             return;
         }
-        let Ok(old_layout) =
-            rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
+        let Ok(old_layout) = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
         else {
             return;
         };
@@ -2881,9 +2886,10 @@ impl VfsCore {
             // hardlink redirect keeps its inode (other names) live; a
             // single-named file is marked removed so a still-open dst fd
             // won't republish the now-overwritten name.
-            let dst_was_indirect = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
-                .map(|l| matches!(l.state, ObjectState::Indirect(_)))
-                .unwrap_or(false);
+            let dst_was_indirect =
+                rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
+                    .map(|l| matches!(l.state, ObjectState::Indirect(_)))
+                    .unwrap_or(false);
             if dst_was_indirect {
                 self.inodes.remove_alias(&dst_key, EntryType::File);
             } else if let Some(dst_ino) = dst_ino_before {
@@ -3132,7 +3138,13 @@ async fn spawn_prefetch_task(
         }
 
         let (data, checksum) = match backend
-            .read_block(blob_guid, block_num, block_content_len, &trace_id)
+            .read_block(
+                blob_guid,
+                layout.blob_version,
+                block_num,
+                block_content_len,
+                &trace_id,
+            )
             .await
         {
             Ok(r) => r,
