@@ -827,6 +827,20 @@ impl WritebackQueue {
             .depth
     }
 
+    /// `true` if a not-yet-committed (`Pending` / `InFlight`) PutInode
+    /// intent exists for `key`. `vfs_lookup` uses this to decide whether a
+    /// NSS miss is authoritative: a key with a pending intent is a
+    /// just-created/just-mutated entry the worker hasn't drained yet (serve
+    /// read-your-writes from cache), whereas a key with NO pending intent
+    /// that NSS reports missing is genuinely gone (e.g. deleted by another
+    /// instance) and must surface ENOENT rather than a stale cache hit.
+    pub fn has_pending_intent_for_key(&self, key: &str) -> bool {
+        let inner = self.inner.lock().expect("writeback queue poisoned");
+        inner.inode_intents.iter().any(|((k, _), intent)| {
+            k == key && matches!(intent.state, IntentState::Pending | IntentState::InFlight)
+        })
+    }
+
     /// `true` if a not-yet-committed child create exists under
     /// `parent_key`. Directory emptiness checks use this before
     /// consulting NSS: a successful FUSE create has already made the

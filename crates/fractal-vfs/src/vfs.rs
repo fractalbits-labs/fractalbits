@@ -1723,14 +1723,24 @@ impl VfsCore {
             Err(e) => return Err(e),
         }
 
-        // Read-your-writes: with async metadata the create's PutInode
-        // may still be queued, so NSS doesn't have it yet. Serve the
-        // in-memory inode entry (file or directory) when it carries a
-        // cached layout and hasn't been unlinked, so a lookup right
-        // after create/mkdir/symlink/mknod still resolves.
+        // Read-your-writes: a just-created entry NSS doesn't have yet must
+        // still resolve from the in-memory inode, but only when there's a
+        // genuine in-flight reason it's missing from NSS, NOT for any stale
+        // cached entry. Otherwise an entry deleted by another instance (NSS
+        // says gone, but our cache still holds it because it was never
+        // FUSE-unlinked here) would be resurrected and a follow-up read
+        // would EIO on the deleted blocks instead of returning ENOENT.
+        //
+        // "In-flight" means either a pending writeback intent (async
+        // metadata create/chmod/mkdir/symlink/mknod not yet drained) or an
+        // open file handle (a regular-file create whose close-time flush
+        // hasn't published to NSS yet). When neither holds, NSS's miss is
+        // authoritative.
         if let Some(ino) = self.inodes.find_ino_by_key(&full_key, EntryType::File)
             && let Some(entry) = self.inodes.get(ino)
             && !entry.name_removed
+            && (self.writeback.has_pending_intent_for_key(&full_key)
+                || self.has_open_handles_for_inode(ino, None))
             && let Some(layout) = entry.layout.clone()
         {
             drop(entry);
@@ -1739,6 +1749,7 @@ impl VfsCore {
         if let Some(ino) = self.inodes.find_ino_by_key(&dir_key, EntryType::Directory)
             && let Some(entry) = self.inodes.get(ino)
             && !entry.name_removed
+            && self.writeback.has_pending_intent_for_key(&dir_key)
         {
             drop(entry);
             return Ok(self.make_dir_attr(ino));
