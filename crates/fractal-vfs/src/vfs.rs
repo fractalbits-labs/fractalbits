@@ -1286,7 +1286,16 @@ impl VfsCore {
         // Snapshot the sparse buffer under the guard and clear `dirty` so a
         // concurrent flush of the same fh sees a clean buffer and
         // early-returns rather than racing in to republish.
-        let (s3_key, ino, file_size, block_size, blocks, eof_low_watermark, trim_upper) = {
+        let (
+            s3_key,
+            ino,
+            file_size,
+            block_size,
+            blocks,
+            eof_low_watermark,
+            trim_upper,
+            pending_reservations,
+        ) = {
             let mut handle = self.file_handles.get_mut(&fh_id).ok_or(FsError::BadFd)?;
             let s3_key = handle.s3_key.clone();
             let ino = handle.ino;
@@ -1299,6 +1308,7 @@ impl VfsCore {
             let blocks = std::mem::take(&mut wb.blocks);
             let eof_low_watermark = wb.eof_low_watermark;
             let trim_upper = wb.trim_upper;
+            let pending_reservations = std::mem::take(&mut wb.pending_reservations);
             wb.dirty = false;
             (
                 s3_key,
@@ -1308,6 +1318,7 @@ impl VfsCore {
                 blocks,
                 eof_low_watermark,
                 trim_upper,
+                pending_reservations,
             )
         };
 
@@ -1409,6 +1420,9 @@ impl VfsCore {
                     for (b, st) in blocks {
                         wb.blocks.entry(b).or_insert(st);
                     }
+                    for b in pending_reservations {
+                        wb.pending_reservations.insert(b);
+                    }
                     wb.dirty = true;
                 }
                 return Err(e);
@@ -1470,6 +1484,17 @@ impl VfsCore {
                                 .await;
                         }
                     }
+                    // Reserve fallocate-claimed blocks not superseded by a
+                    // Rewrite/Delete this flush (single-op; EC is a no-op).
+                    for b in pending_reservations.iter() {
+                        if blocks.contains_key(b) {
+                            continue;
+                        }
+                        let _ = self
+                            .backend()
+                            .reserve_block(blob_guid, *b, block_size as u32, new_version, &trace_id)
+                            .await;
+                    }
                     break layout;
                 }
                 Err(FsError::CasConflict) => {
@@ -1484,6 +1509,9 @@ impl VfsCore {
                         {
                             for (b, st) in blocks {
                                 wb.blocks.entry(b).or_insert(st);
+                            }
+                            for b in pending_reservations {
+                                wb.pending_reservations.insert(b);
                             }
                             wb.dirty = true;
                         }
@@ -2845,6 +2873,238 @@ impl VfsCore {
         wb.dirty = true;
 
         Ok(data.len() as u32)
+    }
+
+    pub async fn vfs_fallocate(
+        &self,
+        fh: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+    ) -> Result<(), FsError> {
+        self.check_write_enabled()?;
+        if length == 0 {
+            return Ok(());
+        }
+        let keep_size = mode & libc::FALLOC_FL_KEEP_SIZE as u32 != 0;
+        let punch_hole = mode & libc::FALLOC_FL_PUNCH_HOLE as u32 != 0;
+        // Linux requires PUNCH_HOLE be combined with KEEP_SIZE.
+        if punch_hole && !keep_size {
+            return Err(FsError::InvalidArg);
+        }
+        // Reject mode bits we don't model. Allowing them silently
+        // would let userspace assume semantics we never delivered.
+        let known = libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE;
+        if mode & !(known as u32) != 0 {
+            return Err(FsError::InvalidArg);
+        }
+
+        let end = offset + length;
+
+        // Phase 1: snapshot enough state to compute the touched range
+        // and decide which blocks need a lazy load for edge zeroing.
+        let (block_size, existing_blob_guid, committed_size, committed_blob_version, edge_loads) = {
+            let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
+            let block_size = handle
+                .layout
+                .as_ref()
+                .map(|l| l.block_size)
+                .unwrap_or(DEFAULT_BLOCK_SIZE);
+            let committed_size = handle
+                .layout
+                .as_ref()
+                .and_then(|l| l.size().ok())
+                .unwrap_or(0);
+            let layout_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
+            let committed_blob_version =
+                handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
+            let wb = handle.write_buf.get_or_insert_with(|| {
+                WriteBuffer::new(layout_blob_guid, committed_size, block_size)
+            });
+            let bsz_u64 = wb.block_size as u64;
+            let mut edge_loads: Vec<u32> = Vec::new();
+
+            if punch_hole {
+                let hole_end = end;
+                let lo_partial = !offset.is_multiple_of(bsz_u64);
+                let hi_partial = !hole_end.is_multiple_of(bsz_u64);
+                let first_full = offset.div_ceil(bsz_u64) as u32;
+                let last_full_excl = (hole_end / bsz_u64) as u32;
+
+                let lo_block = (offset / bsz_u64) as u32;
+                let hi_block = (hole_end / bsz_u64) as u32;
+
+                // Determine which edge blocks need a lazy load. We only
+                // load when:
+                //   - The block has committed bytes in BSS, AND
+                //   - There isn't already a buffered (Rewrite/Cached)
+                //     copy we can edit in place, AND
+                //   - The shrink-destroys watermark hasn't already
+                //     turned this block into zeros.
+                let mut consider_edge = |b: u32| {
+                    if matches!(
+                        wb.blocks.get(&b),
+                        Some(BlockState::Rewrite(_)) | Some(BlockState::Cached(_))
+                    ) {
+                        return;
+                    }
+                    if wb.block_destroyed_by_shrink(b) {
+                        return;
+                    }
+                    let block_start = b as u64 * bsz_u64;
+                    if block_start >= committed_size {
+                        return;
+                    }
+                    edge_loads.push(b);
+                };
+
+                if lo_partial {
+                    consider_edge(lo_block);
+                }
+                // Only schedule the trailing edge load when it isn't the
+                // same block as the leading edge AND isn't a fully-covered
+                // interior block (which we Delete instead of zeroing).
+                if hi_partial && hi_block != lo_block && hi_block >= first_full {
+                    // hi_block >= first_full means hi_block is past the
+                    // last fully-covered interior block.
+                    let _ = last_full_excl; // silence unused warning when no full blocks
+                    consider_edge(hi_block);
+                }
+            }
+            (
+                block_size,
+                wb.existing_blob_guid,
+                committed_size,
+                committed_blob_version,
+                edge_loads,
+            )
+        };
+
+        // Phase 2: lazy-load edge blocks outside the DashMap guard.
+        let trace_id = TraceId::new();
+        let mut loaded: std::collections::BTreeMap<u32, Bytes> = std::collections::BTreeMap::new();
+        if punch_hole {
+            let bsz_u64 = block_size as u64;
+            for b in edge_loads {
+                let block_start = b as u64 * bsz_u64;
+                let committed_content_len = if block_start < committed_size {
+                    std::cmp::min(bsz_u64, committed_size - block_start) as usize
+                } else {
+                    0
+                };
+                let bytes = self
+                    .lazy_load_block_for_flush(
+                        existing_blob_guid,
+                        committed_blob_version,
+                        b,
+                        committed_content_len,
+                        block_size as usize,
+                        &trace_id,
+                    )
+                    .await?;
+                loaded.insert(b, bytes);
+            }
+        }
+
+        // Phase 3: re-acquire the guard and apply the buffered edits.
+        let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
+        let wb = handle
+            .write_buf
+            .as_mut()
+            .ok_or(FsError::Internal("write_buf gone".into()))?;
+        let bsz_u64 = wb.block_size as u64;
+        let bsz_usize = wb.block_size as usize;
+
+        if punch_hole {
+            let hole_end = end;
+            let first_full = offset.div_ceil(bsz_u64) as u32;
+            let last_full_excl = (hole_end / bsz_u64) as u32;
+            let lo_block = (offset / bsz_u64) as u32;
+            let hi_block = (hole_end / bsz_u64) as u32;
+
+            let edge_zero = |wb: &mut WriteBuffer,
+                             loaded: &std::collections::BTreeMap<u32, Bytes>,
+                             b: u32,
+                             lo: usize,
+                             hi: usize| {
+                let mut buf = BytesMut::with_capacity(bsz_usize);
+                let existing: Option<Bytes> = match wb.blocks.get(&b) {
+                    Some(BlockState::Rewrite(b2)) | Some(BlockState::Cached(b2)) => {
+                        Some(b2.clone())
+                    }
+                    _ => loaded.get(&b).cloned(),
+                };
+                if let Some(existing) = existing {
+                    buf.extend_from_slice(&existing);
+                }
+                if buf.len() < bsz_usize {
+                    buf.resize(bsz_usize, 0);
+                }
+                for byte in &mut buf[lo..hi] {
+                    *byte = 0;
+                }
+                wb.blocks.insert(b, BlockState::Rewrite(buf.freeze()));
+                wb.pending_reservations.remove(&b);
+            };
+
+            // Special case: hole confined to a single partial block.
+            if lo_block == hi_block
+                && !offset.is_multiple_of(bsz_u64)
+                && !hole_end.is_multiple_of(bsz_u64)
+            {
+                edge_zero(
+                    wb,
+                    &loaded,
+                    lo_block,
+                    (offset % bsz_u64) as usize,
+                    (hole_end % bsz_u64) as usize,
+                );
+            } else {
+                if !offset.is_multiple_of(bsz_u64) {
+                    let lo = (offset % bsz_u64) as usize;
+                    edge_zero(wb, &loaded, lo_block, lo, bsz_usize);
+                }
+                if !hole_end.is_multiple_of(bsz_u64) && hi_block >= first_full {
+                    let hi = (hole_end % bsz_u64) as usize;
+                    edge_zero(wb, &loaded, hi_block, 0, hi);
+                }
+            }
+
+            if first_full < last_full_excl {
+                for b in first_full..last_full_excl {
+                    wb.blocks.insert(b, BlockState::Delete);
+                    wb.pending_reservations.remove(&b);
+                }
+            }
+            wb.dirty = true;
+            return Ok(());
+        }
+
+        // mode == 0 or KEEP_SIZE: reservation-only path. Record the
+        // touched range so flush has something to publish if the user
+        // did nothing else, and so SEEK_DATA / dirty-handle reads count
+        // the range as data per Linux convention.
+        let first_block = (offset / bsz_u64) as u32;
+        let last_block_excl = end.div_ceil(bsz_u64) as u32;
+        for b in first_block..last_block_excl {
+            // Don't shadow buffered Rewrite or committed Data with a
+            // reservation entry; the reservation is only for blocks
+            // that don't already have content.
+            if matches!(
+                wb.blocks.get(&b),
+                Some(BlockState::Rewrite(_)) | Some(BlockState::Cached(_))
+            ) {
+                continue;
+            }
+            wb.pending_reservations.insert(b);
+        }
+
+        if !keep_size && end > wb.file_size {
+            wb.file_size = end;
+            wb.size_changed = true;
+        }
+        wb.dirty = true;
+        Ok(())
     }
 
     pub async fn vfs_flush(&self, fh: u64) -> Result<(), FsError> {

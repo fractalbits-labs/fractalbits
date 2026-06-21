@@ -331,6 +331,25 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         test_sparse_shrink_then_grow_destroys
     );
 
+    // fallocate (sparse-file syscalls)
+    run_test!("fallocate Extend Grows File", test_fallocate_extend);
+    run_test!(
+        "fallocate KEEP_SIZE Does Not Grow",
+        test_fallocate_keep_size
+    );
+    run_test!(
+        "fallocate PUNCH_HOLE Aligned Drops Block",
+        test_fallocate_punch_hole_aligned
+    );
+    run_test!(
+        "fallocate PUNCH_HOLE Edge Zeroes Bytes",
+        test_fallocate_punch_hole_edge
+    );
+    run_test!(
+        "fallocate PUNCH_HOLE Within Single Block",
+        test_fallocate_punch_hole_single_block
+    );
+
     // Cache staleness tests: verify FUSE sees external S3 mutations after TTL
     run_test!(
         "External Create Visibility",
@@ -2722,4 +2741,305 @@ async fn test_sparse_sparse_file_round_trip(disk_cache: bool) -> CmdResult {
 // Used by the fallocate / lseek tests (ported in a later phase).
 #[allow(dead_code)]
 const BLOCK_SIZE: u64 = 128 * 1024;
+
+
+fn do_fallocate(fd: i32, mode: i32, offset: u64, length: u64) -> Result<(), i32> {
+    let rc = unsafe { libc::fallocate(fd, mode, offset as libc::off_t, length as libc::off_t) };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
+    } else {
+        Ok(())
+    }
+}
+
+/// Wrapper around libc::lseek(2) that returns the resulting offset or errno.
+
+async fn test_fallocate_extend(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    println!("  Step 1: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/fallocate-extend.bin", MOUNT_POINT);
+    println!("  Step 2: Create file with a small seed write");
+    std::fs::write(&file_path, b"hello").expect("seed write failed");
+
+    println!("  Step 3: fallocate(mode=0, offset=0, length=8KB) extends to 8KB");
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        do_fallocate(f.as_raw_fd(), 0, 0, 8 * 1024).expect("fallocate failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Reopen and verify size grew to 8KB");
+    let meta = std::fs::metadata(&file_path).expect("stat failed");
+    assert_eq!(meta.len(), 8 * 1024, "fallocate did not grow the file");
+
+    println!("  Step 5: Tail past the original write reads as zeros");
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(&file_path).expect("open ro failed");
+    let mut tail = vec![0xffu8; 8 * 1024 - 5];
+    f.read_exact_at(&mut tail, 5).expect("tail read failed");
+    assert!(
+        tail.iter().all(|&b| b == 0),
+        "fallocated tail should be zero-filled"
+    );
+    drop(f);
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: fallocate extend test passed".green());
+    Ok(())
+}
+
+async fn test_fallocate_keep_size(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    println!("  Step 1: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/fallocate-keep-size.bin", MOUNT_POINT);
+    println!("  Step 2: Create a 4KB file");
+    std::fs::write(&file_path, vec![b'x'; 4 * 1024]).expect("seed write failed");
+
+    println!("  Step 3: fallocate(KEEP_SIZE) past EOF must NOT grow the file");
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        do_fallocate(f.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, 64 * 1024)
+            .expect("fallocate KEEP_SIZE failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Verify size is still 4KB");
+    let meta = std::fs::metadata(&file_path).expect("stat failed");
+    assert_eq!(meta.len(), 4 * 1024, "KEEP_SIZE must not change file size");
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: fallocate KEEP_SIZE test passed".green());
+    Ok(())
+}
+
+async fn test_fallocate_punch_hole_aligned(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    println!("  Step 1: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/fallocate-punch-aligned.bin", MOUNT_POINT);
+    let total = 3 * BLOCK_SIZE as usize;
+    println!(
+        "  Step 2: Create a {}KB file with non-zero pattern",
+        total / 1024
+    );
+    let pattern: Vec<u8> = (0..total).map(|i| (i % 251 + 1) as u8).collect();
+    std::fs::write(&file_path, &pattern).expect("seed write failed");
+
+    println!("  Step 3: PUNCH_HOLE the middle block (block-aligned)");
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        do_fallocate(
+            f.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            BLOCK_SIZE,
+            BLOCK_SIZE,
+        )
+        .expect("PUNCH_HOLE failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Verify punched block reads as zeros, neighbours intact");
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(&file_path).expect("open ro failed");
+
+    let mut head = vec![0u8; BLOCK_SIZE as usize];
+    f.read_exact_at(&mut head, 0).expect("head read failed");
+    assert_eq!(
+        &head,
+        &pattern[..BLOCK_SIZE as usize],
+        "head block corrupted"
+    );
+
+    let mut hole = vec![0xffu8; BLOCK_SIZE as usize];
+    f.read_exact_at(&mut hole, BLOCK_SIZE)
+        .expect("hole read failed");
+    assert!(
+        hole.iter().all(|&b| b == 0),
+        "punched block should be zeros"
+    );
+
+    let mut tail = vec![0u8; BLOCK_SIZE as usize];
+    f.read_exact_at(&mut tail, 2 * BLOCK_SIZE)
+        .expect("tail read failed");
+    assert_eq!(
+        &tail,
+        &pattern[2 * BLOCK_SIZE as usize..],
+        "tail block corrupted"
+    );
+
+    let meta = std::fs::metadata(&file_path).expect("stat failed");
+    assert_eq!(meta.len(), total as u64, "PUNCH_HOLE must keep size");
+
+    drop(f);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: fallocate PUNCH_HOLE aligned test passed".green()
+    );
+    Ok(())
+}
+
+async fn test_fallocate_punch_hole_edge(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    println!("  Step 1: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/fallocate-punch-edge.bin", MOUNT_POINT);
+    let total = 3 * BLOCK_SIZE as usize;
+    let pattern: Vec<u8> = (0..total).map(|i| (i % 251 + 1) as u8).collect();
+    println!("  Step 2: Seed a {}KB file", total / 1024);
+    std::fs::write(&file_path, &pattern).expect("seed write failed");
+
+    let punch_offset: u64 = BLOCK_SIZE - 1024;
+    let punch_len: u64 = 2 * 1024 + BLOCK_SIZE; // crosses two block boundaries
+    println!(
+        "  Step 3: PUNCH_HOLE crossing block boundaries (offset={}, len={})",
+        punch_offset, punch_len
+    );
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        do_fallocate(
+            f.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            punch_offset,
+            punch_len,
+        )
+        .expect("PUNCH_HOLE failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Verify [punch_offset..punch_offset+punch_len) reads as zeros");
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(&file_path).expect("open ro failed");
+
+    let mut hole = vec![0xffu8; punch_len as usize];
+    f.read_exact_at(&mut hole, punch_offset)
+        .expect("hole read failed");
+    assert!(
+        hole.iter().all(|&b| b == 0),
+        "punched edge range should be zeros, first non-zero at {}",
+        hole.iter().position(|&b| b != 0).unwrap_or(usize::MAX)
+    );
+
+    println!("  Step 5: Verify pre-punch and post-punch bytes are intact");
+    let mut pre = vec![0u8; punch_offset as usize];
+    f.read_exact_at(&mut pre, 0).expect("pre read failed");
+    assert_eq!(
+        &pre,
+        &pattern[..punch_offset as usize],
+        "pre-punch corrupted"
+    );
+
+    let post_offset = punch_offset + punch_len;
+    let post_len = total as u64 - post_offset;
+    let mut post = vec![0u8; post_len as usize];
+    f.read_exact_at(&mut post, post_offset)
+        .expect("post read failed");
+    assert_eq!(
+        &post,
+        &pattern[post_offset as usize..],
+        "post-punch corrupted"
+    );
+
+    drop(f);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: fallocate PUNCH_HOLE edge test passed".green()
+    );
+    Ok(())
+}
+
+async fn test_fallocate_punch_hole_single_block(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    println!("  Step 1: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/fallocate-punch-single.bin", MOUNT_POINT);
+    let total: usize = 8 * 1024;
+    let pattern: Vec<u8> = (0..total).map(|i| ((i % 250) + 5) as u8).collect();
+    println!("  Step 2: Seed an 8KB file (single 128KB block)");
+    std::fs::write(&file_path, &pattern).expect("seed write failed");
+
+    let punch_offset: u64 = 1024;
+    let punch_len: u64 = 2 * 1024;
+    println!(
+        "  Step 3: PUNCH_HOLE confined to one block ({}, {})",
+        punch_offset, punch_len
+    );
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        do_fallocate(
+            f.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            punch_offset,
+            punch_len,
+        )
+        .expect("PUNCH_HOLE failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Verify only [1024..3072) is zero, surroundings intact");
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(&file_path).expect("open ro failed");
+
+    let mut all = vec![0u8; total];
+    f.read_exact_at(&mut all, 0).expect("read failed");
+    assert_eq!(
+        &all[..punch_offset as usize],
+        &pattern[..punch_offset as usize],
+        "head bytes corrupted"
+    );
+    assert!(
+        all[punch_offset as usize..(punch_offset + punch_len) as usize]
+            .iter()
+            .all(|&b| b == 0),
+        "punched range must be zero"
+    );
+    assert_eq!(
+        &all[(punch_offset + punch_len) as usize..],
+        &pattern[(punch_offset + punch_len) as usize..],
+        "tail bytes corrupted"
+    );
+
+    drop(f);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: fallocate single-block PUNCH_HOLE test passed".green()
+    );
+    Ok(())
+}
 

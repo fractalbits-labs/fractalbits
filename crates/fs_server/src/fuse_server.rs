@@ -318,6 +318,21 @@ impl Filesystem for FuseServer {
         self.vfs.vfs_flush(fh).await.map_err(fs_err)
     }
 
+    async fn fallocate(
+        &self,
+        _req: Request,
+        _inode: u64,
+        fh: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+    ) -> FsResult<()> {
+        self.vfs
+            .vfs_fallocate(fh, offset, length, mode)
+            .await
+            .map_err(fs_err)
+    }
+
     async fn release(
         &self,
         _req: Request,
