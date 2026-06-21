@@ -10,6 +10,7 @@ compio-runtime = ["rpc_client_bss/compio-runtime", "rpc_client_common/compio-run
 metrics = ["metrics_wrapper/metrics", "dep:metrics"]
 
 [dependencies]
+bss_codec.workspace = true
 bytes.workspace = true
 futures.workspace = true
 metrics_wrapper.workspace = true

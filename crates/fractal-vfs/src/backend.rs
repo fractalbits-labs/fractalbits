@@ -288,6 +288,38 @@ impl StorageBackend {
         Ok(())
     }
 
+    /// Reserve a single block (single-op, no batch) at `version`. Used by
+    /// fallocate; EC volumes treat it as a no-op.
+    pub async fn reserve_block(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        block_size: u32,
+        version: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        self.data_vg_proxy
+            .reserve_blob(blob_guid, block_number, block_size, version, trace_id)
+            .await?;
+        Ok(())
+    }
+
+    /// Enumerate the BSS-visible block entries for one blob over
+    /// `[first_block, first_block + block_count)`. Absent blocks are holes.
+    /// Used by lseek(SEEK_DATA/SEEK_HOLE).
+    pub async fn list_blob_blocks(
+        &self,
+        blob_guid: DataBlobGuid,
+        first_block: u32,
+        block_count: u32,
+        trace_id: &TraceId,
+    ) -> Result<Vec<bss_codec::list_blob_blocks_response::BlobBlockEntry>, FsError> {
+        Ok(self
+            .data_vg_proxy
+            .list_blob_blocks(blob_guid, first_block, block_count, trace_id)
+            .await?)
+    }
+
     /// Put (create/update) an inode in NSS. Returns the previous object bytes
     /// (empty if this is a new object).
     pub async fn put_inode(

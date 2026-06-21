@@ -79,6 +79,11 @@ pub enum Command {
     GetMetadataBlob = 20,
     DeleteMetadataBlob = 21,
     ListBlobs = 22,
+    // 23 PutJournal, 24 GetJournal, 25 HeadJournal are NSS-internal BSS
+    // commands the Zig server owns; this Rust client never issues them, so
+    // they are gaps here. The numbers must still match core's enum.
+    ReserveBlocks = 26,
+    ListBlobBlocks = 27,
 }
 
 #[allow(clippy::derivable_impls)]

@@ -29,3 +29,49 @@ message ListBlobsResponse {
     bool has_more = 2;
   }
 }
+
+// ReserveBlocks: pre-allocate `block_count` contiguous blocks starting at
+// header.block_number without writing data, stamped at header.version.
+message ReserveBlocksRequest {
+  uint32 block_count = 1;
+  uint32 block_size = 2;
+}
+
+message ReserveBlocksResponse {
+  oneof result {
+    Stats ok = 1;
+    string err = 2;
+  }
+
+  message Stats {
+    uint32 reserved = 1;
+    uint32 skipped_newer = 2;
+    uint32 idempotent = 3;
+  }
+}
+
+// ListBlobBlocks: enumerate the block entries for a single blob over
+// [first_block, first_block + block_count). Blocks absent from the
+// response are holes. Used by lseek(SEEK_HOLE/SEEK_DATA).
+message ListBlobBlocksRequest {
+  uint32 first_block = 1;
+  uint32 block_count = 2;
+}
+
+message ListBlobBlocksResponse {
+  oneof result {
+    Blocks ok = 1;
+    string err = 2;
+  }
+
+  message BlobBlockEntry {
+    uint32 block_number = 1;
+    // 0 = Data, 1 = Reserved.
+    uint32 entry_type = 2;
+    uint64 version = 3;
+  }
+
+  message Blocks {
+    repeated BlobBlockEntry blocks = 1;
+  }
+}
