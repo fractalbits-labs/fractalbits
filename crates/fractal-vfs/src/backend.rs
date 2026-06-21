@@ -251,23 +251,16 @@ impl StorageBackend {
         trace_id: &TraceId,
     ) -> Result<(Bytes, u64), FsError> {
         let mut body = Bytes::new();
-        // For overridden blobs (blob_version > 1) enforce a read-side version
-        // check so a lagging replica can't serve a pre-override block; the
-        // initial-create version (<= 1) reads without arbitration as before.
-        let expected_version = if blob_version > 1 {
-            Some(blob_version)
-        } else {
-            None
-        };
+        // Do NOT enforce a strict block-version == file-version check: under
+        // the sparse override model an unrewritten block legitimately sits at
+        // an older blob_version than the file's current version (a flush bumps
+        // the file version but only rewrites dirty blocks). BSS always returns
+        // each block's latest stored content, so a plain read is correct;
+        // requiring equality would StaleVersion-fail every untouched block.
+        // (`blob_version` is still used to pick the padded read length.)
+        let _ = blob_version;
         self.data_vg_proxy
-            .get_blob_with_version(
-                blob_guid,
-                block_number,
-                content_len,
-                expected_version,
-                &mut body,
-                trace_id,
-            )
+            .get_blob(blob_guid, block_number, content_len, &mut body, trace_id)
             .await?;
         let checksum = xxhash_rust::xxh3::xxh3_64(&body);
         Ok((body, checksum))
