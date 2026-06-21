@@ -251,17 +251,32 @@ impl StorageBackend {
         trace_id: &TraceId,
     ) -> Result<(Bytes, u64), FsError> {
         let mut body = Bytes::new();
-        // Do NOT enforce a strict block-version == file-version check: under
+        // Do NOT enforce strict block-version == file-version equality: under
         // the sparse override model an unrewritten block legitimately sits at
         // an older blob_version than the file's current version (a flush bumps
-        // the file version but only rewrites dirty blocks). BSS always returns
-        // each block's latest stored content, so a plain read is correct;
-        // requiring equality would StaleVersion-fail every untouched block.
-        // (`blob_version` is still used to pick the padded read length.)
-        let _ = blob_version;
-        self.data_vg_proxy
-            .get_blob(blob_guid, block_number, content_len, &mut body, trace_id)
-            .await?;
+        // the file version but only rewrites dirty blocks).
+        //
+        // For an overridden file (blob_version > 1) use the max-version
+        // (quorum-check) read so a lagging replica / EC shard can't serve a
+        // pre-override block: it picks the highest version available across
+        // replicas (replicated) or reconstructs from the max-version shard
+        // cohort (EC). The initial-create version (<= 1) has no override
+        // history, so the plain first-success read is correct and faster.
+        if blob_version > 1 {
+            self.data_vg_proxy
+                .get_blob_with_quorum_check(
+                    blob_guid,
+                    block_number,
+                    content_len,
+                    &mut body,
+                    trace_id,
+                )
+                .await?;
+        } else {
+            self.data_vg_proxy
+                .get_blob(blob_guid, block_number, content_len, &mut body, trace_id)
+                .await?;
+        }
         let checksum = xxhash_rust::xxh3::xxh3_64(&body);
         Ok((body, checksum))
     }

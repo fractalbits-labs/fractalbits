@@ -24,6 +24,12 @@ pub enum DataVgError {
     #[error("Block not found on any replica")]
     BlockNotFound,
 
+    /// Two or more replicas reported the same version but disagree on body
+    /// length / checksum -- a divergence the inline-repair read path can't
+    /// resolve safely; surfaced for operator investigation.
+    #[error("Replicated data divergence: same version, different bytes")]
+    Corrupted,
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
