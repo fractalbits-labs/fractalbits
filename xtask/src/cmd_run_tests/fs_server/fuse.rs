@@ -300,6 +300,37 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     run_test!("Fsync Persistence", test_fsync_persistence);
     run_test!("Truncate to Non-Zero Size", test_truncate_nonzero);
 
+    // Sparse WriteBuffer + single-writer regression tests.
+    run_test!("Sparse: Large Truncate", test_sparse_truncate_large);
+    run_test!(
+        "Sparse: Partial-Block Overwrite",
+        test_sparse_partial_overwrite
+    );
+    run_test!(
+        "Sparse: Dirty-Handle Read After Write",
+        test_sparse_dirty_read_after_write
+    );
+    run_test!(
+        "Sparse: Single-Writer EBUSY",
+        test_sparse_single_writer_ebusy
+    );
+    run_test!(
+        "Sparse: Override Flush Preserves Bytes",
+        test_sparse_override_flush_persists
+    );
+    run_test!(
+        "Sparse: Sparse File Round Trip Reads Zeros",
+        test_sparse_sparse_file_round_trip
+    );
+    run_test!(
+        "Sparse: Truncate-Then-Extend Reads Zeros",
+        test_sparse_truncate_then_extend
+    );
+    run_test!(
+        "Sparse: Shrink-Then-Grow Destroys Pre-Shrink Bytes",
+        test_sparse_shrink_then_grow_destroys
+    );
+
     // Cache staleness tests: verify FUSE sees external S3 mutations after TTL
     run_test!(
         "External Create Visibility",
@@ -2176,3 +2207,519 @@ async fn test_truncate_nonzero(disk_cache: bool) -> CmdResult {
     );
     Ok(())
 }
+
+async fn test_sparse_truncate_large(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Create a small file");
+    let file_path = format!("{}/sparse-trunc-large.bin", MOUNT_POINT);
+    std::fs::write(&file_path, b"hello").expect("Failed to write seed file");
+
+    println!("  Step 3: ftruncate up to 256MB (sparse extend)");
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .expect("Failed to open for truncate-large");
+        // 256 MB is far larger than what the legacy BytesMut::resize
+        // path would tolerate without obvious memory pressure, but
+        // small enough to keep the test fast on a constrained box.
+        file.set_len(256 * 1024 * 1024)
+            .expect("ftruncate(256MB) failed -- sparse buffer regressed?");
+    }
+
+    println!("  Step 4: Verify stat() reports the buffered size");
+    let meta = std::fs::metadata(&file_path).expect("Failed to stat");
+    assert_eq!(
+        meta.len(),
+        256 * 1024 * 1024,
+        "stat after ftruncate should report buffered size"
+    );
+
+    println!("  Step 5: Read first 5 bytes (existing data preserved)");
+    let mut head = vec![0u8; 5];
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&file_path)
+        .expect("Failed to open for read");
+    use std::os::unix::fs::FileExt;
+    f.read_exact_at(&mut head, 0).expect("read_at(0..5) failed");
+    assert_eq!(&head, b"hello", "Original bytes should survive ftruncate");
+
+    println!("  Step 6: Read 4KB from a hole (returns zeros)");
+    let mut hole = vec![0xffu8; 4096];
+    f.read_exact_at(&mut hole, 1024 * 1024)
+        .expect("read_at(1MB) failed");
+    assert!(
+        hole.iter().all(|&b| b == 0),
+        "Hole region should read as zeros"
+    );
+
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: Sparse O(1) truncate large test passed".green()
+    );
+    Ok(())
+}
+
+// The sparse buffer lazy-loads only the touched blocks on a partial-
+// block edit. A small write at a high offset must not disturb the
+// surrounding bytes.
+async fn test_sparse_partial_overwrite(disk_cache: bool) -> CmdResult {
+    use aws_sdk_s3::primitives::ByteStream;
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Upload an existing 64KB file via S3");
+    let key = "sparse-partial.bin";
+    let original = generate_test_data(key, 64 * 1024);
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(original.clone()))
+        .send()
+        .await
+        .expect("Failed to put existing object");
+
+    println!("  Step 2: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 3: Open the file for RDWR and overwrite 16 bytes at offset 32KB");
+    let file_path = format!("{}/{}", MOUNT_POINT, key);
+    let patch = b"V1-PARTIAL-WRITE";
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("Failed to open RDWR");
+        f.write_all_at(patch, 32 * 1024)
+            .expect("write_all_at failed");
+        f.sync_all().expect("fsync failed");
+    }
+
+    println!("  Step 4: Verify the file is unchanged outside the patched region");
+    let actual = std::fs::read(&file_path).expect("Failed to read after partial write");
+    assert_eq!(actual.len(), original.len(), "Length must match original");
+    assert_eq!(
+        &actual[..32 * 1024],
+        &original[..32 * 1024],
+        "Pre-patch region corrupted"
+    );
+    assert_eq!(
+        &actual[32 * 1024..32 * 1024 + patch.len()],
+        patch,
+        "Patch did not land"
+    );
+    assert_eq!(
+        &actual[32 * 1024 + patch.len()..],
+        &original[32 * 1024 + patch.len()..],
+        "Post-patch region corrupted"
+    );
+
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+    println!(
+        "{}",
+        "SUCCESS: Sparse partial-block overwrite test passed".green()
+    );
+    Ok(())
+}
+
+// A same-handle read after write must observe the just-written bytes
+// via the per-block merge, including reads that span the transition
+// between buffered and unbuffered blocks.
+async fn test_sparse_dirty_read_after_write(disk_cache: bool) -> CmdResult {
+    use aws_sdk_s3::primitives::ByteStream;
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Upload a 32KB seed file via S3");
+    let key = "sparse-dirty-read.bin";
+    let original = generate_test_data(key, 32 * 1024);
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(original.clone()))
+        .send()
+        .await
+        .expect("Failed to put seed object");
+
+    println!("  Step 2: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 3: Write at offset 1024, then read overlapping range without close");
+    let file_path = format!("{}/{}", MOUNT_POINT, key);
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&file_path)
+        .expect("Failed to open RDWR");
+    let patch = b"DIRTY-READ-AFTER-WRITE-CHECK";
+    f.write_all_at(patch, 1024).expect("write_all_at failed");
+
+    let mut readback = vec![0u8; patch.len()];
+    f.read_exact_at(&mut readback, 1024)
+        .expect("read_exact_at failed");
+    assert_eq!(
+        &readback, patch,
+        "Dirty-handle read should see just-written bytes"
+    );
+
+    // Read across a buffered/unbuffered boundary too.
+    let mut head = vec![0u8; 1024 + patch.len() + 32];
+    f.read_exact_at(&mut head, 0)
+        .expect("cross-boundary read failed");
+    assert_eq!(
+        &head[..1024],
+        &original[..1024],
+        "Pre-patch region should reflect committed bytes"
+    );
+    assert_eq!(
+        &head[1024..1024 + patch.len()],
+        patch,
+        "Patch region should reflect buffered bytes"
+    );
+    assert_eq!(
+        &head[1024 + patch.len()..],
+        &original[1024 + patch.len()..1024 + patch.len() + 32],
+        "Post-patch region should reflect committed bytes"
+    );
+
+    drop(f);
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+    println!(
+        "{}",
+        "SUCCESS: Sparse dirty-handle read-after-write test passed".green()
+    );
+    Ok(())
+}
+
+// The inode-scoped write lock must reject a second open(O_WRONLY) on
+// the same inode while the first is live. Read-only opens are
+// unaffected.
+async fn test_sparse_single_writer_ebusy(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Create + flush a file so it exists in NSS");
+    let file_path = format!("{}/sparse-busy.bin", MOUNT_POINT);
+    std::fs::write(&file_path, b"seed").expect("seed write failed");
+
+    println!("  Step 3: Open the file for write and hold the handle");
+    let f1 = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file_path)
+        .expect("Failed to open first writer");
+
+    println!("  Step 4: Second writer open must fail with EBUSY");
+    let err = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file_path)
+        .expect_err("Second writer should be rejected");
+    let raw = err.raw_os_error().unwrap_or(0);
+    assert_eq!(
+        raw,
+        libc::EBUSY,
+        "Expected EBUSY, got {} ({:?})",
+        raw,
+        err.kind()
+    );
+    println!("    Got EBUSY as expected");
+
+    println!("  Step 5: A reader open on the same inode is unaffected");
+    let reader = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&file_path)
+        .expect("Read open should succeed alongside the writer");
+    drop(reader);
+
+    println!("  Step 6: Closing the first writer releases the lock");
+    drop(f1);
+    let f2 = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file_path)
+        .expect("Second writer should succeed after first closes");
+    drop(f2);
+
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: Sparse single-writer EBUSY test passed".green()
+    );
+    Ok(())
+}
+
+// Shrink + grow inside one buffer session. A read of the regrown
+// region must return zeros, not pre-shrink committed data. Exercises
+// the wb.file_size logic and the shrink-clamp on per-block intents
+// inside vfs_setattr_size.
+// Shrink-then-grow within the SAME handle, same session. Seeds a
+// 256KB file with a recognizable pattern, shrinks to 4KB, then writes
+// past the old EOF (re-grows past the originally committed size).
+// POSIX: bytes between the new EOF and the re-extended position must
+// read as zeros, NOT the pre-shrink data. Without the
+// `eof_low_watermark` guard, the lazy-load on the re-extended write
+// would resurface the pre-shrink BSS bytes and the read would see the
+// original pattern instead of zeros.
+async fn test_sparse_shrink_then_grow_destroys(disk_cache: bool) -> CmdResult {
+    use aws_sdk_s3::primitives::ByteStream;
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Seed a 256KB file via S3 with a recognizable pattern");
+    let key = "shrink-grow-destroys.bin";
+    let pattern: Vec<u8> = (0..256 * 1024).map(|i| (i % 251 + 1) as u8).collect();
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(pattern.clone()))
+        .send()
+        .await
+        .expect("seed put failed");
+
+    println!("  Step 2: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/{}", MOUNT_POINT, key);
+
+    println!(
+        "  Step 3: Open RDWR, shrink to 4KB, then write at offset 200KB, all on the same handle"
+    );
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        f.set_len(4096).expect("set_len(4096) failed");
+        let marker = b"MARKER-AT-200K";
+        f.write_all_at(marker, 200 * 1024)
+            .expect("write past old EOF failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Re-open and read [4096..200KB) -- must be zeros, NOT the seed pattern");
+    let read_handle = std::fs::File::open(&file_path).expect("open for read");
+    use std::os::unix::fs::FileExt;
+    let mut span = vec![0xffu8; 200 * 1024 - 4096];
+    read_handle
+        .read_exact_at(&mut span, 4096)
+        .expect("span read failed");
+    assert!(
+        span.iter().all(|&b| b == 0),
+        "destroyed-by-shrink range must read as zeros (POSIX shrink-destroys), \
+         got first non-zero at offset {} (value {})",
+        span.iter().position(|&b| b != 0).unwrap_or(usize::MAX),
+        span.iter().find(|&&b| b != 0).copied().unwrap_or(0)
+    );
+
+    println!("  Step 5: Verify the marker at 200KB is intact");
+    let mut marker_back = [0u8; 14];
+    read_handle
+        .read_exact_at(&mut marker_back, 200 * 1024)
+        .expect("marker read failed");
+    assert_eq!(&marker_back, b"MARKER-AT-200K");
+    drop(read_handle);
+
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+    println!(
+        "{}",
+        "SUCCESS: Sparse shrink-then-grow destroys pre-shrink bytes test passed".green()
+    );
+    Ok(())
+}
+
+async fn test_sparse_truncate_then_extend(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Write a small file, then ftruncate up");
+    let file_path = format!("{}/sparse-shrink-grow.bin", MOUNT_POINT);
+    std::fs::write(&file_path, b"abcdefghij").expect("seed write failed");
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file_path)
+        .expect("Failed to open for set_len");
+    f.set_len(4096).expect("set_len(4096) failed");
+
+    println!("  Step 3: Read [10..4096) -- must be zeros");
+    use std::os::unix::fs::FileExt;
+    let read_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&file_path)
+        .expect("Failed to open for read");
+    let mut tail = vec![0xffu8; 4096 - 10];
+    read_handle
+        .read_exact_at(&mut tail, 10)
+        .expect("tail read failed");
+    assert!(
+        tail.iter().all(|&b| b == 0),
+        "Extended region must read as zeros"
+    );
+    drop(read_handle);
+    drop(f);
+
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: Sparse truncate-then-extend test passed".green()
+    );
+    Ok(())
+}
+
+// Override flush preserves the surrounding bytes after a partial write
+// + close + reopen + read. This exercises the path where flush keeps
+// the existing blob_guid, bumps blob_version, and writes only the
+// modified block at V+1; other blocks stay at their old version on
+// disk and remain reachable through the new layout.
+async fn test_sparse_override_flush_persists(disk_cache: bool) -> CmdResult {
+    use aws_sdk_s3::primitives::ByteStream;
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Upload a 256KB file via S3 (spans 2 blocks)");
+    let key = "sparse-override.bin";
+    let original = generate_test_data(key, 256 * 1024);
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(original.clone()))
+        .send()
+        .await
+        .expect("put failed");
+
+    println!("  Step 2: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 3: Open RDWR, patch 32 bytes near the start of block 1, close");
+    let file_path = format!("{}/{}", MOUNT_POINT, key);
+    let patch = b"OVERRIDE-FLUSH-CHECK-32B-MARKER!";
+    let patch_offset: u64 = 128 * 1024 + 16; // 16 bytes into block 1
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        f.write_all_at(patch, patch_offset)
+            .expect("write_all_at failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Reopen and read; verify patch landed and surroundings are intact");
+    let actual = std::fs::read(&file_path).expect("read failed");
+    assert_eq!(actual.len(), original.len(), "size changed unexpectedly");
+    assert_eq!(
+        &actual[..patch_offset as usize],
+        &original[..patch_offset as usize],
+        "block 0 (or pre-patch region of block 1) corrupted"
+    );
+    assert_eq!(
+        &actual[patch_offset as usize..patch_offset as usize + patch.len()],
+        patch,
+        "patch did not land"
+    );
+    assert_eq!(
+        &actual[patch_offset as usize + patch.len()..],
+        &original[patch_offset as usize + patch.len()..],
+        "post-patch tail of block 1 corrupted"
+    );
+
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+    println!(
+        "{}",
+        "SUCCESS: Sparse override flush persists test passed".green()
+    );
+    Ok(())
+}
+
+// A sparse file written through the override flush path: ftruncate to a
+// large size, write a single small chunk near the end, close. After
+// reopen, the unwritten ranges read as zeros (BlockNotFound -> zeros)
+// and the written chunk reads correctly. This is the round-trip
+// version of test_sparse_truncate_large that actually flushes.
+async fn test_sparse_sparse_file_round_trip(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE rw and create a fresh file");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let file_path = format!("{}/sparse-roundtrip.bin", MOUNT_POINT);
+
+    println!("  Step 2: Write seed bytes, then ftruncate to 4MB, write a marker near 3MB, close");
+    let marker = b"END-MARKER-32B-XXXXXXXXXXXXXXXXX";
+    let marker_offset: u64 = 3 * 1024 * 1024;
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&file_path)
+            .expect("create failed");
+        f.write_all_at(b"head!", 0).expect("write head failed");
+        f.set_len(4 * 1024 * 1024).expect("set_len failed");
+        f.write_all_at(marker, marker_offset)
+            .expect("write marker failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 3: Reopen; verify size, head, marker, and a hole region read zeros");
+    let meta = std::fs::metadata(&file_path).expect("stat failed");
+    assert_eq!(meta.len(), 4 * 1024 * 1024, "size mismatch after flush");
+
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&file_path)
+        .expect("open ro failed");
+
+    let mut head = vec![0u8; 5];
+    f.read_exact_at(&mut head, 0).expect("read head failed");
+    assert_eq!(&head, b"head!", "head bytes lost");
+
+    let mut hole = vec![0xffu8; 4096];
+    f.read_exact_at(&mut hole, 1024 * 1024)
+        .expect("read hole failed");
+    assert!(hole.iter().all(|&b| b == 0), "hole did not read as zeros");
+
+    let mut readback = vec![0u8; marker.len()];
+    f.read_exact_at(&mut readback, marker_offset)
+        .expect("read marker failed");
+    assert_eq!(&readback, marker, "marker mismatch");
+
+    drop(f);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: Sparse sparse-file round trip test passed".green()
+    );
+    Ok(())
+}
+
+// fallocate + lseek tests --------------------------------------------------
+//
+// FUSE block_size used by fs_server is 128KB (`DEFAULT_BLOCK_SIZE`).
+// Tests below assume that boundary so the aligned / edge / single-block
+// PUNCH_HOLE shapes are exercised.
+
+// Used by the fallocate / lseek tests (ported in a later phase).
+#[allow(dead_code)]
+const BLOCK_SIZE: u64 = 128 * 1024;
+
