@@ -309,7 +309,10 @@ pub async fn run_pjdfstest(subdir: Option<&str>) -> CmdResult {
         return Ok(());
     }
     if !SKIP_TEST_FILES.is_empty() {
-        println!("  skipping {} known test file(s): {SKIP_TEST_FILES:?}", SKIP_TEST_FILES.len());
+        println!(
+            "  skipping {} known test file(s): {SKIP_TEST_FILES:?}",
+            SKIP_TEST_FILES.len()
+        );
     }
     println!(
         "  running prove (as root, via sudo) over {} file(s) under {prove_target}",

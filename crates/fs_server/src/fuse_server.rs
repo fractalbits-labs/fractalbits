@@ -46,7 +46,18 @@ impl Filesystem for FuseServer {
     }
 
     async fn destroy(&self) {
+        // Block new enqueues, then await a full writeback drain so queued
+        // metadata intents (mkdir directory markers, chmod/chown/utimes,
+        // symlink/mknod) are persisted before the process exits. Without the
+        // await, a shutdown with a non-empty queue loses that metadata: the
+        // dir/file still resolves via its NSS data/children, but its posix
+        // reverts to defaults (uid 0, epoch-0 mtime) on the next mount. This
+        // reuses the same generation-aware barrier as fsyncdir(2), so it
+        // only waits for the worker to commit what is already queued.
         self.vfs.vfs_destroy();
+        if let Err(e) = self.vfs.drain_all_dirty_cycles().await {
+            tracing::warn!(error = %e, "destroy: writeback drain incomplete");
+        }
     }
 
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FsResult<ReplyEntry> {
@@ -299,9 +310,17 @@ impl Filesystem for FuseServer {
         offset: u64,
         data: &[u8],
         _write_flags: u32,
-        _flags: u32,
+        flags: u32,
     ) -> FsResult<usize> {
         let written = self.vfs.vfs_write(fh, offset, data).await.map_err(fs_err)?;
+
+        // O_SYNC / O_DSYNC: every write is durability-tied, drain the queue
+        // before the FUSE reply so the kernel sees the same synchronous
+        // guarantee userspace asked for.
+        if (flags & (libc::O_SYNC as u32 | libc::O_DSYNC as u32)) != 0 {
+            self.vfs.vfs_flush(fh).await.map_err(fs_err)?;
+        }
+
         Ok(written as usize)
     }
 
@@ -331,6 +350,17 @@ impl Filesystem for FuseServer {
             .vfs_fallocate(fh, offset, length, mode)
             .await
             .map_err(fs_err)
+    }
+
+    async fn lseek(
+        &self,
+        _req: Request,
+        _inode: u64,
+        fh: u64,
+        offset: u64,
+        whence: u32,
+    ) -> FsResult<u64> {
+        self.vfs.vfs_lseek(fh, offset, whence).await.map_err(fs_err)
     }
 
     async fn release(
@@ -589,6 +619,10 @@ impl Filesystem for FuseServer {
         _fh: u64,
         _datasync: bool,
     ) -> FsResult<()> {
+        // Drain every dirty writeback cycle the queue currently knows
+        // about. Cheap mount-wide barrier; a true subtree-scoped variant
+        // is a future optimization.
+        self.vfs.drain_all_dirty_cycles().await.map_err(fs_err)?;
         Ok(())
     }
 

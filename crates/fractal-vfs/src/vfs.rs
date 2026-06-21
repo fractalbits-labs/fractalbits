@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::backend::{BackendConfig, StorageBackend};
+use crate::backend::{BackendConfig, BlobInfo, StorageBackend};
 use crate::cache::{DirCache, DirEntry};
 use crate::config::WritebackMode;
 use crate::disk_cache::DiskCache;
@@ -378,6 +378,28 @@ impl VfsCore {
         }
     }
 
+    /// Acquire the inode write lock, briefly retrying to absorb the
+    /// close-then-reopen-for-write race: a just-closed handle's FUSE_RELEASE
+    /// (which drops this lock via `release_write_lock`) is asynchronous and
+    /// may not have been processed by the time the kernel sends the next
+    /// OPEN, so a single-process `write(); open(O_WRONLY)` would otherwise
+    /// spuriously EBUSY (observed in truncate/O_TRUNC tests once per-flush
+    /// latency grew). A genuinely concurrent writer keeps its handle open
+    /// past the budget and still gets EBUSY.
+    async fn acquire_write_lock_retry(&self, inode: u64, fh: u64) -> Result<(), FsError> {
+        if self.acquire_write_lock(inode, fh).is_ok() {
+            return Ok(());
+        }
+        let deadline = SystemTime::now() + Duration::from_millis(200);
+        while SystemTime::now() < deadline {
+            compio_runtime::time::sleep(Duration::from_millis(5)).await;
+            if self.acquire_write_lock(inode, fh).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(FsError::Busy)
+    }
+
     fn release_write_lock(&self, inode: u64, fh: u64) {
         self.inode_write_owner
             .remove_if(&inode, |_, owner| *owner == fh);
@@ -646,12 +668,7 @@ impl VfsCore {
         };
 
         // Check if fully cached
-        if !dc.is_complete(
-            blob_guid.blob_id,
-            blob_guid.volume_id,
-            layout.blob_version,
-            file_size,
-        ) {
+        if !dc.is_complete(blob_guid, file_size) {
             return (0, 0);
         }
 
@@ -661,8 +678,7 @@ impl VfsCore {
         };
 
         // Open the cache file and register as backing fd
-        let cache_path =
-            dc.cache_file_path(blob_guid.blob_id, blob_guid.volume_id, layout.blob_version);
+        let cache_path = dc.cache_file_path(blob_guid.blob_id, blob_guid.volume_id);
         let backing_file = match std::fs::File::open(&cache_path) {
             Ok(f) => f,
             Err(e) => {
@@ -719,20 +735,12 @@ impl VfsCore {
         blob_version: u64,
         block_num: u32,
         block_content_len: usize,
-        file_size: u64,
+        _file_size: u64,
         trace_id: &TraceId,
     ) -> Result<Bytes, FsError> {
         // Try disk cache
         if let Some(dc) = &self.disk_cache
-            && let Some(cached) = dc
-                .get(
-                    blob_guid.blob_id,
-                    blob_guid.volume_id,
-                    blob_version,
-                    block_num,
-                    file_size,
-                )
-                .await
+            && let Some(cached) = dc.get_block(blob_guid, block_num, block_content_len).await
         {
             return Ok(cached);
         }
@@ -749,7 +757,7 @@ impl VfsCore {
         } else {
             block_content_len
         };
-        let (mut data, mut checksum) = match self
+        let (mut data, _checksum) = match self
             .backend()
             .read_block(blob_guid, blob_version, block_num, read_len, trace_id)
             .await
@@ -764,21 +772,13 @@ impl VfsCore {
         };
         if data.len() > block_content_len {
             data = data.slice(0..block_content_len);
-            checksum = xxhash_rust::xxh3::xxh3_64(&data);
         }
 
         // Populate disk cache
         if let Some(dc) = &self.disk_cache {
-            dc.insert(
-                blob_guid.blob_id,
-                blob_guid.volume_id,
-                blob_version,
-                block_num,
-                file_size,
-                &data,
-                checksum,
-            )
-            .await;
+            let _ = dc
+                .insert_block(blob_guid, block_num, blob_version, &data)
+                .await;
         }
 
         Ok(data)
@@ -957,21 +957,14 @@ impl VfsCore {
     async fn read_block_cached_into(
         &self,
         blob_guid: data_types::DataBlobGuid,
-        blob_version: u64,
+        _blob_version: u64,
         block_num: u32,
-        file_size: u64,
+        block_content_len: usize,
         buf: &mut [u8],
     ) -> Option<usize> {
         if let Some(dc) = &self.disk_cache {
-            dc.get_into(
-                blob_guid.blob_id,
-                blob_guid.volume_id,
-                blob_version,
-                block_num,
-                file_size,
-                buf,
-            )
-            .await
+            dc.get_block_into(blob_guid, block_num, block_content_len, buf)
+                .await
         } else {
             None
         }
@@ -1025,7 +1018,7 @@ impl VfsCore {
                         blob_guid,
                         layout.blob_version,
                         block_num,
-                        file_size,
+                        block_content_len,
                         &mut buf[written..written + chunk_len],
                     )
                     .await
@@ -1043,7 +1036,7 @@ impl VfsCore {
                         blob_guid,
                         layout.blob_version,
                         block_num,
-                        file_size,
+                        block_content_len,
                         &mut tmp,
                     )
                     .await
@@ -1360,7 +1353,7 @@ impl VfsCore {
 
         const MAX_CAS_RETRIES: u32 = 5;
         let mut attempt: u32 = 0;
-        let final_layout = loop {
+        let (final_layout, final_committed_size) = loop {
             attempt += 1;
 
             let (blob_guid, base_version, committed_size, expected_old, is_override) =
@@ -1468,6 +1461,11 @@ impl VfsCore {
                     let lower =
                         std::cmp::min(new_num_blocks, eof_low_watermark.unwrap_or(new_num_blocks));
                     let upper = std::cmp::max(committed_bc, trim_upper.unwrap_or(0));
+                    // Blind-delete the trim range. Deleting a hole is now an
+                    // idempotent no-op at the DataVgProxy layer (a delete that
+                    // hits RpcError::NotFound is treated as success, not a
+                    // circuit-breaker failure), so sparse holes in [lower, upper)
+                    // no longer trip the per-node breaker.
                     for b in lower..upper {
                         if matches!(blocks.get(&b), Some(BlockState::Rewrite(_))) {
                             continue;
@@ -1495,7 +1493,7 @@ impl VfsCore {
                             .reserve_block(blob_guid, *b, block_size as u32, new_version, &trace_id)
                             .await;
                     }
-                    break layout;
+                    break (layout, committed_size);
                 }
                 Err(FsError::CasConflict) => {
                     if attempt >= MAX_CAS_RETRIES {
@@ -1539,6 +1537,88 @@ impl VfsCore {
                 wb.eof_low_watermark = None;
                 wb.trim_upper = None;
                 wb.existing_blob_guid = final_layout.blob_guid().ok();
+            }
+        }
+
+        // Sync the local disk cache to the writer's just-published
+        // state: rewrites land at their natural offsets, deletes
+        // punch holes, and the file-level authoritative_blob_v in
+        // the cache header advances to match. Under the single-
+        // writer-per-inode policy this is safe to do without any
+        // additional locking; no other instance has a write in
+        // flight on this inode at this moment.
+        //
+        // Best-effort: a sync failure (e.g. ENOSPC) is logged and
+        // does not affect flush durability. The next read on an
+        // affected block cold-fetches from BSS and re-populates.
+        if let Some(dc) = &self.disk_cache
+            && let Ok(final_blob_guid) = final_layout.blob_guid()
+        {
+            let bsz_u64 = block_size as u64;
+            let rewrites: Vec<(u32, Bytes)> = blocks
+                .iter()
+                .filter_map(|(b, s)| match s {
+                    BlockState::Rewrite(bytes) => Some((*b, bytes.clone())),
+                    _ => None,
+                })
+                .collect();
+
+            let new_bc = file_size.div_ceil(bsz_u64) as u32;
+            let committed_bc = final_committed_size.div_ceil(bsz_u64) as u32;
+            let trim_lo = eof_low_watermark.map(|w| w.min(new_bc)).unwrap_or(new_bc);
+            let trim_hi = trim_upper.unwrap_or(committed_bc).max(committed_bc);
+
+            let mut deletes: Vec<u32> = (trim_lo..trim_hi)
+                .filter(|b| !matches!(blocks.get(b), Some(BlockState::Rewrite(_))))
+                .collect();
+            for (b, s) in blocks.iter() {
+                if matches!(s, BlockState::Delete) {
+                    deletes.push(*b);
+                }
+            }
+
+            if let Err(e) = dc
+                .sync_after_flush(
+                    final_blob_guid,
+                    final_layout.blob_version,
+                    &rewrites,
+                    &deletes,
+                )
+                .await
+            {
+                tracing::warn!(
+                    %final_blob_guid,
+                    blob_version = final_layout.blob_version,
+                    error = %e,
+                    "disk cache sync_after_flush failed (best-effort, continuing)"
+                );
+            }
+        }
+
+        // Publish the authoritative blob-geometry sentinel so a peer instance
+        // serving vfs_getattr from a stale cached layout still observes the
+        // latest cross-instance size override (the inode size+blob_version it
+        // cached may lag this flush). Written at the just-published
+        // blob_version via the normal block path (no batch RPC); best-effort,
+        // since the inode itself is already durable in NSS.
+        if let Ok(geom_guid) = final_layout.blob_guid() {
+            let new_bc = file_size.div_ceil(block_size as u64) as u32;
+            let info = BlobInfo {
+                total_size: file_size,
+                block_count: new_bc,
+                blob_version: final_layout.blob_version,
+            };
+            if let Err(e) = self
+                .backend()
+                .write_blob_info(geom_guid, info, final_layout.blob_version, &trace_id)
+                .await
+            {
+                tracing::warn!(
+                    %geom_guid,
+                    blob_version = final_layout.blob_version,
+                    error = %e,
+                    "write_blob_info (geometry sentinel) failed; cross-instance size may lag until next flush"
+                );
             }
         }
 
@@ -1973,17 +2053,27 @@ impl VfsCore {
                     EntryType::File,
                     Some(real_layout.clone()),
                 );
-                if let Some(id) = inode_id
-                    && let Some(mut e) = self.inodes.get_mut(ino)
-                {
-                    // Refresh the cached posix + layout from the record:
-                    // lookup_or_insert leaves an existing entry untouched,
-                    // so a chmod/chown/unlink-ctime-bump made via another
-                    // hardlink name would otherwise stay masked by the
-                    // stale cached posix (make_file_attr reads posix).
-                    e.inode_id = Some(id);
-                    e.posix = crate::inode::layout_posix(&real_layout);
+                if let Some(mut e) = self.inodes.get_mut(ino) {
+                    // Cross-instance coherency: lookup_or_insert leaves an
+                    // EXISTING entry's layout untouched, so a peer instance's
+                    // override (new blob_version + size) would otherwise stay
+                    // masked behind our stale cached layout; getattr reads
+                    // size from entry.layout, so a follow-up stat (after the
+                    // 1s lookup-attr TTL) would report the old size even
+                    // though this lookup already fetched the fresh one from
+                    // NSS. Refresh the cached layout to the just-read
+                    // authoritative one. (Local unflushed writes live in the
+                    // handle's write_buf, and unflushed setattr in
+                    // entry.posix, so neither is clobbered here.)
                     e.layout = Some(real_layout.clone());
+                    if let Some(id) = inode_id {
+                        // Hardlink: also refresh the cached posix from the
+                        // shared record so a chmod/chown/unlink-ctime-bump
+                        // made via another name isn't masked by stale posix
+                        // (make_file_attr reads posix for mode/times).
+                        e.inode_id = Some(id);
+                        e.posix = crate::inode::layout_posix(&real_layout);
+                    }
                 }
                 let mut attr = self.make_file_attr(ino, &real_layout)?;
                 attr.nlink = nlink;
@@ -2115,6 +2205,47 @@ impl VfsCore {
                         }
                     }
                     let mut attr = self.make_file_attr(inode, &layout)?;
+                    // Cross-instance size authority: this entry's cached layout
+                    // (size + blob_version) may lag a peer instance's most
+                    // recent overwrite, so make_file_attr's size can be stale.
+                    // Re-read the authoritative geometry sentinel from BSS via a
+                    // max-version quorum read, which reflects the latest
+                    // published override regardless of our cached layout
+                    // version. Skips symlinks/special files (they report their
+                    // own size and have no data blob). getattr is gated by the
+                    // 1s FUSE attr TTL, so this BSS read happens at most about
+                    // once/sec/inode: a bounded, throttled extra read.
+                    if !layout.is_symlink()
+                        && layout.special().is_none()
+                        && let Ok(geom_guid) = layout.blob_guid()
+                    {
+                        let trace_id = TraceId::new();
+                        match self.backend().get_blob_info(geom_guid, &trace_id).await {
+                            // Only let the sentinel move size FORWARD: apply it
+                            // when it is at least as new as our cached layout
+                            // (vfs_lookup refreshes the cached layout from NSS,
+                            // so a stale sentinel must never downgrade a fresh
+                            // size back to an older value).
+                            Ok(Some(info)) if info.blob_version >= layout.blob_version => {
+                                attr.size = info.total_size;
+                                // make_file_attr derives st_blocks from size
+                                // (512-byte units) for regular files; keep it
+                                // consistent with the refreshed size.
+                                attr.blocks = info.total_size.div_ceil(512);
+                            }
+                            // Sentinel older than our cached layout: keep the
+                            // (fresher) cached-layout size.
+                            Ok(Some(_)) => {}
+                            // No sentinel yet: keep the cached-layout size.
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "getattr get_blob_info failed; using cached size"
+                                );
+                            }
+                        }
+                    }
                     if name_removed {
                         // POSIX: an open-but-unlinked file with no
                         // remaining links reports nlink=0 (unlink/14.t).
@@ -2125,18 +2256,41 @@ impl VfsCore {
                     let key = entry.s3_key.clone();
                     drop(entry);
                     let trace_id = TraceId::new();
-                    let layout = self.backend().get_inode(&key, &trace_id).await?;
-                    let (real_layout, resolved_id, nlink) =
-                        self.resolve_indirect(layout, &trace_id).await?;
-                    let mut attr = self.make_file_attr(inode, &real_layout)?;
-                    attr.nlink = nlink;
-                    if let Some(mut entry) = self.inodes.get_mut(inode) {
-                        entry.layout = Some(real_layout);
-                        if let Some(id) = resolved_id {
-                            entry.inode_id = Some(id);
+                    match self.backend().get_inode(&key, &trace_id).await {
+                        Ok(layout) => {
+                            let (real_layout, resolved_id, nlink) =
+                                self.resolve_indirect(layout, &trace_id).await?;
+                            let mut attr = self.make_file_attr(inode, &real_layout)?;
+                            attr.nlink = nlink;
+                            if let Some(mut entry) = self.inodes.get_mut(inode) {
+                                entry.layout = Some(real_layout);
+                                if let Some(id) = resolved_id {
+                                    entry.inode_id = Some(id);
+                                }
+                            }
+                            Ok(attr)
                         }
+                        // A freshly created file that hasn't flushed to NSS
+                        // yet has no committed layout, so it isn't resolvable
+                        // by key. It still exists in memory behind an open
+                        // write handle; synthesize its attr from the cached
+                        // posix + the largest open write-buffer size. Without
+                        // this, an fd-based stat/utimes before the first flush
+                        // (tar -x does openat(O_CREAT) then futimens(fd)
+                        // before close, and the kernel may not forward the fh
+                        // on SETATTR) would wrongly return ENOENT.
+                        Err(FsError::NotFound) if self.has_open_handles_for_inode(inode, None) => {
+                            let size = self
+                                .file_handles
+                                .iter()
+                                .filter(|e| e.value().ino == inode)
+                                .filter_map(|e| e.value().write_buf.as_ref().map(|wb| wb.file_size))
+                                .max()
+                                .unwrap_or(0);
+                            Ok(self.make_new_file_attr(inode, size))
+                        }
+                        Err(e) => Err(e),
                     }
-                    Ok(attr)
                 }
             }
         }
@@ -2561,7 +2715,7 @@ impl VfsCore {
         // crash, so the next open reacquires.
         let fh = self.alloc_fh();
         if is_write {
-            self.acquire_write_lock(inode, fh)?;
+            self.acquire_write_lock_retry(inode, fh).await?;
         }
 
         // Resolve layout if not cached
@@ -2576,6 +2730,23 @@ impl VfsCore {
                 }
             }
         };
+
+        // Cross-instance staleness reconciliation: if the cache file's
+        // authoritative_blob_v lags the inode's blob_version, another
+        // instance has bumped the version since we last sync'd. Clear
+        // the cache file so subsequent reads cold-fetch from BSS.
+        // Done on every open (read or write) so read-only handles
+        // don't keep serving stale bytes.
+        if let Some(dc) = &self.disk_cache
+            && let Some(ref l) = layout
+            && let Ok(blob_guid) = l.blob_guid()
+            && let Err(e) = dc.reconcile_on_open(blob_guid, l.blob_version).await
+        {
+            tracing::warn!(
+                %blob_guid, error = %e,
+                "disk cache reconcile_on_open failed; continuing"
+            );
+        }
 
         let has_trunc = flags & libc::O_TRUNC as u32 != 0;
         let write_buf = if is_write {
@@ -2616,7 +2787,7 @@ impl VfsCore {
             && let Some(ref l) = layout
             && let Ok(blob_guid) = l.blob_guid()
         {
-            dc.touch_versioned(blob_guid.blob_id, blob_guid.volume_id, l.blob_version);
+            dc.touch_blob(blob_guid);
         }
 
         // Spawn a whole-blob prefetch when the open-time policy says
@@ -2644,12 +2815,7 @@ impl VfsCore {
                     keep_cache_hint,
                     &self.prefetch_policy,
                 )
-                && !dc.is_complete(
-                    blob_guid.blob_id,
-                    blob_guid.volume_id,
-                    l.blob_version,
-                    file_size,
-                )
+                && !dc.is_complete(blob_guid, file_size)
             {
                 let dc_arc = Arc::clone(dc);
                 let backend_cfg = Arc::clone(&self.backend_config);
@@ -3107,6 +3273,138 @@ impl VfsCore {
         Ok(())
     }
 
+    /// lseek(SEEK_DATA / SEEK_HOLE). Classifies each block in
+    /// `[offset, file_size)` as data or hole and returns the offset of the
+    /// first match. EOF source: a write handle uses the in-memory
+    /// `WriteBuffer::file_size`; a read-only handle uses the inode-published
+    /// `layout.size()` (the override flush publishes the authoritative size
+    /// into the inode via `put_inode_cas`, so no separate BSS geometry probe
+    /// is needed). Per-block classification merges buffer state with a single
+    /// bounded `ListBlobBlocks` probe (present => data, absent => hole).
+    pub async fn vfs_lseek(&self, fh: u64, offset: u64, whence: u32) -> Result<u64, FsError> {
+        let seek_data = whence == libc::SEEK_DATA as u32;
+        let seek_hole = whence == libc::SEEK_HOLE as u32;
+        if !seek_data && !seek_hole {
+            return Err(FsError::InvalidArg);
+        }
+
+        // Snapshot the bits we need without holding the guard across awaits.
+        let (
+            file_size,
+            block_size,
+            probe_blob_guid,
+            blocks,
+            pending_reservations,
+            eof_low_watermark,
+        ) = {
+            let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
+            let layout_block_size = handle
+                .layout
+                .as_ref()
+                .map(|l| l.block_size)
+                .unwrap_or(DEFAULT_BLOCK_SIZE);
+            let layout_size = handle
+                .layout
+                .as_ref()
+                .and_then(|l| l.size().ok())
+                .unwrap_or(0);
+            let layout_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
+            if let Some(ref wb) = handle.write_buf {
+                (
+                    wb.file_size,
+                    wb.block_size,
+                    wb.existing_blob_guid,
+                    wb.blocks.clone(),
+                    wb.pending_reservations.clone(),
+                    wb.eof_low_watermark,
+                )
+            } else {
+                (
+                    layout_size,
+                    layout_block_size,
+                    layout_blob_guid,
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeSet::new(),
+                    None,
+                )
+            }
+        };
+
+        // Match Linux semantics: offset >= file_size returns ENXIO for both
+        // SEEK_HOLE and SEEK_DATA.
+        if offset >= file_size {
+            return Err(FsError::NoData);
+        }
+
+        let bsz_u64 = block_size as u64;
+        let first_block = (offset / bsz_u64) as u32;
+        let last_block_excl = file_size.div_ceil(bsz_u64) as u32;
+
+        // Per-block classifier. `Some(true)` -> data, `Some(false)` -> hole,
+        // `None` -> not buffered, fall through to the BSS probe.
+        let buffered_kind = |b: u32| -> Option<bool> {
+            match blocks.get(&b) {
+                Some(BlockState::Rewrite(_)) | Some(BlockState::Cached(_)) => Some(true),
+                Some(BlockState::Delete) => Some(false),
+                None => {
+                    if pending_reservations.contains(&b) {
+                        return Some(true);
+                    }
+                    if eof_low_watermark.is_some_and(|low| b >= low) {
+                        return Some(false);
+                    }
+                    None
+                }
+            }
+        };
+
+        // BSS-side classification: one ListBlobBlocks call covers the whole
+        // walk range. Reserved entries count as data (Linux SEEK_DATA
+        // convention), Data is data, anything not returned is a hole.
+        let trace_id = TraceId::new();
+        let block_map: std::collections::BTreeSet<u32> = match probe_blob_guid {
+            Some(guid) => {
+                let count = last_block_excl.saturating_sub(first_block);
+                if count == 0 {
+                    std::collections::BTreeSet::new()
+                } else {
+                    let entries = self
+                        .backend()
+                        .list_blob_blocks(guid, first_block, count, &trace_id)
+                        .await?;
+                    entries.into_iter().map(|e| e.block_number).collect()
+                }
+            }
+            None => std::collections::BTreeSet::new(),
+        };
+
+        for b in first_block..last_block_excl {
+            let is_data = match buffered_kind(b) {
+                Some(d) => d,
+                None => block_map.contains(&b),
+            };
+            let result_offset = if b == first_block {
+                offset
+            } else {
+                b as u64 * bsz_u64
+            };
+            if seek_data && is_data {
+                return Ok(result_offset);
+            }
+            if seek_hole && !is_data {
+                return Ok(result_offset);
+            }
+        }
+
+        if seek_hole {
+            // No further data in the file; SEEK_HOLE returns the EOF.
+            Ok(file_size)
+        } else {
+            // SEEK_DATA hit no data: ENXIO.
+            Err(FsError::NoData)
+        }
+    }
+
     pub async fn vfs_flush(&self, fh: u64) -> Result<(), FsError> {
         self.ensure_writeback_worker_started();
         self.flush_write_buffer(fh).await?;
@@ -3181,6 +3479,39 @@ impl VfsCore {
         Ok(())
     }
 
+    /// Mount-wide writeback barrier: drain every dirty cycle the queue
+    /// currently knows about. Used by `fsyncdir(2)`. A true subtree-scoped
+    /// variant is a future optimization; this is a cheap, correct barrier.
+    pub async fn drain_all_dirty_cycles(&self) -> Result<(), FsError> {
+        let snapshot = self.writeback.snapshot_dirty_cycles();
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        let poll_dur = Duration::from_millis(5);
+        let timeout_secs = self.backend_config.config.rpc_request_timeout_seconds * 4;
+        let deadline = SystemTime::now() + Duration::from_secs(timeout_secs);
+        let mut tainted_seen = false;
+        for (inode, barrier) in snapshot {
+            loop {
+                if self.writeback.cycles_at_or_below_drained(inode, barrier) {
+                    if self.writeback.is_tainted(inode) {
+                        tainted_seen = true;
+                    }
+                    break;
+                }
+                if SystemTime::now() > deadline {
+                    tracing::warn!(inode, barrier = barrier.0, "drain_all_dirty_cycles timeout");
+                    return Err(FsError::Internal("writeback drain timeout".to_string()));
+                }
+                compio_runtime::time::sleep(poll_dur).await;
+            }
+        }
+        if tainted_seen {
+            return Err(FsError::Internal("writeback drain".to_string()));
+        }
+        Ok(())
+    }
+
     pub async fn vfs_release(&self, fh: u64) -> Result<(), FsError> {
         // Flush any dirty write buffer before releasing
         let (has_dirty, was_writer) = self
@@ -3193,9 +3524,21 @@ impl VfsCore {
             })
             .unwrap_or((false, false));
 
-        if has_dirty {
-            self.flush_write_buffer(fh).await?;
-        }
+        // Flush, but DON'T early-return on error: the handle and its
+        // inode-scoped write lock must always be torn down on release,
+        // even when the close-time flush fails (e.g. a transient CAS
+        // conflict or RPC timeout). Returning early here would leave the
+        // FileHandle in `file_handles`, so `acquire_write_lock`'s
+        // stale-owner reclaim (which only fires when the owner fh is GONE
+        // from the table) never triggers, and the inode stays wedged at
+        // EBUSY for the lifetime of the mount, observed as
+        // `echo x > f; open f O_TRUNC` returning EBUSY in open/00.t. The
+        // flush error is still surfaced to the caller after cleanup.
+        let flush_res = if has_dirty {
+            self.flush_write_buffer(fh).await
+        } else {
+            Ok(())
+        };
 
         // Get the inode before removing the handle
         let ino = self.file_handles.get(&fh).map(|h| h.ino);
@@ -3206,6 +3549,8 @@ impl VfsCore {
         if was_writer && let Some(ino) = ino {
             self.release_write_lock(ino, fh);
         }
+
+        flush_res?;
 
         // Handle deferred blob cleanup for unlinked files
         if let Some(ino) = ino
@@ -3267,7 +3612,7 @@ impl VfsCore {
         // vfs_create implicitly opens the new file for writing,
         // so it must obey the inode-scoped write lock. A re-create on an
         // inode that already has a live write handle returns EBUSY.
-        self.acquire_write_lock(ino, fh)?;
+        self.acquire_write_lock_retry(ino, fh).await?;
         self.file_handles.insert(
             fh,
             FileHandle {
@@ -4012,13 +4357,7 @@ async fn spawn_prefetch_task(
         // racing read), the cache hit short-circuits the BSS round
         // trip.
         if disk_cache
-            .get(
-                blob_guid.blob_id,
-                blob_guid.volume_id,
-                layout.blob_version,
-                block_num,
-                file_size,
-            )
+            .get_block(blob_guid, block_num, block_content_len)
             .await
             .is_some()
         {
@@ -4033,7 +4372,7 @@ async fn spawn_prefetch_task(
         } else {
             block_content_len
         };
-        let (mut data, mut checksum) = match backend
+        let (mut data, _checksum) = match backend
             .read_block(
                 blob_guid,
                 layout.blob_version,
@@ -4059,19 +4398,10 @@ async fn spawn_prefetch_task(
         };
         if data.len() > block_content_len {
             data = data.slice(0..block_content_len);
-            checksum = xxhash_rust::xxh3::xxh3_64(&data);
         }
 
-        disk_cache
-            .insert(
-                blob_guid.blob_id,
-                blob_guid.volume_id,
-                layout.blob_version,
-                block_num,
-                file_size,
-                &data,
-                checksum,
-            )
+        let _ = disk_cache
+            .insert_block(blob_guid, block_num, layout.blob_version, &data)
             .await;
     }
 }

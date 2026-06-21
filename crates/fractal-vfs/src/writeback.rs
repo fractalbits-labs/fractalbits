@@ -549,6 +549,22 @@ impl WritebackQueue {
         inner.pending_overlay.get(&inode).cloned()
     }
 
+    /// Snapshot every inode/generation pair that still has an
+    /// uncommitted (non-`Done`) cycle. Used by the mount-wide
+    /// `fsyncdir` drain barrier to learn what to wait on.
+    pub fn snapshot_dirty_cycles(&self) -> Vec<(u64, Generation)> {
+        let inner = self.inner.lock().expect("writeback queue poisoned");
+        let mut out = Vec::new();
+        for (ino, cycles) in inner.file_pipeline.iter() {
+            for (generation, cycle) in cycles.iter() {
+                if cycle.stage != FileCommitStage::Done {
+                    out.push((*ino, *generation));
+                }
+            }
+        }
+        out
+    }
+
     /// `true` iff every cycle on `inode` at generation `<= barrier`
     /// has reached `Done`. The fsync drain loop polls this after
     /// scheduling work; a true return means the drain is complete.

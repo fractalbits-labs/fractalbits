@@ -1736,6 +1736,22 @@ impl DataVgProxy {
                     successful_deletes += 1;
                     debug!("Successful delete from BSS node: {}", address);
                 }
+                Err(RpcError::NotFound) => {
+                    // Deleting an absent block is idempotent success, not a
+                    // node failure: the desired post-state (block gone) already
+                    // holds and the node proved liveness by answering. Counting
+                    // it via record_failure would trip the circuit breaker
+                    // during sparse-file EOF-trim / PUNCH_HOLE, where many
+                    // target blocks legitimately do not exist -- three such
+                    // hole-deletes in a row would open the breaker and cascade
+                    // QuorumFailure/ENOENT into unrelated files.
+                    node.record_success();
+                    successful_deletes += 1;
+                    debug!(
+                        "Delete of absent block on BSS node {} (idempotent)",
+                        address
+                    );
+                }
                 Err(rpc_error) => {
                     node.record_failure();
                     warn!(
@@ -1754,6 +1770,10 @@ impl DataVgProxy {
                             Ok(()) => {
                                 bg_node.record_success();
                                 debug!("Background delete to {} completed", addr);
+                            }
+                            Err(RpcError::NotFound) => {
+                                // Idempotent: absent block is the desired state.
+                                bg_node.record_success();
                             }
                             Err(e) => {
                                 bg_node.record_failure();

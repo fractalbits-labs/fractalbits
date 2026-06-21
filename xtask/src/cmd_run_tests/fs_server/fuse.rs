@@ -259,6 +259,18 @@ pub async fn run_fuse_tests_with_disk_cache(disk_cache_only: bool) -> CmdResult 
 async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     let dc_label = if disk_cache { " [disk-cache]" } else { "" };
 
+    // Start the disk-cache phase from a clean cache directory so the run is
+    // deterministic. A real deployment uses unique (UUIDv7) blob ids per
+    // object, so a persisted cache never collides across object lifetimes;
+    // but repeated local suite runs share one fixed cache dir and accumulate
+    // per-version entries from prior runs, which perturbs eviction/timing and
+    // makes cache-mode tests (mmap, cross-instance overwrite) flaky. CI starts
+    // from a fresh checkout (empty dir); mirror that here.
+    if disk_cache {
+        let dc_path = disk_cache_path();
+        std::fs::remove_dir_all(&dc_path).ok();
+    }
+
     macro_rules! run_test {
         ($name:expr, $func:ident) => {
             println!(
@@ -287,6 +299,26 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     run_test!(
         "Writeback default mode (symlink commit via async worker)",
         test_writeback_default_mode_symlink
+    );
+    run_test!(
+        "Writeback default mode (async release of dirty file)",
+        test_writeback_default_mode_async_release
+    );
+    run_test!(
+        "Writeback default mode (5-level mkdir -p)",
+        test_writeback_default_mode_mkdir
+    );
+    run_test!(
+        "Writeback default mode (ancestor deps; 30 mkdirs)",
+        test_writeback_default_mode_ancestor_deps
+    );
+    run_test!(
+        "Writeback default mode (fsyncdir drains queue)",
+        test_writeback_default_mode_fsyncdir
+    );
+    run_test!(
+        "Writeback default mode (O_DSYNC per-write drain)",
+        test_writeback_default_mode_o_sync
     );
     run_test!("Rename", test_rename);
     run_test!("Unlink with Open Handle", test_unlink_open_handle);
@@ -349,6 +381,11 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         "fallocate PUNCH_HOLE Within Single Block",
         test_fallocate_punch_hole_single_block
     );
+    run_test!(
+        "lseek SEEK_DATA / SEEK_HOLE on Sparse File",
+        test_lseek_seek_data_hole
+    );
+    run_test!("lseek SEEK_HOLE on Punched File", test_lseek_punched_hole);
 
     // Cache staleness tests: verify FUSE sees external S3 mutations after TTL
     run_test!(
@@ -386,6 +423,19 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         test_cross_instance_overwrite_visibility
     );
 
+    // Destructive: stops/starts bss@0 to exercise override durability
+    // across a replica partition+rejoin. Run it ONCE (no-cache phase) and
+    // in isolation -- the override write path is disk-cache-independent, and
+    // running it in both phases double-cycles bss@0, racing the cluster's
+    // recovery between phases. The reference branch invokes it via a separate
+    // wrapper for the same reason.
+    if !disk_cache {
+        run_test!(
+            "Override Survives BSS Partition-Rejoin",
+            test_override_survives_bss_partition_rejoin
+        );
+    }
+
     // Disk-cache-specific tests (only run when disk_cache is enabled)
     if disk_cache {
         run_test!("Disk Cache Populates on Read", test_disk_cache_populates);
@@ -394,6 +444,18 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
             "Disk Cache Cold Start After Remount",
             test_disk_cache_cold_start
         );
+        run_test!(
+            "Disk Cache Survives Override (stable path + inline metadata)",
+            test_disk_cache_survives_override
+        );
+        // Skip if fio isn't on PATH -- the test is opt-in to the host
+        // tooling rather than a hard dependency on the test fixture.
+        if run_cmd!(bash -c "command -v fio").is_ok() {
+            run_test!(
+                "Disk Cache: qemu-style fio random-write workload",
+                test_qemu_style_fio_workload
+            );
+        }
     }
 
     Ok(())
@@ -2742,7 +2804,6 @@ async fn test_sparse_sparse_file_round_trip(disk_cache: bool) -> CmdResult {
 #[allow(dead_code)]
 const BLOCK_SIZE: u64 = 128 * 1024;
 
-
 fn do_fallocate(fd: i32, mode: i32, offset: u64, length: u64) -> Result<(), i32> {
     let rc = unsafe { libc::fallocate(fd, mode, offset as libc::off_t, length as libc::off_t) };
     if rc < 0 {
@@ -2755,6 +2816,16 @@ fn do_fallocate(fd: i32, mode: i32, offset: u64, length: u64) -> Result<(), i32>
 }
 
 /// Wrapper around libc::lseek(2) that returns the resulting offset or errno.
+fn do_lseek(fd: i32, offset: i64, whence: i32) -> Result<i64, i32> {
+    let rc = unsafe { libc::lseek(fd, offset as libc::off_t, whence) };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
+    } else {
+        Ok(rc as i64)
+    }
+}
 
 async fn test_fallocate_extend(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
@@ -3043,3 +3114,670 @@ async fn test_fallocate_punch_hole_single_block(disk_cache: bool) -> CmdResult {
     Ok(())
 }
 
+async fn test_lseek_seek_data_hole(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    println!("  Step 1: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/lseek-sparse.bin", MOUNT_POINT);
+
+    // The replace-flush path that handles brand-new files writes every
+    // logical block dense, so a fresh `create + set_len + write_at_3MB`
+    // sequence ends up with no actual holes on disk. To exercise lseek
+    // against real holes we seed the file first (one block becomes
+    // committed), then re-open and let the override-flush path place
+    // only the new tail block at offset 3MB. Everything between the
+    // first block and the tail block stays unallocated in BSS.
+    println!("  Step 2: Seed a tiny file so subsequent flushes use the override path");
+    std::fs::write(&file_path, b"seed-data").expect("seed write failed");
+
+    println!("  Step 3: Re-open, extend to 4MB, write at 3MB; sync");
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        f.set_len(4 * 1024 * 1024).expect("set_len failed");
+        f.write_all_at(b"data!", 3 * 1024 * 1024)
+            .expect("data write failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: SEEK_DATA from inside the hole must jump to the tail data block");
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(&file_path).expect("open ro failed");
+    let fd = f.as_raw_fd();
+
+    let data_off = do_lseek(fd, BLOCK_SIZE as i64, libc::SEEK_DATA)
+        .expect("SEEK_DATA from inside hole failed");
+    assert!(
+        data_off >= BLOCK_SIZE as i64 && data_off <= 3 * 1024 * 1024,
+        "SEEK_DATA returned {} (expected jump to the 3MB data block)",
+        data_off
+    );
+
+    println!(
+        "  Step 5: SEEK_HOLE from offset 0 (block 0 has the seed) should land in the hole region"
+    );
+    let hole_off = do_lseek(fd, 0, libc::SEEK_HOLE).expect("SEEK_HOLE from 0 failed");
+    assert!(
+        hole_off >= BLOCK_SIZE as i64 && hole_off < 3 * 1024 * 1024,
+        "SEEK_HOLE returned {} (expected first hole offset between block 1 and 3MB)",
+        hole_off
+    );
+
+    println!("  Step 6: SEEK_HOLE from offset 3MB (mid-data) should advance past the data block");
+    let after_data =
+        do_lseek(fd, 3 * 1024 * 1024, libc::SEEK_HOLE).expect("SEEK_HOLE from 3MB failed");
+    assert!(
+        after_data > 3 * 1024 * 1024,
+        "SEEK_HOLE from 3MB returned {} (must be > 3MB)",
+        after_data
+    );
+
+    println!("  Step 7: SEEK_DATA past EOF must return ENXIO");
+    let err =
+        do_lseek(fd, 4 * 1024 * 1024, libc::SEEK_DATA).expect_err("SEEK_DATA past EOF must fail");
+    assert_eq!(err, libc::ENXIO, "expected ENXIO past EOF, got {}", err);
+
+    drop(f);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: lseek SEEK_DATA / SEEK_HOLE on sparse file test passed".green()
+    );
+    Ok(())
+}
+
+async fn test_lseek_punched_hole(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    println!("  Step 1: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/lseek-punched.bin", MOUNT_POINT);
+    let total = 3 * BLOCK_SIZE as usize;
+    println!(
+        "  Step 2: Seed a {}KB file with a non-zero pattern",
+        total / 1024
+    );
+    let pattern: Vec<u8> = (0..total).map(|i| (i % 251 + 1) as u8).collect();
+    std::fs::write(&file_path, &pattern).expect("seed write failed");
+
+    println!("  Step 3: PUNCH_HOLE the middle aligned block");
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        do_fallocate(
+            f.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            BLOCK_SIZE,
+            BLOCK_SIZE,
+        )
+        .expect("PUNCH_HOLE failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: SEEK_HOLE from offset 0 must land at the punched block");
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(&file_path).expect("open ro failed");
+    let fd = f.as_raw_fd();
+
+    let hole_off = do_lseek(fd, 0, libc::SEEK_HOLE).expect("SEEK_HOLE failed");
+    assert!(
+        hole_off >= BLOCK_SIZE as i64 && hole_off < 2 * BLOCK_SIZE as i64,
+        "SEEK_HOLE returned {}, expected within the punched range",
+        hole_off
+    );
+
+    println!("  Step 5: SEEK_DATA from inside the hole must land in the trailing data block");
+    let data_off =
+        do_lseek(fd, BLOCK_SIZE as i64, libc::SEEK_DATA).expect("SEEK_DATA from hole failed");
+    assert!(
+        data_off >= 2 * BLOCK_SIZE as i64,
+        "SEEK_DATA returned {}, expected the trailing data block",
+        data_off
+    );
+
+    drop(f);
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: lseek punched-hole test passed".green());
+    Ok(())
+}
+
+async fn test_disk_cache_survives_override(disk_cache: bool) -> CmdResult {
+    assert!(disk_cache, "this test requires disk cache");
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    let dc_path = disk_cache_path();
+    let _ = std::fs::remove_dir_all(&dc_path);
+
+    println!("  Step 1: Mount RW and create a file with original bytes");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let key = "dc-survives-override.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let original = generate_test_data(key, 64 * 1024);
+    std::fs::write(&fuse_path, &original).expect("Failed to write original");
+    println!("    Wrote: {} ({} bytes)", key, original.len());
+
+    println!("  Step 2: Read once to populate the disk cache at V=1");
+    let first_read = std::fs::read(&fuse_path).expect("Failed initial read");
+    assert_eq!(first_read, original, "initial read mismatch");
+    let cache_files_v1: Vec<_> = std::fs::read_dir(&dc_path)
+        .expect("Failed to list disk cache dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        cache_files_v1.len(),
+        1,
+        "exactly one cache file at the stable path expected; got {:?}",
+        cache_files_v1
+    );
+    let cache_name = cache_files_v1[0].clone();
+    assert!(
+        !cache_name.contains("_v"),
+        "cache filename {} must not carry a version suffix under the new scheme",
+        cache_name
+    );
+    println!("    Cache file: {}", cache_name);
+
+    println!("  Step 3: Override-flush: rewrite the file with new bytes at V+1");
+    let updated = {
+        let mut v = original.clone();
+        // Mutate every byte so a stale-cache hit produces a clearly
+        // different result than the new content.
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = b.wrapping_add(((i % 251) + 1) as u8);
+        }
+        v
+    };
+    std::fs::write(&fuse_path, &updated).expect("Failed to overwrite");
+    println!("    Overwrote: {} bytes", updated.len());
+
+    println!("  Step 4: Read after override; the disk cache must serve V+1 bytes");
+    let post_read = std::fs::read(&fuse_path).expect("Failed post-override read");
+    assert_eq!(
+        post_read, updated,
+        "stale-cache regression: read returned previous-version bytes"
+    );
+
+    println!("  Step 5: Cache file path is unchanged (no rename, no new file)");
+    let cache_files_v2: Vec<_> = std::fs::read_dir(&dc_path)
+        .expect("Failed to list disk cache dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        cache_files_v2.len(),
+        1,
+        "expected exactly one cache file post-override; got {:?}",
+        cache_files_v2
+    );
+    assert_eq!(
+        cache_files_v2[0], cache_name,
+        "cache file path must be stable across the override flush"
+    );
+    println!("    Cache file (unchanged): {}", cache_files_v2[0]);
+
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: Disk cache survives override (stable path) passed".green()
+    );
+    Ok(())
+}
+
+async fn test_qemu_style_fio_workload(disk_cache: bool) -> CmdResult {
+    assert!(disk_cache, "this test requires disk cache");
+    let (_ctx, bucket) = setup_test_bucket().await;
+    let dc_path = disk_cache_path();
+    let _ = std::fs::remove_dir_all(&dc_path);
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let key = "qemu-style.img";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+
+    println!("  Step 2: Create a 64 MiB seed file (dd from /dev/urandom)");
+    let seed_size: u64 = 64 * 1024 * 1024;
+    run_cmd!(dd if=/dev/urandom of=$fuse_path bs=1M count=64 conv=fsync 2>/dev/null)?;
+    let stat0 = std::fs::metadata(&fuse_path).expect("stat seed");
+    assert_eq!(stat0.len(), seed_size, "seed file size");
+
+    println!("  Step 3: Snapshot pre-fio cache state");
+    let pre_count = std::fs::read_dir(&dc_path)
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .count()
+        })
+        .unwrap_or(0);
+    println!("    pre-fio cache files: {}", pre_count);
+
+    println!("  Step 4: fio random 4 KiB writes for 10s");
+    let fio_output = run_fun!(
+        fio --name=qemu-style --filename=$fuse_path --rw=randwrite --bs=4k
+            --size=64M --iodepth=1 --numjobs=1 --runtime=10 --time_based
+            --minimal 2>&1
+    )?;
+    // The `--minimal` output is one CSV line per job; pick a couple of
+    // numbers out for the log so we have evidence the workload actually
+    // ran (some IOPS, non-zero bytes).
+    let fields: Vec<&str> = fio_output.split(';').collect();
+    if fields.len() > 30 {
+        // Field positions for minimal output are documented in fio(1).
+        // 7 = total bytes written (KB), 8 = bandwidth (KB/s),
+        // 49 = total IO time (msec) -- best-effort label.
+        let bytes_written = fields.get(48).copied().unwrap_or("?");
+        let iops = fields.get(49).copied().unwrap_or("?");
+        println!("    fio: writes_KB={} iops_avg={}", bytes_written, iops);
+    } else {
+        println!(
+            "    fio: completed (minimal output had {} fields)",
+            fields.len()
+        );
+    }
+
+    println!("  Step 5: Sync + verify file size unchanged");
+    run_cmd!(sync $fuse_path 2>/dev/null)?;
+    let stat1 = std::fs::metadata(&fuse_path).expect("stat post-fio");
+    assert_eq!(
+        stat1.len(),
+        seed_size,
+        "file size must be stable across the random-write workload"
+    );
+
+    println!("  Step 6: Read every block back and assert population");
+    let bytes = std::fs::read(&fuse_path).expect("read post-fio");
+    assert_eq!(bytes.len(), seed_size as usize, "read length");
+    let nonzero = bytes
+        .chunks(4096)
+        .filter(|b| b.iter().any(|&v| v != 0))
+        .count();
+    assert!(
+        nonzero > 1000,
+        "expected most 4 KiB blocks populated, got {}",
+        nonzero
+    );
+
+    println!("  Step 7: Cache stability -- exactly one file per blob (stable-path invariant)");
+    let post_files: Vec<_> = std::fs::read_dir(&dc_path)
+        .expect("read disk cache dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    println!("    post-fio cache files: {:?}", post_files);
+    let result = if post_files.len() == 1 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "expected exactly 1 cache file under stable-path scheme; got {} ({:?})",
+            post_files.len(),
+            post_files,
+        )))
+    };
+    unmount_fuse()?;
+    result?;
+
+    println!(
+        "{}",
+        "SUCCESS: qemu-style fio workload + stable-path cache invariant".green()
+    );
+    Ok(())
+}
+
+async fn test_override_survives_bss_partition_rejoin(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    let key = "partition-rejoin.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+
+    println!("  Step 1: Mount RW, create a 256 KiB file at V=1, fsync to drain to BSS");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let v1 = generate_test_data("partition-rejoin-v1", 256 * 1024);
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&fuse_path)
+            .expect("open for v1");
+        f.write_all(&v1).expect("write_all v1");
+        // sync_all forces the writeback flush to land in NSS+BSS
+        // before we stop node 0 in Step 2. std::fs::write does not
+        // fsync, and default-mode release-flush is async (a spawned
+        // task) that would be killed by the upcoming unmount.
+        f.sync_all().expect("sync_all v1");
+    }
+    let meta = std::fs::metadata(&fuse_path).expect("stat v1");
+    assert_eq!(meta.len(), v1.len() as u64, "v1 file_size after release");
+    unmount_fuse()?;
+
+    println!("  Step 2: Stop BSS node 0 (one of 3 replicas)");
+    run_cmd!(systemctl --user stop bss@0.service)?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    println!("  Step 3: Remount and override-flush at V=2 with node 0 down");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let v2 = generate_test_data("partition-rejoin-v2", 256 * 1024);
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&fuse_path)
+            .expect("open for override-write");
+        f.write_all(&v2).expect("write_all v2");
+        f.sync_all().expect("sync_all v2");
+    }
+    unmount_fuse()?;
+
+    println!("  Step 4: Restart BSS node 0 (rejoins with stale V=1 bytes)");
+    run_cmd!(systemctl --user start bss@0.service)?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    if disk_cache {
+        println!("  Step 5: Wipe the disk cache so reads actually hit BSS");
+        let _ = std::fs::remove_dir_all(disk_cache_path());
+    }
+
+    println!(
+        "  Step 6: Remount read-only and read; expect V=2 bytes regardless of which replica answers"
+    );
+    mount_fuse_ro(&bucket, disk_cache)?;
+    let post = std::fs::read(&fuse_path).expect("Failed post-rejoin read");
+    let read_ok = post == v2;
+    unmount_fuse()?;
+    if !read_ok {
+        return Err(std::io::Error::other(
+            "stale-replica regression: post-rejoin read did not return V=2 content",
+        ));
+    }
+
+    println!(
+        "{}",
+        "SUCCESS: Override survives BSS partition-rejoin (3-replica fan-out + inline-repair)"
+            .green()
+    );
+    Ok(())
+}
+
+async fn test_writeback_default_mode_async_release(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Create + write + close a file (close returns before NSS commit)");
+    let key = "wb-async-release.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let payload = generate_test_data(key, 32 * 1024);
+    std::fs::write(&fuse_path, &payload).expect("write+close failed");
+
+    println!("  Step 3: Poll until NSS commit visible via dir listing (up to 5s)");
+    let mount_point = MOUNT_POINT;
+    let mut committed = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        let entries: Vec<_> = std::fs::read_dir(mount_point)
+            .expect("readdir failed")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        if entries.iter().any(|n| n == key) {
+            committed = true;
+            break;
+        }
+    }
+    assert!(
+        committed,
+        "async-release flush failed to commit within 5s; default-mode pipeline broken"
+    );
+    println!("    NSS commit observed via dir listing");
+
+    println!("  Step 4: Read the file back; bytes must match");
+    let read_back = std::fs::read(&fuse_path).expect("post-flush read failed");
+    assert_eq!(
+        read_back.len(),
+        payload.len(),
+        "post-flush size mismatch: expected {}, got {}",
+        payload.len(),
+        read_back.len()
+    );
+    assert_eq!(read_back, payload, "post-flush content mismatch");
+
+    let _ = std::fs::remove_file(&fuse_path);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode async release passed".green()
+    );
+    Ok(())
+}
+
+async fn test_writeback_default_mode_mkdir(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Create a 5-deep nested directory tree");
+    let path_a = format!("{}/wb-mkdir-a", MOUNT_POINT);
+    let path_b = format!("{}/b", path_a);
+    let path_c = format!("{}/c", path_b);
+    let path_d = format!("{}/d", path_c);
+    let path_e = format!("{}/e", path_d);
+    std::fs::create_dir_all(&path_e).expect("create_dir_all failed");
+    println!("    enqueued nested mkdirs");
+
+    println!("  Step 3: Poll until every level is visible (up to 5s)");
+    let mut all_visible = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        let levels = [&path_a, &path_b, &path_c, &path_d, &path_e];
+        let visible = levels
+            .iter()
+            .filter(|p| std::fs::metadata(p).is_ok())
+            .count();
+        if visible == levels.len() {
+            all_visible = true;
+            break;
+        }
+    }
+    assert!(
+        all_visible,
+        "default-mode mkdir failed to commit all 5 levels within 5s"
+    );
+
+    println!("  Step 4: Drop a regular file in the deepest dir");
+    let leaf_file = format!("{}/leaf.txt", path_e);
+    std::fs::write(&leaf_file, b"hello deep").expect("write leaf failed");
+    let mut leaf_committed = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        if std::fs::metadata(&leaf_file).is_ok() {
+            leaf_committed = true;
+            break;
+        }
+    }
+    assert!(leaf_committed, "leaf file did not commit within 5s");
+    let read_back = std::fs::read(&leaf_file).expect("read leaf failed");
+    assert_eq!(&read_back[..], b"hello deep");
+
+    // Cleanup
+    let _ = std::fs::remove_file(&leaf_file);
+    let _ = std::fs::remove_dir(&path_e);
+    let _ = std::fs::remove_dir(&path_d);
+    let _ = std::fs::remove_dir(&path_c);
+    let _ = std::fs::remove_dir(&path_b);
+    let _ = std::fs::remove_dir(&path_a);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode mkdir (5-level nested) passed".green()
+    );
+    Ok(())
+}
+
+async fn test_writeback_default_mode_ancestor_deps(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Rapid-fire 30 (mkdir, mkdir/, ) pairs");
+    let n = 30usize;
+    for i in 0..n {
+        let dir = format!("{}/wb-deps-d{:03}", MOUNT_POINT, i);
+        std::fs::create_dir(&dir).unwrap_or_else(|e| panic!("mkdir wb-deps-d{:03}: {}", i, e));
+    }
+    println!("    enqueued {} mkdirs", n);
+
+    println!("  Step 3: Poll until every dir is visible (up to 10s)");
+    let mount_point = MOUNT_POINT;
+    let mut all_dirs = false;
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(100));
+        let entries: Vec<_> = std::fs::read_dir(mount_point)
+            .expect("readdir failed")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let visible = (0..n)
+            .filter(|i| entries.iter().any(|nm| nm == &format!("wb-deps-d{:03}", i)))
+            .count();
+        if visible == n {
+            all_dirs = true;
+            break;
+        }
+    }
+    assert!(
+        all_dirs,
+        "default-mode mkdir burst failed to commit {} dirs",
+        n
+    );
+
+    // Cleanup
+    for i in 0..n {
+        let _ = std::fs::remove_dir(format!("{}/wb-deps-d{:03}", MOUNT_POINT, i));
+    }
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode ancestor deps (30 mkdirs) passed".green()
+    );
+    Ok(())
+}
+
+async fn test_writeback_default_mode_fsyncdir(disk_cache: bool) -> CmdResult {
+    use std::os::fd::AsRawFd;
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Burst-create 20 files at the mount root");
+    let n = 20usize;
+    for i in 0..n {
+        let path = format!("{}/wb-fsyncdir-{:03}.txt", MOUNT_POINT, i);
+        std::fs::write(&path, format!("payload-{}", i).as_bytes())
+            .unwrap_or_else(|e| panic!("write file {}: {}", i, e));
+    }
+    println!("    enqueued {} files", n);
+
+    println!("  Step 3: fsync the parent directory; must block until queue drains");
+    let dir = std::fs::File::open(MOUNT_POINT).expect("open mount root");
+    let dir_fd = dir.as_raw_fd();
+    let r = unsafe { libc::fsync(dir_fd) };
+    if r != 0 {
+        let err = std::io::Error::last_os_error();
+        panic!("fsync(dir) failed: {}", err);
+    }
+    drop(dir);
+
+    println!("  Step 4: Without polling, every file must already be in NSS");
+    let entries: Vec<_> = std::fs::read_dir(MOUNT_POINT)
+        .expect("readdir failed")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let visible = (0..n)
+        .filter(|i| {
+            entries
+                .iter()
+                .any(|name| name == &format!("wb-fsyncdir-{:03}.txt", i))
+        })
+        .count();
+    assert_eq!(
+        visible, n,
+        "fsyncdir did not drain the queue: {}/{} files visible",
+        visible, n
+    );
+
+    // Cleanup
+    for i in 0..n {
+        let _ = std::fs::remove_file(format!("{}/wb-fsyncdir-{:03}.txt", MOUNT_POINT, i));
+    }
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode fsyncdir drain passed".green()
+    );
+    Ok(())
+}
+
+async fn test_writeback_default_mode_o_sync(disk_cache: bool) -> CmdResult {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let path = format!("{}/wb-osync.txt", MOUNT_POINT);
+
+    println!("  Step 2: Pre-create the file (sets up the inode + early-publish)");
+    std::fs::write(&path, b"v0").expect("pre-create failed");
+    // Wait for that initial create's queue cycle to drain (we expect
+    // it to take one worker tick at most). Without this, the O_DSYNC
+    // open below races with the create's own put_inode.
+    std::thread::sleep(Duration::from_millis(200));
+
+    println!("  Step 3: Open with O_DSYNC and write");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_DSYNC)
+        .open(&path)
+        .expect("open O_DSYNC failed");
+    let payload = b"sync-payload";
+    f.write_all(payload).expect("write failed");
+    // Each write under O_SYNC drains the queue; close (which flushes
+    // again) is then a no-op but kept for symmetry with userspace.
+    drop(f);
+
+    println!("  Step 4: Read back via a fresh fd; bytes must match");
+    let read_back = std::fs::read(&path).expect("read failed");
+    assert_eq!(
+        &read_back[..],
+        payload,
+        "O_DSYNC write did not surface synchronously"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode O_DSYNC drain passed".green()
+    );
+    Ok(())
+}

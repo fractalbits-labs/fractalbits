@@ -43,6 +43,9 @@ pub enum FsError {
     #[error("invalid argument")]
     InvalidArg,
 
+    #[error("no data available at offset (lseek SEEK_DATA past EOF / SEEK_HOLE/DATA beyond end)")]
+    NoData,
+
     #[error("deserialization error: {0}")]
     Deserialize(String),
 
@@ -75,6 +78,7 @@ impl From<FsError> for io::Error {
             FsError::DataVg(_) => io::Error::from_raw_os_error(libc::EIO),
             FsError::InvalidState => io::Error::from_raw_os_error(libc::EINVAL),
             FsError::InvalidArg => io::Error::from_raw_os_error(libc::EINVAL),
+            FsError::NoData => io::Error::from_raw_os_error(libc::ENXIO),
             FsError::Deserialize(_) => io::Error::from_raw_os_error(libc::EIO),
             FsError::Internal(_) => io::Error::from_raw_os_error(libc::EIO),
             // A CAS conflict means the inode was rewritten underneath this
