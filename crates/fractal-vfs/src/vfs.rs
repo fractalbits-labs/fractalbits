@@ -786,13 +786,37 @@ impl VfsCore {
 
     // ── Read helpers ──
 
+    /// Authoritative logical file size for data reads. The geometry
+    /// sentinel (our BSS-parent-size authority) reflects the latest
+    /// committed override regardless of our cached layout version, so a
+    /// read on a handle whose cached layout lags a peer's overwrite (or
+    /// this instance's own just-committed flush) still sees the right EOF.
+    /// The cached/NSS layout size is a lazy copy. Falls back to the cached
+    /// size when no sentinel exists or it is older than the cached layout
+    /// (so a stale sentinel never shrinks a fresher local size).
+    async fn authoritative_file_size(&self, layout: &ObjectLayout) -> Result<u64, FsError> {
+        let cached = layout.size()?;
+        if layout.is_symlink() || layout.special().is_some() {
+            return Ok(cached);
+        }
+        if let Ok(guid) = layout.blob_guid() {
+            let trace_id = TraceId::new();
+            if let Ok(Some(info)) = self.backend().get_blob_info(guid, &trace_id).await
+                && info.blob_version >= layout.blob_version
+            {
+                return Ok(info.total_size);
+            }
+        }
+        Ok(cached)
+    }
+
     async fn read_normal(
         &self,
         layout: &ObjectLayout,
         offset: u64,
         size: u32,
     ) -> Result<Bytes, FsError> {
-        let file_size = layout.size()?;
+        let file_size = self.authoritative_file_size(layout).await?;
         if size == 0 || offset >= file_size {
             return Ok(Bytes::new());
         }
@@ -979,7 +1003,7 @@ impl VfsCore {
         offset: u64,
         buf: &mut [u8],
     ) -> Result<usize, FsError> {
-        let file_size = layout.size()?;
+        let file_size = self.authoritative_file_size(layout).await?;
         let size = buf.len() as u32;
         if size == 0 || offset >= file_size {
             return Ok(0);
@@ -2077,6 +2101,17 @@ impl VfsCore {
                 }
                 let mut attr = self.make_file_attr(ino, &real_layout)?;
                 attr.nlink = nlink;
+                // Size authority: the NSS layout size is a lazy copy that can
+                // lag a peer instance's most recent override, so the dentry
+                // attr this LOOKUP installs (and the i_size the kernel derives
+                // from it) would otherwise be stale; a follow-up read clamps
+                // to the old size. Override with the authoritative geometry
+                // sentinel so cross-instance stat/read see the latest EOF.
+                let auth_size = self.authoritative_file_size(&real_layout).await?;
+                if auth_size != attr.size {
+                    attr.size = auth_size;
+                    attr.blocks = auth_size.div_ceil(512);
+                }
                 return Ok(attr);
             }
             Err(FsError::NotFound) => {}
