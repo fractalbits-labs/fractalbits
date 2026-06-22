@@ -44,7 +44,7 @@ pub struct MessageHeader {
     /// The bss block number
     pub block_number: u32,
     /// Content (body) length
-    pub content_len: u32,
+    pub body_len: u32,
 
     /// Trace ID for distributed tracing
     pub trace_id: u64,
@@ -109,7 +109,7 @@ impl Default for MessageHeader {
             version: 0,
             block_number: 0,
             errno: 0,
-            content_len: 0,
+            body_len: 0,
             volume_id: 0,
             retry_count: 0,
             is_new: 0,

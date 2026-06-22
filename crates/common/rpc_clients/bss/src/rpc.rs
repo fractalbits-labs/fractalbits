@@ -178,8 +178,8 @@ impl RpcClient {
         header.volume_id = blob_guid.volume_id;
         header.block_number = block_number;
         header.command = Command::PutDataBlob;
-        header.content_len = body.len() as u32;
-        header.size = size_of::<MessageHeader>() as u32 + header.content_len;
+        header.body_len = body.len() as u32;
+        header.size = size_of::<MessageHeader>() as u32 + header.body_len;
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
         header.checksum_body = body_checksum;
@@ -219,8 +219,8 @@ impl RpcClient {
         header.block_number = block_number;
         header.command = Command::PutDataBlob;
         let total_size: usize = chunks.iter().map(|c| c.len()).sum();
-        header.content_len = total_size as u32;
-        header.size = size_of::<MessageHeader>() as u32 + header.content_len;
+        header.body_len = total_size as u32;
+        header.size = size_of::<MessageHeader>() as u32 + header.body_len;
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
         header.checksum_body = body_checksum;
@@ -265,7 +265,7 @@ impl RpcClient {
         header.command = Command::GetDataBlob;
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
-        header.content_len = content_len as u32;
+        header.body_len = content_len as u32;
         header.size = size_of::<MessageHeader>() as u32;
 
         let msg_frame = MessageFrame::new(header, Bytes::new());
@@ -343,7 +343,7 @@ impl RpcClient {
         header.volume_id = volume_id;
         header.command = Command::GetMetadataBlob;
         header.skip_fence_token = 1;
-        header.content_len = content_len as u32;
+        header.body_len = content_len as u32;
         header.size = size_of::<MessageHeader>() as u32;
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
@@ -390,8 +390,8 @@ impl RpcClient {
         header.blob_id = blob_id;
         header.volume_id = volume_id;
         header.command = Command::PutMetadataBlob;
-        header.content_len = body.len() as u32;
-        header.size = size_of::<MessageHeader>() as u32 + header.content_len;
+        header.body_len = body.len() as u32;
+        header.size = size_of::<MessageHeader>() as u32 + header.body_len;
         header.version = version;
         header.is_new = if is_new { 1 } else { 0 };
         header.skip_fence_token = 1;
