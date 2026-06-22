@@ -4,6 +4,7 @@ use data_types::ec_utils::{ec_padded_len, ec_rotation};
 use data_types::{DataBlobGuid, DataVgInfo, TraceId, Volume, VolumeMode};
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics_wrapper::{counter, histogram};
+use rand::RngExt;
 use rand::seq::{IndexedRandom, SliceRandom};
 use reed_solomon_simd::{decode as rs_decode, encode as rs_encode};
 use rpc_client_bss::RpcClientBss;
@@ -212,12 +213,41 @@ struct VolumeWithNodes {
     volume_id: u16,
     bss_nodes: Vec<Arc<BssNode>>,
     mode: VolumeMode,
+    /// Number of write requests currently in flight against this volume.
+    /// Used as the load signal for Power-of-Two-Choices volume selection.
+    inflight: AtomicU64,
+}
+
+/// RAII guard that decrements a volume's in-flight write counter on drop,
+/// so every early return / `?` in the write path is accounted for.
+struct InflightGuard<'a> {
+    counter: &'a AtomicU64,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Policy used to pick a volume out of a candidate tier on the write path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VolumeSelectionPolicy {
+    /// Rotate through the candidates with a shared counter. Spreads writes
+    /// evenly by count but ignores how busy each volume currently is.
+    RoundRobin,
+    /// Power-of-Two-Choices over the in-flight write counters: sample two
+    /// distinct candidates and route to the one with fewer in-flight writes.
+    /// Default, because it steers away from temporarily slow/busy volumes.
+    #[default]
+    LeastQd,
 }
 
 pub struct DataVgProxy {
     volumes: Vec<VolumeWithNodes>,
     round_robin_counter: AtomicU64,
     rpc_timeout: Duration,
+    policy: VolumeSelectionPolicy,
 }
 
 impl DataVgProxy {
@@ -348,6 +378,7 @@ impl DataVgProxy {
                 volume_id,
                 bss_nodes,
                 mode,
+                inflight: AtomicU64::new(0),
             });
         }
 
@@ -360,34 +391,101 @@ impl DataVgProxy {
             volumes: volumes_with_nodes,
             round_robin_counter: AtomicU64::new(0),
             rpc_timeout: rpc_request_timeout,
+            policy: VolumeSelectionPolicy::default(),
         })
     }
 
+    /// Override the volume selection policy (defaults to
+    /// [`VolumeSelectionPolicy::LeastQd`]).
+    pub fn with_selection_policy(mut self, policy: VolumeSelectionPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
     pub fn select_volume_for_blob_with_preference(&self, prefer_ec: bool) -> u16 {
-        let counter = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) as usize;
-
+        // Build the candidate tier. Large objects (prefer_ec) route to EC
+        // volumes when any exist; otherwise everything routes to replicated
+        // volumes. If the preferred tier is empty we fall back to whatever is
+        // configured so a single-tier deployment still works.
+        let mut candidates: Vec<&VolumeWithNodes> = Vec::new();
         if prefer_ec {
-            let ec_volumes: Vec<_> = self
-                .volumes
-                .iter()
-                .filter(|v| matches!(v.mode, VolumeMode::ErasureCoded { .. }))
-                .collect();
-            if !ec_volumes.is_empty() {
-                return ec_volumes[counter % ec_volumes.len()].volume_id;
-            }
+            candidates.extend(
+                self.volumes
+                    .iter()
+                    .filter(|v| matches!(v.mode, VolumeMode::ErasureCoded { .. })),
+            );
+        }
+        if candidates.is_empty() {
+            candidates.extend(
+                self.volumes
+                    .iter()
+                    .filter(|v| matches!(v.mode, VolumeMode::Replicated { .. })),
+            );
+        }
+        if candidates.is_empty() {
+            candidates.extend(self.volumes.iter());
         }
 
-        let replicated: Vec<_> = self
-            .volumes
-            .iter()
-            .filter(|v| matches!(v.mode, VolumeMode::Replicated { .. }))
-            .collect();
-        if !replicated.is_empty() {
-            return replicated[counter % replicated.len()].volume_id;
+        self.pick_volume(&candidates).volume_id
+    }
+
+    /// Pick a volume out of a candidate tier according to the configured
+    /// [`VolumeSelectionPolicy`].
+    fn pick_volume<'a>(&self, candidates: &[&'a VolumeWithNodes]) -> &'a VolumeWithNodes {
+        match candidates.len() {
+            0 => unreachable!("DataVgProxy always has at least one volume configured"),
+            1 => return candidates[0],
+            _ => {}
         }
 
-        // Fallback to whatever is available
-        self.volumes[counter % self.volumes.len()].volume_id
+        match self.policy {
+            VolumeSelectionPolicy::RoundRobin => self.pick_volume_round_robin(candidates),
+            VolumeSelectionPolicy::LeastQd => self.pick_volume_least_qd(candidates),
+        }
+    }
+
+    /// Rotate through the candidates with the shared round-robin counter.
+    fn pick_volume_round_robin<'a>(
+        &self,
+        candidates: &[&'a VolumeWithNodes],
+    ) -> &'a VolumeWithNodes {
+        let counter = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) as usize;
+        candidates[counter % candidates.len()]
+    }
+
+    /// Power-of-Two-Choices selection over a candidate tier: sample two
+    /// distinct volumes and route to the one with fewer in-flight writes.
+    ///
+    /// Sampling only two keeps the decision O(1) regardless of how many
+    /// volumes exist, while still collapsing worst-case load imbalance from
+    /// ~log N (blind round-robin / random) down to ~log log N. The benefit
+    /// grows as volumes are added, which is exactly the regime we expect.
+    /// Equal-load ties pick one of the two samples at random so identically
+    /// loaded volumes are not biased towards the lower index.
+    fn pick_volume_least_qd<'a>(&self, candidates: &[&'a VolumeWithNodes]) -> &'a VolumeWithNodes {
+        let len = candidates.len();
+        let mut rng = rand::rng();
+        let i = rng.random_range(0..len);
+        // Pick a second, distinct index uniformly over the remaining volumes.
+        let mut j = rng.random_range(0..len - 1);
+        if j >= i {
+            j += 1;
+        }
+
+        let a = candidates[i];
+        let b = candidates[j];
+        let a_load = a.inflight.load(Ordering::Relaxed);
+        let b_load = b.inflight.load(Ordering::Relaxed);
+
+        if a_load < b_load {
+            a
+        } else if b_load < a_load {
+            b
+        } else if rng.random_bool(0.5) {
+            a
+        } else {
+            b
+        }
     }
 
     pub fn select_volume_for_blob(&self) -> u16 {
@@ -547,6 +645,13 @@ impl DataVgProxy {
                 .await;
         }
 
+        // Track this write against the volume so concurrent selections can
+        // steer away from a busy volume (Power-of-Two-Choices load signal).
+        selected_volume.inflight.fetch_add(1, Ordering::Relaxed);
+        let _inflight = InflightGuard {
+            counter: &selected_volume.inflight,
+        };
+
         let start = Instant::now();
         let trace_id = *trace_id;
         histogram!("blob_size", "operation" => "put").record(body.len() as f64);
@@ -694,6 +799,11 @@ impl DataVgProxy {
                 .put_blob_ec(blob_guid, block_number, Bytes::from(combined), trace_id)
                 .await;
         }
+
+        selected_volume.inflight.fetch_add(1, Ordering::Relaxed);
+        let _inflight = InflightGuard {
+            counter: &selected_volume.inflight,
+        };
 
         let start = Instant::now();
         let trace_id = *trace_id;
@@ -1298,6 +1408,11 @@ impl DataVgProxy {
         };
         let total = k + m;
         let write_quorum = k + 1; // W = k + 1
+
+        ec_vol.inflight.fetch_add(1, Ordering::Relaxed);
+        let _inflight = InflightGuard {
+            counter: &ec_vol.inflight,
+        };
 
         // Pad body to a full RS stripe with even shard size.
         let original_len = body.len();
