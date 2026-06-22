@@ -245,10 +245,18 @@ pub struct ObjectCoreMetaData {
     pub etag: String,
     pub headers: HeaderList,
     pub checksum: Option<ChecksumValue>,
-    /// POSIX attrs the FUSE / NFS layer reads back via `stat(2)`.
-    /// `mode == 0` means "uninitialised"; the runtime treats that as
-    /// the fall-back-to-default-mode sentinel.
-    pub posix: PosixAttrs,
+    /// POSIX attrs the FUSE / NFS layer reads back via `stat(2)`, stored
+    /// behind a relative pointer so a pure-S3 object (which never sets
+    /// them) costs only the `None` niche (~5 archived bytes) instead of
+    /// the full inline `PosixAttrs` (28 bytes). rkyv is a zero-copy
+    /// format -- an inline `Option<PosixAttrs>` would still reserve the
+    /// 28 bytes -- so the `Box` is what moves the payload out-of-line and
+    /// makes the absent case cheap. `None` means "uninitialised": the
+    /// runtime falls back to the mount-default mode/uid/gid and
+    /// synthesises mtime/ctime from the layout `timestamp`. Only an
+    /// explicit chmod/chown/utimensat (or an FS-created inode) stores
+    /// `Some`.
+    pub posix: Option<Box<PosixAttrs>>,
 }
 
 /// Persisted POSIX attrs for a regular file, directory, or symlink
@@ -419,6 +427,83 @@ mod tests {
             headers: vec![],
             checksum: None,
             ..Default::default()
+        }
+    }
+
+    fn normal_layout(core: ObjectCoreMetaData) -> ObjectLayout {
+        ObjectLayout {
+            timestamp: 1,
+            version_id: ObjectLayout::gen_version_id(),
+            block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
+            blob_version: 1,
+            state: ObjectState::Normal(ObjectMetaData {
+                blob_guid: DataBlobGuid {
+                    blob_id: Uuid::nil(),
+                    volume_id: 0,
+                },
+                core_meta_data: core,
+            }),
+        }
+    }
+
+    #[test]
+    fn absent_posix_serializes_smaller_than_present() {
+        // Pure-S3 object: posix is None (the common case). An FS inode or
+        // a chmod'd object carries Some(Box). The None case must be the
+        // cheaper one -- that is the whole point of the Box indirection
+        // (an inline Option<PosixAttrs> would not save anything in rkyv).
+        let mut s3 = core_meta(123);
+        s3.posix = None;
+        let mut fs = core_meta(123);
+        fs.posix = Some(Box::new(PosixAttrs {
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            mtime_ns: 42,
+            ctime_ns: 42,
+        }));
+        let s3_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&normal_layout(s3)).expect("ser none");
+        let fs_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&normal_layout(fs)).expect("ser some");
+        assert!(
+            s3_bytes.len() < fs_bytes.len(),
+            "None-posix layout ({} bytes) must be smaller than Some-posix ({} bytes)",
+            s3_bytes.len(),
+            fs_bytes.len()
+        );
+    }
+
+    #[test]
+    fn posix_option_box_round_trips() {
+        // None.
+        let mut none = core_meta(7);
+        none.posix = None;
+        let l = normal_layout(none);
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(&l).expect("ser");
+        let back: ObjectLayout =
+            rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&b).expect("de");
+        match back.state {
+            ObjectState::Normal(d) => assert!(d.core_meta_data.posix.is_none()),
+            _ => unreachable!(),
+        }
+        // Some.
+        let p = PosixAttrs {
+            mode: 0o100600,
+            uid: 5,
+            gid: 6,
+            mtime_ns: 9,
+            ctime_ns: 10,
+        };
+        let mut some = core_meta(7);
+        some.posix = Some(Box::new(p));
+        let l = normal_layout(some);
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(&l).expect("ser");
+        let back: ObjectLayout =
+            rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&b).expect("de");
+        match back.state {
+            ObjectState::Normal(d) => {
+                assert_eq!(d.core_meta_data.posix.as_deref().copied(), Some(p))
+            }
+            _ => unreachable!(),
         }
     }
 

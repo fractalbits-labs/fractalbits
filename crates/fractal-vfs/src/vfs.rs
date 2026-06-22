@@ -1462,7 +1462,7 @@ impl VfsCore {
                         etag: blob_guid.blob_id.simple().to_string(),
                         headers: vec![],
                         checksum: None,
-                        posix,
+                        posix: Some(Box::new(posix)),
                     },
                 }),
             };
@@ -2698,7 +2698,7 @@ impl VfsCore {
                     etag: String::new(),
                     headers: vec![],
                     checksum: None,
-                    posix,
+                    posix: Some(Box::new(posix)),
                 },
             }),
         };
@@ -3735,7 +3735,7 @@ impl VfsCore {
                     etag: String::new(),
                     headers: vec![],
                     checksum: None,
-                    posix,
+                    posix: Some(Box::new(posix)),
                 },
             }),
         };

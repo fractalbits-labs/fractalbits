@@ -18,10 +18,27 @@ pub enum EntryType {
 /// "uninitialised, fall back to defaults" sentinel.
 pub fn layout_posix(layout: &ObjectLayout) -> PosixAttrs {
     match &layout.state {
-        ObjectState::Normal(data) => data.core_meta_data.posix,
-        ObjectState::Mpu(data_types::object_layout::MpuState::Completed(core)) => core.posix,
-        ObjectState::Symlink(data) => data.core_meta_data.posix,
-        ObjectState::Special(data) => data.core_meta_data.posix,
+        ObjectState::Normal(data) => data
+            .core_meta_data
+            .posix
+            .as_deref()
+            .copied()
+            .unwrap_or_default(),
+        ObjectState::Mpu(data_types::object_layout::MpuState::Completed(core)) => {
+            core.posix.as_deref().copied().unwrap_or_default()
+        }
+        ObjectState::Symlink(data) => data
+            .core_meta_data
+            .posix
+            .as_deref()
+            .copied()
+            .unwrap_or_default(),
+        ObjectState::Special(data) => data
+            .core_meta_data
+            .posix
+            .as_deref()
+            .copied()
+            .unwrap_or_default(),
         ObjectState::Directory(data) => data.posix,
         _ => PosixAttrs::default(),
     }
@@ -36,10 +53,10 @@ pub fn layout_posix(layout: &ObjectLayout) -> PosixAttrs {
 pub fn layout_with_posix(mut layout: ObjectLayout, new_posix: PosixAttrs) -> ObjectLayout {
     use data_types::object_layout::MpuState;
     match &mut layout.state {
-        ObjectState::Normal(data) => data.core_meta_data.posix = new_posix,
-        ObjectState::Mpu(MpuState::Completed(core)) => core.posix = new_posix,
-        ObjectState::Symlink(data) => data.core_meta_data.posix = new_posix,
-        ObjectState::Special(data) => data.core_meta_data.posix = new_posix,
+        ObjectState::Normal(data) => data.core_meta_data.posix = Some(Box::new(new_posix)),
+        ObjectState::Mpu(MpuState::Completed(core)) => core.posix = Some(Box::new(new_posix)),
+        ObjectState::Symlink(data) => data.core_meta_data.posix = Some(Box::new(new_posix)),
+        ObjectState::Special(data) => data.core_meta_data.posix = Some(Box::new(new_posix)),
         ObjectState::Directory(data) => data.posix = new_posix,
         _ => {}
     }
