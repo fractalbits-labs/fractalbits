@@ -1,5 +1,5 @@
 pub mod data_vg_proxy;
-pub use data_vg_proxy::{CircuitBreakerConfig, DataVgProxy};
+pub use data_vg_proxy::{CircuitBreakerConfig, DataVgProxy, VolumeSelectionPolicy};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DataVgError {
