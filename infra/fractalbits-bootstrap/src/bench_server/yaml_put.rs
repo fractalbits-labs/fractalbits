@@ -186,10 +186,10 @@ pub fn create_put_workload_config(
     resolve-host: false
 
     # Specify custom write socket buffer size in bytes
-    sndbuf: 32768
+    sndbuf: 131072
 
     # Specify custom read socket buffer size in bytes
-    rcvbuf: 32768
+    rcvbuf: 131072
 
     # When running benchmarks open a webserver to fetch results remotely, eg: localhost:7762
     serve:
