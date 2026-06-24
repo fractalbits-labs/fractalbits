@@ -13,6 +13,9 @@ nightly *args:
 run-tests *args:
   cargo xtask run-tests {{args}}
 
+fstest *args:
+  cargo xtask run-tests pjdfstest {{args}}
+
 deploy *args:
   cargo xtask deploy {{args}}
 

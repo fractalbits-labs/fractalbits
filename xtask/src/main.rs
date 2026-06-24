@@ -605,6 +605,17 @@ pub enum TestType {
         #[clap(long, help = "Run only with disk cache enabled")]
         disk_cache_only: bool,
     },
+    /// Build (on first run) and execute the pjdfstest POSIX
+    /// compliance suite against a FUSE mount in writeback default
+    /// mode. Optionally restrict to a single subgroup with
+    /// `--subdir chmod` etc.
+    Pjdfstest {
+        #[clap(
+            long,
+            help = "Restrict to a single tests/<NAME>/ subgroup (e.g. chmod, mkdir, rename)"
+        )]
+        subdir: Option<String>,
+    },
 }
 
 #[derive(Parser, Clone, EnumString)]
