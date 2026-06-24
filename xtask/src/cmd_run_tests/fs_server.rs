@@ -1,4 +1,5 @@
 pub mod fuse;
+pub mod pjdfs;
 
 use crate::CmdResult;
 use cmd_lib::*;

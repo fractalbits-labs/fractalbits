@@ -135,6 +135,13 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         TestType::BssRepair => test_bss_repair().await,
         TestType::NssFailover => test_nss_failover(RssBackend::Etcd).await,
         TestType::FsServer { disk_cache_only } => test_fs_server(disk_cache_only).await,
+        TestType::Pjdfstest { subdir } => {
+            cmd_service::init_service(ServiceName::All, BuildMode::Debug, &InitConfig::default())?;
+            cmd_service::start_service(ServiceName::All)?;
+            let result = fs_server::pjdfs::run_pjdfstest(subdir.as_deref()).await;
+            cmd_service::stop_service(ServiceName::All)?;
+            result
+        }
         TestType::All => {
             test_fs_server(false).await?;
             test_bss_node_failure().await?;
