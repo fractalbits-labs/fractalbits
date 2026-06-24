@@ -47,11 +47,11 @@ FractalBits delivers exceptional performance that exceeds AWS S3 Express One Zon
 
 | Metric      | Value     |
 | ----------- | --------- |
-| Obj/s       | 270K      |
-| Throughput  | 1.0 GiB/s |
-| Avg Latency | 3.2 ms    |
-| P90 Latency | 4.3 ms    |
-| P99 Latency | 10.9 ms   |
+| Obj/s       | 280K      |
+| Throughput  | 1.1 GiB/s |
+| Avg Latency | 3.0 ms    |
+| P90 Latency | 3.5 ms    |
+| P99 Latency | 8.5 ms    |
 
 **Benchmark Configuration:**
 
