@@ -301,6 +301,18 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         test_writeback_default_mode_symlink
     );
     run_test!(
+        "Hardlink: write after link is durable on both names",
+        test_hardlink_write_visible
+    );
+    run_test!(
+        "Hardlink: cold-Indirect write resolves to shared record",
+        test_hardlink_write_cold_indirect
+    );
+    run_test!(
+        "Hardlink: cross-alias chmod + write both survive",
+        test_hardlink_chmod_then_write
+    );
+    run_test!(
         "Writeback default mode (async release of dirty file)",
         test_writeback_default_mode_async_release
     );
@@ -1002,6 +1014,247 @@ async fn test_writeback_default_mode_symlink(disk_cache: bool) -> CmdResult {
     println!(
         "{}",
         "SUCCESS: writeback default mode symlink path passed".green()
+    );
+    Ok(())
+}
+
+/// Regression for the P0 where a write after creating a hardlink was
+/// silently discarded: hardlink promotion sets `inode_id`, and the flush
+/// then skipped publish entirely, never touching the shared blob or the
+/// `#hardlink/<id>` InodeRecord. Writes must instead flush to the record
+/// (record-aware CAS path) so both names observe the new bytes, before
+/// and after a remount.
+async fn test_hardlink_write_visible(disk_cache: bool) -> CmdResult {
+    use std::os::unix::fs::MetadataExt;
+
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE rw, create hl-a with initial bytes");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let a_path = format!("{}/hl-a", MOUNT_POINT);
+    let b_path = format!("{}/hl-b", MOUNT_POINT);
+    std::fs::write(&a_path, b"AAAAAAAA").expect("write hl-a failed");
+
+    println!("  Step 2: hard_link(hl-a, hl-b) promotes the inode (nlink=2)");
+    std::fs::hard_link(&a_path, &b_path).expect("hard_link failed");
+    let nlink = std::fs::metadata(&b_path)
+        .expect("stat hl-b failed")
+        .nlink();
+    assert_eq!(nlink, 2, "hardlink nlink should be 2, got {nlink}");
+
+    println!("  Step 3: Write new bytes through hl-b, then fsync");
+    {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&b_path)
+            .expect("open hl-b for write failed");
+        use std::io::Write;
+        let mut f = f;
+        f.write_all(b"ZZZZZZZZZZZZZZZZ").expect("write hl-b failed");
+        f.sync_all().expect("fsync hl-b failed");
+    }
+    let want = b"ZZZZZZZZZZZZZZZZ".to_vec();
+
+    println!("  Step 4: Both names must observe the new bytes pre-remount");
+    let a_live = std::fs::read(&a_path).expect("read hl-a failed");
+    let b_live = std::fs::read(&b_path).expect("read hl-b failed");
+    assert_eq!(a_live, want, "hl-a stale before remount (write discarded)");
+    assert_eq!(b_live, want, "hl-b stale before remount");
+
+    println!("  Step 5: Remount; the write must be durable on both names");
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let a_cold = std::fs::read(&a_path).expect("post-remount read hl-a failed");
+    let b_cold = std::fs::read(&b_path).expect("post-remount read hl-b failed");
+    assert_eq!(
+        a_cold, want,
+        "hl-a stale after remount (P0: old bytes remained)"
+    );
+    assert_eq!(b_cold, want, "hl-b stale after remount");
+
+    let _ = std::fs::remove_file(&a_path);
+    let _ = std::fs::remove_file(&b_path);
+    unmount_fuse()?;
+
+    println!(
+        "{}",
+        "SUCCESS: write after hardlink is durable on both names".green()
+    );
+    Ok(())
+}
+
+/// Cold-cache variant: after a remount the inode cache is empty, so an
+/// enumeration (readdirplus) can cache the raw `Indirect` redirect with
+/// no `inode_id`. A write must still resolve the redirect to the shared
+/// record (persisting the resolved identity) rather than CAS a Normal
+/// layout over the redirect. Exercises the P0 cold path that the
+/// warm-cache test cannot.
+async fn test_hardlink_write_cold_indirect(disk_cache: bool) -> CmdResult {
+    use std::os::unix::fs::MetadataExt;
+
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Create hl-c, link hl-d, commit, then remount cold");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let c_path = format!("{}/hl-c", MOUNT_POINT);
+    let d_path = format!("{}/hl-d", MOUNT_POINT);
+    std::fs::write(&c_path, b"AAAAAAAA").expect("write hl-c failed");
+    std::fs::hard_link(&c_path, &d_path).expect("hard_link failed");
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    // Step 2: enumerate on the fresh mount. FUSE_READDIRPLUS_AUTO makes the
+    // kernel use readdirplus for this first pass, which must resolve the
+    // hardlink (Indirect) entries -- both to size their attrs (an
+    // unresolved redirect has no size, which previously EINVAL'd the whole
+    // `ls`) and to report the shared record's true link count (nlink=2, not
+    // the redirect's default 1). Enumerating + resolving here also caches
+    // the inode_id, so the write below takes vfs_open's warm resolve path;
+    // the pure-Indirect vfs_open branch is a defensive stateless/NFS path
+    // not reachable once a lookup or readdirplus has run.
+    println!("  Step 2: Enumerate (readdirplus); attrs resolve to the record");
+    let (mut saw_c, mut saw_d) = (false, false);
+    for e in std::fs::read_dir(MOUNT_POINT)
+        .expect("readdir on hardlink dir failed (readdirplus EINVAL on Indirect?)")
+    {
+        let e = e.expect("dir entry failed");
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name == "hl-c" || name == "hl-d" {
+            let nlink = e.metadata().expect("entry metadata failed").nlink();
+            assert_eq!(
+                nlink, 2,
+                "{name}: hardlink attr nlink should be 2, got {nlink}"
+            );
+            if name == "hl-c" {
+                saw_c = true;
+            } else {
+                saw_d = true;
+            }
+        }
+    }
+    assert!(saw_c && saw_d, "both hardlink names must enumerate");
+
+    println!("  Step 3: Write via hl-d on the cold cache, then fsync");
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&d_path)
+            .expect("open hl-d for write failed");
+        f.write_all(b"YYYYYYYYYYYY").expect("write hl-d failed");
+        f.sync_all().expect("fsync hl-d failed");
+    }
+    let want = b"YYYYYYYYYYYY".to_vec();
+
+    // The written name (hl-d) reflects the new bytes immediately. We do not
+    // assert the *other* name (hl-c) here: Step 2's readdirplus cached its
+    // attr at the pre-write size, and the two hardlink names are distinct
+    // FUSE inodes with independent kernel attr caches, so hl-c's size stays
+    // cached-stale until its TTL lapses. That cross-alias attr-cache lag is
+    // a separate, pre-existing limitation; the P0 guarantee under test is
+    // that the cold write reached the shared record (not a clobbered
+    // redirect), which the post-remount cross-name check below proves.
+    println!("  Step 4: The written name sees the new bytes immediately");
+    assert_eq!(
+        std::fs::read(&d_path).expect("read hl-d failed"),
+        want,
+        "hl-d stale right after its own write"
+    );
+
+    // Step 5 is the real P0 guard: had the cold write taken the wrong
+    // (s3_key) path it would have CAS'd a Normal layout over hl-c's
+    // redirect, so after a remount hl-c and hl-d would diverge (one the
+    // clobbered standalone file, the other the untouched record). Both
+    // resolving to the new bytes proves the redirect survived and the
+    // shared record carries the write.
+    println!("  Step 5: Remount; both links must still resolve to the new bytes");
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket, disk_cache)?;
+    assert_eq!(
+        std::fs::read(&c_path).expect("post-remount read hl-c failed"),
+        want,
+        "hl-c stale after remount (redirect clobbered / write lost)"
+    );
+    assert_eq!(
+        std::fs::read(&d_path).expect("post-remount read hl-d failed"),
+        want,
+        "hl-d stale after remount"
+    );
+
+    let _ = std::fs::remove_file(&c_path);
+    let _ = std::fs::remove_file(&d_path);
+    unmount_fuse()?;
+
+    println!(
+        "{}",
+        "SUCCESS: cold-Indirect write resolves to the shared record".green()
+    );
+    Ok(())
+}
+
+/// Cross-alias metadata/data merge: a chmod via one hardlink name and a
+/// write via the other must BOTH survive. Regression for the record-CAS
+/// read-modify-write applying a stale whole-layout -- which would either
+/// revert the chmod's mode (write flush rebuilt from the pre-chmod posix
+/// snapshot) or revert the write's size/version (setattr restored the
+/// pre-write cached layout).
+async fn test_hardlink_chmod_then_write(disk_cache: bool) -> CmdResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_ctx, bucket) = setup_test_bucket().await;
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let e_path = format!("{}/hl-e", MOUNT_POINT);
+    let f_path = format!("{}/hl-f", MOUNT_POINT);
+
+    println!("  Step 1: create hl-e (mode 0644), link hl-f");
+    std::fs::write(&e_path, b"AAAAAAAA").expect("write hl-e failed");
+    std::fs::set_permissions(&e_path, std::fs::Permissions::from_mode(0o644))
+        .expect("chmod 0644 failed");
+    std::fs::hard_link(&e_path, &f_path).expect("hard_link failed");
+
+    println!("  Step 2: chmod hl-e -> 0600, then truncating write+fsync via hl-f");
+    std::fs::set_permissions(&e_path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 failed");
+    {
+        use std::io::Write;
+        let mut wf = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&f_path)
+            .expect("open hl-f for write failed");
+        wf.write_all(b"ZZZZZZZZZZZZ").expect("write hl-f failed");
+        wf.sync_all().expect("fsync hl-f failed");
+    }
+    let want = b"ZZZZZZZZZZZZ".to_vec();
+
+    println!("  Step 3: remount; content AND mode must be correct on both names");
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket, disk_cache)?;
+    for p in [e_path.as_str(), f_path.as_str()] {
+        assert_eq!(
+            std::fs::read(p).expect("post-remount read failed"),
+            want,
+            "{p}: content wrong (write lost, or chmod reverted size/version)"
+        );
+        let mode = std::fs::metadata(p)
+            .expect("post-remount stat failed")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "{p}: mode wrong (chmod undone by the write flush)"
+        );
+    }
+
+    let _ = std::fs::remove_file(&e_path);
+    let _ = std::fs::remove_file(&f_path);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: cross-alias chmod + write both survive".green()
     );
     Ok(())
 }

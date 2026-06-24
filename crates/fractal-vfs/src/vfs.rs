@@ -1299,6 +1299,30 @@ impl VfsCore {
         Ok(written.min(actual_len))
     }
 
+    /// Re-arm a flush's snapshotted buffer after a post-snapshot failure,
+    /// so a later fsync retries instead of seeing a falsely-clean buffer:
+    /// the flush takes `blocks`/`pending_reservations` and clears `dirty`
+    /// up front, so any error after that point must put them back or the
+    /// write is silently lost. Re-inserts without clobbering newer writes.
+    fn restore_flush_snapshot(
+        &self,
+        fh_id: u64,
+        blocks: std::collections::BTreeMap<u32, BlockState>,
+        pending_reservations: std::collections::BTreeSet<u32>,
+    ) {
+        if let Some(mut handle) = self.file_handles.get_mut(&fh_id)
+            && let Some(ref mut wb) = handle.write_buf
+        {
+            for (b, st) in blocks {
+                wb.blocks.entry(b).or_insert(st);
+            }
+            for b in pending_reservations {
+                wb.pending_reservations.insert(b);
+            }
+            wb.dirty = true;
+        }
+    }
+
     async fn flush_write_buffer(&self, fh_id: u64) -> Result<(), FsError> {
         // Snapshot the sparse buffer under the guard and clear `dirty` so a
         // concurrent flush of the same fh sees a clean buffer and
@@ -1339,16 +1363,18 @@ impl VfsCore {
             )
         };
 
-        // Skip publish when the name was unlinked while the fd stayed open
-        // (don't resurrect it in NSS) or the inode was promoted to a
-        // hardlink (its authoritative layout lives at the `#hardlink/<id>`
-        // record, not this s3_key).
-        let (name_removed, promoted) = self
+        // A name unlinked while its fd stayed open must not be resurrected
+        // in NSS, unless the inode was promoted to a hardlink, in which
+        // case its data lives in the shared `#hardlink/<id>` InodeRecord
+        // blob and the other names still reference it, so the write must
+        // still flush (routed to the record below, not this s3_key, whose
+        // NSS row holds only an Indirect redirect).
+        let (name_removed, mut promoted_inode_id) = self
             .inodes
             .get(ino)
-            .map(|e| (e.name_removed, e.inode_id.is_some()))
-            .unwrap_or((false, false));
-        if name_removed || promoted {
+            .map(|e| (e.name_removed, e.inode_id))
+            .unwrap_or((false, None));
+        if name_removed && promoted_inode_id.is_none() {
             if let Some(mut handle) = self.file_handles.get_mut(&fh_id)
                 && let Some(ref mut wb) = handle.write_buf
             {
@@ -1365,15 +1391,39 @@ impl VfsCore {
         let bsz_u64 = block_size as u64;
         let new_num_blocks = file_size.div_ceil(bsz_u64) as u32;
 
+        // Promoted (hardlink) inodes flush into the shared InodeRecord at
+        // `#hardlink/<id>` via CAS, not at this name's s3_key. Fetch the
+        // record up front: its layout seeds the override-flush base (the
+        // shared blob_guid + blob_version) and its nlink/orphan_since are
+        // preserved on republish.
+        let mut promoted_record_key = promoted_inode_id.map(InodeRecord::key_for);
+        // The publish CAS guards on the fetched record re-serialized (rkyv is
+        // deterministic for these types, as the s3_key flush CAS also relies
+        // on), so we keep only the decoded record here.
+        let mut promoted_record: Option<InodeRecord> = match promoted_inode_id {
+            Some(id) => match self.backend().get_inode_record(id, &trace_id).await {
+                Ok(rec) => Some(rec),
+                Err(e) => {
+                    self.restore_flush_snapshot(fh_id, blocks, pending_reservations);
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
+
         // Override flush: reuse the file's stable blob_guid, bump
         // blob_version, write only the dirty (`Rewrite`) blocks in place at
         // the new version, CAS-publish the layout, then trim blocks past the
         // (possibly shrunk) EOF and replay PUNCH_HOLE deletes. Old blocks
         // are never blindly deleted; holes (absent blocks) are never
         // written. The CAS guard makes a stale/cross-instance publish lose
-        // the race instead of clobbering the winner.
-        let mut base_layout: Option<ObjectLayout> =
-            self.file_handles.get(&fh_id).and_then(|h| h.layout.clone());
+        // the race instead of clobbering the winner. For a promoted inode
+        // the base is the record's layout (the shared blob), not the
+        // redirect at the handle's s3_key.
+        let mut base_layout: Option<ObjectLayout> = match &promoted_record {
+            Some(rec) => Some(rec.layout.clone()),
+            None => self.file_handles.get(&fh_id).and_then(|h| h.layout.clone()),
+        };
 
         const MAX_CAS_RETRIES: u32 = 5;
         let mut attempt: u32 = 0;
@@ -1386,9 +1436,18 @@ impl VfsCore {
                     .and_then(|l| l.blob_guid().ok().map(|g| (g, l)))
                 {
                     Some((g, l)) => {
-                        let bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(l, Vec::new())
-                            .map_err(FsError::from)?
-                            .into();
+                        let bytes: Bytes =
+                            match to_bytes_in::<_, rkyv::rancor::Error>(l, Vec::new()) {
+                                Ok(b) => b.into(),
+                                Err(e) => {
+                                    self.restore_flush_snapshot(
+                                        fh_id,
+                                        blocks,
+                                        pending_reservations,
+                                    );
+                                    return Err(FsError::from(e));
+                                }
+                            };
                         (g, l.blob_version, l.size().unwrap_or(0), bytes, true)
                     }
                     None => (self.backend().create_blob_guid(), 0, 0, Bytes::new(), false),
@@ -1431,17 +1490,7 @@ impl VfsCore {
             if let Some(e) = flush_err {
                 // Restore the taken blocks for a forward-retry on a
                 // transient error (CasConflict never reaches here).
-                if let Some(mut handle) = self.file_handles.get_mut(&fh_id)
-                    && let Some(ref mut wb) = handle.write_buf
-                {
-                    for (b, st) in blocks {
-                        wb.blocks.entry(b).or_insert(st);
-                    }
-                    for b in pending_reservations {
-                        wb.pending_reservations.insert(b);
-                    }
-                    wb.dirty = true;
-                }
+                self.restore_flush_snapshot(fh_id, blocks, pending_reservations);
                 return Err(e);
             }
 
@@ -1450,6 +1499,22 @@ impl VfsCore {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64;
+            // On the promoted (hardlink) path, carry the freshly-fetched
+            // record's posix forward, NOT the local snapshot taken before
+            // this flush: another alias may have chmod/chown'd the shared
+            // record between the snapshot and this CAS attempt, and a data
+            // write changes only size/blob_version (never posix), so the
+            // snapshot has nothing of ours to merge. Using it would undo a
+            // concurrent metadata change. The non-promoted path is
+            // single-writer-per-inode, so the local snapshot is correct.
+            let effective_posix = if promoted_record.is_some() {
+                base_layout
+                    .as_ref()
+                    .map(crate::inode::layout_posix)
+                    .unwrap_or(posix)
+            } else {
+                posix
+            };
             let layout = ObjectLayout {
                 version_id: ObjectLayout::gen_version_id(),
                 block_size: DEFAULT_BLOCK_SIZE,
@@ -1462,18 +1527,66 @@ impl VfsCore {
                         etag: blob_guid.blob_id.simple().to_string(),
                         headers: vec![],
                         checksum: None,
-                        posix: Some(Box::new(posix)),
+                        posix: Some(Box::new(effective_posix)),
                     },
                 }),
             };
-            let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())
-                .map_err(FsError::from)?
-                .into();
+            // Choose the publish target. A promoted inode republishes its
+            // layout inside the shared InodeRecord at the `#hardlink/<id>`
+            // key, CAS'd on the current record bytes so a concurrent writer
+            // on another hardlink name (a different FUSE inode with its own
+            // write lock) loses the race and retries instead of clobbering.
+            // A normal file publishes the bare layout at its own s3_key.
+            let (publish_key, publish_bytes, publish_expected_old) = match &promoted_record {
+                Some(rec) => {
+                    let new_record = InodeRecord {
+                        layout: layout.clone(),
+                        nlink: rec.nlink,
+                        orphan_since: rec.orphan_since,
+                    };
+                    let new_bytes: Bytes =
+                        match to_bytes_in::<_, rkyv::rancor::Error>(&new_record, Vec::new()) {
+                            Ok(b) => b.into(),
+                            Err(e) => {
+                                self.restore_flush_snapshot(fh_id, blocks, pending_reservations);
+                                return Err(FsError::from(e));
+                            }
+                        };
+                    // Guard on the record as fetched (re-serialized); rkyv is
+                    // deterministic for these types.
+                    let old_bytes: Bytes =
+                        match to_bytes_in::<_, rkyv::rancor::Error>(rec, Vec::new()) {
+                            Ok(b) => b.into(),
+                            Err(e) => {
+                                self.restore_flush_snapshot(fh_id, blocks, pending_reservations);
+                                return Err(FsError::from(e));
+                            }
+                        };
+                    (
+                        promoted_record_key
+                            .clone()
+                            .expect("promoted_record implies a record key"),
+                        new_bytes,
+                        old_bytes,
+                    )
+                }
+                None => {
+                    let layout_bytes: Bytes =
+                        match to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new()) {
+                            Ok(b) => b.into(),
+                            Err(e) => {
+                                self.restore_flush_snapshot(fh_id, blocks, pending_reservations);
+                                return Err(FsError::from(e));
+                            }
+                        };
+                    (s3_key.clone(), layout_bytes, expected_old)
+                }
+            };
 
-            // CAS-publish: only lands if NSS still holds `expected_old`.
+            // CAS-publish: only lands if NSS still holds `publish_expected_old`.
             match self
                 .backend()
-                .put_inode_cas(&s3_key, layout_bytes, expected_old, &trace_id)
+                .put_inode_cas(&publish_key, publish_bytes, publish_expected_old, &trace_id)
                 .await
             {
                 Ok(_prev) => {
@@ -1522,31 +1635,71 @@ impl VfsCore {
                 Err(FsError::CasConflict) => {
                     if attempt >= MAX_CAS_RETRIES {
                         tracing::warn!(
-                            key = %s3_key,
+                            key = %publish_key,
                             "flush_write_buffer: CAS still conflicting after retries"
                         );
                         // Restore blocks so a later flush can retry.
-                        if let Some(mut handle) = self.file_handles.get_mut(&fh_id)
-                            && let Some(ref mut wb) = handle.write_buf
-                        {
-                            for (b, st) in blocks {
-                                wb.blocks.entry(b).or_insert(st);
-                            }
-                            for b in pending_reservations {
-                                wb.pending_reservations.insert(b);
-                            }
-                            wb.dirty = true;
-                        }
+                        self.restore_flush_snapshot(fh_id, blocks, pending_reservations);
                         return Err(FsError::CasConflict);
                     }
-                    match self.backend().get_inode(&s3_key, &trace_id).await {
-                        Ok(cur) => base_layout = Some(cur),
-                        Err(FsError::NotFound) => base_layout = None,
-                        Err(e) => return Err(e),
+                    // Re-fetch the base for the next attempt: the shared
+                    // record for a promoted inode, else the s3_key layout.
+                    if let Some(id) = promoted_inode_id {
+                        match self.backend().get_inode_record(id, &trace_id).await {
+                            Ok(rec) => {
+                                base_layout = Some(rec.layout.clone());
+                                promoted_record = Some(rec);
+                            }
+                            Err(e) => {
+                                self.restore_flush_snapshot(fh_id, blocks, pending_reservations);
+                                return Err(e);
+                            }
+                        }
+                    } else {
+                        match self.backend().get_inode(&s3_key, &trace_id).await {
+                            Ok(cur) => {
+                                if let ObjectState::Indirect(redirect) = &cur.state {
+                                    // The file was promoted to a hardlink
+                                    // concurrently (another client/instance)
+                                    // since we seeded from a cached normal
+                                    // layout. Switch to the record path so we
+                                    // publish into the shared record instead
+                                    // of clobbering the redirect with a normal
+                                    // layout.
+                                    let id = redirect.inode_id;
+                                    match self.backend().get_inode_record(id, &trace_id).await {
+                                        Ok(rec) => {
+                                            base_layout = Some(rec.layout.clone());
+                                            promoted_record = Some(rec);
+                                            promoted_inode_id = Some(id);
+                                            promoted_record_key = Some(InodeRecord::key_for(id));
+                                        }
+                                        Err(e) => {
+                                            self.restore_flush_snapshot(
+                                                fh_id,
+                                                blocks,
+                                                pending_reservations,
+                                            );
+                                            return Err(e);
+                                        }
+                                    }
+                                } else {
+                                    base_layout = Some(cur);
+                                }
+                            }
+                            Err(FsError::NotFound) => base_layout = None,
+                            Err(e) => {
+                                self.restore_flush_snapshot(fh_id, blocks, pending_reservations);
+                                return Err(e);
+                            }
+                        }
                     }
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.restore_flush_snapshot(fh_id, blocks, pending_reservations);
+                    return Err(e);
+                }
             }
         };
 
@@ -1562,6 +1715,20 @@ impl VfsCore {
                 wb.trim_upper = None;
                 wb.existing_blob_guid = final_layout.blob_guid().ok();
             }
+        }
+
+        // If this inode is a promoted hardlink (including one discovered
+        // mid-flush when a CAS conflict revealed an Indirect redirect),
+        // persist the record identity + resolved layout/posix onto the
+        // inode entry. Otherwise a later setattr would see inode_id == None,
+        // take the non-hardlink path, and overwrite the name's Indirect
+        // redirect with a normal layout.
+        if let Some(id) = promoted_inode_id
+            && let Some(mut e) = self.inodes.get_mut(ino)
+        {
+            e.inode_id = Some(id);
+            e.posix = crate::inode::layout_posix(&final_layout);
+            e.layout = Some(final_layout.clone());
         }
 
         // Sync the local disk cache to the writer's just-published
@@ -1899,6 +2066,73 @@ impl VfsCore {
         }
     }
 
+    /// Read-modify-write an `InodeRecord` under the same byte-equality CAS
+    /// the record-aware flush uses, retrying on conflict. Without this,
+    /// link / setattr / unlink would read-modify-write the record
+    /// unconditionally and could clobber a concurrent flush that bumped the
+    /// shared blob's version/size (and vice versa). Returns the committed
+    /// record. `NotFound` propagates (the caller decides whether a vanished
+    /// record is an error).
+    async fn cas_mutate_inode_record(
+        &self,
+        inode_id: uuid::Uuid,
+        trace_id: &TraceId,
+        mut mutate: impl FnMut(&mut InodeRecord) -> Result<(), FsError>,
+    ) -> Result<InodeRecord, FsError> {
+        const MAX_RETRIES: u32 = 5;
+        let key = InodeRecord::key_for(inode_id);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let mut record = self.backend().get_inode_record(inode_id, trace_id).await?;
+            // Re-serialize the fetched record as the CAS guard. rkyv output is
+            // deterministic for these map-free layout types, and the override
+            // flush's own CAS already relies on exactly that, so this matches
+            // the stored bytes without a separate raw-bytes fetch.
+            let old_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&record, Vec::new())
+                .map_err(FsError::from)?
+                .into();
+            // A fallible mutate lets the caller abort against the freshly
+            // fetched record (e.g. `link` refusing to revive a record whose
+            // last link is already gone) without publishing anything.
+            mutate(&mut record)?;
+            let new_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&record, Vec::new())
+                .map_err(FsError::from)?
+                .into();
+            match self
+                .backend()
+                .put_inode_cas(&key, new_bytes, old_bytes, trace_id)
+                .await
+            {
+                Ok(_) => return Ok(record),
+                Err(FsError::CasConflict) if attempt < MAX_RETRIES => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Undo the nlink increment a `link` made when its destination publish
+    /// then failed, so a failed first link can't strand a record at an
+    /// inflated count (which would block its eventual reclamation). The
+    /// decrement is itself a retrying CAS (`cas_mutate_inode_record`); if it
+    /// still fails it is surfaced loudly; the residual case needs the same
+    /// orphan-reconcile sweep as the unlink path.
+    async fn compensate_link_increment(&self, inode_id: uuid::Uuid, trace_id: &TraceId) {
+        if let Err(e) = self
+            .cas_mutate_inode_record(inode_id, trace_id, |r| {
+                r.nlink = r.nlink.saturating_sub(1);
+                Ok(())
+            })
+            .await
+        {
+            tracing::warn!(
+                %inode_id, error = %e,
+                "link: could not compensate nlink after a failed destination \
+                 publish; link count may be inflated until reconciled"
+            );
+        }
+    }
+
     /// Create a hardlink `new_parent/new_name` to the file at `inode`.
     ///
     /// The first link promotes the file: its real layout is moved into a
@@ -1952,91 +2186,229 @@ impl VfsCore {
 
         let now = now_ns();
 
-        // Resolve the inode_id + record, bumping nlink. Three arms:
-        //   - cached inode_id: already promoted, fetch + bump.
-        //   - src layout is Indirect: promoted but cache cold, follow it.
-        //   - fresh file: mint a new inode_id, seed the record at nlink=2.
-        let (inode_id, mut record, was_indirect) = if let Some(inode_id) = cached_inode_id {
-            let mut record = self.backend().get_inode_record(inode_id, &trace_id).await?;
-            record.nlink = record.nlink.saturating_add(1);
-            (inode_id, record, true)
+        // POSIX: link(2) bumps the file's ctime. Stamp it into the record's
+        // layout so a later lookup repopulating posix from the record sees
+        // it (the in-memory mutation alone would be lost).
+        let bump_link = |r: &mut InodeRecord| -> Result<(), FsError> {
+            // Refuse to revive a record whose last link is already gone
+            // (nlink == 0, awaiting reclaim by a concurrent unlink). Once
+            // nlink hits 0 it stays there, so the unlink's post-commit
+            // reclaim is safe: a racing link either commits its bump before
+            // the decrement (the decrement then observes nlink > 0 and skips
+            // reclaim) or observes nlink == 0 here and fails with ENOENT.
+            if r.nlink == 0 {
+                return Err(FsError::NotFound);
+            }
+            r.nlink = r.nlink.saturating_add(1);
+            let mut p = crate::inode::layout_posix(&r.layout);
+            p.ctime_ns = now;
+            r.layout = crate::inode::layout_with_posix(r.layout.clone(), p);
+            Ok(())
+        };
+
+        // The Indirect redirect bytes written at a promoted name (non-state
+        // fields are placeholders; the record is authoritative).
+        let make_redirect_bytes = |id: uuid::Uuid| -> Result<Bytes, FsError> {
+            let l = ObjectLayout {
+                timestamp: now / 1_000_000,
+                version_id: ObjectLayout::gen_version_id(),
+                block_size: DEFAULT_BLOCK_SIZE,
+                blob_version: 0,
+                state: ObjectState::Indirect(IndirectEntry { inode_id: id }),
+            };
+            let b: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&l, Vec::new())
+                .map_err(FsError::from)?
+                .into();
+            Ok(b)
+        };
+
+        // Resolve to a shared inode_id, joining or creating the record.
+        //   - cached inode_id: already promoted; bump nlink under CAS.
+        //   - src layout Indirect: promoted, cache cold; follow + bump.
+        //   - fresh normal source: promote ATOMICALLY: mint a record then
+        //     CAS the source's NSS row from its exact normal bytes to an
+        //     Indirect redirect. If that CAS loses (another client promoted
+        //     first), discard our orphan record, re-read the now-Indirect
+        //     redirect, and join the winner's record via the bump path, so
+        //     concurrent first links converge on one record instead of each
+        //     minting a divergent one and clobbering the source redirect.
+        let (inode_id, record) = if let Some(inode_id) = cached_inode_id {
+            let record = self
+                .cas_mutate_inode_record(inode_id, &trace_id, bump_link)
+                .await?;
+            (inode_id, record)
         } else {
-            let src_layout = self.backend().get_inode(&src_key, &trace_id).await?;
-            match &src_layout.state {
-                ObjectState::Indirect(redirect) => {
-                    let inode_id = redirect.inode_id;
-                    let mut record = self.backend().get_inode_record(inode_id, &trace_id).await?;
-                    record.nlink = record.nlink.saturating_add(1);
-                    (inode_id, record, true)
-                }
-                ObjectState::Directory(_) | ObjectState::Mpu(MpuState::Uploading) => {
-                    return Err(FsError::IsDir);
-                }
-                ObjectState::Normal(_)
-                | ObjectState::Mpu(MpuState::Completed(_))
-                | ObjectState::Symlink(_)
-                | ObjectState::Special(_) => {
-                    let inode_id = uuid::Uuid::new_v4();
-                    let record = InodeRecord {
-                        layout: src_layout.clone(),
-                        nlink: 2,
-                        orphan_since: None,
-                    };
-                    (inode_id, record, false)
+            // Promote a fresh source. A source-promotion CAS conflict does
+            // NOT necessarily mean another linker won: a concurrent ordinary
+            // write/chmod can also rewrite a still-normal source. So loop
+            // (bounded): re-read the source each time and either join a
+            // winner's record (now Indirect) or re-promote from the fresh
+            // normal bytes (still Normal). One minted record id is reused
+            // across attempts and dropped if we end up joining.
+            let new_id = uuid::Uuid::new_v4();
+            let mut record_created = false;
+            const MAX_PROMOTE_RETRIES: u32 = 5;
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let src_layout = self.backend().get_inode(&src_key, &trace_id).await?;
+                match &src_layout.state {
+                    ObjectState::Indirect(redirect) => {
+                        let id = redirect.inode_id;
+                        if id == new_id {
+                            // An earlier ambiguous CAS (e.g. a timeout) had
+                            // actually installed our redirect. Recover it as a
+                            // successful promotion rather than deleting new_id
+                            // and dangling the source.
+                            let record = self.backend().get_inode_record(new_id, &trace_id).await?;
+                            break (new_id, record);
+                        }
+                        // Another linker won; the source points elsewhere, so
+                        // our CAS never landed; drop our orphan and join theirs.
+                        if record_created {
+                            let _ = self.backend().delete_inode_record(new_id, &trace_id).await;
+                        }
+                        let record = self
+                            .cas_mutate_inode_record(id, &trace_id, bump_link)
+                            .await?;
+                        break (id, record);
+                    }
+                    ObjectState::Directory(_) | ObjectState::Mpu(MpuState::Uploading) => {
+                        // Source is not Indirect -> our CAS never landed.
+                        if record_created {
+                            let _ = self.backend().delete_inode_record(new_id, &trace_id).await;
+                        }
+                        return Err(FsError::IsDir);
+                    }
+                    ObjectState::Normal(_)
+                    | ObjectState::Mpu(MpuState::Completed(_))
+                    | ObjectState::Symlink(_)
+                    | ObjectState::Special(_) => {
+                        if attempt > MAX_PROMOTE_RETRIES {
+                            // Still normal after all retries -> our CAS never
+                            // landed -> new_id is a true orphan.
+                            if record_created {
+                                let _ = self.backend().delete_inode_record(new_id, &trace_id).await;
+                            }
+                            return Err(FsError::CasConflict);
+                        }
+                        let record = InodeRecord {
+                            layout: crate::inode::layout_with_posix(src_layout.clone(), {
+                                let mut p = crate::inode::layout_posix(&src_layout);
+                                p.ctime_ns = now;
+                                p
+                            }),
+                            nlink: 2,
+                            orphan_since: None,
+                        };
+                        // (Re)seed the record from the current bytes, then
+                        // flip the source row guarded on those exact bytes
+                        // (the current normal layout re-serialized). On ANY CAS
+                        // failure, conflict OR ambiguous (timeout), do NOT
+                        // delete here: loop and re-read. The next iteration
+                        // recovers (Indirect == new_id), joins (Indirect !=
+                        // new_id), or re-promotes (still Normal).
+                        let src_bytes: Bytes =
+                            to_bytes_in::<_, rkyv::rancor::Error>(&src_layout, Vec::new())
+                                .map_err(FsError::from)?
+                                .into();
+                        self.backend()
+                            .put_inode_record(new_id, &record, &trace_id)
+                            .await?;
+                        record_created = true;
+                        if self
+                            .backend()
+                            .put_inode_cas(
+                                &src_key,
+                                make_redirect_bytes(new_id)?,
+                                src_bytes,
+                                &trace_id,
+                            )
+                            .await
+                            .is_ok()
+                        {
+                            break (new_id, record);
+                        }
+                    }
                 }
             }
         };
 
-        // POSIX: link(2) bumps the file's ctime. Stamp it into the
-        // record's layout so a later lookup repopulating posix from the
-        // record sees it (the in-memory mutation alone would be lost).
-        record.layout = crate::inode::layout_with_posix(record.layout.clone(), {
-            let mut p = crate::inode::layout_posix(&record.layout);
-            p.ctime_ns = now;
-            p
-        });
-
-        // 1. Persist the InodeRecord first.
-        self.backend()
-            .put_inode_record(inode_id, &record, &trace_id)
-            .await?;
-
-        // 2. The redirect layout written at each name. Its non-state
-        //    fields are placeholders; the record is authoritative.
-        let redirect_layout = ObjectLayout {
-            timestamp: now / 1_000_000,
-            version_id: ObjectLayout::gen_version_id(),
-            block_size: DEFAULT_BLOCK_SIZE,
-            blob_version: 0,
-            state: ObjectState::Indirect(IndirectEntry { inode_id }),
-        };
-        let redirect_bytes: Bytes =
-            to_bytes_in::<_, rkyv::rancor::Error>(&redirect_layout, Vec::new())
-                .map_err(FsError::from)?
-                .into();
-
-        // 3. On a fresh promotion, replace the source's NSS entry with
-        //    the redirect. For an already-promoted source it's already
-        //    a redirect, so leave it.
-        if !was_indirect {
-            self.backend()
-                .put_inode(&src_key, redirect_bytes.clone(), &trace_id)
-                .await?;
-        }
-
-        // 4. Write the destination redirect.
-        self.backend()
-            .put_inode(&new_key, redirect_bytes, &trace_id)
-            .await?;
-
-        // 5. Update the InodeTable: cache the resolved layout + posix +
-        //    inode_id on the source inode, and map the new name to it.
+        // Persist the source's resolved hardlink identity NOW, before the
+        // destination write. If the destination absence-CAS below fails
+        // (EEXIST), the source must not be left cached as a normal layout
+        // with inode_id == None; a later setattr would then take the
+        // non-hardlink path and publish that stale layout over the source's
+        // Indirect redirect.
         if let Some(mut e) = self.inodes.get_mut(inode) {
             e.layout = Some(record.layout.clone());
             e.posix = crate::inode::layout_posix(&record.layout);
             e.inode_id = Some(inode_id);
             e.cache_expiry = std::time::Instant::now();
         }
+
+        // Create the destination redirect with an absence CAS (empty
+        // expected_old requires the key to be absent). Two concurrent links
+        // to the same new name, or different sources racing the same name,
+        // can both pass the earlier existence check; the absence CAS lets
+        // only one win.
+        //
+        // Reconcile the outcome carefully so a failed publish never strands
+        // the record at an inflated nlink, and, more importantly, never
+        // *under*-counts a live destination (which would let a later source
+        // unlink drive nlink to 0 and reclaim a still-referenced record):
+        //   - Ok: our redirect landed -> success.
+        //   - CasConflict: the name is taken -> EEXIST + compensate.
+        //   - other (ambiguous, e.g. timeout): re-read the name's exact
+        //     bytes. Only if they equal the exact redirect WE wrote did our
+        //     publish land (matching inode_id alone is insufficient: two
+        //     concurrent links to the same destination share it); then it is
+        //     success. If the name holds other bytes -> EEXIST + compensate.
+        //     If it is confirmed absent -> the publish did not land ->
+        //     surface the error + compensate. If the re-read itself fails we
+        //     CANNOT confirm absence, so we do NOT compensate (an inflated
+        //     count merely leaks; under-counting a live link loses data).
+        let dst_redirect = make_redirect_bytes(inode_id)?;
+        match self
+            .backend()
+            .put_inode_cas(&new_key, dst_redirect.clone(), Bytes::new(), &trace_id)
+            .await
+        {
+            Ok(_) => {}
+            Err(FsError::CasConflict) => {
+                self.compensate_link_increment(inode_id, &trace_id).await;
+                return Err(FsError::AlreadyExists);
+            }
+            Err(e) => match self.backend().get_inode(&new_key, &trace_id).await {
+                Ok(l) => {
+                    // Re-serialize and compare to the exact redirect we wrote:
+                    // equal iff our (ambiguous) CAS actually landed. rkyv is
+                    // deterministic for these types.
+                    let raw: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&l, Vec::new())
+                        .map_err(FsError::from)?
+                        .into();
+                    if raw != dst_redirect {
+                        // Name occupied by something we did not write.
+                        self.compensate_link_increment(inode_id, &trace_id).await;
+                        return Err(FsError::AlreadyExists);
+                    }
+                    // Our redirect is present -> the ambiguous CAS landed ->
+                    // success (fall through).
+                }
+                Err(FsError::NotFound) => {
+                    // Confirmed absent -> publish did not land.
+                    self.compensate_link_increment(inode_id, &trace_id).await;
+                    return Err(e);
+                }
+                Err(_reread_err) => {
+                    // Indeterminate: the publish may have committed. Leave
+                    // nlink as-is rather than risk under-counting a live link.
+                    return Err(e);
+                }
+            },
+        }
+
+        // Map the new name to the inode and refresh dir caches/times.
         self.inodes.add_alias(&new_key, EntryType::File, inode);
 
         self.dir_cache.invalidate(&new_prefix);
@@ -2590,7 +2962,19 @@ impl VfsCore {
                 .map(|l| crate::inode::layout_with_posix(l.clone(), new_posix));
             let s3_key = entry.s3_key.clone();
             let name_removed = entry.name_removed;
-            (s3_key, updated_layout, name_removed, entry.inode_id)
+            // Derive the hardlink id from a cached Indirect redirect when the
+            // entry's `inode_id` was never set (e.g. the layout was cached by
+            // a plain readdir that did not resolve it). Without this the
+            // metadata update would take the non-hardlink path and overwrite
+            // the redirect with a normal layout.
+            let inode_id = entry.inode_id.or_else(|| match entry.layout.as_ref() {
+                Some(l) => match &l.state {
+                    ObjectState::Indirect(redir) => Some(redir.inode_id),
+                    _ => None,
+                },
+                None => None,
+            });
+            (s3_key, updated_layout, name_removed, inode_id)
         };
 
         // The dentry was unlinked; skip the NSS publish so we don't
@@ -2607,15 +2991,58 @@ impl VfsCore {
             // every name observes the chmod/chown/utimes; nlink and
             // orphan_since are preserved.
             if let Some(id) = inode_id {
-                if let Some(mut e) = self.inodes.get_mut(inode) {
-                    e.layout = Some(layout.clone());
-                }
                 let trace_id = TraceId::new();
-                let mut record = self.backend().get_inode_record(id, &trace_id).await?;
-                record.layout = layout;
-                self.backend()
-                    .put_inode_record(id, &record, &trace_id)
+                // Apply only the requested posix deltas to the FRESHLY
+                // fetched record layout inside the CAS. Replacing the whole
+                // layout with the snapshot-derived `layout` would restore a
+                // stale size/blob_version if a hardlink-write flush bumped
+                // the record between our snapshot and this CAS; and merging
+                // field-by-field (rather than overwriting posix wholesale)
+                // preserves a concurrent change to fields this call does not
+                // touch.
+                let committed = self
+                    .cas_mutate_inode_record(id, &trace_id, |r| {
+                        let mut p = crate::inode::layout_posix(&r.layout);
+                        if let Some(m) = mode
+                            && m != 0
+                        {
+                            p.mode = m;
+                        }
+                        if let Some(u) = uid {
+                            p.uid = u;
+                        }
+                        if let Some(g) = gid {
+                            p.gid = g;
+                        }
+                        if let Some(mt) = mtime_ns {
+                            p.mtime_ns = mt;
+                        }
+                        if let Some(c) = ctime_ns {
+                            p.ctime_ns = c;
+                        } else if mode.is_some_and(|m| m != 0)
+                            || uid.is_some()
+                            || gid.is_some()
+                            || atime_ns.is_some()
+                            || mtime_ns.is_some()
+                        {
+                            p.ctime_ns = now_ns();
+                        }
+                        r.layout = crate::inode::layout_with_posix(r.layout.clone(), p);
+                        Ok(())
+                    })
                     .await?;
+                // Reflect the committed record (our deltas + any concurrent
+                // flush's size/version) into the local cache. Persist the
+                // hardlink id too: when it was derived from a cached Indirect
+                // redirect rather than `entry.inode_id`, the committed layout
+                // we cache is the record's normal layout, so without setting
+                // inode_id a second setattr would see a normal layout with no
+                // id, take the non-hardlink path, and clobber the redirect.
+                if let Some(mut e) = self.inodes.get_mut(inode) {
+                    e.inode_id = Some(id);
+                    e.posix = crate::inode::layout_posix(&committed.layout);
+                    e.layout = Some(committed.layout.clone());
+                }
                 return Ok(());
             }
 
@@ -2742,6 +3169,7 @@ impl VfsCore {
 
         let s3_key = entry.s3_key.clone();
         let layout = entry.layout.clone();
+        let cached_inode_id = entry.inode_id;
         drop(entry);
 
         // Enforce single-writer per inode. The first writer
@@ -2753,16 +3181,64 @@ impl VfsCore {
             self.acquire_write_lock_retry(inode, fh).await?;
         }
 
-        // Resolve layout if not cached
-        let layout = match layout {
-            Some(l) => Some(l),
-            None => {
-                let trace_id = TraceId::new();
-                match self.backend().get_inode(&s3_key, &trace_id).await {
+        // Resolve the layout (cold-fetch on a cache miss, then follow a
+        // hardlink redirect to the shared record's real layout) and persist
+        // any resolved hardlink identity back to the inode table. Wrapped so
+        // a failure after the write lock was acquired still releases it;
+        // otherwise the inode is left permanently EBUSY.
+        //
+        // Persisting the resolved `inode_id` is also what stops a cold-cache
+        // Indirect entry (e.g. populated by readdirplus/NFS without a prior
+        // vfs_lookup) from flushing a Normal layout over its redirect: the
+        // flush keys its record-aware path on `entry.inode_id`. The redirect
+        // itself has no blob_guid, so the resolved real layout is also what
+        // lets the write buffer seed from the shared blob and reconcile at
+        // the correct blob_version. Covers a cold cache (layout is
+        // `Indirect`) and a warm one (cached `inode_id`, possibly a stale
+        // pre-promotion layout copy).
+        let resolved = async {
+            let layout = match layout {
+                Some(l) => Some(l),
+                None => match self.backend().get_inode(&s3_key, &TraceId::new()).await {
                     Ok(l) => Some(l),
                     Err(FsError::NotFound) if is_write => None,
                     Err(e) => return Err(e),
+                },
+            };
+            match layout {
+                Some(l) => {
+                    let (real, resolved_id) = if let Some(id) = cached_inode_id {
+                        let real = self
+                            .backend()
+                            .get_inode_record(id, &TraceId::new())
+                            .await?
+                            .layout;
+                        (real, Some(id))
+                    } else if matches!(l.state, ObjectState::Indirect(_)) {
+                        let (real, id, _nlink) = self.resolve_indirect(l, &TraceId::new()).await?;
+                        (real, id)
+                    } else {
+                        (l, None)
+                    };
+                    if let Some(id) = resolved_id
+                        && let Some(mut e) = self.inodes.get_mut(inode)
+                    {
+                        e.inode_id = Some(id);
+                        e.layout = Some(real.clone());
+                    }
+                    Ok(Some(real))
                 }
+                None => Ok(None),
+            }
+        }
+        .await;
+        let layout = match resolved {
+            Ok(l) => l,
+            Err(e) => {
+                if is_write {
+                    self.release_write_lock(inode, fh);
+                }
+                return Err(e);
             }
         };
 
@@ -3853,40 +4329,59 @@ impl VfsCore {
             }
             ObjectState::Indirect(redirect) => {
                 let inode_id = redirect.inode_id;
-                if let Ok(mut record) = self.backend().get_inode_record(inode_id, trace_id).await {
-                    record.nlink = record.nlink.saturating_sub(1);
-                    if record.nlink > 0 {
-                        // POSIX: a successful unlink bumps the surviving
-                        // file's ctime. Stamp it into the record so the
-                        // next lookup-driven posix refresh keeps it.
-                        record.layout = crate::inode::layout_with_posix(record.layout.clone(), {
-                            let mut p = crate::inode::layout_posix(&record.layout);
+                // Whether an open fd still references the inode is
+                // independent of nlink; decide it up front so the CAS
+                // mutation can fold orphan-marking into the same write.
+                let still_open = ino_hint
+                    .map(|i| self.has_open_handles_for_inode(i, None))
+                    .unwrap_or(false);
+                // CAS-decrement so a concurrent record-aware flush isn't
+                // clobbered (and vice versa); on nlink>0 stamp the surviving
+                // file's ctime, on the last link mark orphan if a handle
+                // still holds it.
+                let committed = self
+                    .cas_mutate_inode_record(inode_id, trace_id, |r| {
+                        r.nlink = r.nlink.saturating_sub(1);
+                        if r.nlink > 0 {
+                            let mut p = crate::inode::layout_posix(&r.layout);
                             p.ctime_ns = now_ns();
-                            p
-                        });
-                        let _ = self
-                            .backend()
-                            .put_inode_record(inode_id, &record, trace_id)
-                            .await;
-                    } else {
-                        let still_open = ino_hint
-                            .map(|i| self.has_open_handles_for_inode(i, None))
-                            .unwrap_or(false);
-                        if still_open {
-                            // Last link gone but a handle survives: keep
-                            // the record (orphaned) so the open fd still
-                            // resolves; scan/repair reclaims it later.
-                            record.orphan_since = Some(now_ns());
-                            let _ = self
-                                .backend()
-                                .put_inode_record(inode_id, &record, trace_id)
-                                .await;
-                        } else {
+                            r.layout = crate::inode::layout_with_posix(r.layout.clone(), p);
+                        } else if still_open {
+                            r.orphan_since = Some(now_ns());
+                        }
+                        Ok(())
+                    })
+                    .await;
+                match committed {
+                    Ok(record) if record.nlink == 0 && !still_open => {
+                        // Reclaim the shared blob + record. This is safe
+                        // against a racing link: `bump_link` refuses to
+                        // revive an nlink==0 record, so a link can only have
+                        // committed *before* our decrement (then we observe
+                        // nlink>0 above and skip), never after. The re-read
+                        // confirms nlink is still 0 before deleting.
+                        if let Ok(fresh) = self.backend().get_inode_record(inode_id, trace_id).await
+                            && fresh.nlink == 0
+                        {
                             self.backend()
-                                .delete_blob_blocks(&record.layout, trace_id)
+                                .delete_blob_blocks(&fresh.layout, trace_id)
                                 .await;
                             let _ = self.backend().delete_inode_record(inode_id, trace_id).await;
                         }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        // The name is already removed but the shared link
+                        // count could not be decremented (e.g. CAS retries
+                        // exhausted under sustained contention). Surface it
+                        // rather than silently leaving st_nlink too high /
+                        // leaking the blob; a record repair/GC sweep would
+                        // reconcile.
+                        tracing::warn!(
+                            %inode_id, error = %e,
+                            "unlink: failed to decrement hardlink record nlink; \
+                             link count may be stale until reconciled"
+                        );
                     }
                 }
             }
@@ -4234,31 +4729,84 @@ impl VfsCore {
         let dir_entries = self.fetch_dir_entries(parent, &prefix).await?;
 
         let offset = offset as usize;
-        let entries: Result<Vec<VfsDirEntryPlus>, FsError> = dir_entries
-            .iter()
-            .skip(offset)
-            .enumerate()
-            .map(|(idx, entry)| {
-                let attr = if entry.is_dir {
-                    self.make_dir_attr(entry.ino)
-                } else {
-                    self.inodes
-                        .get(entry.ino)
-                        .and_then(|e| e.layout.as_ref().map(|l| self.make_file_attr(entry.ino, l)))
-                        .transpose()?
-                        .unwrap_or_else(|| self.make_default_file_attr(entry.ino))
-                };
-                Ok(VfsDirEntryPlus {
-                    ino: entry.ino,
-                    is_dir: entry.is_dir,
-                    name: entry.name.clone(),
-                    offset: (offset + idx + 1) as u64,
-                    attr,
-                })
-            })
-            .collect();
+        let trace_id = TraceId::new();
+        let mut entries: Vec<VfsDirEntryPlus> =
+            Vec::with_capacity(dir_entries.len().saturating_sub(offset));
+        // Per-page cache so a directory holding many aliases of one hardlink
+        // resolves the shared InodeRecord once, not once per name (otherwise
+        // a single readdirplus fans out into N identical record RPCs).
+        let mut record_cache: std::collections::HashMap<uuid::Uuid, InodeRecord> =
+            std::collections::HashMap::new();
+        for (idx, entry) in dir_entries.iter().skip(offset).enumerate() {
+            let attr = if entry.is_dir {
+                self.make_dir_attr(entry.ino)
+            } else {
+                // Clone the cached layout out (dropping the map guard before
+                // any await), then resolve a hardlink redirect to the shared
+                // record's real layout: make_file_attr needs a sized layout,
+                // and an `Indirect` redirect has none; `layout.size()`
+                // would error and fail the whole readdirplus, surfacing as
+                // EINVAL on the first `ls` of a directory holding a hardlink.
+                let (cached_layout, cached_id) = self
+                    .inodes
+                    .get(entry.ino)
+                    .map(|e| (e.layout.clone(), e.inode_id))
+                    .unwrap_or((None, None));
+                match cached_layout {
+                    Some(l) => {
+                        // A hardlink alias either already carries the record
+                        // id on its entry (a prior pass replaced the Indirect
+                        // redirect with the record's normal layout) or still
+                        // has the Indirect redirect cached. Either way resolve
+                        // through the per-page record cache.
+                        let id_opt = cached_id.or(match &l.state {
+                            ObjectState::Indirect(redir) => Some(redir.inode_id),
+                            _ => None,
+                        });
+                        let (resolved, resolved_id, nlink) = if let Some(id) = id_opt {
+                            let rec = match record_cache.get(&id) {
+                                Some(r) => r.clone(),
+                                None => {
+                                    let r = self.backend().get_inode_record(id, &trace_id).await?;
+                                    record_cache.insert(id, r.clone());
+                                    r
+                                }
+                            };
+                            (rec.layout, Some(id), rec.nlink)
+                        } else {
+                            (l, None, 1)
+                        };
+                        // Persist the resolved hardlink identity + real
+                        // layout + record posix so later lookups/opens/
+                        // flushes target the shared record, and so the attr
+                        // below reports the record's mode/uid/gid/times
+                        // rather than stale cached defaults.
+                        if let Some(id) = resolved_id
+                            && let Some(mut e) = self.inodes.get_mut(entry.ino)
+                        {
+                            e.inode_id = Some(id);
+                            e.posix = crate::inode::layout_posix(&resolved);
+                            e.layout = Some(resolved.clone());
+                        }
+                        let mut attr = self.make_file_attr(entry.ino, &resolved)?;
+                        // resolve_indirect returns the record's true link
+                        // count; the redirect layout carries none.
+                        attr.nlink = nlink;
+                        attr
+                    }
+                    None => self.make_default_file_attr(entry.ino),
+                }
+            };
+            entries.push(VfsDirEntryPlus {
+                ino: entry.ino,
+                is_dir: entry.is_dir,
+                name: entry.name.clone(),
+                offset: (offset + idx + 1) as u64,
+                attr,
+            });
+        }
 
-        entries
+        Ok(entries)
     }
 
     /// Stateless read by inode (for NFS). Opens, reads, and releases in one call.

@@ -467,10 +467,15 @@ impl StorageBackend {
         Ok(parse_put_inode_cas(resp)?)
     }
 
-    /// Fetch the `InodeRecord` backing a hardlink-promoted inode from
-    /// its `#hardlink/<inode_id>` NSS key. Uses the raw `get_inode` RPC
-    /// (rather than `get_inode`, which deserialises as `ObjectLayout`)
-    /// so the bytes can be decoded as an `InodeRecord` instead.
+    /// Fetch the `InodeRecord` backing a hardlink-promoted inode from its
+    /// `#hardlink/<inode_id>` NSS key. Uses the raw `get_inode` RPC and
+    /// decodes the bytes as an `InodeRecord` (rather than `ObjectLayout`).
+    ///
+    /// Callers that CAS-update a record re-serialize the value returned here
+    /// as `expected_old_value`. That is sound because rkyv output is
+    /// deterministic for these map-free layout types -- the override-flush's
+    /// own s3_key CAS already re-serializes a fetched `ObjectLayout` the same
+    /// way -- so a separate exact-bytes fetch is unnecessary.
     pub async fn get_inode_record(
         &self,
         inode_id: uuid::Uuid,
@@ -489,7 +494,7 @@ impl StorageBackend {
             trace_id
         )
         .await?;
-        let bytes = match resp.result {
+        let bytes: Bytes = match resp.result {
             Some(nss_codec::get_inode_response::Result::Ok(b)) => b,
             Some(nss_codec::get_inode_response::Result::ErrNotFound(()))
             | Some(nss_codec::get_inode_response::Result::ErrNoSuchRootBlob(())) => {
