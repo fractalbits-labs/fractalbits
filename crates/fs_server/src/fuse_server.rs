@@ -62,16 +62,27 @@ impl Filesystem for FuseServer {
 
     async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FsResult<ReplyEntry> {
         let name_str = name.to_str().ok_or(libc::EINVAL)?;
-        let attr = self
-            .vfs
-            .vfs_lookup(parent, name_str)
-            .await
-            .map_err(fs_err)?;
-        Ok(ReplyEntry {
-            ttl: TTL,
-            attr: to_file_attr(&attr),
-            generation: 0,
-        })
+        match self.vfs.vfs_lookup(parent, name_str).await {
+            Ok(attr) => Ok(ReplyEntry {
+                ttl: TTL,
+                attr: to_file_attr(&attr),
+                generation: 0,
+            }),
+            // Negative-dentry caching: nodeid = 0 + non-zero TTL tells
+            // the kernel the name is absent, so the next LOOKUP for the
+            // same (parent, name) -- e.g. tar's CREATE precheck -- is
+            // served from the dcache and never reaches us. vfs_lookup
+            // already serves pending-writeback and open-handle entries,
+            // so a NotFound here is a genuine absence. Safe under 1W:NR:
+            // the CREATE that follows promotes the dentry to positive,
+            // and the TTL bounds any staleness window.
+            Err(FsError::NotFound) => Ok(ReplyEntry {
+                ttl: TTL,
+                attr: to_file_attr(&VfsAttr::negative_dentry()),
+                generation: 0,
+            }),
+            Err(e) => Err(fs_err(e)),
+        }
     }
 
     fn forget(&self, _req: Request, inode: u64, nlookup: u64) {
@@ -105,7 +116,14 @@ impl Filesystem for FuseServer {
         // EPERM contract ourselves. root (uid 0) bypasses the whole
         // block.
         if req.uid != 0 {
-            let cur = self.vfs.vfs_getattr(inode, fh).await.map_err(fs_err)?;
+            // In-memory attrs are sufficient for ordinary inodes. Hardlinks
+            // store owner/mode in the shared NSS record, so permission checks
+            // must read the authoritative record instead of a stale alias cache.
+            let cur = if self.vfs.is_hardlink(inode) {
+                self.vfs.vfs_getattr(inode, fh).await.map_err(fs_err)?
+            } else {
+                self.vfs.vfs_getattr_inmem(inode, fh).map_err(fs_err)?
+            };
             let is_owner = cur.uid == req.uid;
             // chmod by a non-owner is EPERM. In writeback-cache mode the
             // kernel never forwards a suid-clear-on-write as a setattr
@@ -234,9 +252,24 @@ impl Filesystem for FuseServer {
                 .map_err(fs_err)?;
         }
 
-        // Reply through vfs_getattr so the size field reflects an
-        // in-flight write buffer.
-        let attr = self.vfs.vfs_getattr(inode, fh).await.map_err(fs_err)?;
+        // Reply from in-memory state: setattr_posix has already applied
+        // the new mode/owner/times to the inode's posix, and the cached
+        // layout carries size + type -- no backend round-trip needed.
+        // (A size-changing setattr handled via vfs_setattr_size above
+        // updates the write buffer, which vfs_getattr_inmem reads.)
+        //
+        // Exception: a hardlinked inode's nlink (and shared posix) live in
+        // the NSS record, which the in-memory attr can't see. It reports
+        // nlink=1, and the kernel caches that for every name, so a later
+        // lstat on any link returns the wrong count (link/00.t: a
+        // chmod/chown clobbers nlink for all names). Reply through the full
+        // getattr for those; the common non-hardlink case keeps the
+        // in-memory fast path (utimensat on tar).
+        let attr = if self.vfs.is_hardlink(inode) {
+            self.vfs.vfs_getattr(inode, fh).await.map_err(fs_err)?
+        } else {
+            self.vfs.vfs_getattr_inmem(inode, fh).map_err(fs_err)?
+        };
         Ok(ReplyAttr {
             ttl: TTL,
             attr: to_file_attr(&attr),
@@ -324,12 +357,17 @@ impl Filesystem for FuseServer {
         Ok(written as usize)
     }
 
-    async fn flush(&self, _req: Request, _inode: u64, fh: u64, _lock_owner: u64) -> FsResult<()> {
-        // FUSE_FLUSH fires on every close(2). It is not a durability
-        // request -- POSIX only requires errors-on-close to propagate --
-        // so use the no-drain variant to keep writeback cycles async and
-        // avoid serialising create-heavy workloads against the worker.
-        self.vfs.vfs_flush_no_drain(fh).await.map_err(fs_err)
+    async fn flush(&self, _req: Request, _inode: u64, _fh: u64, _lock_owner: u64) -> FsResult<()> {
+        // FUSE_FLUSH fires on every close(2). POSIX close requires only
+        // error propagation, not durability, so do no work here: the
+        // actual publish runs in FUSE_RELEASE, off the FUSE worker thread
+        // (see `release`). That lets create-heavy workloads (tar -xf,
+        // cp -r) pipeline closes instead of serialising each one against
+        // a synchronous BSS+NSS publish. A flush error that would have
+        // surfaced here is instead recorded as a deferred taint and
+        // surfaces on the next fsync / open of the same path; fsync(2)
+        // still drains the writeback barrier for true durability.
+        Ok(())
     }
 
     async fn fsync(&self, _req: Request, _inode: u64, fh: u64, _datasync: bool) -> FsResult<()> {
@@ -374,6 +412,17 @@ impl Filesystem for FuseServer {
         _flock_release: bool,
     ) -> FsResult<()> {
         self.vfs.release_passthrough(fh);
+        // In Default writeback mode a dirty handle flushes asynchronously:
+        // spawn the publish off the FUSE worker thread and reply to the
+        // kernel immediately, so distinct-inode closes (every tar file)
+        // pipeline their BSS+NSS round-trips instead of serialising. The
+        // spawned flush registers a writeback cycle, so fsync / unlink /
+        // open barriers still wait for it. Read-only / clean handles and
+        // Strict mode fall through to the synchronous inline release.
+        if let Some((ino, file_size)) = self.vfs.peek_release_state(fh) {
+            self.vfs.clone().spawn_release_flush(fh, ino, file_size);
+            return Ok(());
+        }
         self.vfs.vfs_release(fh).await.map_err(fs_err)
     }
 

@@ -14,7 +14,7 @@ use crate::config::WritebackMode;
 use crate::disk_cache::DiskCache;
 use crate::error::FsError;
 use crate::inode::{EntryType, InodeTable, ROOT_INODE};
-use crate::writeback::{FhId, Generation, InodeOp as WbInodeOp, WritebackQueue};
+use crate::writeback::{FhId, FileCommitStage, Generation, InodeOp as WbInodeOp, WritebackQueue};
 use data_types::object_layout::{
     DirectoryData, IndirectEntry, InodeRecord, MpuState, ObjectCoreMetaData, ObjectLayout,
     ObjectMetaData, ObjectState, PosixAttrs, SpecialData, SpecialKind, SymlinkData,
@@ -48,6 +48,34 @@ pub struct VfsAttr {
     pub gid: u32,
     pub rdev: u32,
     pub blksize: u32,
+}
+
+impl VfsAttr {
+    /// Synthetic `VfsAttr` for a negative-dentry FUSE_LOOKUP reply.
+    /// `ino == 0` is the FUSE protocol sentinel for "name does not
+    /// exist"; combined with a non-zero entry TTL the kernel caches
+    /// the absence and skips future LOOKUPs for the same name. The
+    /// kernel reads only `nodeid` for negative entries, so the rest
+    /// are zeros.
+    pub fn negative_dentry() -> Self {
+        Self {
+            ino: 0,
+            size: 0,
+            blocks: 0,
+            atime_secs: 0,
+            mtime_secs: 0,
+            ctime_secs: 0,
+            atime_ns_part: 0,
+            mtime_ns_part: 0,
+            ctime_ns_part: 0,
+            mode: 0,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +367,17 @@ impl VfsCore {
         self.inodes.get_s3_key(ino)
     }
 
+    fn cache_dir_entry(&self, prefix: &str, name: &str, ino: u64, is_dir: bool) {
+        self.dir_cache.upsert(
+            prefix,
+            DirEntry {
+                name: name.to_string(),
+                ino,
+                is_dir,
+            },
+        );
+    }
+
     fn check_write_enabled(&self) -> Result<(), FsError> {
         if !self.read_write {
             return Err(FsError::ReadOnly);
@@ -387,6 +426,17 @@ impl VfsCore {
     /// latency grew). A genuinely concurrent writer keeps its handle open
     /// past the budget and still gets EBUSY.
     async fn acquire_write_lock_retry(&self, inode: u64, fh: u64) -> Result<(), FsError> {
+        if self.acquire_write_lock(inode, fh).is_ok() {
+            return Ok(());
+        }
+        // The lock may be held by an in-flight async close-flush:
+        // FUSE_RELEASE spawns `vfs_release` off-thread and only drops the
+        // write lock once the publish lands. Drain this inode's writeback
+        // barrier so a re-open of a just-closed file (e.g. an O_TRUNC
+        // reopen, or `echo x > f; cat f`) waits for the prior close to
+        // commit (and reads its freshly published layout) instead of
+        // spuriously failing EBUSY. No-op on an idle inode.
+        let _ = self.drain_inode_to_barrier(inode).await;
         if self.acquire_write_lock(inode, fh).is_ok() {
             return Ok(());
         }
@@ -1717,6 +1767,19 @@ impl VfsCore {
             }
         }
 
+        // Mirror the just-published layout onto the inode entry so a
+        // subsequent getattr / setattr can serve the correct size + type
+        // from memory without a cross-instance coherency round-trip. The
+        // single-writer-per-inode lock makes the local layout
+        // authoritative for this window. The promoted-hardlink block
+        // below re-sets `entry.layout` from the resolved record, so skip
+        // it here when this inode is promoted.
+        if promoted_inode_id.is_none()
+            && let Some(mut e) = self.inodes.get_mut(ino)
+        {
+            e.layout = Some(final_layout.clone());
+        }
+
         // If this inode is a promoted hardlink (including one discovered
         // mid-flush when a CAS conflict revealed an Indirect redirect),
         // persist the record identity + resolved layout/posix onto the
@@ -1730,6 +1793,14 @@ impl VfsCore {
             e.posix = crate::inode::layout_posix(&final_layout);
             e.layout = Some(final_layout.clone());
         }
+
+        let parent_prefix = parent_prefix_of(&s3_key);
+        let name = s3_key
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .map(|(_, n)| n.to_string())
+            .unwrap_or_else(|| s3_key.clone());
+        self.cache_dir_entry(&parent_prefix, &name, ino, false);
 
         // Sync the local disk cache to the writer's just-published
         // state: rewrites land at their natural offsets, deletes
@@ -1789,10 +1860,12 @@ impl VfsCore {
         // Publish the authoritative blob-geometry sentinel so a peer instance
         // serving vfs_getattr from a stale cached layout still observes the
         // latest cross-instance size override (the inode size+blob_version it
-        // cached may lag this flush). Written at the just-published
-        // blob_version via the normal block path (no batch RPC); best-effort,
-        // since the inode itself is already durable in NSS.
-        if let Ok(geom_guid) = final_layout.blob_guid() {
+        // cached may lag this flush). Initial creates use a fresh blob_guid
+        // and publish exact size in NSS, so only override versions need this
+        // extra BSS write.
+        if final_layout.blob_version > 1
+            && let Ok(geom_guid) = final_layout.blob_guid()
+        {
             let new_bc = file_size.div_ceil(block_size as u64) as u32;
             let info = BlobInfo {
                 total_size: file_size,
@@ -1822,10 +1895,6 @@ impl VfsCore {
                 entry.layout = Some(final_layout);
             }
         }
-
-        // Invalidate dir cache for parent prefix
-        let parent_prefix = parent_prefix_of(&s3_key);
-        self.dir_cache.invalidate(&parent_prefix);
 
         Ok(())
     }
@@ -1945,9 +2014,7 @@ impl VfsCore {
             }
         }
 
-        let entries = Arc::new(all_entries);
-        self.dir_cache.insert(prefix.to_string(), entries.clone());
-        Ok(entries)
+        Ok(self.dir_cache.insert(prefix.to_string(), all_entries))
     }
 
     // ── Public VFS operations ──
@@ -2168,6 +2235,10 @@ impl VfsCore {
 
         let trace_id = TraceId::new();
 
+        if let Some(ino) = self.inodes.find_ino_by_key(&new_key, EntryType::File) {
+            self.drain_inode_to_barrier(ino).await?;
+        }
+
         // EEXIST if the destination name already exists. This also
         // subsumes the `link(a, a)` case (the source name is live, so
         // get_inode returns it), without a separate `new_key ==
@@ -2182,7 +2253,7 @@ impl VfsCore {
 
         // Drain a pending publish for the source so we promote against
         // the post-flush layout, not a stale placeholder.
-        let _ = self.drain_inode_to_barrier(inode).await;
+        self.drain_inode_to_barrier(inode).await?;
 
         let now = now_ns();
 
@@ -2411,7 +2482,7 @@ impl VfsCore {
         // Map the new name to the inode and refresh dir caches/times.
         self.inodes.add_alias(&new_key, EntryType::File, inode);
 
-        self.dir_cache.invalidate(&new_prefix);
+        self.cache_dir_entry(&new_prefix, new_name, inode, false);
         self.touch_parent_times(new_parent);
 
         let mut attr = self.make_file_attr(inode, &record.layout)?;
@@ -2429,6 +2500,12 @@ impl VfsCore {
         } else {
             format!("{}{}", prefix, name)
         };
+
+        // Directory membership survives FUSE_FORGET. Local mutations
+        // invalidate this snapshot, and its TTL bounds peer changes.
+        if let Some(false) = self.dir_cache.contains_name(&prefix, name) {
+            return Err(FsError::NotFound);
+        }
 
         let trace_id = TraceId::new();
 
@@ -2703,6 +2780,68 @@ impl VfsCore {
         }
     }
 
+    /// In-memory-only attributes: like `vfs_getattr` but never touches
+    /// the backend. Serves uid/gid/mode/times from the inode entry's
+    /// `posix` and size/type from the cached `layout` (which the flush
+    /// keeps current under the single-writer lock). Used on the setattr
+    /// path (both the permission precheck and the post-mutation reply),
+    /// so a `chmod`/`chown`/`utimensat` does not pay the two
+    /// cross-instance coherency round-trips `vfs_getattr` makes
+    /// (`get_inode` on a cold layout, `get_blob_info` size sentinel).
+    /// This is the dominant per-file cost on create-heavy workloads
+    /// (tar -xf issues one `utimensat` per file). Cross-instance
+    /// freshness is still provided by the 1s FUSE attr TTL, after which
+    /// the kernel re-issues a full `getattr`.
+    ///
+    /// True if the inode is a promoted hardlink (its `nlink` and shared
+    /// posix live in the NSS `InodeRecord`, not the in-memory entry). The
+    /// in-memory attr fast path below can't see that nlink, so a caller
+    /// that replies an attr to the kernel must resolve the record for
+    /// these (otherwise it clobbers the kernel's cached link count to 1).
+    pub fn is_hardlink(&self, inode: u64) -> bool {
+        self.inodes
+            .get(inode)
+            .map(|e| e.inode_id.is_some())
+            .unwrap_or(false)
+    }
+
+    pub fn vfs_getattr_inmem(&self, inode: u64, fh: Option<u64>) -> Result<VfsAttr, FsError> {
+        if inode == ROOT_INODE {
+            return Ok(self.make_dir_attr(ROOT_INODE));
+        }
+        // An open write handle's dirty buffer is the authoritative size.
+        if let Some(fh_id) = fh
+            && let Some(handle) = self.file_handles.get(&fh_id)
+            && let Some(ref wb) = handle.write_buf
+            && wb.dirty
+        {
+            return Ok(self.make_new_file_attr(inode, wb.file_size));
+        }
+        let entry = self.inodes.get(inode).ok_or(FsError::NotFound)?;
+        match entry.entry_type {
+            EntryType::Directory => Ok(self.make_dir_attr(inode)),
+            EntryType::File => match entry.layout.as_ref() {
+                // `make_file_attr` preserves size + S_IFMT (symlink /
+                // device) from the layout and reads mode/uid/gid/times
+                // from `entry.posix`, all in-memory, no round-trip.
+                Some(layout) => {
+                    let layout = layout.clone();
+                    drop(entry);
+                    self.make_file_attr(inode, &layout)
+                }
+                // No cached layout yet (a brand-new file whose flush has
+                // not landed): report a zero-size regular file from the
+                // in-memory posix. setattr changes mode/owner/times (all
+                // in posix), not size, so this is correct for the reply;
+                // the TTL-bounded next getattr fills in the real size.
+                None => {
+                    drop(entry);
+                    Ok(self.make_new_file_attr(inode, 0))
+                }
+            },
+        }
+    }
+
     /// Handle size changes via setattr (truncate, extend, or truncate-to-zero).
     pub async fn vfs_setattr_size(
         &self,
@@ -2849,6 +2988,62 @@ impl VfsCore {
     fn allocate_flush_generation(&self, inode: u64) -> Generation {
         let cur = self.writeback.active_generation(inode);
         Generation(cur.0 + 1)
+    }
+
+    /// Decide whether `FUSE_RELEASE` should flush this handle off the
+    /// FUSE worker thread. Returns `Some((inode, file_size))` only when
+    /// the mount is in `Default` writeback mode AND the handle has a
+    /// dirty write buffer, i.e. an async close-flush is both safe and
+    /// worthwhile. `None` means "release inline": a read-only handle, a
+    /// clean buffer, or `Strict` mode where close must publish
+    /// synchronously.
+    pub fn peek_release_state(&self, fh: u64) -> Option<(u64, u64)> {
+        if self.writeback_mode != WritebackMode::Default {
+            return None;
+        }
+        let handle = self.file_handles.get(&fh)?;
+        let wb = handle.write_buf.as_ref()?;
+        if !wb.dirty {
+            return None;
+        }
+        Some((handle.ino, wb.file_size))
+    }
+
+    /// Flush + release a dirty write handle asynchronously, off the FUSE
+    /// worker thread. Registers a writeback cycle (so `fsync` / unlink /
+    /// open barriers can wait for the in-flight close), then spawns the
+    /// synchronous `vfs_release` (which runs `flush_write_buffer` and
+    /// drops the inode write lock) and collapses the cycle to `Done`
+    /// when the publish lands. Returns immediately; the FUSE_RELEASE
+    /// reply does not wait on the publish. A failed flush taints the
+    /// inode via `record_failure`, surfacing deferred EIO on the next
+    /// fsync / open of the same path (POSIX close gives no durability
+    /// guarantee). Only invoked for dirty handles in Default mode (see
+    /// `peek_release_state`); single-writer-per-inode keeps at most one
+    /// async close-flush in flight per inode.
+    pub fn spawn_release_flush(self: Arc<Self>, fh: u64, ino: u64, file_size: u64) {
+        let generation = self.allocate_flush_generation(ino);
+        self.writeback.open_cycle(ino, generation, file_size, 0);
+        let _ = self
+            .writeback
+            .advance_stage(ino, generation, FileCommitStage::StageAQueued);
+        compio_runtime::spawn(async move {
+            match self.vfs_release(fh).await {
+                Ok(()) => self.writeback.advance_to_done(ino, generation),
+                Err(e) => {
+                    tracing::warn!(
+                        fh,
+                        ino,
+                        generation = generation.0,
+                        error = %e,
+                        "async release flush failed; tainting inode"
+                    );
+                    self.writeback.record_failure(ino, generation);
+                    self.writeback.advance_to_done(ino, generation);
+                }
+            }
+        })
+        .detach();
     }
 
     /// Persist a freshly-built inode layout at `key`. Metadata
@@ -3144,7 +3339,7 @@ impl VfsCore {
         self.publish_inode_layout(ino, &key, &prefix, name, layout_bytes, &trace_id)
             .await?;
 
-        self.dir_cache.invalidate(&prefix);
+        self.cache_dir_entry(&prefix, name, ino, false);
         self.touch_parent_times(parent);
 
         self.make_file_attr(ino, &layout)
@@ -3161,12 +3356,21 @@ impl VfsCore {
             return Err(FsError::ReadOnly);
         }
 
-        let entry = self.inodes.get(inode).ok_or(FsError::NotFound)?;
-
-        if entry.entry_type != EntryType::File {
-            return Err(FsError::IsDir);
+        {
+            let entry = self.inodes.get(inode).ok_or(FsError::NotFound)?;
+            if entry.entry_type != EntryType::File {
+                return Err(FsError::IsDir);
+            }
         }
 
+        // A read-open after close may race the async release flush.
+        // Drain before snapshotting the cached layout so a just-closed
+        // truncate/extend or create is visible to the new read handle.
+        if !is_write && self.writeback_mode == WritebackMode::Default {
+            self.drain_inode_to_barrier(inode).await?;
+        }
+
+        let entry = self.inodes.get(inode).ok_or(FsError::NotFound)?;
         let s3_key = entry.s3_key.clone();
         let layout = entry.layout.clone();
         let cached_inode_id = entry.inode_id;
@@ -3202,6 +3406,13 @@ impl VfsCore {
                 None => match self.backend().get_inode(&s3_key, &TraceId::new()).await {
                     Ok(l) => Some(l),
                     Err(FsError::NotFound) if is_write => None,
+                    Err(FsError::NotFound) if !is_write => {
+                        self.drain_inode_to_barrier(inode).await?;
+                        match self.backend().get_inode(&s3_key, &TraceId::new()).await {
+                            Ok(l) => Some(l),
+                            Err(e) => return Err(e),
+                        }
+                    }
                     Err(e) => return Err(e),
                 },
             };
@@ -4144,8 +4355,7 @@ impl VfsCore {
 
         let attr = self.make_new_file_attr(ino, 0);
 
-        // Invalidate dir cache so the new file shows up in listings
-        self.dir_cache.invalidate(&prefix);
+        self.cache_dir_entry(&prefix, name, ino, false);
         self.touch_parent_times(parent);
 
         Ok((attr, fh))
@@ -4230,8 +4440,7 @@ impl VfsCore {
         self.publish_inode_layout(ino, &key, &prefix, name, layout_bytes, &trace_id)
             .await?;
 
-        // Invalidate dir cache so the new symlink shows up in listings.
-        self.dir_cache.invalidate(&prefix);
+        self.cache_dir_entry(&prefix, name, ino, false);
         self.touch_parent_times(parent);
 
         self.make_file_attr(ino, &layout)
@@ -4487,8 +4696,8 @@ impl VfsCore {
         self.publish_inode_layout(ino, &key, &prefix, name, layout_bytes, &trace_id)
             .await?;
 
-        // Invalidate dir cache for parent
-        self.dir_cache.invalidate(&prefix);
+        self.cache_dir_entry(&prefix, name, ino, true);
+        self.dir_cache.insert_empty_dir(key.clone(), ino, parent);
         self.touch_parent_times(parent);
 
         Ok(self.make_dir_attr(ino))
@@ -4521,6 +4730,20 @@ impl VfsCore {
         if self.writeback_mode == WritebackMode::Default
             && self.writeback.has_pending_child_put_inode_for_parent(&key)
         {
+            return Err(FsError::NotEmpty);
+        }
+
+        // Regular-file creates publish their final layout on close, so the
+        // writeback queue child check above cannot see an open or async-
+        // closing FILE child. A locally cached file child is already
+        // visible to this mount and must keep rmdir from winning the race.
+        // Only files, not dirs: a cached dir child can be a phantom (a
+        // tombstoned subtree still emits a CommonPrefix into the readdir
+        // cache), so dir emptiness is decided by the tombstone-filtering
+        // no-delimiter NSS list below, not this cache (pjdfstest
+        // mkdir/03.t, rmdir/03.t: rm -rf of a deep tree after a
+        // mkdir+rmdir of the leaf).
+        if self.dir_cache.has_file_children(&key) == Some(true) {
             return Err(FsError::NotEmpty);
         }
 
@@ -4586,6 +4809,33 @@ impl VfsCore {
 
         let trace_id = TraceId::new();
 
+        let src_file_ino = self.inodes.find_ino_by_key(&src_key, EntryType::File);
+        if let Some(ino) = src_file_ino {
+            self.drain_inode_to_barrier(ino).await?;
+        }
+        let dst_ino_before = self.inodes.find_ino_by_key(&dst_key, EntryType::File);
+        if let Some(ino) = dst_ino_before {
+            self.drain_inode_to_barrier(ino).await?;
+        }
+        // A just-created directory publishes its marker via an async
+        // PutInode (Default writeback mode), so the NSS probe + rename below
+        // would otherwise miss it and ENOENT, and a queued publish could
+        // resurrect the old name after the rename. Drain the source (and a
+        // replaced destination) directory barrier first, mirroring the file
+        // drains above (pjdfstest rename/21.t renames a just-mkdir'd dir).
+        if let Some(ino) = self
+            .inodes
+            .find_ino_by_key(&format!("{}/", src_key), EntryType::Directory)
+        {
+            self.drain_inode_to_barrier(ino).await?;
+        }
+        if let Some(ino) = self
+            .inodes
+            .find_ino_by_key(&format!("{}/", dst_key), EntryType::Directory)
+        {
+            self.drain_inode_to_barrier(ino).await?;
+        }
+
         // Determine type by probing NSS backend directly (no inode side effects)
         let is_dir = match self.backend().get_inode(&src_key, &trace_id).await {
             Ok(_) => false,
@@ -4628,14 +4878,6 @@ impl VfsCore {
             // replace (create+close returns to userspace before the
             // close-time publish lands in NSS; rename/09.t / 10.t fire
             // the rename immediately after).
-            if let Some(ino) = self.inodes.find_ino_by_key(&src_key, EntryType::File) {
-                let _ = self.drain_inode_to_barrier(ino).await;
-            }
-            let dst_ino_before = self.inodes.find_ino_by_key(&dst_key, EntryType::File);
-            if let Some(ino) = dst_ino_before {
-                let _ = self.drain_inode_to_barrier(ino).await;
-            }
-
             // POSIX rename(2) atomically replaces an existing
             // regular-file dst. NSS does the swap via
             // `force_overwrite=true` and hands back the prior dst value

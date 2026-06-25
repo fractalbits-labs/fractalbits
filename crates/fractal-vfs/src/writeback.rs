@@ -1021,6 +1021,23 @@ impl WritebackQueue {
         Ok(())
     }
 
+    /// Collapse a cycle straight to `Done`, bypassing per-stage
+    /// validation. The async close-flush (FUSE_RELEASE) runs the layout
+    /// CAS + block writes as one synchronous unit inside
+    /// `flush_write_buffer`, so the queue records a single
+    /// `Idle -> StageAQueued -> Done` arc rather than walking each
+    /// stage. Called by the spawned release task once the flush lands
+    /// (or after `record_failure` on error) so `fsync` / unlink / open
+    /// barriers stop waiting. Idempotent; a missing cycle is a no-op.
+    pub fn advance_to_done(&self, inode: u64, generation: Generation) {
+        let mut inner = self.inner.lock().expect("writeback queue poisoned");
+        if let Some(cycles) = inner.file_pipeline.get_mut(&inode)
+            && let Some(cycle) = cycles.get_mut(&generation)
+        {
+            cycle.stage = FileCommitStage::Done;
+        }
+    }
+
     /// Capture a fsync barrier: the highest dirty generation for
     /// `inode` at this instant. Returns `None` when no cycle is
     /// dirty (a fsync(fd) on an idle inode is a no-op).
