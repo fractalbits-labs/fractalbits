@@ -713,9 +713,7 @@ async fn main() -> CmdResult {
             Some(build_cmd) => match build_cmd {
                 BuildCommand::All => cmd_build::build_all(release)?,
                 BuildCommand::Zig { command } => match command {
-                    Some(ZigCommand::Test) => {
-                        cmd_precheckin::run_zig_unit_tests(&InitConfig::default())?
-                    }
+                    Some(ZigCommand::Test) => cmd_precheckin::run_zig_unit_tests()?,
                     None => {
                         let mode = cmd_build::build_mode(release);
                         cmd_build::build_zig_servers(cmd_build::ZigBuildOpts {

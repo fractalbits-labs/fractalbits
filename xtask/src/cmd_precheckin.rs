@@ -31,11 +31,11 @@ pub fn run_cmd_precheckin(
     }
 
     if zig_unit_tests_only {
-        return run_zig_unit_tests(&init_config);
+        return run_zig_unit_tests();
     }
 
     cmd_service::init_service(ServiceName::All, BuildMode::Debug, &init_config)?;
-    run_zig_unit_tests(&init_config)?;
+    run_zig_unit_tests()?;
     run_cmd! {
         info "Run cargo tests (except s3 api and fs_server)";
         cargo test --workspace --exclude api_server --exclude fs_server;
@@ -167,36 +167,17 @@ fn run_s3_api_tests(init_config: &InitConfig, debug_api_server: bool) -> CmdResu
     Ok(())
 }
 
-pub fn run_zig_unit_tests(init_config: &InitConfig) -> CmdResult {
+pub fn run_zig_unit_tests() -> CmdResult {
     if !std::path::Path::new(&format!("{ZIG_REPO_PATH}/build.zig")).exists() {
         info!("Skipping zig unit-tests");
         return Ok(());
     }
-
-    cmd_service::init_service(ServiceName::All, BuildMode::Debug, init_config)?;
-
-    // Start all BSS instances for testing
-    for id in 0..init_config.bss_count {
-        cmd_service::start_bss_instance(id)?;
-    }
-
-    let working_dir = run_fun!(pwd)?;
-    let journal_uuid = std::fs::read_to_string("data/etc/journal_uuid.txt")?
-        .trim()
-        .to_string();
-    let journal_config = xtask_common::generate_initial_journal_config(&journal_uuid, "nss-0");
-    run_cmd! {
-        info "Formatting nss_server";
-        JOURNAL_CONFIG=$journal_config $working_dir/$ZIG_DEBUG_OUT/bin/nss_server format;
-    }?;
 
     run_cmd! {
         info "Running zig unit tests";
         cd $ZIG_REPO_PATH;
         zig build -p ../$ZIG_DEBUG_OUT test --summary all 2>&1;
     }?;
-    // Stop all BSS instances
-    cmd_service::stop_service(ServiceName::Bss)?;
 
     info!("Zig unit tests completed successfully");
     Ok(())
