@@ -5,7 +5,7 @@ use rkyv::api::high::to_bytes_in;
 use std::cell::Cell;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::backend::{BackendConfig, BlobInfo, StorageBackend};
@@ -222,6 +222,91 @@ struct FileHandle {
     backing_id: Option<i32>,
 }
 
+/// A best-effort disk-cache mirror write, handed to the dedicated mirror
+/// thread so the local-cache I/O + checksum never run on a FUSE worker.
+struct MirrorJob {
+    blob_guid: data_types::DataBlobGuid,
+    blob_version: u64,
+    rewrites: Vec<(u32, Bytes)>,
+    deletes: Vec<u32>,
+    /// Retained `rewrites` payload size, used to keep `mirror_queued_bytes`
+    /// balanced (added on enqueue, subtracted once the job is processed).
+    byte_len: usize,
+}
+
+/// Sender + the shared queued-byte counter for the mirror channel.
+struct MirrorHandle {
+    tx: futures::channel::mpsc::Sender<MirrorJob>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+/// Bound on queued mirror jobs by count. The dedicated thread drains local
+/// page-cache writes far faster than the network publish feeds it, so this
+/// rarely fills; when it does, `try_send` drops the job (best-effort; the
+/// block cold-fills from BSS on the next read) instead of blocking a FUSE
+/// worker.
+const MIRROR_QUEUE_CAP: usize = 4096;
+
+/// Byte bound on the mirror queue. A job retains its rewritten `Bytes`
+/// until the mirror thread writes them, so a slow cache device could
+/// otherwise pin unbounded flushed write buffers (one large-file override
+/// flush is a single job but many MiB). When the in-flight payload exceeds
+/// this, new jobs are dropped (best-effort) before their `Bytes` are
+/// retained. 256 MiB caps memory while staying far above the steady-state
+/// backlog of an 83k-file untar.
+const MIRROR_BYTE_BUDGET: usize = 256 * 1024 * 1024;
+
+/// Spawn the dedicated disk-cache mirror thread. It owns its own compio
+/// runtime (separate io_uring) and drains the job channel, so a
+/// create-heavy workload's cache writes never steal cycles from the FUSE
+/// worker threads. Returns the handle, or `None` if the runtime could not
+/// be built (mirror then silently disabled; the cache still serves
+/// reads via cold-fill, just not write-populated).
+fn spawn_mirror_worker(dc: Arc<DiskCache>) -> Option<MirrorHandle> {
+    let (tx, mut rx) = futures::channel::mpsc::channel::<MirrorJob>(MIRROR_QUEUE_CAP);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let worker_bytes = queued_bytes.clone();
+    let spawned = std::thread::Builder::new()
+        .name("fb-disk-mirror".to_string())
+        .spawn(move || {
+            let rt = match compio_runtime::Runtime::builder().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::warn!(error = %e, "disk-cache mirror thread: runtime build failed");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                use futures::StreamExt;
+                while let Some(job) = rx.next().await {
+                    if let Err(e) = dc
+                        .sync_after_flush(
+                            job.blob_guid,
+                            job.blob_version,
+                            &job.rewrites,
+                            &job.deletes,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            blob_version = job.blob_version,
+                            error = %e,
+                            "disk cache mirror write failed (best-effort)"
+                        );
+                    }
+                    worker_bytes.fetch_sub(job.byte_len, Ordering::Relaxed);
+                }
+            });
+        });
+    match spawned {
+        Ok(_) => Some(MirrorHandle { tx, queued_bytes }),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to spawn disk-cache mirror thread");
+            None
+        }
+    }
+}
+
 pub struct VfsCore {
     backend_config: Arc<BackendConfig>,
     inodes: Arc<InodeTable>,
@@ -256,6 +341,11 @@ pub struct VfsCore {
     // can be reclaimed by the next opener. Reads do not touch
     // this lock.
     inode_write_owner: DashMap<u64, u64>,
+    // Handle to the dedicated disk-cache mirror thread. `None` when the
+    // disk cache is disabled or the mirror thread failed to start. Keeps
+    // the best-effort local-cache write off the FUSE worker threads so it
+    // does not steal foreground cycles on a create-heavy workload.
+    mirror: Option<MirrorHandle>,
 }
 
 impl VfsCore {
@@ -289,6 +379,12 @@ impl VfsCore {
         } else {
             None
         };
+
+        // The mirror thread owns a clone of the disk-cache handle and
+        // drains queued writes off the FUSE worker threads.
+        let mirror = disk_cache
+            .as_ref()
+            .and_then(|dc| spawn_mirror_worker(dc.clone()));
 
         let passthrough_enabled = config.passthrough_enabled;
         let passthrough_max_object_size =
@@ -326,6 +422,7 @@ impl VfsCore {
             fuse_dev_fd: None,
             deferred_blob_cleanup: DashMap::new(),
             inode_write_owner: DashMap::new(),
+            mirror,
         }
     }
 
@@ -696,6 +793,13 @@ impl VfsCore {
         if !self.passthrough_enabled {
             return (0, 0);
         }
+        if self.read_write {
+            // A read-write mount can later override this blob. Once the
+            // kernel has a passthrough backing fd, metadata floors and cache
+            // file unlinks cannot revoke that raw fd, so only arm passthrough
+            // on read-only mounts.
+            return (0, 0);
+        }
 
         let dc = match &self.disk_cache {
             Some(dc) => dc,
@@ -795,21 +899,33 @@ impl VfsCore {
             return Ok(cached);
         }
 
-        // Cache miss: fetch from backend. Override (blob_version > 1) blocks
-        // are zero-padded to a full block_size on disk, so the EC shard size
-        // is block_size/k -- request the full block_size (otherwise the EC
-        // read derives a smaller shard size from the logical length and
-        // filters out the padded shards), then truncate to the logical
-        // content length. Non-override blocks are stored at their exact
-        // length and read as-is.
-        let read_len = if blob_version > 1 {
+        // Cache miss: fetch from backend at a version no older than the
+        // cache's floor. A reader on a stale handle still carries its open-
+        // time `blob_version`; if a newer override has since raised the
+        // floor, fetching at the stale version could trip BSS's non-quorum
+        // `v <= 1` path and return pre-override bytes. Lower-bounding by the
+        // floor matches what a cache hit would have returned (the latest
+        // this instance published).
+        let read_version = match &self.disk_cache {
+            Some(dc) => blob_version.max(dc.floor_version(blob_guid).await.unwrap_or(0)),
+            None => blob_version,
+        };
+
+        // Override (read_version > 1) blocks are zero-padded to a full
+        // block_size on disk, so the EC shard size is block_size/k;
+        // request the full block_size (otherwise the EC read derives a
+        // smaller shard size from the logical length and filters out the
+        // padded shards), then truncate to the logical content length.
+        // Non-override blocks are stored at their exact length and read
+        // as-is.
+        let read_len = if read_version > 1 {
             (DEFAULT_BLOCK_SIZE as usize).max(block_content_len)
         } else {
             block_content_len
         };
         let (mut data, _checksum) = match self
             .backend()
-            .read_block(blob_guid, blob_version, block_num, read_len, trace_id)
+            .read_block(blob_guid, read_version, block_num, read_len, trace_id)
             .await
         {
             Ok(r) => r,
@@ -824,10 +940,10 @@ impl VfsCore {
             data = data.slice(0..block_content_len);
         }
 
-        // Populate disk cache
+        // Populate disk cache at the version actually fetched.
         if let Some(dc) = &self.disk_cache {
             let _ = dc
-                .insert_block(blob_guid, block_num, blob_version, &data)
+                .insert_block(blob_guid, block_num, read_version, &data)
                 .await;
         }
 
@@ -1839,21 +1955,78 @@ impl VfsCore {
                 }
             }
 
-            if let Err(e) = dc
-                .sync_after_flush(
-                    final_blob_guid,
-                    final_layout.blob_version,
-                    &rewrites,
-                    &deletes,
-                )
-                .await
-            {
-                tracing::warn!(
-                    %final_blob_guid,
-                    blob_version = final_layout.blob_version,
-                    error = %e,
-                    "disk cache sync_after_flush failed (best-effort, continuing)"
-                );
+            let blob_version = final_layout.blob_version;
+
+            if blob_version > 1 {
+                // Override path: mirror the cache SYNCHRONOUSLY before the
+                // flush returns. An override can have a pre-existing cache
+                // file that other readers already trust: a passthrough
+                // backing fd reading raw cache bytes (which never consults
+                // our metadata), or a concurrent reader on a stale handle.
+                // An async write would leave those bytes stale until (or
+                // unless) the mirror lands, so the rewritten bytes must be
+                // correct at flush time. sync_after_flush also advances the
+                // version floor, which fences any still-queued OLDER create
+                // job for this blob. fdatasync is still dropped, so this is
+                // page-cache-cheap; overrides are not the create-storm path.
+                if let Err(e) = dc
+                    .sync_after_flush(final_blob_guid, blob_version, &rewrites, &deletes)
+                    .await
+                {
+                    // An override mirror cannot be best-effort: a partial
+                    // failure (header/floor advanced, block write failed)
+                    // can leave the superseded block as a valid
+                    // populated+checksum hit. Drop the whole cache file so
+                    // every block cold-fetches the authoritative bytes from
+                    // BSS before this flush reports success.
+                    tracing::warn!(
+                        %final_blob_guid,
+                        error = %e,
+                        "disk cache override mirror failed; dropping cache file"
+                    );
+                    dc.drop_blob(final_blob_guid, blob_version).await;
+                }
+            } else if let Some(mirror) = &self.mirror {
+                // Fresh create (the create-storm hot path): hand the cache
+                // write to the dedicated mirror thread so the local I/O +
+                // xxh3 never run on a FUSE worker. A fresh blob has no pre-
+                // existing cache file and a single version, so there is no
+                // stale-byte window for any reader. `try_send` never
+                // blocks; the queue is bounded by both job count and
+                // retained bytes, and over budget the job is dropped (best-
+                // effort; the block cold-fills from BSS on the next read).
+                let byte_len: usize = rewrites.iter().map(|(_, b)| b.len()).sum();
+                let queued = mirror.queued_bytes.fetch_add(byte_len, Ordering::Relaxed);
+                if queued + byte_len > MIRROR_BYTE_BUDGET {
+                    mirror.queued_bytes.fetch_sub(byte_len, Ordering::Relaxed);
+                    tracing::trace!(
+                        %final_blob_guid,
+                        byte_len,
+                        "disk cache mirror byte budget exceeded; dropping (best-effort)"
+                    );
+                } else {
+                    let job = MirrorJob {
+                        blob_guid: final_blob_guid,
+                        blob_version,
+                        rewrites,
+                        deletes,
+                        byte_len,
+                    };
+                    if let Err(e) = mirror.tx.clone().try_send(job) {
+                        mirror.queued_bytes.fetch_sub(byte_len, Ordering::Relaxed);
+                        if e.is_full() {
+                            tracing::trace!(
+                                %final_blob_guid,
+                                "disk cache mirror queue full; dropping (best-effort)"
+                            );
+                        } else {
+                            tracing::warn!(
+                                %final_blob_guid,
+                                "disk cache mirror channel closed; dropping (best-effort)"
+                            );
+                        }
+                    }
+                }
             }
         }
 

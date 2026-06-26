@@ -1,4 +1,5 @@
 use std::io;
+use std::num::NonZeroUsize;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -273,6 +274,15 @@ impl CacheTracker {
 /// bumped the version), the whole cache file is unlinked so the next
 /// read cold-fetches from BSS.
 #[allow(dead_code)]
+/// Number of stripe locks serializing per-blob cache-file mutations.
+/// Fixed (not per-blob) to bound memory; distinct blobs that collide on a
+/// stripe only see rare, brief contention.
+const MIRROR_LOCK_STRIPES: usize = 256;
+/// Process-local floors only protect stale handles after their cache file has
+/// been dropped. Bound the map so a long-lived process that overrides many
+/// distinct blobs cannot grow it forever.
+const VERSION_FLOOR_CAP: usize = 65_536;
+
 pub struct DiskCache {
     cache_dir: PathBuf,
     max_size_bytes: u64,
@@ -280,6 +290,16 @@ pub struct DiskCache {
     high_bytes: u64,
     low_bytes: u64,
     tracker: Arc<CacheTracker>,
+    /// Highest override blob_version this process has observed for each
+    /// cache file. Kept outside the cache file so dropping/evicting the file
+    /// does not let stale open handles fall back to old-version BSS reads.
+    version_floors: Arc<Mutex<LruCache<(Uuid, u16), u64>>>,
+    /// Serializes cache writers for the same blob so they cannot race on the
+    /// cache file or its version floor. Striped to bound memory. With the
+    /// inline mirror this was guaranteed by the single-writer-per-inode
+    /// lock; the async create mirror runs on its own thread, so the
+    /// serialization is reestablished here.
+    mirror_locks: Vec<futures::lock::Mutex<()>>,
 }
 
 #[allow(dead_code)]
@@ -292,6 +312,20 @@ impl DiskCache {
         max_size_gb: u64,
         block_size: u64,
     ) -> io::Result<Self> {
+        Self::new_with_version_floor_cap(
+            cache_dir,
+            max_size_gb,
+            block_size,
+            NonZeroUsize::new(VERSION_FLOOR_CAP).expect("version floor cap is nonzero"),
+        )
+    }
+
+    fn new_with_version_floor_cap(
+        cache_dir: impl Into<PathBuf>,
+        max_size_gb: u64,
+        block_size: u64,
+        version_floor_cap: NonZeroUsize,
+    ) -> io::Result<Self> {
         let cache_dir = cache_dir.into();
         std::fs::create_dir_all(&cache_dir)?;
 
@@ -300,9 +334,14 @@ impl DiskCache {
 
         let max_size_bytes = max_size_gb * 1024 * 1024 * 1024;
         let tracker = Arc::new(CacheTracker::new());
+        let version_floors = Arc::new(Mutex::new(LruCache::new(version_floor_cap)));
 
         // Cold-start: populate tracker from existing cache files
         cold_start_scan(&cache_dir, &tracker);
+
+        let mirror_locks = (0..MIRROR_LOCK_STRIPES)
+            .map(|_| futures::lock::Mutex::new(()))
+            .collect();
 
         Ok(Self {
             cache_dir,
@@ -311,7 +350,41 @@ impl DiskCache {
             high_bytes: (max_size_bytes as f64 * HIGH_WATERMARK) as u64,
             low_bytes: (max_size_bytes as f64 * LOW_WATERMARK) as u64,
             tracker,
+            version_floors,
+            mirror_locks,
         })
+    }
+
+    /// The stripe lock guarding cache-file mutations for `blob_guid`.
+    fn mirror_lock(&self, blob_guid: DataBlobGuid) -> &futures::lock::Mutex<()> {
+        let idx = (blob_guid.blob_id.as_u128() as usize) % self.mirror_locks.len();
+        &self.mirror_locks[idx]
+    }
+
+    fn memory_floor(&self, blob_id: Uuid, vol: u16) -> u64 {
+        self.version_floors
+            .lock()
+            .expect("version floor lock poisoned")
+            .get(&(blob_id, vol))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn record_floor(&self, blob_id: Uuid, vol: u16, version: u64) {
+        if version <= 1 {
+            return;
+        }
+        let mut floors = self
+            .version_floors
+            .lock()
+            .expect("version floor lock poisoned");
+        if let Some(entry) = floors.get_mut(&(blob_id, vol)) {
+            if version > *entry {
+                *entry = version;
+            }
+        } else {
+            floors.push((blob_id, vol), version);
+        }
     }
 
     /// Spawn a background evictor task that checks usage every 60s.
@@ -531,6 +604,14 @@ impl DiskCache {
         let vol = blob_guid.volume_id;
         let path = self.cache_file_path(blob_id, vol);
 
+        // Serialize against drop_blob / sync_after_flush for
+        // this blob so the floor check below and the block write are atomic.
+        let _guard = self.mirror_lock(blob_guid).lock().await;
+        let memory_floor = self.memory_floor(blob_id, vol);
+        if block_version < memory_floor {
+            return Ok(());
+        }
+
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -542,19 +623,32 @@ impl DiskCache {
                 tracing::warn!(%blob_id, vol, block, error = %e, "failed to open cache file");
             })?;
 
-        // Ensure the header exists (one-time per file). If the file
-        // is brand new the header read returns None; write a fresh
-        // one. If the header is malformed, we treat that as
-        // corruption and rewrite -- the per-block xxhash gate keeps
-        // any leftover bytes from being trusted.
-        let header_present = read_header(&file).await.is_some();
-        if !header_present {
-            let header = CacheHeader::new(self.block_size as u32, block_version);
-            write_header(&mut file, &header).await?;
-        } else {
-            // Advance authoritative_blob_v if the inserter has seen
-            // something newer than the header records.
-            advance_authoritative_v_if_higher(&mut file, block_version).await?;
+        // Header + version floor. A read handle whose layout still carries
+        // an old blob_version can cold-fetch superseded bytes from BSS's
+        // non-quorum path; caching them below the floor that a newer
+        // override flush established (via sync_after_flush) would
+        // poison later reads, which only check populated+checksum, not
+        // version. So refuse to cache a block older than the floor. A brand
+        // new (or malformed) header reads as None -> initialize it; the
+        // per-block xxhash gate keeps any leftover bytes from being trusted.
+        match read_header(&file).await {
+            Some(mut hdr) => {
+                let floor = memory_floor.max(hdr.authoritative_blob_v);
+                if block_version < floor {
+                    return Ok(());
+                }
+                if floor > hdr.authoritative_blob_v {
+                    hdr.authoritative_blob_v = floor;
+                    write_header(&mut file, &hdr).await?;
+                }
+                self.record_floor(blob_id, vol, floor);
+            }
+            None => {
+                let floor = memory_floor.max(block_version);
+                let header = CacheHeader::new(self.block_size as u32, floor);
+                write_header(&mut file, &header).await?;
+                self.record_floor(blob_id, vol, floor);
+            }
         }
 
         // Check if this block was already cached (avoid double-counting).
@@ -626,6 +720,42 @@ impl DiskCache {
         clear_block_meta(&file, block).await
     }
 
+    /// The recorded version floor (`authoritative_blob_v` on disk, plus the
+    /// in-process floor kept when a cache file is removed), or `None` if no
+    /// floor exists. A read that missed cache uses this to lower-bound the
+    /// BSS fetch version, so a reader on a stale handle doesn't refetch a
+    /// superseded version when this instance has already seen newer.
+    pub async fn floor_version(&self, blob_guid: DataBlobGuid) -> Option<u64> {
+        let memory_floor = self.memory_floor(blob_guid.blob_id, blob_guid.volume_id);
+        let path = self.cache_file_path(blob_guid.blob_id, blob_guid.volume_id);
+        let file_floor = match File::open(&path).await {
+            Ok(file) => read_header(&file).await.map(|h| h.authoritative_blob_v),
+            Err(_) => None,
+        };
+        match (memory_floor, file_floor) {
+            (0, None) => None,
+            (floor, None) => Some(floor),
+            (floor, Some(file_floor)) => Some(floor.max(file_floor)),
+        }
+    }
+
+    /// Coherence-safe fallback: drop the entire cache file for a blob so
+    /// every block misses and cold-fetches the authoritative bytes from
+    /// BSS. Used when an override mirror fails partway -- the superseded
+    /// block body+metadata could otherwise remain a valid
+    /// populated+checksum hit, so an override flush must not report success
+    /// with that file still active. Holds the stripe lock so it cannot race a
+    /// concurrent write for the same blob.
+    pub async fn drop_blob(&self, blob_guid: DataBlobGuid, floor_version: u64) {
+        let _guard = self.mirror_lock(blob_guid).lock().await;
+        let blob_id = blob_guid.blob_id;
+        let vol = blob_guid.volume_id;
+        let path = self.cache_file_path(blob_id, vol);
+        self.record_floor(blob_id, vol, floor_version);
+        self.tracker.remove(blob_id, vol);
+        let _ = compio_fs::remove_file(&path).await;
+    }
+
     /// Post-flush hook. Updates the cache to reflect the writer's
     /// just-published version: rewrites land at their natural offsets,
     /// deletes punch holes, the per-block metadata is bumped to the
@@ -647,6 +777,14 @@ impl DiskCache {
         let vol = blob_guid.volume_id;
         let path = self.cache_file_path(blob_id, vol);
 
+        // Serialize against concurrent cache writers for the same blob, and
+        // read the version floor they may have set.
+        let _guard = self.mirror_lock(blob_guid).lock().await;
+        let memory_floor = self.memory_floor(blob_id, vol);
+        if new_blob_version < memory_floor {
+            return Ok(());
+        }
+
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -655,17 +793,30 @@ impl DiskCache {
             .open(&path)
             .await?;
 
-        // Ensure header is present + advance authoritative_blob_v.
+        // Version floor + header advance. If a newer flush already raised
+        // `authoritative_blob_v` past this job's version (via
+        // `sync_after_flush`/`drop_blob` or a later mirror write), this job is a
+        // stale straggler: writing its blocks would revive data the newer
+        // flush superseded, so skip it entirely. The blocks it would have
+        // written stay missing and cold-fetch the current bytes from BSS.
         match read_header(&file).await {
             Some(mut hdr) => {
-                if new_blob_version > hdr.authoritative_blob_v {
-                    hdr.authoritative_blob_v = new_blob_version;
+                let floor = memory_floor.max(hdr.authoritative_blob_v);
+                if new_blob_version < floor {
+                    return Ok(());
+                }
+                let new_floor = floor.max(new_blob_version);
+                if new_floor > hdr.authoritative_blob_v {
+                    hdr.authoritative_blob_v = new_floor;
                     write_header(&mut file, &hdr).await?;
                 }
+                self.record_floor(blob_id, vol, new_floor);
             }
             None => {
-                let hdr = CacheHeader::new(self.block_size as u32, new_blob_version);
+                let floor = memory_floor.max(new_blob_version);
+                let hdr = CacheHeader::new(self.block_size as u32, floor);
                 write_header(&mut file, &hdr).await?;
+                self.record_floor(blob_id, vol, floor);
             }
         }
 
@@ -706,9 +857,18 @@ impl DiskCache {
             clear_block_meta(&file, *block_num).await?;
         }
 
-        if let Err(e) = file.sync_data().await {
-            tracing::warn!(%blob_id, vol, error = %e, "failed to sync cache file after flush");
-        }
+        // No per-file fdatasync here. The disk cache is a non-
+        // authoritative read cache: durability is owned by BSS+NSS,
+        // which the writeback flush has already published before this
+        // mirror runs. A per-file fdatasync on a create-heavy workload
+        // (one device barrier per file, 83k files on a linux untar)
+        // dominates wall time -- ~51s -- for zero correctness value.
+        // The data stays in the page cache and the OS writes it back
+        // lazily; on a crash a torn block fails its per-block checksum
+        // on read and cold-fetches from BSS, and reconcile_on_open
+        // drops a cache file whose header lags the authoritative
+        // blob_version. Eviction/teardown can force a single bulk sync
+        // if cache persistence across reboot is ever required.
 
         if added_bytes > 0 {
             let new_total = self.tracker.record_insert(blob_id, vol, added_bytes);
@@ -730,9 +890,14 @@ impl DiskCache {
         blob_guid: DataBlobGuid,
         layout_blob_version: u64,
     ) -> io::Result<()> {
+        if layout_blob_version > 1 {
+            self.record_floor(blob_guid.blob_id, blob_guid.volume_id, layout_blob_version);
+        }
         let blob_id = blob_guid.blob_id;
         let vol = blob_guid.volume_id;
         let path = self.cache_file_path(blob_id, vol);
+
+        let _guard = self.mirror_lock(blob_guid).lock().await;
         let file = match File::open(&path).await {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -860,16 +1025,6 @@ async fn write_header(file: &mut File, header: &CacheHeader) -> io::Result<()> {
     let bytes = header.to_bytes().to_vec();
     let BufResult(r, _) = file.write_at(bytes, META_OFFSET).await;
     r.map(|_| ())
-}
-
-async fn advance_authoritative_v_if_higher(file: &mut File, candidate: u64) -> io::Result<()> {
-    if let Some(mut hdr) = read_header(file).await
-        && candidate > hdr.authoritative_blob_v
-    {
-        hdr.authoritative_blob_v = candidate;
-        write_header(file, &hdr).await?;
-    }
-    Ok(())
 }
 
 async fn read_block_meta(file: &File, block: u32) -> Option<BlockMeta> {
@@ -1290,6 +1445,7 @@ mod tests {
         cache.reconcile_on_open(guid, 6).await.unwrap();
         assert!(!path.exists(), "stale cache file unlinked");
         assert_eq!(cache.tracked_file_count(), 0);
+        assert_eq!(cache.floor_version(guid).await, Some(6));
 
         // No-op when cache file is missing.
         cache.reconcile_on_open(guid, 6).await.unwrap();
@@ -1314,6 +1470,182 @@ mod tests {
         assert!(path.exists(), "cache file kept when up to date");
         cache.reconcile_on_open(guid, 9).await.unwrap();
         assert!(path.exists(), "cache file kept when ahead");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An override (sync_after_flush at a higher version) overwrites the
+    /// block bytes in place and raises the version floor; a stale older
+    /// sync_after_flush below the floor is then refused, instead of
+    /// reviving the superseded bytes.
+    #[compio_macros::test]
+    async fn test_sync_after_flush_overrides_and_floors() {
+        let dir = test_cache_dir();
+        let block_size = 8192u64;
+        let cache = DiskCache::new(&dir, 1, block_size).unwrap();
+
+        let guid = guid_with(Uuid::new_v4(), 1);
+        let bsz = block_size as usize;
+        let v1 = vec![0xAAu8; bsz];
+
+        cache.insert_block(guid, 0, 1, &v1).await.unwrap();
+        assert_eq!(
+            cache.get_block(guid, 0, bsz).await.as_deref(),
+            Some(&v1[..])
+        );
+
+        // Override to v2 rewrites block 0 in place and raises the floor.
+        let v2 = vec![0xBBu8; bsz];
+        cache
+            .sync_after_flush(guid, 2, &[(0, Bytes::from(v2.clone()))], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.get_block(guid, 0, bsz).await.as_deref(),
+            Some(&v2[..]),
+            "override bytes visible immediately"
+        );
+        assert_eq!(cache.floor_version(guid).await, Some(2));
+
+        // A stale older mirror job (e.g. a delayed create-job at v1) must
+        // NOT revive the superseded bytes: it is below the floor.
+        cache
+            .sync_after_flush(guid, 1, &[(0, Bytes::from(vec![0xDDu8; bsz]))], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.get_block(guid, 0, bsz).await.as_deref(),
+            Some(&v2[..]),
+            "stale v1 mirror job refused by version floor"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read-miss cold-fill (`insert_block`) must honor the version floor
+    /// too: a read on a lagging handle can fetch superseded bytes from
+    /// BSS's non-quorum path, and caching them below the floor would
+    /// poison later reads. The stale insert is refused; a matching lands.
+    #[compio_macros::test]
+    async fn test_insert_block_honors_version_floor() {
+        let dir = test_cache_dir();
+        let block_size = 8192u64;
+        let cache = DiskCache::new(&dir, 1, block_size).unwrap();
+
+        let guid = guid_with(Uuid::new_v4(), 1);
+        let bsz = block_size as usize;
+
+        // An override to v2 (writes block 0) establishes a floor of 2.
+        cache
+            .sync_after_flush(guid, 2, &[(0, Bytes::from(vec![0xBBu8; bsz]))], &[])
+            .await
+            .unwrap();
+        assert_eq!(cache.floor_version(guid).await, Some(2));
+
+        // A stale v1 cold-fill of block 1 must NOT populate.
+        cache
+            .insert_block(guid, 1, 1, &vec![0xDDu8; bsz])
+            .await
+            .unwrap();
+        assert!(
+            cache.get_block(guid, 1, bsz).await.is_none(),
+            "stale v1 cold-fill refused by version floor"
+        );
+
+        // A floor-matching v2 cold-fill lands.
+        let fresh = vec![0xEEu8; bsz];
+        cache.insert_block(guid, 1, 2, &fresh).await.unwrap();
+        assert_eq!(
+            cache.get_block(guid, 1, bsz).await.as_deref(),
+            Some(&fresh[..]),
+            "version-2 cold-fill lands"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `drop_blob` (the override-mirror-failure fallback) removes the whole
+    /// cache file so every block misses, while preserving the version floor
+    /// so stale handles cannot repopulate below it.
+    #[compio_macros::test]
+    async fn test_drop_blob_removes_cache_file() {
+        let dir = test_cache_dir();
+        let block_size = 8192u64;
+        let cache = DiskCache::new(&dir, 1, block_size).unwrap();
+
+        let guid = guid_with(Uuid::new_v4(), 1);
+        let bsz = block_size as usize;
+        cache
+            .insert_block(guid, 0, 1, &vec![0xAAu8; bsz])
+            .await
+            .unwrap();
+        cache
+            .insert_block(guid, 1, 1, &vec![0xBBu8; bsz])
+            .await
+            .unwrap();
+        let path = cache.cache_file_path(guid.blob_id, guid.volume_id);
+        assert!(path.exists());
+        assert!(cache.get_block(guid, 0, bsz).await.is_some());
+
+        cache.drop_blob(guid, 2).await;
+        assert!(!path.exists(), "cache file removed");
+        assert!(
+            cache.get_block(guid, 0, bsz).await.is_none(),
+            "every block misses after drop"
+        );
+        assert!(cache.get_block(guid, 1, bsz).await.is_none());
+        assert_eq!(cache.floor_version(guid).await, Some(2));
+
+        cache
+            .insert_block(guid, 0, 1, &vec![0xDDu8; bsz])
+            .await
+            .unwrap();
+        assert!(
+            cache.get_block(guid, 0, bsz).await.is_none(),
+            "stale cold-fill refused after drop"
+        );
+
+        // Drop on an absent blob is a no-op.
+        cache.drop_blob(guid_with(Uuid::new_v4(), 1), 2).await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The in-process floor map is bounded. Evicting an old floor is allowed:
+    /// it only drops protection for a very old stale handle after the cache
+    /// file was removed.
+    #[compio_macros::test]
+    async fn test_version_floor_map_is_lru_capped() {
+        let dir = test_cache_dir();
+        let cache = DiskCache::new_with_version_floor_cap(
+            &dir,
+            1,
+            8192,
+            NonZeroUsize::new(2).expect("test cap is nonzero"),
+        )
+        .unwrap();
+
+        let guid1 = guid_with(Uuid::new_v4(), 1);
+        let guid2 = guid_with(Uuid::new_v4(), 1);
+        let guid3 = guid_with(Uuid::new_v4(), 1);
+
+        cache.drop_blob(guid1, 2).await;
+        cache.drop_blob(guid2, 3).await;
+        assert_eq!(cache.floor_version(guid1).await, Some(2));
+
+        cache.drop_blob(guid3, 4).await;
+
+        assert_eq!(
+            cache.floor_version(guid1).await,
+            Some(2),
+            "recently touched floor retained"
+        );
+        assert_eq!(
+            cache.floor_version(guid2).await,
+            None,
+            "least recently used floor evicted"
+        );
+        assert_eq!(cache.floor_version(guid3).await, Some(4));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
