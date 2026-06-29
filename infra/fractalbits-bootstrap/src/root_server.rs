@@ -193,9 +193,15 @@ fn bootstrap_leader(
     let (nss_id, nss_endpoint) = resolve_nss(config)?;
     info!("Discovered NSS: id={nss_id} ip={nss_endpoint}");
 
+    // Build the VG configs (incl. the journal pool) before starting RSS: BSS
+    // addresses are already registered, and journal-configs must be complete
+    // before the observer caches it (it panics on any later external mutation).
+    let total_bss_nodes = num_bss_nodes.unwrap_or(TOTAL_BSS_NODES);
+    let journal_vg_pool_json = initialize_bss_volume_groups(config, &barrier, total_bss_nodes)?;
+
     // Initialize NSS role states in service discovery BEFORE starting RSS
     // This ensures the observer state exists when RSS starts
-    initialize_observer_state(config, &nss_id, &nss_endpoint)?;
+    initialize_observer_state(config, &nss_id, &nss_endpoint, &journal_vg_pool_json)?;
 
     create_rss_config(config, &nss_endpoint, ha_enabled)?;
     create_rss_bootstrap_env()?;
@@ -211,10 +217,6 @@ fn bootstrap_leader(
 
     // Complete RSS initialized stage - signals NSS and other services can proceed
     RssInitializedStage::complete(&barrier)?;
-
-    // Initialize BSS volume group configurations in service discovery
-    let total_bss_nodes = num_bss_nodes.unwrap_or(TOTAL_BSS_NODES);
-    initialize_bss_volume_groups(config, &barrier, total_bss_nodes)?;
 
     // Signal metadata VG ready - NSS active nodes wait for this before starting nss_role_agent
     // This ensures metadata_vg_config is available when nss_role_agent calls wait_for_metadata_vg_ready()
@@ -248,6 +250,7 @@ fn initialize_observer_state(
     config: &BootstrapConfig,
     nss_id: &str,
     nss_endpoint: &str,
+    journal_vg_pool_json: &str,
 ) -> CmdResult {
     info!("Initializing journal config and nss-store in service discovery");
 
@@ -263,9 +266,14 @@ fn initialize_observer_state(
     // Initialize journal config in service discovery with running_nss_id set to nss_id
     if let Some(journal_uuid) = shared_journal_uuid {
         let journal_size: u64 = 3200 * 1024 * 1024; // 3.2GB for cloud deployment
+        // The default journal writes to all pool volumes.
+        let journal_volumes =
+            data_types::pool_volume_refs(journal_vg_pool_json).map_err(Error::other)?;
+        let journal_volumes_json =
+            serde_json::to_string(&journal_volumes).expect("journal_volumes is serializable");
         let journal_config_json = format!(
-            r#"[{{"journal_uuid":"{}","device_id":1,"journal_size":{},"version":1,"running_nss_id":"{}"}}]"#,
-            journal_uuid, journal_size, nss_id
+            r#"[{{"journal_uuid":"{}","device_id":1,"journal_size":{},"version":1,"running_nss_id":"{}","journal_volumes":{}}}]"#,
+            journal_uuid, journal_size, nss_id, journal_volumes_json
         );
 
         if config.is_etcd_backend() {
@@ -365,11 +373,13 @@ fn initialize_observer_state(
     Ok(())
 }
 
+/// Persist the global data, metadata, and journal VG configs, returning the
+/// journal pool JSON (the caller records which volumes the journal uses).
 fn initialize_bss_volume_groups(
     config: &BootstrapConfig,
     barrier: &WorkflowBarrier,
     total_bss_nodes: usize,
-) -> CmdResult {
+) -> Result<String, Error> {
     info!("Initializing BSS volume group configurations...");
 
     let bss_addresses: Vec<(String, String)> = if config.is_etcd_backend() {
@@ -568,7 +578,9 @@ fn initialize_bss_volume_groups(
     }
 
     info!("BSS volume group configurations initialized in service discovery");
-    Ok(())
+
+    // The pool JSON; the caller records which volumes the journal uses.
+    Ok(bss_journal_vg_config_json)
 }
 
 fn build_data_volume_group_config(
@@ -594,8 +606,9 @@ fn build_data_volume_group_config(
             .collect();
 
         volumes.push(format!(
-            r#"{{"volume_id":{},"bss_nodes":[{}],"mode":{{"type":"replicated","n":{quorum_n},"r":{quorum_r},"w":{quorum_w}}}}}"#,
+            r#"{{"volume_id":{},"uuid":"{}","bss_nodes":[{}],"mode":{{"type":"replicated","n":{quorum_n},"r":{quorum_r},"w":{quorum_w}}}}}"#,
             vol_id_idx + 1,
+            uuid::Uuid::now_v7(),
             nodes.join(",")
         ));
     }
@@ -626,8 +639,9 @@ fn build_metadata_volume_group_config(
             .collect();
 
         volumes.push(format!(
-            r#"{{"volume_id":{},"bss_nodes":[{}]}}"#,
+            r#"{{"volume_id":{},"uuid":"{}","bss_nodes":[{}]}}"#,
             vol_id_idx + 1,
+            uuid::Uuid::now_v7(),
             nodes.join(",")
         ));
     }

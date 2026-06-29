@@ -596,8 +596,9 @@ fn generate_data_vg_replicated_config(bss_count: u32, n: u32, r: u32, w: u32) ->
             .collect();
 
         volumes.push(format!(
-            r#"{{"volume_id":{},"bss_nodes":[{}],"mode":{{"type":"replicated","n":{n},"r":{r},"w":{w}}}}}"#,
+            r#"{{"volume_id":{},"uuid":"{}","bss_nodes":[{}],"mode":{{"type":"replicated","n":{n},"r":{r},"w":{w}}}}}"#,
             vol_idx + 1,
+            Uuid::now_v7(),
             nodes.join(",")
         ));
     }
@@ -624,8 +625,9 @@ fn generate_ec_volume_group_config(bss_count: u32) -> String {
     assert_eq!(bss_count, total_shards);
 
     format!(
-        r#"{{"volumes":[{{"volume_id":{},"bss_nodes":[{}],"mode":{{"type":"erasure_coded","data_shards":{},"parity_shards":{}}}}}]}}"#,
+        r#"{{"volumes":[{{"volume_id":{},"uuid":"{}","bss_nodes":[{}],"mode":{{"type":"erasure_coded","data_shards":{},"parity_shards":{}}}}}]}}"#,
         ec_volume_id,
+        Uuid::now_v7(),
         nodes.join(","),
         data_shards,
         parity_shards,
@@ -663,8 +665,9 @@ pub fn generate_metadata_vg_config(bss_count: u32, n: u32, r: u32, w: u32) -> St
             .collect();
 
         volumes.push(format!(
-            r#"{{"volume_id":{},"bss_nodes":[{}]}}"#,
+            r#"{{"volume_id":{},"uuid":"{}","bss_nodes":[{}]}}"#,
             vol_idx + 1,
+            Uuid::now_v7(),
             nodes.join(",")
         ));
     }
@@ -709,23 +712,44 @@ pub fn generate_bss_journal_vg_config(bss_count: u32) -> String {
     }
 }
 
-/// Generate initial JournalConfig JSON for seeding into service discovery.
-/// journal_size defaults to 1GB.
-/// Generate a single JournalConfig JSON (for NSS env var JOURNAL_CONFIG).
-pub fn generate_initial_journal_config(journal_uuid: &str, nss_id: &str) -> String {
+/// Single JournalConfig JSON for the JOURNAL_CONFIG env var / journal-configs.
+/// The default journal selects every volume in the pool.
+pub fn generate_initial_journal_config(
+    journal_uuid: &str,
+    nss_id: &str,
+    journal_vg_pool_json: &str,
+) -> String {
     let journal_size: u64 = 1024 * 1024 * 1024; // 1GB
+    let journal_volumes_json = journal_volumes_json_from_pool(journal_vg_pool_json);
     format!(
-        r#"{{"journal_uuid":"{}","device_id":1,"journal_size":{},"version":1,"running_nss_id":"{}"}}"#,
-        journal_uuid, journal_size, nss_id
+        r#"{{"journal_uuid":"{}","device_id":1,"journal_size":{},"version":1,"running_nss_id":"{}","journal_volumes":{}}}"#,
+        journal_uuid, journal_size, nss_id, journal_volumes_json
     )
 }
 
 /// Generate a journal-configs list JSON (for service discovery key "journal-configs").
-pub fn generate_initial_journal_configs(journal_uuid: &str, nss_id: &str) -> String {
+pub fn generate_initial_journal_configs(
+    journal_uuid: &str,
+    nss_id: &str,
+    journal_vg_pool_json: &str,
+) -> String {
     format!(
         "[{}]",
-        generate_initial_journal_config(journal_uuid, nss_id)
+        generate_initial_journal_config(journal_uuid, nss_id, journal_vg_pool_json)
     )
+}
+
+/// `[{volume_id,uuid},...]` selecting every volume in a VG pool JSON.
+pub fn journal_volumes_json_from_pool(pool_json: &str) -> String {
+    let parsed: serde_json::Value =
+        serde_json::from_str(pool_json).expect("journal VG pool is valid JSON");
+    let refs: Vec<serde_json::Value> = parsed["volumes"]
+        .as_array()
+        .expect("journal VG pool has volumes array")
+        .iter()
+        .map(|v| serde_json::json!({"volume_id": v["volume_id"], "uuid": v["uuid"]}))
+        .collect();
+    serde_json::to_string(&refs).expect("journal_volumes serializable")
 }
 
 #[cfg(test)]

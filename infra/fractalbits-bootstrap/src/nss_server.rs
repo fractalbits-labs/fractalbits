@@ -154,6 +154,8 @@ pub fn bootstrap(config: &BootstrapConfig, journal_uuid: Option<&str>) -> CmdRes
 
     if is_journal_owner {
         info!("This NSS ({my_instance_id}) owns the journal; will format");
+        // Forward the cluster-global metadata VG and the global journal pool;
+        // NSS resolves its own subset from the journal config.
         let metadata_vg_config = get_service_discovery_value(config, BSS_METADATA_VG_CONFIG_KEY)?;
         let journal_vg_config = get_service_discovery_value(config, BSS_JOURNAL_VG_CONFIG_KEY)?;
         let journal_config_str = journal_config.to_string();

@@ -2047,7 +2047,7 @@ mod tests {
     fn parse_ec_config_json() {
         let json = r#"{
             "volumes": [{
-                "volume_id": 32768,
+                "volume_id": 32768,"uuid":"test-uuid",
                 "bss_nodes": [
                     {"node_id":"bss-0","ip":"127.0.0.1","port":8088},
                     {"node_id":"bss-1","ip":"127.0.0.1","port":8089},
@@ -2080,7 +2080,7 @@ mod tests {
     #[test]
     fn parse_replicated_config_json() {
         let json = r#"{
-            "volumes": [{"volume_id":1,"bss_nodes":[{"node_id":"bss-0","ip":"127.0.0.1","port":8088}],"mode":{"type":"replicated","n":1,"r":1,"w":1}}]
+            "volumes": [{"volume_id":1,"uuid":"test-uuid","bss_nodes":[{"node_id":"bss-0","ip":"127.0.0.1","port":8088}],"mode":{"type":"replicated","n":1,"r":1,"w":1}}]
         }"#;
 
         let info: DataVgInfo = serde_json::from_str(json).unwrap();
@@ -2092,7 +2092,7 @@ mod tests {
     fn datavgproxy_init_ec_only() {
         let json = r#"{
             "volumes": [{
-                "volume_id": 32768,
+                "volume_id": 32768,"uuid":"test-uuid",
                 "bss_nodes": [
                     {"node_id":"bss-0","ip":"127.0.0.1","port":18088},
                     {"node_id":"bss-1","ip":"127.0.0.1","port":18089},
@@ -2118,7 +2118,7 @@ mod tests {
     fn datavgproxy_init_ec_invalid_node_count() {
         let json = r#"{
             "volumes": [{
-                "volume_id": 32768,
+                "volume_id": 32768,"uuid":"test-uuid",
                 "bss_nodes": [
                     {"node_id":"bss-0","ip":"127.0.0.1","port":18088},
                     {"node_id":"bss-1","ip":"127.0.0.1","port":18089}
@@ -2138,7 +2138,7 @@ mod tests {
     fn datavgproxy_init_ec_invalid_volume_id_range() {
         let json = r#"{
             "volumes": [{
-                "volume_id": 65535,
+                "volume_id": 65535,"uuid":"test-uuid",
                 "bss_nodes": [
                     {"node_id":"bss-0","ip":"127.0.0.1","port":18088},
                     {"node_id":"bss-1","ip":"127.0.0.1","port":18089},
@@ -2162,7 +2162,7 @@ mod tests {
     fn datavgproxy_init_ec_zero_data_shards_fails() {
         let json = r#"{
             "volumes": [{
-                "volume_id": 32768,
+                "volume_id": 32768,"uuid":"test-uuid",
                 "bss_nodes": [
                     {"node_id":"bss-0","ip":"127.0.0.1","port":18088},
                     {"node_id":"bss-1","ip":"127.0.0.1","port":18089}
@@ -2182,7 +2182,7 @@ mod tests {
     fn datavgproxy_init_ec_zero_parity_shards_fails() {
         let json = r#"{
             "volumes": [{
-                "volume_id": 32768,
+                "volume_id": 32768,"uuid":"test-uuid",
                 "bss_nodes": [
                     {"node_id":"bss-0","ip":"127.0.0.1","port":18088},
                     {"node_id":"bss-1","ip":"127.0.0.1","port":18089},
@@ -2216,14 +2216,14 @@ mod tests {
         let json = r#"{
             "volumes": [
                 {
-                    "volume_id": 1,
+                    "volume_id": 1,"uuid":"test-uuid",
                     "bss_nodes": [
                         {"node_id":"bss-0","ip":"127.0.0.1","port":18088}
                     ],
                     "mode": {"type":"replicated","n":1,"r":1,"w":1}
                 },
                 {
-                    "volume_id": 32768,
+                    "volume_id": 32768,"uuid":"test-uuid",
                     "bss_nodes": [
                         {"node_id":"bss-0","ip":"127.0.0.1","port":18088},
                         {"node_id":"bss-1","ip":"127.0.0.1","port":18089},

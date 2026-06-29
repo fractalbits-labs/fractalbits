@@ -1,3 +1,4 @@
+use crate::VolumeRef;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -42,12 +43,11 @@ pub struct JournalConfig {
     /// Which NSS instance is currently running with this journal
     #[serde(default)]
     pub running_nss_id: Option<String>,
-    /// Metadata VG config JSON, passed to NSS as METADATA_VG_CONFIG env var
-    #[serde(default)]
-    pub metadata_vg_config_json: Option<String>,
-    /// Journal VG config JSON, passed to NSS as JOURNAL_VG_CONFIG env var
-    #[serde(default)]
-    pub journal_vg_config_json: Option<String>,
+    /// Journal volumes this device writes to, referencing the global pool
+    /// `bss-journal-vg-config`. Shared: journals may overlap and use only a
+    /// subset. The effective JOURNAL_VG_CONFIG is the pool filtered to these,
+    /// with each uuid verified. (Metadata VG stays cluster-global.)
+    pub journal_volumes: Vec<VolumeRef>,
 }
 
 impl JournalConfig {
@@ -55,6 +55,9 @@ impl JournalConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.device_id == 0 {
             return Err("device_id must be >= 1".to_string());
+        }
+        if self.journal_volumes.is_empty() {
+            return Err("journal config has empty journal_volumes".to_string());
         }
         Ok(())
     }
@@ -96,8 +99,10 @@ mod tests {
             journal_size: 1024 * 1024 * 1024,
             version: 1,
             running_nss_id: Some("nss-0".to_string()),
-            metadata_vg_config_json: None,
-            journal_vg_config_json: None,
+            journal_volumes: vec![VolumeRef {
+                volume_id: 1,
+                uuid: "u-1".to_string(),
+            }],
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: JournalConfig = serde_json::from_str(&json).unwrap();
@@ -106,7 +111,7 @@ mod tests {
 
     #[test]
     fn test_journal_config_default_running_nss_id() {
-        let json = r#"{"journal_uuid":"test-uuid","device_id":1,"journal_size":0,"version":1}"#;
+        let json = r#"{"journal_uuid":"test-uuid","device_id":1,"journal_size":0,"version":1,"journal_volumes":[{"volume_id":1,"uuid":"u-1"}]}"#;
         let config: JournalConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.running_nss_id, None);
     }
@@ -119,8 +124,10 @@ mod tests {
             journal_size: 0,
             version: 1,
             running_nss_id: None,
-            metadata_vg_config_json: None,
-            journal_vg_config_json: None,
+            journal_volumes: vec![VolumeRef {
+                volume_id: 1,
+                uuid: "u-1".to_string(),
+            }],
         };
         assert!(config.validate().is_ok());
     }
@@ -133,8 +140,10 @@ mod tests {
             journal_size: 0,
             version: 1,
             running_nss_id: None,
-            metadata_vg_config_json: None,
-            journal_vg_config_json: None,
+            journal_volumes: vec![VolumeRef {
+                volume_id: 1,
+                uuid: "u-1".to_string(),
+            }],
         };
         assert!(config.validate().is_err());
     }

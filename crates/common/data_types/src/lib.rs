@@ -19,6 +19,7 @@ pub use permission::BucketKeyPerm;
 pub use trace_id::TraceId;
 pub use volume::{
     BssNode, DataVgInfo, MetadataQuorum, MetadataVgInfo, MetadataVolume, Volume, VolumeMode,
+    VolumeRef, pool_volume_refs,
 };
 
 pub use bss_repair_report::{

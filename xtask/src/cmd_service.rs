@@ -173,7 +173,8 @@ pub fn init_service(
         }?;
 
         // Initialize journal configs in service-discovery table
-        let journal_configs_json = generate_initial_journal_configs(&journal_uuid, "nss-0");
+        let journal_configs_json =
+            generate_initial_journal_configs(&journal_uuid, "nss-0", &bss_journal_vg_config_json);
         let journal_configs_item = format!(
             r#"{{"service_id":{{"S":"journal-configs"}},"value":{{"S":"{}"}}}}"#,
             journal_configs_json.replace('"', r#"\""#)
@@ -220,7 +221,8 @@ pub fn init_service(
             $etcdctl put /fractalbits-service-discovery/journal-uuid $journal_uuid >/dev/null;
         }?;
 
-        let journal_configs_json = generate_initial_journal_configs(&journal_uuid, "nss-0");
+        let journal_configs_json =
+            generate_initial_journal_configs(&journal_uuid, "nss-0", &bss_journal_vg_config);
         let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"},"nss-1":{"network_address":"127.0.0.1:8087"}}}"#;
         run_cmd! {
             info "Initializing journal configs, nss-store, and observer fence in etcd ...";
@@ -303,7 +305,7 @@ pub fn init_service(
         let metadata_vg = generate_bss_metadata_vg_config(init_config.bss_count);
         let journal_vg = generate_bss_journal_vg_config(init_config.bss_count);
 
-        let journal_config = generate_initial_journal_config(&journal_uuid, "nss-0");
+        let journal_config = generate_initial_journal_config(&journal_uuid, "nss-0", &journal_vg);
 
         match build_mode {
             BuildMode::Debug => run_cmd! {
@@ -479,7 +481,8 @@ fn seed_firestore_emulator() -> CmdResult {
         &journal_fields,
     )?;
 
-    let journal_configs_json = generate_initial_journal_configs(&journal_uuid, "nss-0");
+    let journal_configs_json =
+        generate_initial_journal_configs(&journal_uuid, "nss-0", &bss_journal_vg_config);
     let escaped_journal_configs = journal_configs_json.replace('"', r#"\""#);
     let journal_configs_fields = format!(
         r#"{{"fields":{{"value":{{"stringValue":"{escaped_journal_configs}"}},"version":{{"integerValue":"1"}}}}}}"#
