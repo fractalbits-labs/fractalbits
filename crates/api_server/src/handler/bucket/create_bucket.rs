@@ -71,15 +71,9 @@ pub async fn create_bucket_handler(ctx: BucketRequestContext) -> Result<HttpResp
         }
     }
 
-    // Determine if we're in multi-AZ mode based on the blob storage backend
-    let is_multi_az = matches!(
-        ctx.app.config.blob_storage.backend,
-        crate::BlobStorageBackend::S3ExpressMultiAz
-    );
-
     let result = ctx
         .app
-        .create_bucket(&ctx.bucket_name, &api_key_id, is_multi_az, ctx.trace_id)
+        .create_bucket(&ctx.bucket_name, &api_key_id, ctx.trace_id)
         .await;
     match result {
         Ok(_) => {

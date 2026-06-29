@@ -110,7 +110,6 @@ export class FractalbitsBenchVpcStack extends cdk.Stack {
       },
       aws: {
         bucket: "unused",
-        local_az: "unused",
         iam_role: ec2Role.roleName,
       },
       endpoints: {

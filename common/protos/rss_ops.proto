@@ -16,9 +16,7 @@ enum Command {
   // NSS role management
   GetNssRole = 21;
 
-  // AZ status management
-  GetAzStatus = 22;
-  SetAzStatus = 23;
+  reserved 22, 23;
 
   // Bucket management
   CreateBucket = 24;
@@ -126,37 +124,12 @@ message GetNssRoleResponse {
   optional string journal_config_json = 3;
 }
 
-// GetAzStatus - Query AZ availability status from service-discovery table
-message GetAzStatusResponse {
-  oneof result {
-    AzStatusMap status_map = 1;
-    string error = 2;
-  }
-}
-
-message AzStatusMap {
-  map<string, string> az_status = 1;  // Key: AZ name (e.g. "use1-az4"), Value: status ("Normal", "Degraded", "Resync", "Sanitize")
-}
-
-// SetAzStatus - Update AZ availability status in service-discovery table
-message SetAzStatusRequest {
-  string az_id = 1;   // AZ name (e.g. "use1-az4")
-  string status = 2;  // Status ("Normal", "Degraded", "Resync", "Sanitize")
-}
-
-message SetAzStatusResponse {
-  oneof result {
-    google.protobuf.Empty ok = 1;
-    string error = 2;
-  }
-}
-
 // CreateBucket - Create a new bucket with full NSS integration
 message CreateBucketRequest {
   string bucket_name = 1;
   bool enable_versioning = 2;
   string api_key_id = 3;
-  bool is_multi_az = 4;
+  reserved 4;
 }
 
 message CreateBucketResponse {

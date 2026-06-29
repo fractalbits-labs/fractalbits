@@ -176,7 +176,6 @@ pub enum DataBlobStorage {
     #[default]
     AllInBssSingleAz,
     S3HybridSingleAz,
-    S3ExpressMultiAz,
 }
 
 #[derive(
@@ -286,9 +285,6 @@ pub struct ClusterGlobalConfig {
 pub struct ClusterAwsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_blob_bucket: Option<String>,
-    pub local_az: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_az: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -334,7 +334,6 @@ async fn put_object_streaming_internal(
     );
 
     let routing_key = bucket_obj.routing_key;
-    let tracking_root_blob_name = bucket_obj.tracking_root_blob_name.clone();
 
     // Extract metadata headers
     let headers = extract_metadata_headers(ctx.request.headers())?;
@@ -371,7 +370,6 @@ async fn put_object_streaming_internal(
         .enumerate()
         .map(|(i, block_result)| {
             let blob_client = blob_client.clone();
-            let tracking_root_blob_name = tracking_root_blob_name.clone();
 
             async move {
                 let chunks = block_result.map_err(|e| {
@@ -381,13 +379,7 @@ async fn put_object_streaming_internal(
 
                 let len: usize = chunks.iter().map(|c| c.len()).sum();
                 let put_result = blob_client
-                    .put_blob_vectored(
-                        tracking_root_blob_name.as_deref(),
-                        blob_guid,
-                        i as u32,
-                        chunks,
-                        &ctx.trace_id,
-                    )
+                    .put_blob_vectored(blob_guid, i as u32, chunks, &ctx.trace_id)
                     .await;
 
                 match put_result {
@@ -409,7 +401,7 @@ async fn put_object_streaming_internal(
     // Only use S3_VOLUME for large objects when using S3-based backends
     let uses_s3_for_large_blobs = matches!(
         ctx.app.config.blob_storage.backend,
-        BlobStorageBackend::S3HybridSingleAz | BlobStorageBackend::S3ExpressMultiAz
+        BlobStorageBackend::S3HybridSingleAz
     );
     if uses_s3_for_large_blobs
         && total_size >= ObjectLayout::DEFAULT_BLOCK_SIZE as u64
@@ -527,7 +519,6 @@ async fn put_object_streaming_internal(
             })?;
             for block_number in 0..num_blocks {
                 let request = BlobDeletionRequest {
-                    tracking_root_blob_name: bucket_obj.tracking_root_blob_name.clone(),
                     blob_guid: old_blob_guid,
                     block_number: block_number as u32,
                     location: blob_location,
@@ -612,12 +603,11 @@ async fn put_object_with_no_trailer(
         .map_err(|_| S3Error::InternalError)?;
     let size = total_size as u64;
     let block_size = ObjectLayout::DEFAULT_BLOCK_SIZE as usize;
-    let tracking_root_blob_name = bucket.tracking_root_blob_name.as_deref();
 
     // If total size fits in one block, use vectored API to avoid copying
     if total_size <= block_size {
         blob_client
-            .put_blob_vectored(tracking_root_blob_name, blob_guid, 0, chunks, &ctx.trace_id)
+            .put_blob_vectored(blob_guid, 0, chunks, &ctx.trace_id)
             .await
             .map_err(|e| {
                 tracing::error!("Failed to store blob: {e}");
@@ -632,13 +622,7 @@ async fn put_object_with_no_trailer(
 
             let future = async move {
                 blob_client
-                    .put_blob_vectored(
-                        tracking_root_blob_name,
-                        blob_guid,
-                        block_num as u32,
-                        block_chunks,
-                        &ctx.trace_id,
-                    )
+                    .put_blob_vectored(blob_guid, block_num as u32, block_chunks, &ctx.trace_id)
                     .await
                     .map_err(|e| {
                         tracing::error!("Failed to store blob block {}: {e}", block_num);
@@ -743,7 +727,6 @@ async fn put_object_with_no_trailer(
             })?;
             for block_number in 0..num_blocks {
                 let request = BlobDeletionRequest {
-                    tracking_root_blob_name: bucket.tracking_root_blob_name.clone(),
                     blob_guid: old_blob_guid,
                     block_number: block_number as u32,
                     location: blob_location,

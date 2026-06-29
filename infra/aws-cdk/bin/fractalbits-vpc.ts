@@ -59,19 +59,10 @@ const numBssNodes = Number(app.node.tryGetContext("numBssNodes")) || 1;
 const rootServerHa = app.node.tryGetContext("rootServerHa") || false;
 const deployOS = (app.node.tryGetContext("deployOS") ?? "al2023") as DeployOS;
 
-// Determine default AZ based on deployment mode and region
-// For single-AZ modes: single AZ ID (e.g., "usw2-az3")
-// For multi-AZ: AZ pair (e.g., "usw2-az3,usw2-az4")
-const isMultiAz = dataBlobStorage === "s3_express_multi_az";
+// Determine default AZ based on region (single AZ ID, e.g., "usw2-az3")
 let az = app.node.tryGetContext("az");
 if (!az) {
-  if (!isMultiAz) {
-    // Default single AZ based on region
-    az = env.region === "us-east-1" ? "use1-az4" : "usw2-az3";
-  } else {
-    // Default AZ pair for multi-AZ based on region
-    az = env.region === "us-east-1" ? "use1-az4,use1-az6" : "usw2-az3,usw2-az4";
-  }
+  az = env.region === "us-east-1" ? "use1-az4" : "usw2-az3";
 }
 
 const vpcStack = new FractalbitsVpcStack(app, "FractalbitsVpcStack", {

@@ -13,7 +13,6 @@ exclude = [
     "crates/container-all-in-one/src",
     "crates/bench_rpc/src",
     "crates/common/aws_signature/src",
-    "crates/common/data_blob_tracking/src",
     "crates/common/data_types/src",
     "crates/common/metrics_wrapper/src",
     "crates/common/rpc_clients/bss/src",
@@ -35,8 +34,6 @@ exclude = [
     "crates/fractal-vfs/src",
     "crates/fractal-s3/demo",
     "crates/fractal-s3/src",
-    "crates/ha/multi_az/src",
-    "crates/ha/multi_az/data_blob_resync_server/src",
     "crates/ha/bss_repair/src",
     "crates/ha/nss_role_agent/src",
     "crates/ha/src",
@@ -51,7 +48,6 @@ resolver = "2"
 [workspace.dependencies]
 aws_signature = { path = "crates/common/aws_signature" }
 data_types = { path = "crates/common/data_types" }
-data_blob_tracking = { path = "crates/common/data_blob_tracking", default-features = false }
 volume_group_proxy = { path = "crates/common/volume_group_proxy", default-features = false }
 metrics_wrapper = { path = "crates/common/metrics_wrapper" }
 rpc_client_common = { path = "crates/common/rpc_clients/client_common", default-features = false }

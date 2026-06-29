@@ -1,8 +1,7 @@
-use crate::config::{BootstrapConfig, DataBlobStorage, DeployTarget};
+use crate::config::{BootstrapConfig, DeployTarget};
 use crate::stage_helpers::{InstancesReadyStage, ServicesReadyStageDef};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use crate::*;
-use std::io::Error;
 use xtask_common::stages::{VerifiedGlobalDep, VerifiedNodeDep};
 
 struct ServicesReadyStage;
@@ -42,12 +41,9 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     info!("Waiting for RSS to initialize...");
     ServicesReadyStage::wait_for_rss_initialized(&barrier)?;
 
-    let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
-    // Wait for NSS journals to be ready before we can serve requests
-    // For multi-AZ, both active and standby publish journal-ready
-    let expected_journal_ready = if remote_az.is_some() { 2 } else { 1 };
-    info!("Waiting for {expected_journal_ready} NSS journal(s) to be ready...");
-    ServicesReadyStage::wait_for_nss_journal_ready(&barrier, expected_journal_ready)?;
+    // Wait for NSS journal to be ready before we can serve requests
+    info!("Waiting for NSS journal to be ready...");
+    ServicesReadyStage::wait_for_nss_journal_ready(&barrier, 1)?;
 
     create_config(config)?;
 
@@ -69,12 +65,10 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
 }
 
 pub fn create_config(config: &BootstrapConfig) -> CmdResult {
-    let data_blob_storage = &config.global.data_blob_storage;
     let data_blob_bucket = config
         .aws
         .as_ref()
         .and_then(|aws| aws.data_blob_bucket.as_deref());
-    let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     let rss_ha_enabled = config.global.rss_ha_enabled;
 
     let region = &config.global.region;
@@ -89,69 +83,7 @@ pub fn create_config(config: &BootstrapConfig) -> CmdResult {
         .collect::<Vec<_>>()
         .join(", ");
 
-    let config_content = if *data_blob_storage == DataBlobStorage::S3ExpressMultiAz {
-        let remote_az =
-            remote_az.ok_or_else(|| Error::other("remote_az required for s3_express_multi_az"))?;
-        let aws_region = get_current_aws_region()?;
-        // S3 Express Multi-AZ configuration
-        let local_az = get_current_aws_az_id()?;
-        let local_bucket = get_s3_express_bucket_name(&local_az)?;
-        let remote_bucket = get_s3_express_bucket_name(remote_az)?;
-
-        format!(
-            r##"rss_addrs = [{rss_addrs_toml}]
-region = "{aws_region}"
-port = 80
-mgmt_port = 18088
-root_domain = ".localhost"
-with_metrics = true
-http_request_timeout_seconds = 100
-rpc_request_timeout_seconds = 5
-rpc_connection_timeout_seconds = 5
-rss_rpc_timeout_seconds = 30
-client_request_timeout_seconds = 10
-stats_dir = "/data/local/stats"
-enable_stats_writer = false
-allow_missing_or_bad_signature = false
-worker_threads = {num_cores}
-set_thread_affinity = true
-
-[https]
-enabled = false
-port = 443
-cert_file = "/opt/fractalbits/etc/cert.pem"
-key_file = "/opt/fractalbits/etc/key.pem"
-force_http1_only = false
-
-[blob_storage]
-backend = "s3_express_multi_az"
-
-[blob_storage.s3_express_multi_az]
-local_az_host = "http://s3.{aws_region}.amazonaws.com"
-local_az_port = 80
-remote_az_host = "http://s3.{aws_region}.amazonaws.com"
-remote_az_port = 80
-s3_region = "{aws_region}"
-local_az_bucket = "{local_bucket}"
-remote_az_bucket = "{remote_bucket}"
-local_az = "{local_az}"
-remote_az = "{remote_az}"
-
-[blob_storage.s3_express_multi_az.ratelimit]
-enabled = false
-put_qps = 7000
-get_qps = 10000
-delete_qps = 5000
-
-[blob_storage.s3_express_multi_az.retry_config]
-enabled = false
-max_attempts = 15
-initial_backoff_us = 50
-max_backoff_us = 500
-backoff_multiplier = 1.0
-"##
-        )
-    } else if let Some(bucket_name) = data_blob_bucket {
+    let config_content = if let Some(bucket_name) = data_blob_bucket {
         // S3 Hybrid single-az configuration (AWS only)
         let aws_region = get_current_aws_region()?;
         format!(

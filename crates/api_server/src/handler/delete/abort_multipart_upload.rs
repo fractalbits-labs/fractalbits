@@ -81,12 +81,7 @@ pub async fn abort_multipart_upload_handler(
             &ctx.trace_id
         )
         .await?;
-        delete_blob(
-            bucket.tracking_root_blob_name.clone(),
-            part_obj,
-            blob_deletion.clone(),
-        )
-        .await?;
+        delete_blob(part_obj, blob_deletion.clone()).await?;
     }
 
     // Delete the main MPU inode

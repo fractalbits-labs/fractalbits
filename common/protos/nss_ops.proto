@@ -92,16 +92,15 @@ message DeleteInodeResponse {
 }
 
 // CreateRootInode
-// in case of az mirroring, also needs to create internal tracking tree
 message CreateRootInodeRequest {
   string bucket = 1;
-  bool az_mirroring = 2;
+  reserved 2;
 }
 
 message CreateRootInodeResponse {
   message Blobs {
     string root_blob_name = 1;
-    string tracking_root_blob_name = 2;
+    reserved 2;
   }
 
   oneof result {

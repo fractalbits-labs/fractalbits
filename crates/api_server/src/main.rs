@@ -72,7 +72,6 @@ fn main() -> std::io::Result<()> {
             if let Ok(backend) = std::env::var("APP_BLOB_STORAGE_BACKEND") {
                 info!("APP_BLOB_STORAGE_BACKEND: {backend}");
                 match backend.as_str() {
-                    "s3_express_multi_az" => Config::s3_express_multi_az(),
                     "s3_hybrid_single_az" => Config::s3_hybrid_single_az(),
                     "all_in_bss_single_az" => Config::all_in_bss_single_az(),
                     _ => {

@@ -1,21 +1,18 @@
 use crate::{
     blob_storage::{
         AllInBssSingleAzStorage, BlobLocation, BlobStorageError, BlobStorageImpl,
-        S3ExpressMultiAzStorage, S3HybridSingleAzStorage,
+        S3HybridSingleAzStorage,
     },
     config::{BlobStorageBackend, BlobStorageConfig},
 };
 use bytes::Bytes;
-use data_blob_tracking::DataBlobTracker;
 use data_types::object_layout::ObjectLayout;
 use data_types::{DataBlobGuid, TraceId};
-use moka::future::Cache;
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc::Receiver, task::JoinHandle};
 
 #[derive(Debug)]
 pub struct BlobDeletionRequest {
-    pub tracking_root_blob_name: Option<String>,
     pub blob_guid: DataBlobGuid,
     pub block_number: u32,
     pub location: BlobLocation,
@@ -33,14 +30,12 @@ impl BlobClient {
         rx: Receiver<BlobDeletionRequest>,
         rpc_request_timeout: Duration,
         rpc_connection_timeout: Duration,
-        data_blob_tracker: Option<Arc<DataBlobTracker>>,
         data_vg_info: data_types::DataVgInfo,
     ) -> Result<Self, BlobStorageError> {
         let storage = Self::create_storage_impl(
             blob_storage_config,
             rpc_request_timeout,
             rpc_connection_timeout,
-            data_blob_tracker,
             data_vg_info,
         )
         .await?;
@@ -52,7 +47,6 @@ impl BlobClient {
         blob_storage_config: &BlobStorageConfig,
         rpc_request_timeout: Duration,
         rpc_connection_timeout: Duration,
-        data_blob_tracker: Option<Arc<DataBlobTracker>>,
         data_vg_info: data_types::DataVgInfo,
     ) -> Result<Arc<BlobStorageImpl>, BlobStorageError> {
         let storage = match &blob_storage_config.backend {
@@ -72,35 +66,6 @@ impl BlobClient {
                         s3_hybrid_config,
                         rpc_request_timeout,
                         rpc_connection_timeout,
-                    )
-                    .await?,
-                )
-            }
-            BlobStorageBackend::S3ExpressMultiAz => {
-                let data_blob_tracker = data_blob_tracker.ok_or_else(|| {
-                    BlobStorageError::Config(
-                        "DataBlobTracker required for S3ExpressWithTracking backend".into(),
-                    )
-                })?;
-
-                let s3_express_multi_az_config =
-                    Self::get_s3_express_multi_az_config(blob_storage_config, "S3ExpressMultiAz")?;
-
-                // Internal-only az_status cache; was previously also exposed
-                // via /mgmt/cache/update/az_status fan-out, which has been
-                // removed along with the rest of the recall machinery.
-                let az_status_cache = Arc::new(
-                    Cache::builder()
-                        .time_to_idle(Duration::from_secs(30))
-                        .max_capacity(100)
-                        .build(),
-                );
-
-                BlobStorageImpl::S3ExpressMultiAz(
-                    S3ExpressMultiAzStorage::new(
-                        s3_express_multi_az_config,
-                        data_blob_tracker,
-                        az_status_cache,
                     )
                     .await?,
                 )
@@ -137,20 +102,6 @@ impl BlobClient {
         }
     }
 
-    fn get_s3_express_multi_az_config<'a>(
-        blob_storage_config: &'a BlobStorageConfig,
-        backend_name: &str,
-    ) -> Result<&'a crate::config::S3ExpressMultiAzConfig, BlobStorageError> {
-        blob_storage_config
-            .s3_express_multi_az
-            .as_ref()
-            .ok_or_else(|| {
-                BlobStorageError::Config(format!(
-                    "S3 Express configuration required for {backend_name} backend"
-                ))
-            })
-    }
-
     async fn blob_deletion_task(
         storage: Arc<BlobStorageImpl>,
         mut input: Receiver<BlobDeletionRequest>,
@@ -158,7 +109,6 @@ impl BlobClient {
         while let Some(request) = input.recv().await {
             let res = storage
                 .delete_blob(
-                    request.tracking_root_blob_name.as_deref(),
                     request.blob_guid,
                     request.block_number,
                     request.location,
@@ -182,7 +132,6 @@ impl BlobClient {
     pub fn create_data_blob_guid(&self) -> DataBlobGuid {
         match &*self.storage {
             BlobStorageImpl::HybridSingleAz(storage) => storage.create_data_blob_guid(),
-            BlobStorageImpl::S3ExpressMultiAz(storage) => storage.create_data_blob_guid(),
             BlobStorageImpl::AllInBssSingleAz(storage) => storage.create_data_blob_guid(),
         }
     }
@@ -194,7 +143,6 @@ impl BlobClient {
             BlobStorageImpl::HybridSingleAz(storage) => {
                 storage.create_data_blob_guid_with_preference(prefer_ec)
             }
-            BlobStorageImpl::S3ExpressMultiAz(storage) => storage.create_data_blob_guid(),
             BlobStorageImpl::AllInBssSingleAz(storage) => {
                 storage.create_data_blob_guid_with_preference(prefer_ec)
             }
@@ -203,7 +151,6 @@ impl BlobClient {
 
     pub async fn put_blob(
         &self,
-        tracking_root_blob_name: Option<&str>,
         blob_guid: DataBlobGuid,
         block_number: u32,
         body: Bytes,
@@ -211,7 +158,6 @@ impl BlobClient {
     ) -> Result<(), BlobStorageError> {
         self.storage
             .put_blob(
-                tracking_root_blob_name,
                 blob_guid.blob_id,
                 blob_guid.volume_id,
                 block_number,
@@ -223,7 +169,6 @@ impl BlobClient {
 
     pub async fn put_blob_vectored(
         &self,
-        tracking_root_blob_name: Option<&str>,
         blob_guid: DataBlobGuid,
         block_number: u32,
         chunks: Vec<actix_web::web::Bytes>,
@@ -231,7 +176,6 @@ impl BlobClient {
     ) -> Result<(), BlobStorageError> {
         self.storage
             .put_blob_vectored(
-                tracking_root_blob_name,
                 blob_guid.blob_id,
                 blob_guid.volume_id,
                 block_number,
@@ -264,20 +208,13 @@ impl BlobClient {
 
     pub async fn delete_blob(
         &self,
-        tracking_root_blob_name: Option<&str>,
         blob_guid: DataBlobGuid,
         block_number: u32,
         location: BlobLocation,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         self.storage
-            .delete_blob(
-                tracking_root_blob_name,
-                blob_guid,
-                block_number,
-                location,
-                trace_id,
-            )
+            .delete_blob(blob_guid, block_number, location, trace_id)
             .await
     }
 }
