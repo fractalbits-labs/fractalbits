@@ -6,7 +6,6 @@ use std::time::Duration;
 #[serde(rename_all = "snake_case")]
 pub enum BlobStorageBackend {
     S3HybridSingleAz,
-    S3ExpressMultiAz,
     #[default]
     AllInBssSingleAz,
 }
@@ -16,7 +15,6 @@ pub struct BlobStorageConfig {
     pub backend: BlobStorageBackend,
 
     pub s3_hybrid_single_az: Option<S3HybridSingleAzConfig>,
-    pub s3_express_multi_az: Option<S3ExpressMultiAzConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -34,39 +32,6 @@ impl Default for RatelimitConfig {
             put_qps: 7000,
             get_qps: 10000,
             delete_qps: 5000,
-        }
-    }
-}
-
-#[derive(Deserialize, Debug, Clone)]
-pub struct S3ExpressMultiAzConfig {
-    pub local_az_host: String,
-    pub local_az_port: u16,
-    pub s3_region: String,
-    pub local_az_bucket: String,
-    pub remote_az_bucket: String,
-    pub remote_az_host: String,
-    pub remote_az_port: u16,
-    pub local_az: String,
-    pub remote_az: String,
-    pub ratelimit: RatelimitConfig,
-    pub retry_config: S3RetryConfig,
-}
-
-impl Default for S3ExpressMultiAzConfig {
-    fn default() -> Self {
-        Self {
-            local_az_host: "http://127.0.0.1".into(),
-            local_az_port: 9001,
-            s3_region: "localdev".into(),
-            local_az_bucket: "fractalbits-localdev-az1-data-bucket".into(),
-            remote_az_bucket: "fractalbits-localdev-az2-data-bucket".into(),
-            remote_az_host: "http://127.0.0.1".into(),
-            remote_az_port: 9002,
-            local_az: "localdev-az1".into(),
-            remote_az: "localdev-az2".into(),
-            ratelimit: RatelimitConfig::default(),
-            retry_config: S3RetryConfig::default(),
         }
     }
 }
@@ -156,33 +121,6 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn s3_express_multi_az() -> Self {
-        Self {
-            rss_addrs: vec!["127.0.0.1:8086".to_string()],
-            port: 8080,
-            mgmt_port: 18080,
-            https: HttpsConfig::default(),
-            region: "localdev".into(),
-            root_domain: ".localhost".into(),
-            with_metrics: false,
-            http_request_timeout_seconds: 120,
-            rpc_request_timeout_seconds: 30,
-            rpc_connection_timeout_seconds: 5,
-            rss_rpc_timeout_seconds: 30,
-            client_request_timeout_seconds: 120,
-            stats_dir: "data/api-server/local/stats".into(),
-            enable_stats_writer: false,
-            blob_storage: BlobStorageConfig {
-                backend: BlobStorageBackend::S3ExpressMultiAz,
-                s3_hybrid_single_az: None,
-                s3_express_multi_az: Some(S3ExpressMultiAzConfig::default()),
-            },
-            allow_missing_or_bad_signature: false,
-            worker_threads: 2,
-            set_thread_affinity: false,
-        }
-    }
-
     pub fn s3_hybrid_single_az() -> Self {
         Self {
             rss_addrs: vec!["127.0.0.1:8086".to_string()],
@@ -209,7 +147,6 @@ impl Config {
                     ratelimit: RatelimitConfig::default(),
                     retry_config: S3RetryConfig::default(),
                 }),
-                s3_express_multi_az: None,
             },
             allow_missing_or_bad_signature: false,
             worker_threads: 2,
@@ -236,7 +173,6 @@ impl Config {
             blob_storage: BlobStorageConfig {
                 backend: BlobStorageBackend::AllInBssSingleAz,
                 s3_hybrid_single_az: None,
-                s3_express_multi_az: None,
             },
             allow_missing_or_bad_signature: false,
             worker_threads: 2,

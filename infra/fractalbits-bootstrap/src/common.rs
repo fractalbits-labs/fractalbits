@@ -7,8 +7,7 @@ use xtask_common::cloud_storage;
 
 // Re-exports from target-specific modules so callers don't need to change imports
 pub use crate::aws::{
-    create_ena_irq_affinity_service, create_s3_express_bucket, ensure_ec2_metadata,
-    get_current_aws_az_id, get_current_aws_region, get_s3_express_bucket_name,
+    create_ena_irq_affinity_service, ensure_ec2_metadata, get_current_aws_region,
 };
 pub use crate::etcd::get_etcd_endpoints;
 pub use crate::gcp::firestore_put_document;
@@ -32,11 +31,8 @@ pub const BSS_DATA_VG_CONFIG_KEY: &str = "bss-data-vg-config";
 pub const BSS_METADATA_VG_CONFIG_KEY: &str = "bss-metadata-vg-config";
 pub const BSS_JOURNAL_VG_CONFIG_KEY: &str = "bss-journal-vg-config";
 pub const BSS_SERVER_KEY: &str = "bss-server";
-pub const AZ_STATUS_KEY: &str = "az_status";
 #[allow(dead_code)]
 pub const CLOUDWATCH_AGENT_CONFIG: &str = "cloudwatch_agent_config.json";
-pub const S3EXPRESS_LOCAL_BUCKET_CONFIG: &str = "s3express-local-bucket-config.json";
-pub const S3EXPRESS_REMOTE_BUCKET_CONFIG: &str = "s3express-remote-bucket-config.json";
 
 /// Shared binaries that are not CPU-specific (stored directly under {arch}/)
 const SHARED_BINARIES: &[&str] = &["fractalbits-bootstrap", "etcd", "etcdctl", "warp"];

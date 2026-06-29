@@ -157,16 +157,10 @@ fn build_rust_for_target(
     let arch = target.arch;
 
     // Common excludes for all deploy builds
-    let mut excludes: Vec<String> = [
-        "xtask",
-        "fractalbits-bootstrap",
-        "fractal-s3",
-        "data_blob_resync_server",
-        "rewrk_rpc",
-    ]
-    .iter()
-    .flat_map(|pkg| vec!["--exclude".to_string(), pkg.to_string()])
-    .collect();
+    let mut excludes: Vec<String> = ["xtask", "fractalbits-bootstrap", "fractal-s3", "rewrk_rpc"]
+        .iter()
+        .flat_map(|pkg| vec!["--exclude".to_string(), pkg.to_string()])
+        .collect();
     for pkg in extra_excludes {
         excludes.push("--exclude".to_string());
         excludes.push(pkg.to_string());

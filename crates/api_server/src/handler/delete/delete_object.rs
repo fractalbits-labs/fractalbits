@@ -75,12 +75,7 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
                         &ctx.trace_id
                     )
                     .await;
-                    let _ = delete_blob(
-                        bucket.tracking_root_blob_name.clone(),
-                        mpu_obj,
-                        blob_deletion.clone(),
-                    )
-                    .await;
+                    let _ = delete_blob(mpu_obj, blob_deletion.clone()).await;
                 }
                 if !mpus.is_empty() {
                     tracing::info!(
@@ -111,12 +106,7 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
         match &object.state {
             ObjectState::Normal(..) => {
                 // Delete blob for normal objects
-                delete_blob(
-                    bucket.tracking_root_blob_name.clone(),
-                    &object,
-                    blob_deletion,
-                )
-                .await?;
+                delete_blob(&object, blob_deletion).await?;
             }
             ObjectState::Mpu(mpu_state) => match mpu_state {
                 MpuState::Uploading => {
@@ -153,12 +143,7 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
                         )
                         .await?;
                         // Delete blob for each multipart upload part
-                        delete_blob(
-                            bucket.tracking_root_blob_name.clone(),
-                            mpu_obj,
-                            blob_deletion.clone(),
-                        )
-                        .await?;
+                        delete_blob(mpu_obj, blob_deletion.clone()).await?;
                     }
                 }
             },
@@ -169,7 +154,6 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
 }
 
 pub async fn delete_blob(
-    tracking_root_blob_name: Option<String>,
     object: &ObjectLayout,
     blob_deletion: Sender<BlobDeletionRequest>,
 ) -> Result<(), S3Error> {
@@ -180,7 +164,6 @@ pub async fn delete_blob(
     // Send deletion request for each block
     for block_number in 0..num_blocks {
         let request = BlobDeletionRequest {
-            tracking_root_blob_name: tracking_root_blob_name.clone(),
             blob_guid,
             block_number: block_number as u32,
             location: blob_location,

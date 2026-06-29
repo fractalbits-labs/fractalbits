@@ -22,18 +22,10 @@ pub fn generate_bootstrap_config(vpc_config: &VpcConfig) -> Result<BootstrapClus
     // Pre-generate a cluster-scoped journal UUID for NSS (embedded in UserData)
     let journal_uuid = Uuid::now_v7().to_string();
 
-    // Query the first AZ in the region (used for S3 Express / EBS placement)
-    let local_az = run_fun! {
-        aws ec2 describe-availability-zones
-            --region $region --query "AvailabilityZones[0].ZoneName" --output text
-    }?;
-
     let aws_config = ClusterAwsConfig {
         // data_blob_bucket: for AllInBss it's unused; for S3Hybrid it comes from CDK output
         // and is not pre-knowable. Leave None — API server reads it from DDB service discovery.
         data_blob_bucket: None,
-        local_az,
-        remote_az: None,
     };
 
     let config = BootstrapClusterConfig {

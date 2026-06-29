@@ -17,10 +17,7 @@ import {
   DeployOS,
 } from "./ec2-utils";
 
-export type DataBlobStorage =
-  | "all_in_bss_single_az"
-  | "s3_hybrid_single_az"
-  | "s3_express_multi_az";
+export type DataBlobStorage = "all_in_bss_single_az" | "s3_hybrid_single_az";
 
 export interface FractalbitsVpcStackProps extends cdk.StackProps {
   numApiServers: number;
@@ -39,47 +36,24 @@ export interface FractalbitsVpcStackProps extends cdk.StackProps {
   deployOS?: DeployOS;
 }
 
-function isSingleAzMode(mode: DataBlobStorage): boolean {
-  return mode === "all_in_bss_single_az" || mode === "s3_hybrid_single_az";
-}
-
 export class FractalbitsVpcStack extends cdk.Stack {
   public readonly nlbLoadBalancerDnsName: string;
   public readonly vpc: ec2.Vpc;
 
   constructor(scope: Construct, id: string, props: FractalbitsVpcStackProps) {
     super(scope, id, props);
-    const dataBlobStorage = props.dataBlobStorage;
-    const singleAz = isSingleAzMode(dataBlobStorage);
-    const multiAz = dataBlobStorage === "s3_express_multi_az";
 
     // === VPC Configuration ===
-    // Parse az based on deployment mode
-    // singleAz: single AZ ID (e.g., "usw2-az3")
-    // multiAz: AZ pair (e.g., "usw2-az3,usw2-az4")
-    const azArray = props.az.split(",");
-
-    // Validate az format based on deployment mode
-    if (singleAz && azArray.length !== 1) {
+    // az is a single AZ ID (e.g., "usw2-az3")
+    if (props.az.split(",").length !== 1) {
       throw new Error(
-        `Single-AZ mode requires single AZ ID (e.g., "usw2-az3"), got: "${props.az}"`,
-      );
-    }
-    if (multiAz && azArray.length !== 2) {
-      throw new Error(
-        `Multi-AZ mode requires AZ pair (e.g., "usw2-az3,usw2-az4"), got: "${props.az}"`,
+        `Single AZ ID required (e.g., "usw2-az3"), got: "${props.az}"`,
       );
     }
 
-    // Resolve AZ IDs to actual AZ names
-    const az1 = getAzNameFromIdAtBuildTime(azArray[0]);
-    // Only resolve second AZ for multi-AZ mode
-    const az2 = multiAz ? getAzNameFromIdAtBuildTime(azArray[1]) : "";
-
-    // Determine availability zones based on storage mode
-    const availabilityZones = singleAz
-      ? [az1] // Single AZ for single-AZ mode
-      : [az1, az2]; // Multi-AZ for multi-AZ mode
+    // Resolve AZ ID to the actual AZ name
+    const az1 = getAzNameFromIdAtBuildTime(props.az);
+    const availabilityZones = [az1];
 
     // AL2023 (default): no NAT needed, repos are S3-hosted, AWS CLI pre-installed.
     // Ubuntu: needs NAT gateway for apt-get access to public repos.
@@ -183,7 +157,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
 
     // Create data blob bucket only for s3_hybrid_single_az mode
     let dataBlobBucket: s3.Bucket | undefined;
-    if (dataBlobStorage === "s3_hybrid_single_az") {
+    if (props.dataBlobStorage === "s3_hybrid_single_az") {
       dataBlobBucket = new s3.Bucket(this, "DataBlobBucket", {
         removalPolicy: cdk.RemovalPolicy.DESTROY,
         autoDeleteObjects: true,
@@ -220,11 +194,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
       : this.vpc.isolatedSubnets;
     const publicSubnets = this.vpc.publicSubnets;
     const subnet1 = privateSubnets[0]; // First AZ (private)
-    // Only get second subnet for multi-AZ mode
-    const subnet2 =
-      multiAz && privateSubnets.length > 1
-        ? privateSubnets[1] // Second AZ (private)
-        : subnet1; // Use first subnet for single-AZ mode
     const publicSubnet1 = publicSubnets[0]; // First AZ (public)
 
     const instanceConfigs: {
@@ -248,8 +217,8 @@ export class FractalbitsVpcStack extends cdk.Stack {
       instanceConfigs.splice(1, 0, {
         id: "rss-B",
         instanceType: rssInstanceType,
-        // For singleAz, place rss-B in same AZ as rss-A
-        specificSubnet: singleAz ? subnet1 : subnet2,
+        // Place rss-B in the same AZ as rss-A
+        specificSubnet: subnet1,
         sg: privateSg,
       });
     }
@@ -356,23 +325,20 @@ export class FractalbitsVpcStack extends cdk.Stack {
     );
 
     // Create BSS nodes in ASG (dynamic cluster discovery via S3)
-    let bssAsg: autoscaling.AutoScalingGroup | undefined;
-    if (singleAz) {
-      bssAsg = createEc2Asg(
-        this,
-        "BssAsg",
-        this.vpc,
-        subnet1,
-        privateSg,
-        ec2Role,
-        [props.bssInstanceTypes.split(",")[0]],
-        props.numBssNodes,
-        props.numBssNodes,
-        "bss_server",
-        deployOS,
-        createUserData(this, deployOS, "--role bss_server"),
-      );
-    }
+    const bssAsg = createEc2Asg(
+      this,
+      "BssAsg",
+      this.vpc,
+      subnet1,
+      privateSg,
+      ec2Role,
+      [props.bssInstanceTypes.split(",")[0]],
+      props.numBssNodes,
+      props.numBssNodes,
+      "bss_server",
+      deployOS,
+      createUserData(this, deployOS, "--role bss_server"),
+    );
 
     // Create api_server(s) in ASG
     const apiServerAsg = createEc2Asg(
@@ -429,7 +395,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       vpc: this.vpc,
       internetFacing: false,
       vpcSubnets: { subnetType: privateSubnetType },
-      crossZoneEnabled: multiAz, // Only enable cross-zone for multi-AZ
+      crossZoneEnabled: false,
     });
     const listener = nlb.addListener("ApiListener", { port: 80 });
     listener.addTargets("ApiTargets", {
@@ -504,12 +470,10 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
-    if (bssAsg) {
-      new cdk.CfnOutput(this, "bssAsgName", {
-        value: bssAsg.autoScalingGroupName,
-        description: `BSS Auto Scaling Group Name`,
-      });
-    }
+    new cdk.CfnOutput(this, "bssAsgName", {
+      value: bssAsg.autoScalingGroupName,
+      description: `BSS Auto Scaling Group Name`,
+    });
 
     new cdk.CfnOutput(this, "nssAsgName", {
       value: nssAsg.autoScalingGroupName,

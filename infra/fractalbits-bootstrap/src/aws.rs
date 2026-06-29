@@ -56,96 +56,12 @@ pub fn get_current_aws_region() -> FunResult {
     }
 }
 
-pub fn get_current_aws_az_id() -> FunResult {
-    let token = run_fun! {
-        curl -X PUT "http://169.254.169.254/latest/api/token"
-            -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -s
-    }?;
-    run_fun! {
-        curl -H "X-aws-ec2-metadata-token: $token"
-            "http://169.254.169.254/latest/meta-data/placement/availability-zone-id"
-    }
-}
-
-// Get AWS account ID using IMDS (Instance Metadata Service)
-pub fn get_account_id() -> FunResult {
-    let token = run_fun! {
-        curl -X PUT "http://169.254.169.254/latest/api/token"
-            -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -s
-    }?;
-    let account = run_fun! {
-        curl -H "X-aws-ec2-metadata-token: $token"
-            "http://169.254.169.254/latest/dynamic/instance-identity/document" -s
-        | grep accountId
-        | sed r#"s/.*"accountId" : "\([0-9]*\)".*/\1/"#
-    }?;
-    if account.is_empty() {
-        return Err(std::io::Error::other(
-            "Failed to extract account ID from IMDS",
-        ));
-    }
-    Ok(account)
-}
-
 pub fn get_aws_instance_id() -> FunResult {
     run_fun!(ec2-metadata --instance-id | awk r"{print $2}")
 }
 
 pub fn get_aws_private_ip() -> FunResult {
     run_fun!(ec2-metadata --local-ipv4 | awk r"{print $2}")
-}
-
-pub fn get_s3_express_bucket_name(az: &str) -> FunResult {
-    // Generate bucket name in format: fractalbits-data-{account}--{az}--x-s3
-    let account = get_account_id()?;
-    Ok(format!("fractalbits-data-{account}--{az}--x-s3"))
-}
-
-pub fn create_s3_express_bucket(az: &str, config_file_name: &str) -> CmdResult {
-    let bucket_name = get_s3_express_bucket_name(az)?;
-
-    // Check if bucket already exists
-    info!("Checking if S3 Express bucket {bucket_name} already exists...");
-    let bucket_exists = run_cmd! {
-        aws s3api head-bucket --bucket $bucket_name 2>/dev/null
-    }
-    .is_ok();
-
-    if bucket_exists {
-        info!("S3 Express bucket {bucket_name} already exists, skipping creation");
-        return Ok(());
-    }
-
-    // Generate S3 Express bucket configuration JSON
-    let config_content = format!(
-        r#"{{
-  "Location": {{
-    "Type": "AvailabilityZone",
-    "Name": "{az}"
-  }},
-  "Bucket": {{
-    "DataRedundancy": "SingleAvailabilityZone",
-    "Type": "Directory"
-  }}
-}}"#
-    );
-
-    let config_file_path = format!("{ETC_PATH}{config_file_name}");
-    run_cmd! {
-        echo $config_content > $config_file_path
-    }?;
-
-    // Create the S3 Express bucket
-    info!("Creating S3 Express bucket: {bucket_name} in AZ: {az}");
-    let config_file_opt = format!("file://{config_file_path}");
-    run_cmd! {
-        aws s3api create-bucket
-            --bucket $bucket_name
-            --create-bucket-configuration $config_file_opt
-    }?;
-
-    info!("S3 Express bucket ready: {bucket_name}");
-    Ok(())
 }
 
 pub(crate) fn install_cloudwatch_agent(os: OsType) -> CmdResult {

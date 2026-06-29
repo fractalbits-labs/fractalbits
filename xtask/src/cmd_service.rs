@@ -83,17 +83,6 @@ pub fn init_service(
                 --provisioned-throughput ReadCapacityUnits=1,WriteCapacityUnits=1 >/dev/null;
         }?;
 
-        // Initialize AZ status in service-discovery table (using mock AZ names for local testing)
-        let az_status_item = r#"{"service_id":{"S":"az_status"},"status":{"M":{"localdev-az1":{"S":"Normal"},"localdev-az2":{"S":"Normal"}}}}"#;
-
-        run_cmd! {
-            info "Initializing AZ status in service-discovery table ...";
-            $[LOCAL_DDB_ENVS]
-            aws dynamodb put-item
-                --table-name $SERVICE_DISCOVERY_TABLE
-                --item $az_status_item >/dev/null;
-        }?;
-
         // Initialize nss-store in service-discovery table
         let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"},"nss-1":{"network_address":"127.0.0.1:8087"}}}"#;
         let nss_store_item = format!(
@@ -213,14 +202,12 @@ pub fn init_service(
         // Initialize service-discovery keys using etcdctl
         let etcdctl = resolve_etcd_bin("etcdctl");
 
-        let az_status_json = r#"{"status":{"localdev-az1":"Normal","localdev-az2":"Normal"}}"#;
         let bss_data_vg_config = generate_bss_data_vg_config(init_config.bss_count);
         let bss_metadata_vg_config = generate_bss_metadata_vg_config(init_config.bss_count);
         let bss_journal_vg_config = generate_bss_journal_vg_config(init_config.bss_count);
 
         run_cmd! {
             info "Initializing etcd service-discovery keys...";
-            $etcdctl put /fractalbits-service-discovery/az_status $az_status_json >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-data-vg-config $bss_data_vg_config >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-metadata-vg-config $bss_metadata_vg_config >/dev/null;
             $etcdctl put /fractalbits-service-discovery/bss-journal-vg-config $bss_journal_vg_config >/dev/null;
@@ -344,8 +331,6 @@ pub fn init_service(
         }
         ServiceName::DdbLocal => init_ddb_local()?,
         ServiceName::Minio => init_minio("data/s3")?,
-        ServiceName::MinioAz1 => init_minio("data/s3-localdev-az1")?,
-        ServiceName::MinioAz2 => init_minio("data/s3-localdev-az2")?,
         ServiceName::Bss => {
             init_all_bss(init_config.bss_count)?;
         }
@@ -362,8 +347,6 @@ pub fn init_service(
             init_rss()?;
             init_nss()?; // bss is initialized inside
             init_minio("data/s3")?;
-            init_minio("data/s3-localdev-az1")?;
-            init_minio("data/s3-localdev-az2")?;
         }
     }
 
@@ -448,14 +431,6 @@ fn seed_firestore_emulator() -> CmdResult {
                 -d $fields_json >/dev/null
         )
     };
-
-    let az_status_json = r#"{"status":{"localdev-az1":"Normal","localdev-az2":"Normal"}}"#;
-    let escaped_az = az_status_json.replace('"', r#"\""#);
-    let az_fields = format!(
-        r#"{{"fields":{{"value":{{"stringValue":"{escaped_az}"}},"version":{{"integerValue":"1"}}}}}}"#
-    );
-    info!("Seeding AZ status in Firestore...");
-    firestore_put("fractalbits-service-discovery", "az_status", &az_fields)?;
 
     let escaped_data_vg = bss_data_vg_config.replace('"', r#"\""#).replace('\n', "");
     let data_vg_fields = format!(
@@ -859,21 +834,6 @@ fn all_services(
             }
             services
         }
-        DataBlobStorage::S3ExpressMultiAz => {
-            let mut services = vec![
-                ServiceName::ApiServer,
-                ServiceName::NssRoleAgent,
-                ServiceName::Bss,
-                ServiceName::Rss,
-                ServiceName::Minio,
-                ServiceName::MinioAz1,
-                ServiceName::MinioAz2,
-            ];
-            if with_managed_service {
-                services.push(ServiceName::Nss);
-            }
-            services
-        }
         DataBlobStorage::AllInBssSingleAz => {
             let mut services = vec![
                 ServiceName::ApiServer,
@@ -905,10 +865,7 @@ fn get_rss_backend_setting() -> RssBackend {
 }
 
 fn get_data_blob_storage_setting() -> DataBlobStorage {
-    if run_cmd!(grep -q multi_az data/etc/api_server.service &>/dev/null).is_ok() {
-        DataBlobStorage::S3ExpressMultiAz
-    } else if run_cmd!(grep -q s3_hybrid_single_az data/etc/api_server.service &>/dev/null).is_ok()
-    {
+    if run_cmd!(grep -q s3_hybrid_single_az data/etc/api_server.service &>/dev/null).is_ok() {
         DataBlobStorage::S3HybridSingleAz
     } else {
         DataBlobStorage::AllInBssSingleAz
@@ -1060,12 +1017,6 @@ pub fn start_service(service: ServiceName) -> CmdResult {
             // Post-start actions
             match service {
                 ServiceName::Minio => create_minio_bucket(9000, "fractalbits-bucket")?,
-                ServiceName::MinioAz1 => {
-                    create_minio_bucket(9001, "fractalbits-localdev-az1-data-bucket")?
-                }
-                ServiceName::MinioAz2 => {
-                    create_minio_bucket(9002, "fractalbits-localdev-az2-data-bucket")?
-                }
                 ServiceName::ApiServer => register_local_api_server()?,
                 _ => {}
             }
@@ -1139,12 +1090,6 @@ fn start_all_services() -> CmdResult {
             info!("Starting minio for S3HybridSingleAz");
             start_service(ServiceName::Minio)?;
         }
-        DataBlobStorage::S3ExpressMultiAz => {
-            info!("Starting minio instances for S3ExpressMultiAz");
-            start_service(ServiceName::Minio)?;
-            start_service(ServiceName::MinioAz1)?;
-            start_service(ServiceName::MinioAz2)?;
-        }
         DataBlobStorage::AllInBssSingleAz => {}
     }
 
@@ -1170,21 +1115,6 @@ fn start_all_services() -> CmdResult {
             start_nss_role_agent_instance(0)?;
             start_service(ServiceName::ApiServer)?;
         }
-        DataBlobStorage::S3ExpressMultiAz => {
-            info!("Starting multi_az services");
-            // Start BSS instances (NSS requires BSS for metadata storage)
-            let bss_count = get_bss_count_from_config();
-            for id in 0..bss_count {
-                start_bss_instance(id)?;
-            }
-            start_nss_role_agent_instance(1)?;
-            start_service(ServiceName::Rss)?;
-            if reinit_api_key {
-                reinit_firestore_api_key()?;
-            }
-            start_nss_role_agent_instance(0)?;
-            start_service(ServiceName::ApiServer)?;
-        }
     }
 
     info!("All services are started successfully!");
@@ -1206,8 +1136,6 @@ fn create_systemd_unit_files_for_init(
         | ServiceName::Rss
         | ServiceName::DdbLocal
         | ServiceName::Minio
-        | ServiceName::MinioAz1
-        | ServiceName::MinioAz2
         | ServiceName::Etcd
         | ServiceName::FirestoreEmulator
         | ServiceName::FsServer => {
@@ -1329,18 +1257,6 @@ Environment="GUI_WEB_ROOT=../ui/dist""##;
 Environment="MINIO_REGION=localdev""##
                 .to_string();
             format!("{minio_bin} server --address :9000 s3/")
-        }
-        ServiceName::MinioAz1 => {
-            env_settings = r##"
-Environment="MINIO_REGION=localdev""##
-                .to_string();
-            format!("{minio_bin} server --address :9001 s3-localdev-az1/")
-        }
-        ServiceName::MinioAz2 => {
-            env_settings = r##"
-Environment="MINIO_REGION=localdev""##
-                .to_string();
-            format!("{minio_bin} server --address :9002 s3-localdev-az2/")
         }
         ServiceName::Etcd => {
             let etcd_bin = resolve_etcd_bin("etcd");
@@ -1530,8 +1446,6 @@ pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdRes
     let (port_desc, ports): (&str, Vec<u16>) = match service {
         ServiceName::DdbLocal => ("port 8000", vec![8000]),
         ServiceName::Minio => ("port 9000", vec![9000]),
-        ServiceName::MinioAz1 => ("port 9001", vec![9001]),
-        ServiceName::MinioAz2 => ("port 9002", vec![9002]),
         ServiceName::Rss => ("port 8086", vec![8086]),
         ServiceName::Bss => {
             let bss_count = get_bss_count_from_config();

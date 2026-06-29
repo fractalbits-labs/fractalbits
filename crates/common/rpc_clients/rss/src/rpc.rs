@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 
 use crate::client::RpcClient;
-use bytes::Bytes;
 use data_types::{DataVgInfo, TraceId};
 use metrics_wrapper::histogram;
 use prost::Message as PbMessage;
@@ -269,107 +268,10 @@ impl RpcClient {
         }
     }
 
-    pub async fn get_az_status(
-        &self,
-        timeout: Option<Duration>,
-        trace_id: &TraceId,
-        retry_count: u32,
-    ) -> Result<AzStatusMap, RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "get_az_status");
-        let start = Instant::now();
-
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::GetAzStatus;
-        header.size = size_of::<MessageHeader>() as u32;
-        header.retry_count = retry_count as u8;
-        header.set_body_checksum(&[]);
-        header.set_trace_id(trace_id);
-
-        let frame = MessageFrame::new(header, Bytes::new());
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc=%"get_az_status", %request_id, error=?e, "rss rpc failed");
-            }
-            e
-        })?;
-        let resp: GetAzStatusResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
-        let duration = start.elapsed();
-        match resp.result.unwrap() {
-            rss_codec::get_az_status_response::Result::StatusMap(status_map) => {
-                histogram!("rss_rpc_nanos", "status" => "GetAzStatus_Ok")
-                    .record(duration.as_nanos() as f64);
-                Ok(status_map)
-            }
-            rss_codec::get_az_status_response::Result::Error(err) => {
-                histogram!("rss_rpc_nanos", "status" => "GetAzStatus_Error")
-                    .record(duration.as_nanos() as f64);
-                error!(rpc=%"get_az_status", "rss rpc failed: {err}");
-                Err(RpcError::InternalResponseError(err))
-            }
-        }
-    }
-
-    pub async fn set_az_status(
-        &self,
-        az_id: &str,
-        status: &str,
-        timeout: Option<Duration>,
-        trace_id: &TraceId,
-        retry_count: u32,
-    ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "set_az_status");
-        let start = Instant::now();
-        let body = SetAzStatusRequest {
-            az_id: az_id.to_string(),
-            status: status.to_string(),
-        };
-
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::SetAzStatus;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self
-            .send_request( frame, timeout)
-            .await
-            .map_err(|e| {
-                if !e.retryable() {
-                    error!(rpc=%"set_az_status", %request_id, %az_id, %status, error=?e, "rss rpc failed");
-                }
-                e
-            })?;
-        let resp: SetAzStatusResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
-        let duration = start.elapsed();
-        match resp.result.unwrap() {
-            rss_codec::set_az_status_response::Result::Ok(()) => {
-                histogram!("rss_rpc_nanos", "status" => "SetAzStatus_Ok")
-                    .record(duration.as_nanos() as f64);
-                Ok(())
-            }
-            rss_codec::set_az_status_response::Result::Error(err) => {
-                histogram!("rss_rpc_nanos", "status" => "SetAzStatus_Error")
-                    .record(duration.as_nanos() as f64);
-                error!(rpc=%"set_az_status", "rss rpc failed: {err}");
-                Err(RpcError::InternalResponseError(err))
-            }
-        }
-    }
-
     pub async fn create_bucket(
         &self,
         bucket_name: &str,
         api_key_id: &str,
-        is_multi_az: bool,
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
@@ -380,7 +282,6 @@ impl RpcClient {
             bucket_name: bucket_name.to_string(),
             enable_versioning: false,
             api_key_id: api_key_id.to_string(),
-            is_multi_az,
         };
 
         let mut header = MessageHeader::default();

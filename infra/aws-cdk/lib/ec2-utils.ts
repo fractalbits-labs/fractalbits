@@ -47,12 +47,6 @@ export const createVpcEndpoints = (
     service: ec2.GatewayVpcEndpointAwsService.S3,
   });
 
-  // Add Gateway Endpoint for S3 Express One Zone
-  // S3 Express requires a separate gateway endpoint for optimal performance
-  vpc.addGatewayEndpoint("S3ExpressEndpoint", {
-    service: new ec2.GatewayVpcEndpointAwsService("s3express"),
-  });
-
   // Add Gateway Endpoint for DynamoDB
   vpc.addGatewayEndpoint("DynamoDbEndpoint", {
     service: ec2.GatewayVpcEndpointAwsService.DYNAMODB,
@@ -86,24 +80,6 @@ export const createEc2Role = (scope: Construct): iam.Role => {
       iam.ManagedPolicy.fromAwsManagedPolicyName("CloudWatchAgentServerPolicy"),
     ],
   });
-
-  // Add S3 Express One Zone permissions
-  role.addToPolicy(
-    new iam.PolicyStatement({
-      effect: iam.Effect.ALLOW,
-      actions: [
-        "s3express:CreateBucket",
-        "s3express:DeleteBucket",
-        "s3express:CreateSession",
-        "s3express:DeleteSession",
-        "s3express:PutObject",
-        "s3express:GetObject",
-        "s3express:DeleteObject",
-        "s3express:ListBucket",
-      ],
-      resources: ["*"],
-    }),
-  );
 
   return role;
 };

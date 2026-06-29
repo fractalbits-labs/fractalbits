@@ -2,11 +2,10 @@ pub mod bss_node_failure;
 pub mod bss_repair;
 pub mod fs_server;
 pub mod leader_election;
-pub mod multi_az;
 pub mod nss_failover;
 
 use crate::{
-    CmdResult, DataBlobStorage, InitConfig, MultiAzTestType, RssBackend, ServiceName, TestType,
+    CmdResult, DataBlobStorage, InitConfig, RssBackend, ServiceName, TestType,
     cmd_build::{self, BuildMode},
     cmd_service,
 };
@@ -129,7 +128,6 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
     })?;
     cmd_build::build_rust_servers(BuildMode::Debug)?;
     match test_type {
-        TestType::MultiAz { subcommand } => multi_az::run_multi_az_tests(subcommand).await,
         TestType::LeaderElection => test_leader_election(),
         TestType::BssNodeFailure => test_bss_node_failure().await,
         TestType::BssRepair => test_bss_repair().await,
@@ -147,8 +145,7 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
             test_bss_node_failure().await?;
             test_bss_repair().await?;
             test_nss_failover(RssBackend::Etcd).await?;
-            test_leader_election()?;
-            multi_az::run_multi_az_tests(MultiAzTestType::All).await
+            test_leader_election()
         }
     }
 }

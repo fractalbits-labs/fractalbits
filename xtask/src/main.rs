@@ -451,8 +451,6 @@ pub enum ServiceName {
     Rss,
     All,
     Minio,
-    MinioAz1,
-    MinioAz2,
     DdbLocal,
     Etcd,
     FirestoreEmulator,
@@ -593,10 +591,6 @@ pub enum ServiceCommand {
 #[derive(Parser, Clone)]
 pub enum TestType {
     All,
-    MultiAz {
-        #[clap(subcommand)]
-        subcommand: MultiAzTestType,
-    },
     LeaderElection,
     BssNodeFailure,
     BssRepair,
@@ -616,13 +610,6 @@ pub enum TestType {
         )]
         subdir: Option<String>,
     },
-}
-
-#[derive(Parser, Clone, EnumString)]
-pub enum MultiAzTestType {
-    All,
-    DataBlobTracking,
-    DataBlobResyncing,
 }
 
 #[derive(Parser, Clone)]

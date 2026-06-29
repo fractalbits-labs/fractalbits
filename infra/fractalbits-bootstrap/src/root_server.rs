@@ -1,5 +1,5 @@
 use super::common::*;
-use crate::config::{BootstrapConfig, DeployTarget};
+use crate::config::BootstrapConfig;
 use crate::stage_helpers::{InstancesReadyStage, ServicesReadyStageDef};
 use crate::workflow::{StageCompletion, WorkflowBarrier, WorkflowServiceType, stages};
 use cmd_lib::*;
@@ -89,12 +89,11 @@ impl MetadataVgReadyStage {
 }
 
 pub fn bootstrap(config: &BootstrapConfig, is_leader: bool, for_bench: bool) -> CmdResult {
-    let remote_az = config.aws.as_ref().and_then(|aws| aws.remote_az.as_deref());
     let num_bss_nodes = config.global.num_bss_nodes;
     let ha_enabled = config.global.rss_ha_enabled;
 
     if is_leader {
-        bootstrap_leader(config, remote_az, num_bss_nodes, ha_enabled, for_bench)?;
+        bootstrap_leader(config, num_bss_nodes, ha_enabled, for_bench)?;
         Ok(())
     } else {
         bootstrap_follower(config, ha_enabled)
@@ -167,7 +166,6 @@ fn bootstrap_follower(config: &BootstrapConfig, ha_enabled: bool) -> CmdResult {
 
 fn bootstrap_leader(
     config: &BootstrapConfig,
-    remote_az: Option<&str>,
     num_bss_nodes: Option<usize>,
     ha_enabled: bool,
     for_bench: bool,
@@ -187,13 +185,6 @@ fn bootstrap_leader(
         binaries.push("etcdctl");
     }
     download_binaries(config, &binaries)?;
-
-    // Initialize AZ status if this is a multi-AZ deployment (AWS only)
-    if let Some(remote_az) = remote_az
-        && config.global.deploy_target == DeployTarget::Aws
-    {
-        initialize_az_status(config, remote_az)?;
-    }
 
     // Wait for NSS to self-register before initializing observer state. NSS
     // runs in an ASG/MIG and registers to service discovery on boot; the
@@ -218,23 +209,12 @@ fn bootstrap_leader(
         wait_for_service_ready("root_server", 8088, 300)?;
     }
 
-    // Create S3 Express buckets if remote_az is provided (AWS only)
-    if let Some(remote_az) = remote_az
-        && config.global.deploy_target == DeployTarget::Aws
-    {
-        let local_az = get_current_aws_az_id()?;
-        create_s3_express_bucket(&local_az, S3EXPRESS_LOCAL_BUCKET_CONFIG)?;
-        create_s3_express_bucket(remote_az, S3EXPRESS_REMOTE_BUCKET_CONFIG)?;
-    }
-
     // Complete RSS initialized stage - signals NSS and other services can proceed
     RssInitializedStage::complete(&barrier)?;
 
-    // Initialize BSS volume group configurations in service discovery (only for single-AZ mode)
-    if remote_az.is_none() {
-        let total_bss_nodes = num_bss_nodes.unwrap_or(TOTAL_BSS_NODES);
-        initialize_bss_volume_groups(config, &barrier, total_bss_nodes)?;
-    }
+    // Initialize BSS volume group configurations in service discovery
+    let total_bss_nodes = num_bss_nodes.unwrap_or(TOTAL_BSS_NODES);
+    initialize_bss_volume_groups(config, &barrier, total_bss_nodes)?;
 
     // Signal metadata VG ready - NSS active nodes wait for this before starting nss_role_agent
     // This ensures metadata_vg_config is available when nss_role_agent calls wait_for_metadata_vg_ready()
@@ -715,38 +695,6 @@ fn get_all_bss_addresses(
     }
 
     Ok(addresses)
-}
-
-fn initialize_az_status(config: &BootstrapConfig, remote_az: &str) -> CmdResult {
-    let local_az = get_current_aws_az_id()?;
-
-    info!("Initializing AZ status in service discovery");
-    info!("Setting {local_az} and {remote_az} to Normal");
-
-    if config.is_etcd_backend() {
-        let etcdctl = format!("{BIN_PATH}etcdctl");
-        let etcd_endpoints = get_etcd_endpoints_from_workflow(config)?;
-        let key = "/fractalbits-service-discovery/az_status";
-        let az_status_json =
-            format!(r#"{{"status":{{"{local_az}":"Normal","{remote_az}":"Normal"}}}}"#);
-        run_cmd!($etcdctl --endpoints=$etcd_endpoints put $key $az_status_json >/dev/null)?;
-    } else {
-        let region = get_current_aws_region()?;
-        let az_status_item = format!(
-            r#"{{"service_id":{{"S":"{}"}},"status":{{"M":{{"{local_az}":{{"S":"Normal"}},"{remote_az}":{{"S":"Normal"}}}}}}}}"#,
-            AZ_STATUS_KEY
-        );
-
-        run_cmd! {
-            aws dynamodb put-item
-                --table-name $DDB_SERVICE_DISCOVERY_TABLE
-                --item $az_status_item
-                --region $region
-        }?;
-    }
-
-    info!("AZ status initialized in service discovery ({local_az}: Normal, {remote_az}: Normal)");
-    Ok(())
 }
 
 fn get_etcd_endpoints_from_workflow(config: &BootstrapConfig) -> Result<String, Error> {

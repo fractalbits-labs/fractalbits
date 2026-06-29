@@ -86,9 +86,7 @@ export class FractalbitsMetaStack extends cdk.Stack {
           meta_stack_testing: true,
           workflow_cluster_id: workflowClusterId,
         },
-        aws: {
-          local_az: az,
-        },
+        aws: {},
         endpoints: {
           nss_endpoint: "unused",
         },

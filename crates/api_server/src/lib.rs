@@ -9,7 +9,6 @@ pub mod unified_stats;
 pub use blob_client::BlobClient;
 use blob_client::BlobDeletionRequest;
 pub use config::{BlobStorageBackend, BlobStorageConfig, Config, S3HybridSingleAzConfig};
-pub use data_blob_tracking::{DataBlobTracker, DataBlobTrackingError};
 use data_types::{ApiKey, Bucket, RoutingKey, TraceId, Versioned};
 use handler::common::s3_error::S3Error;
 use metrics_wrapper::counter;
@@ -43,7 +42,6 @@ pub struct AppState {
     blob_client: OnceCell<Arc<BlobClient>>,
     blob_deletion_tx: Sender<BlobDeletionRequest>,
     blob_deletion_rx: Mutex<Option<Receiver<BlobDeletionRequest>>>,
-    pub data_blob_tracker: OnceCell<Arc<DataBlobTracker>>,
 }
 
 pub struct NssEntry {
@@ -88,7 +86,6 @@ impl AppState {
             blob_deletion_rx: Mutex::new(Some(rx)),
             cache,
             worker_id,
-            data_blob_tracker: OnceCell::new(),
         }
     }
 
@@ -245,7 +242,7 @@ impl AppState {
 
     pub async fn get_blob_client(
         &self,
-        routing_key: &RoutingKey,
+        _routing_key: &RoutingKey,
     ) -> Result<Arc<BlobClient>, String> {
         self.blob_client
             .get_or_try_init(|| async {
@@ -274,38 +271,11 @@ impl AppState {
                     data_vg_info.volumes.len()
                 );
 
-                // Initialize DataBlobTracker for multi-AZ blob storage
-                let data_blob_tracker = if matches!(
-                    self.config.blob_storage.backend,
-                    BlobStorageBackend::S3ExpressMultiAz
-                ) {
-                    let rss_endpoint = self
-                        .config
-                        .rss_addrs
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "localhost:8086".to_string());
-                    let nss_address = self
-                        .get_nss_address(routing_key)
-                        .await
-                        .unwrap_or_else(|| "localhost:8087".to_string());
-                    let tracker = Arc::new(DataBlobTracker::with_endpoints_and_timeout(
-                        rss_endpoint,
-                        nss_address,
-                        self.config.rpc_connection_timeout(),
-                    ));
-                    let _ = self.data_blob_tracker.set(tracker.clone());
-                    Some(tracker)
-                } else {
-                    None
-                };
-
                 let blob_client = BlobClient::new_with_data_vg_info(
                     &self.config.blob_storage,
                     rx,
                     self.config.rss_rpc_timeout(),
                     self.config.rpc_connection_timeout(),
-                    data_blob_tracker,
                     data_vg_info,
                 )
                 .await
@@ -541,7 +511,6 @@ impl AppState {
         &self,
         bucket_name: &str,
         api_key_id: &str,
-        is_multi_az: bool,
         trace_id: TraceId,
     ) -> Result<(), RpcError> {
         let rss_client = self.get_rss_rpc_client();
@@ -550,7 +519,6 @@ impl AppState {
             create_bucket(
                 bucket_name,
                 api_key_id,
-                is_multi_az,
                 Some(self.config.rss_rpc_timeout()),
                 &trace_id
             )
