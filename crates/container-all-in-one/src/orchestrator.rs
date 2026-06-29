@@ -136,8 +136,11 @@ impl Orchestrator {
         let bss_metadata_vg = generate_bss_metadata_vg_config(1);
         let bss_journal_vg = generate_bss_journal_vg_config(1);
 
-        let journal_configs =
-            generate_initial_journal_configs("00000000-0000-0000-0000-000000000000", "nss-0");
+        let journal_configs = generate_initial_journal_configs(
+            "00000000-0000-0000-0000-000000000000",
+            "nss-0",
+            &bss_journal_vg,
+        );
         let nss_store_json = r#"{"nodes":{"nss-0":{"network_address":"127.0.0.1:8087"}}}"#;
 
         run_cmd! {
@@ -219,10 +222,19 @@ impl Orchestrator {
         let nss_bin = self.bin_dir.join("nss_server");
         let working_dir = self.data_dir.join("nss-0");
 
-        let journal_config =
-            generate_initial_journal_config("00000000-0000-0000-0000-000000000000", "nss-0");
+        let bss_metadata_vg = generate_bss_metadata_vg_config(1);
+        let bss_journal_vg = generate_bss_journal_vg_config(1);
+        let journal_config = generate_initial_journal_config(
+            "00000000-0000-0000-0000-000000000000",
+            "nss-0",
+            &bss_journal_vg,
+        );
         run_cmd! {
-            WORKING_DIR=$working_dir JOURNAL_CONFIG=$journal_config $nss_bin format;
+            WORKING_DIR=$working_dir
+                METADATA_VG_CONFIG=$bss_metadata_vg
+                JOURNAL_VG_CONFIG=$bss_journal_vg
+                JOURNAL_CONFIG=$journal_config
+                $nss_bin format;
         }?;
 
         Ok(())
