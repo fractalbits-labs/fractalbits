@@ -1293,6 +1293,9 @@ Environment="MINIO_REGION=localdev""##
                     fs.disk_cache_size_gb
                 );
             }
+            if fs.allow_other {
+                env_settings += "\nEnvironment=\"FS_SERVER_ALLOW_OTHER=true\"";
+            }
             resolve_binary_path("fs_server", build_mode)
         }
         _ => unreachable!(),
