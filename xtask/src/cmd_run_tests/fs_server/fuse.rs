@@ -208,6 +208,18 @@ pub async fn run_fuse_tests_with_disk_cache(disk_cache_only: bool) -> CmdResult 
 async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     let dc_label = if disk_cache { " [disk-cache]" } else { "" };
 
+    // Start the disk-cache phase from a clean cache directory so the run is
+    // deterministic. A real deployment uses unique (UUIDv7) blob ids per
+    // object, so a persisted cache never collides across object lifetimes;
+    // but repeated local suite runs share one fixed cache dir and accumulate
+    // per-version entries from prior runs, which perturbs eviction/timing and
+    // makes cache-mode tests (mmap, cross-instance overwrite) flaky. CI starts
+    // from a fresh checkout (empty dir); mirror that here.
+    if disk_cache {
+        let dc_path = disk_cache_path();
+        std::fs::remove_dir_all(&dc_path).ok();
+    }
+
     macro_rules! run_test {
         ($name:expr, $func:ident) => {
             println!(
@@ -229,10 +241,26 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     run_test!("Large File Write", test_large_file_write);
     run_test!("Mkdir and Rmdir", test_mkdir_rmdir);
     run_test!("Unlink", test_unlink);
+    run_test!(
+        "Symlink (create / readlink / lstat / unlink)",
+        test_symlink_basic
+    );
+    run_test!(
+        "Hardlink: write after link is durable on both names",
+        test_hardlink_write_visible
+    );
+    run_test!(
+        "Hardlink: cold-Indirect write resolves to shared record",
+        test_hardlink_write_cold_indirect
+    );
+    run_test!(
+        "Hardlink: cross-alias chmod + write both survive",
+        test_hardlink_chmod_then_write
+    );
     run_test!("Rename", test_rename);
     run_test!("Unlink with Open Handle", test_unlink_open_handle);
     run_test!("Overwrite Existing File", test_overwrite_existing);
-    run_test!("Rename No-Replace (EEXIST)", test_rename_noreplace);
+    run_test!("Rename Atomic Replace", test_rename_atomic_replace);
     run_test!("Truncate Write", test_truncate_write);
     run_test!("Write in Subdirectory", test_write_in_subdirectory);
     run_test!("Rename Directory", test_rename_directory);
@@ -240,6 +268,61 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     run_test!("mmap Write", test_mmap_write);
     run_test!("Fsync Persistence", test_fsync_persistence);
     run_test!("Truncate to Non-Zero Size", test_truncate_nonzero);
+
+    // Sparse WriteBuffer + single-writer regression tests.
+    run_test!("Sparse: Large Truncate", test_sparse_truncate_large);
+    run_test!(
+        "Sparse: Partial-Block Overwrite",
+        test_sparse_partial_overwrite
+    );
+    run_test!(
+        "Sparse: Dirty-Handle Read After Write",
+        test_sparse_dirty_read_after_write
+    );
+    run_test!(
+        "Sparse: Single-Writer EBUSY",
+        test_sparse_single_writer_ebusy
+    );
+    run_test!(
+        "Sparse: Override Flush Preserves Bytes",
+        test_sparse_override_flush_persists
+    );
+    run_test!(
+        "Sparse: Sparse File Round Trip Reads Zeros",
+        test_sparse_sparse_file_round_trip
+    );
+    run_test!(
+        "Sparse: Truncate-Then-Extend Reads Zeros",
+        test_sparse_truncate_then_extend
+    );
+    run_test!(
+        "Sparse: Shrink-Then-Grow Destroys Pre-Shrink Bytes",
+        test_sparse_shrink_then_grow_destroys
+    );
+
+    // fallocate (sparse-file syscalls)
+    run_test!("fallocate Extend Grows File", test_fallocate_extend);
+    run_test!(
+        "fallocate KEEP_SIZE Does Not Grow",
+        test_fallocate_keep_size
+    );
+    run_test!(
+        "fallocate PUNCH_HOLE Aligned Drops Block",
+        test_fallocate_punch_hole_aligned
+    );
+    run_test!(
+        "fallocate PUNCH_HOLE Edge Zeroes Bytes",
+        test_fallocate_punch_hole_edge
+    );
+    run_test!(
+        "fallocate PUNCH_HOLE Within Single Block",
+        test_fallocate_punch_hole_single_block
+    );
+    run_test!(
+        "lseek SEEK_DATA / SEEK_HOLE on Sparse File",
+        test_lseek_seek_data_hole
+    );
+    run_test!("lseek SEEK_HOLE on Punched File", test_lseek_punched_hole);
 
     // Cache staleness tests: verify FUSE sees external S3 mutations after TTL
     run_test!(
@@ -277,6 +360,19 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         test_cross_instance_overwrite_visibility
     );
 
+    // Destructive: stops/starts bss@0 to exercise override durability
+    // across a replica partition+rejoin. Run it ONCE (no-cache phase) and
+    // in isolation: the override write path is disk-cache-independent, and
+    // running it in both phases double-cycles bss@0, racing the cluster's
+    // recovery between phases. The reference branch invokes it via a separate
+    // wrapper for the same reason.
+    if !disk_cache {
+        run_test!(
+            "Override Survives BSS Partition-Rejoin",
+            test_override_survives_bss_partition_rejoin
+        );
+    }
+
     // Disk-cache-specific tests (only run when disk_cache is enabled)
     if disk_cache {
         run_test!("Disk Cache Populates on Read", test_disk_cache_populates);
@@ -285,6 +381,18 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
             "Disk Cache Cold Start After Remount",
             test_disk_cache_cold_start
         );
+        run_test!(
+            "Disk Cache Survives Override (stable path + inline metadata)",
+            test_disk_cache_survives_override
+        );
+        // Skip if fio isn't on PATH; the test is opt-in to the host
+        // tooling rather than a hard dependency on the test fixture.
+        if run_cmd!(bash -c "command -v fio").is_ok() {
+            run_test!(
+                "Disk Cache: qemu-style fio random-write workload",
+                test_qemu_style_fio_workload
+            );
+        }
     }
 
     Ok(())
@@ -678,6 +786,328 @@ async fn test_unlink(disk_cache: bool) -> CmdResult {
     Ok(())
 }
 
+/// Exercise symlink create / readlink / lstat / unlink end-to-end. The
+/// kernel routes `symlink(2)` -> `FUSE_SYMLINK` -> our `vfs_symlink`,
+/// stores a layout with `ObjectState::Symlink`, and a subsequent
+/// `readlink(2)` round-trips the original target bytes back through
+/// `vfs_readlink`. `lstat` must report the link mode (S_IFLNK) and the
+/// target byte count as the size.
+async fn test_symlink_basic(disk_cache: bool) -> CmdResult {
+    use std::os::unix::fs::FileTypeExt;
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: symlink(target, link)");
+    let link_path = format!("{}/my-link", MOUNT_POINT);
+    let target = "../etc/hostname";
+    std::os::unix::fs::symlink(target, &link_path)
+        .expect("failed to create symlink via FUSE_SYMLINK");
+    println!("    Created: my-link -> {}", target);
+
+    println!("  Step 3: readlink should round-trip the target verbatim");
+    let resolved = std::fs::read_link(&link_path).expect("read_link failed");
+    assert_eq!(
+        resolved.to_str().expect("non-utf8 target"),
+        target,
+        "readlink(my-link) returned wrong target"
+    );
+
+    println!("  Step 4: lstat reports S_IFLNK and size = target.len()");
+    let meta = std::fs::symlink_metadata(&link_path).expect("symlink_metadata failed");
+    assert!(
+        meta.file_type().is_symlink(),
+        "lstat did not report a symlink: file_type = {:?}",
+        meta.file_type()
+    );
+    assert_eq!(
+        meta.len(),
+        target.len() as u64,
+        "symlink lstat size mismatch: expected {}, got {}",
+        target.len(),
+        meta.len()
+    );
+    // Also assert the type is NOT a regular file or block device.
+    assert!(
+        !meta.file_type().is_file(),
+        "symlink reported as regular file"
+    );
+    assert!(
+        !meta.file_type().is_block_device(),
+        "symlink reported as block device"
+    );
+
+    println!("  Step 5: unlink the symlink (no blob to clean up)");
+    std::fs::remove_file(&link_path).expect("failed to unlink symlink");
+    assert!(
+        std::fs::symlink_metadata(&link_path).is_err(),
+        "symlink still resolves after unlink"
+    );
+
+    println!("  Step 6: same name is reusable after unlink");
+    std::os::unix::fs::symlink("/tmp/another", &link_path)
+        .expect("failed to recreate symlink with same name");
+    let resolved2 = std::fs::read_link(&link_path).expect("read_link after recreate failed");
+    assert_eq!(resolved2.to_str().unwrap(), "/tmp/another");
+
+    println!("  Step 7: symlinks coexist with regular files in the same dir");
+    let regular = format!("{}/sibling.txt", MOUNT_POINT);
+    std::fs::write(&regular, b"hello").expect("regular write failed");
+    let regular_meta = std::fs::metadata(&regular).expect("metadata regular");
+    assert!(regular_meta.file_type().is_file());
+    assert_eq!(regular_meta.len(), 5);
+
+    // Cleanup
+    let _ = std::fs::remove_file(&link_path);
+    let _ = std::fs::remove_file(&regular);
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: symlink basic test passed".green());
+    Ok(())
+}
+
+/// Regression for the P0 where a write after creating a hardlink was
+/// silently discarded: hardlink promotion sets `inode_id`, and the flush
+/// then skipped publish entirely, never touching the shared blob or the
+/// `#hardlink/<id>` InodeRecord. Writes must instead flush to the record
+/// (record-aware CAS path) so both names observe the new bytes, before
+/// and after a remount.
+async fn test_hardlink_write_visible(disk_cache: bool) -> CmdResult {
+    use std::os::unix::fs::MetadataExt;
+
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE rw, create hl-a with initial bytes");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let a_path = format!("{}/hl-a", MOUNT_POINT);
+    let b_path = format!("{}/hl-b", MOUNT_POINT);
+    std::fs::write(&a_path, b"AAAAAAAA").expect("write hl-a failed");
+
+    println!("  Step 2: hard_link(hl-a, hl-b) promotes the inode (nlink=2)");
+    std::fs::hard_link(&a_path, &b_path).expect("hard_link failed");
+    let nlink = std::fs::metadata(&b_path)
+        .expect("stat hl-b failed")
+        .nlink();
+    assert_eq!(nlink, 2, "hardlink nlink should be 2, got {nlink}");
+
+    println!("  Step 3: Write new bytes through hl-b, then fsync");
+    {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&b_path)
+            .expect("open hl-b for write failed");
+        use std::io::Write;
+        let mut f = f;
+        f.write_all(b"ZZZZZZZZZZZZZZZZ").expect("write hl-b failed");
+        f.sync_all().expect("fsync hl-b failed");
+    }
+    let want = b"ZZZZZZZZZZZZZZZZ".to_vec();
+
+    println!("  Step 4: Both names must observe the new bytes pre-remount");
+    let a_live = std::fs::read(&a_path).expect("read hl-a failed");
+    let b_live = std::fs::read(&b_path).expect("read hl-b failed");
+    assert_eq!(a_live, want, "hl-a stale before remount (write discarded)");
+    assert_eq!(b_live, want, "hl-b stale before remount");
+
+    println!("  Step 5: Remount; the write must be durable on both names");
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let a_cold = std::fs::read(&a_path).expect("post-remount read hl-a failed");
+    let b_cold = std::fs::read(&b_path).expect("post-remount read hl-b failed");
+    assert_eq!(
+        a_cold, want,
+        "hl-a stale after remount (P0: old bytes remained)"
+    );
+    assert_eq!(b_cold, want, "hl-b stale after remount");
+
+    let _ = std::fs::remove_file(&a_path);
+    let _ = std::fs::remove_file(&b_path);
+    unmount_fuse()?;
+
+    println!(
+        "{}",
+        "SUCCESS: write after hardlink is durable on both names".green()
+    );
+    Ok(())
+}
+
+/// Cold-cache variant: after a remount the inode cache is empty, so an
+/// enumeration (readdirplus) can cache the raw `Indirect` redirect with
+/// no `inode_id`. A write must still resolve the redirect to the shared
+/// record (persisting the resolved identity) rather than CAS a Normal
+/// layout over the redirect. Exercises the P0 cold path that the
+/// warm-cache test cannot.
+async fn test_hardlink_write_cold_indirect(disk_cache: bool) -> CmdResult {
+    use std::os::unix::fs::MetadataExt;
+
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Create hl-c, link hl-d, commit, then remount cold");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let c_path = format!("{}/hl-c", MOUNT_POINT);
+    let d_path = format!("{}/hl-d", MOUNT_POINT);
+    std::fs::write(&c_path, b"AAAAAAAA").expect("write hl-c failed");
+    std::fs::hard_link(&c_path, &d_path).expect("hard_link failed");
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    // Step 2: enumerate on the fresh mount. FUSE_READDIRPLUS_AUTO makes the
+    // kernel use readdirplus for this first pass, which must resolve the
+    // hardlink (Indirect) entries, both to size their attrs (an
+    // unresolved redirect has no size, which previously EINVAL'd the whole
+    // `ls`) and to report the shared record's true link count (nlink=2, not
+    // the redirect's default 1). Enumerating + resolving here also caches
+    // the inode_id, so the write below takes vfs_open's warm resolve path;
+    // the pure-Indirect vfs_open branch is a defensive stateless/NFS path
+    // not reachable once a lookup or readdirplus has run.
+    println!("  Step 2: Enumerate (readdirplus); attrs resolve to the record");
+    let (mut saw_c, mut saw_d) = (false, false);
+    for e in std::fs::read_dir(MOUNT_POINT)
+        .expect("readdir on hardlink dir failed (readdirplus EINVAL on Indirect?)")
+    {
+        let e = e.expect("dir entry failed");
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name == "hl-c" || name == "hl-d" {
+            let nlink = e.metadata().expect("entry metadata failed").nlink();
+            assert_eq!(
+                nlink, 2,
+                "{name}: hardlink attr nlink should be 2, got {nlink}"
+            );
+            if name == "hl-c" {
+                saw_c = true;
+            } else {
+                saw_d = true;
+            }
+        }
+    }
+    assert!(saw_c && saw_d, "both hardlink names must enumerate");
+
+    println!("  Step 3: Write via hl-d on the cold cache, then fsync");
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&d_path)
+            .expect("open hl-d for write failed");
+        f.write_all(b"YYYYYYYYYYYY").expect("write hl-d failed");
+        f.sync_all().expect("fsync hl-d failed");
+    }
+    let want = b"YYYYYYYYYYYY".to_vec();
+
+    // The written name (hl-d) reflects the new bytes immediately. We do not
+    // assert the *other* name (hl-c) here: Step 2's readdirplus cached its
+    // attr at the pre-write size, and the two hardlink names are distinct
+    // FUSE inodes with independent kernel attr caches, so hl-c's size stays
+    // cached-stale until its TTL lapses. That cross-alias attr-cache lag is
+    // a separate, pre-existing limitation; the P0 guarantee under test is
+    // that the cold write reached the shared record (not a clobbered
+    // redirect), which the post-remount cross-name check below proves.
+    println!("  Step 4: The written name sees the new bytes immediately");
+    assert_eq!(
+        std::fs::read(&d_path).expect("read hl-d failed"),
+        want,
+        "hl-d stale right after its own write"
+    );
+
+    // Step 5 is the real P0 guard: had the cold write taken the wrong
+    // (s3_key) path it would have CAS'd a Normal layout over hl-c's
+    // redirect, so after a remount hl-c and hl-d would diverge (one the
+    // clobbered standalone file, the other the untouched record). Both
+    // resolving to the new bytes proves the redirect survived and the
+    // shared record carries the write.
+    println!("  Step 5: Remount; both links must still resolve to the new bytes");
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket, disk_cache)?;
+    assert_eq!(
+        std::fs::read(&c_path).expect("post-remount read hl-c failed"),
+        want,
+        "hl-c stale after remount (redirect clobbered / write lost)"
+    );
+    assert_eq!(
+        std::fs::read(&d_path).expect("post-remount read hl-d failed"),
+        want,
+        "hl-d stale after remount"
+    );
+
+    let _ = std::fs::remove_file(&c_path);
+    let _ = std::fs::remove_file(&d_path);
+    unmount_fuse()?;
+
+    println!(
+        "{}",
+        "SUCCESS: cold-Indirect write resolves to the shared record".green()
+    );
+    Ok(())
+}
+
+/// Cross-alias metadata/data merge: a chmod via one hardlink name and a
+/// write via the other must BOTH survive. Regression for the record-CAS
+/// read-modify-write applying a stale whole-layout, which would either
+/// revert the chmod's mode (write flush rebuilt from the pre-chmod posix
+/// snapshot) or revert the write's size/version (setattr restored the
+/// pre-write cached layout).
+async fn test_hardlink_chmod_then_write(disk_cache: bool) -> CmdResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_ctx, bucket) = setup_test_bucket().await;
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let e_path = format!("{}/hl-e", MOUNT_POINT);
+    let f_path = format!("{}/hl-f", MOUNT_POINT);
+
+    println!("  Step 1: create hl-e (mode 0644), link hl-f");
+    std::fs::write(&e_path, b"AAAAAAAA").expect("write hl-e failed");
+    std::fs::set_permissions(&e_path, std::fs::Permissions::from_mode(0o644))
+        .expect("chmod 0644 failed");
+    std::fs::hard_link(&e_path, &f_path).expect("hard_link failed");
+
+    println!("  Step 2: chmod hl-e -> 0600, then truncating write+fsync via hl-f");
+    std::fs::set_permissions(&e_path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 failed");
+    {
+        use std::io::Write;
+        let mut wf = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&f_path)
+            .expect("open hl-f for write failed");
+        wf.write_all(b"ZZZZZZZZZZZZ").expect("write hl-f failed");
+        wf.sync_all().expect("fsync hl-f failed");
+    }
+    let want = b"ZZZZZZZZZZZZ".to_vec();
+
+    println!("  Step 3: remount; content AND mode must be correct on both names");
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket, disk_cache)?;
+    for p in [e_path.as_str(), f_path.as_str()] {
+        assert_eq!(
+            std::fs::read(p).expect("post-remount read failed"),
+            want,
+            "{p}: content wrong (write lost, or chmod reverted size/version)"
+        );
+        let mode = std::fs::metadata(p)
+            .expect("post-remount stat failed")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "{p}: mode wrong (chmod undone by the write flush)"
+        );
+    }
+
+    let _ = std::fs::remove_file(&e_path);
+    let _ = std::fs::remove_file(&f_path);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: cross-alias chmod + write both survive".green()
+    );
+    Ok(())
+}
+
 async fn test_rename(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
@@ -801,7 +1231,7 @@ async fn test_overwrite_existing(disk_cache: bool) -> CmdResult {
     Ok(())
 }
 
-async fn test_rename_noreplace(disk_cache: bool) -> CmdResult {
+async fn test_rename_atomic_replace(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
     println!("  Step 1: Mount FUSE in read-write mode");
@@ -814,27 +1244,26 @@ async fn test_rename_noreplace(disk_cache: bool) -> CmdResult {
     std::fs::write(&dst_path, b"destination content").expect("Failed to write dst");
     println!("    Created: rename-src.txt and rename-dst.txt");
 
-    println!("  Step 3: Rename with existing destination should return EEXIST");
-    let err =
-        std::fs::rename(&src_path, &dst_path).expect_err("Rename should have failed with EEXIST");
-    assert_eq!(err.raw_os_error(), Some(17), "Expected EEXIST");
-    println!("    Rename correctly returned EEXIST");
+    println!("  Step 3: rename(2) over an existing dst atomically replaces it");
+    std::fs::rename(&src_path, &dst_path).expect("rename(src, dst) should succeed");
+    println!("    Rename succeeded");
 
-    println!("  Step 4: Verify both files are unchanged");
-    let src_data = std::fs::read(&src_path).expect("Failed to read src");
-    let dst_data = std::fs::read(&dst_path).expect("Failed to read dst");
-    assert_eq!(src_data, b"source content", "Source file content changed");
+    println!("  Step 4: Verify src is gone and dst now has source content");
+    let src_err = std::fs::read(&src_path).expect_err("src should no longer exist");
     assert_eq!(
-        dst_data, b"destination content",
-        "Destination file content changed"
+        src_err.raw_os_error(),
+        Some(libc::ENOENT),
+        "Expected ENOENT"
     );
-    println!("    Both files unchanged: OK");
+    let dst_data = std::fs::read(&dst_path).expect("dst should still exist");
+    assert_eq!(
+        dst_data, b"source content",
+        "Destination should now hold source's content"
+    );
+    println!("    src: ENOENT, dst: holds source bytes");
 
     unmount_fuse()?;
-    println!(
-        "{}",
-        "SUCCESS: Rename no-replace (EEXIST) test passed".green()
-    );
+    println!("{}", "SUCCESS: Rename atomic-replace test passed".green());
     Ok(())
 }
 
@@ -947,7 +1376,7 @@ async fn test_rename_directory(disk_cache: bool) -> CmdResult {
     Ok(())
 }
 
-/// Test dd-style buffered write + fsync exercises the writeback cache path.
+/// Test dd-style buffered write + fsync exercises the write-buffer path.
 async fn test_dd_fsync(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
@@ -1001,7 +1430,7 @@ async fn test_dd_fsync(disk_cache: bool) -> CmdResult {
     Ok(())
 }
 
-/// Test mmap write via libc exercises the writeback cache mmap path.
+/// Test mmap write via libc exercises the write-buffer mmap path.
 async fn test_mmap_write(disk_cache: bool) -> CmdResult {
     use std::os::unix::io::AsRawFd;
 
@@ -1958,6 +2387,1228 @@ async fn test_truncate_nonzero(disk_cache: bool) -> CmdResult {
     println!(
         "{}",
         "SUCCESS: Truncate to non-zero size test passed".green()
+    );
+    Ok(())
+}
+
+async fn test_sparse_truncate_large(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Create a small file");
+    let file_path = format!("{}/sparse-trunc-large.bin", MOUNT_POINT);
+    std::fs::write(&file_path, b"hello").expect("Failed to write seed file");
+
+    println!("  Step 3: ftruncate up to 256MB (sparse extend)");
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .expect("Failed to open for truncate-large");
+        // 256 MB is far larger than what the legacy BytesMut::resize
+        // path would tolerate without obvious memory pressure, but
+        // small enough to keep the test fast on a constrained box.
+        file.set_len(256 * 1024 * 1024)
+            .expect("ftruncate(256MB) failed -- sparse buffer regressed?");
+    }
+
+    println!("  Step 4: Verify stat() reports the buffered size");
+    let meta = std::fs::metadata(&file_path).expect("Failed to stat");
+    assert_eq!(
+        meta.len(),
+        256 * 1024 * 1024,
+        "stat after ftruncate should report buffered size"
+    );
+
+    println!("  Step 5: Read first 5 bytes (existing data preserved)");
+    let mut head = vec![0u8; 5];
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&file_path)
+        .expect("Failed to open for read");
+    use std::os::unix::fs::FileExt;
+    f.read_exact_at(&mut head, 0).expect("read_at(0..5) failed");
+    assert_eq!(&head, b"hello", "Original bytes should survive ftruncate");
+
+    println!("  Step 6: Read 4KB from a hole (returns zeros)");
+    let mut hole = vec![0xffu8; 4096];
+    f.read_exact_at(&mut hole, 1024 * 1024)
+        .expect("read_at(1MB) failed");
+    assert!(
+        hole.iter().all(|&b| b == 0),
+        "Hole region should read as zeros"
+    );
+
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: Sparse O(1) truncate large test passed".green()
+    );
+    Ok(())
+}
+
+// The sparse buffer lazy-loads only the touched blocks on a partial-
+// block edit. A small write at a high offset must not disturb the
+// surrounding bytes.
+async fn test_sparse_partial_overwrite(disk_cache: bool) -> CmdResult {
+    use aws_sdk_s3::primitives::ByteStream;
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Upload an existing 64KB file via S3");
+    let key = "sparse-partial.bin";
+    let original = generate_test_data(key, 64 * 1024);
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(original.clone()))
+        .send()
+        .await
+        .expect("Failed to put existing object");
+
+    println!("  Step 2: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 3: Open the file for RDWR and overwrite 16 bytes at offset 32KB");
+    let file_path = format!("{}/{}", MOUNT_POINT, key);
+    let patch = b"V1-PARTIAL-WRITE";
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("Failed to open RDWR");
+        f.write_all_at(patch, 32 * 1024)
+            .expect("write_all_at failed");
+        f.sync_all().expect("fsync failed");
+    }
+
+    println!("  Step 4: Verify the file is unchanged outside the patched region");
+    let actual = std::fs::read(&file_path).expect("Failed to read after partial write");
+    assert_eq!(actual.len(), original.len(), "Length must match original");
+    assert_eq!(
+        &actual[..32 * 1024],
+        &original[..32 * 1024],
+        "Pre-patch region corrupted"
+    );
+    assert_eq!(
+        &actual[32 * 1024..32 * 1024 + patch.len()],
+        patch,
+        "Patch did not land"
+    );
+    assert_eq!(
+        &actual[32 * 1024 + patch.len()..],
+        &original[32 * 1024 + patch.len()..],
+        "Post-patch region corrupted"
+    );
+
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+    println!(
+        "{}",
+        "SUCCESS: Sparse partial-block overwrite test passed".green()
+    );
+    Ok(())
+}
+
+// A same-handle read after write must observe the just-written bytes
+// via the per-block merge, including reads that span the transition
+// between buffered and unbuffered blocks.
+async fn test_sparse_dirty_read_after_write(disk_cache: bool) -> CmdResult {
+    use aws_sdk_s3::primitives::ByteStream;
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Upload a 32KB seed file via S3");
+    let key = "sparse-dirty-read.bin";
+    let original = generate_test_data(key, 32 * 1024);
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(original.clone()))
+        .send()
+        .await
+        .expect("Failed to put seed object");
+
+    println!("  Step 2: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 3: Write at offset 1024, then read overlapping range without close");
+    let file_path = format!("{}/{}", MOUNT_POINT, key);
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&file_path)
+        .expect("Failed to open RDWR");
+    let patch = b"DIRTY-READ-AFTER-WRITE-CHECK";
+    f.write_all_at(patch, 1024).expect("write_all_at failed");
+
+    let mut readback = vec![0u8; patch.len()];
+    f.read_exact_at(&mut readback, 1024)
+        .expect("read_exact_at failed");
+    assert_eq!(
+        &readback, patch,
+        "Dirty-handle read should see just-written bytes"
+    );
+
+    // Read across a buffered/unbuffered boundary too.
+    let mut head = vec![0u8; 1024 + patch.len() + 32];
+    f.read_exact_at(&mut head, 0)
+        .expect("cross-boundary read failed");
+    assert_eq!(
+        &head[..1024],
+        &original[..1024],
+        "Pre-patch region should reflect committed bytes"
+    );
+    assert_eq!(
+        &head[1024..1024 + patch.len()],
+        patch,
+        "Patch region should reflect buffered bytes"
+    );
+    assert_eq!(
+        &head[1024 + patch.len()..],
+        &original[1024 + patch.len()..1024 + patch.len() + 32],
+        "Post-patch region should reflect committed bytes"
+    );
+
+    drop(f);
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+    println!(
+        "{}",
+        "SUCCESS: Sparse dirty-handle read-after-write test passed".green()
+    );
+    Ok(())
+}
+
+// The inode-scoped write lock must reject a second open(O_WRONLY) on
+// the same inode while the first is live. Read-only opens are
+// unaffected.
+async fn test_sparse_single_writer_ebusy(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Create + flush a file so it exists in NSS");
+    let file_path = format!("{}/sparse-busy.bin", MOUNT_POINT);
+    std::fs::write(&file_path, b"seed").expect("seed write failed");
+
+    println!("  Step 3: Open the file for write and hold the handle");
+    let f1 = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file_path)
+        .expect("Failed to open first writer");
+
+    println!("  Step 4: Second writer open must fail with EBUSY");
+    let err = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file_path)
+        .expect_err("Second writer should be rejected");
+    let raw = err.raw_os_error().unwrap_or(0);
+    assert_eq!(
+        raw,
+        libc::EBUSY,
+        "Expected EBUSY, got {} ({:?})",
+        raw,
+        err.kind()
+    );
+    println!("    Got EBUSY as expected");
+
+    println!("  Step 5: A reader open on the same inode is unaffected");
+    let reader = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&file_path)
+        .expect("Read open should succeed alongside the writer");
+    drop(reader);
+
+    println!("  Step 6: Closing the first writer releases the lock");
+    drop(f1);
+    let f2 = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file_path)
+        .expect("Second writer should succeed after first closes");
+    drop(f2);
+
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: Sparse single-writer EBUSY test passed".green()
+    );
+    Ok(())
+}
+
+// Shrink + grow inside one buffer session. A read of the regrown
+// region must return zeros, not pre-shrink committed data. Exercises
+// the wb.file_size logic and the shrink-clamp on per-block intents
+// inside vfs_setattr_size.
+// Shrink-then-grow within the SAME handle, same session. Seeds a
+// 256KB file with a recognizable pattern, shrinks to 4KB, then writes
+// past the old EOF (re-grows past the originally committed size).
+// POSIX: bytes between the new EOF and the re-extended position must
+// read as zeros, NOT the pre-shrink data. Without the
+// `eof_low_watermark` guard, the lazy-load on the re-extended write
+// would resurface the pre-shrink BSS bytes and the read would see the
+// original pattern instead of zeros.
+async fn test_sparse_shrink_then_grow_destroys(disk_cache: bool) -> CmdResult {
+    use aws_sdk_s3::primitives::ByteStream;
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Seed a 256KB file via S3 with a recognizable pattern");
+    let key = "shrink-grow-destroys.bin";
+    let pattern: Vec<u8> = (0..256 * 1024).map(|i| (i % 251 + 1) as u8).collect();
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(pattern.clone()))
+        .send()
+        .await
+        .expect("seed put failed");
+
+    println!("  Step 2: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/{}", MOUNT_POINT, key);
+
+    println!(
+        "  Step 3: Open RDWR, shrink to 4KB, then write at offset 200KB, all on the same handle"
+    );
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        f.set_len(4096).expect("set_len(4096) failed");
+        let marker = b"MARKER-AT-200K";
+        f.write_all_at(marker, 200 * 1024)
+            .expect("write past old EOF failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Re-open and read [4096..200KB) -- must be zeros, NOT the seed pattern");
+    let read_handle = std::fs::File::open(&file_path).expect("open for read");
+    use std::os::unix::fs::FileExt;
+    let mut span = vec![0xffu8; 200 * 1024 - 4096];
+    read_handle
+        .read_exact_at(&mut span, 4096)
+        .expect("span read failed");
+    assert!(
+        span.iter().all(|&b| b == 0),
+        "destroyed-by-shrink range must read as zeros (POSIX shrink-destroys), \
+         got first non-zero at offset {} (value {})",
+        span.iter().position(|&b| b != 0).unwrap_or(usize::MAX),
+        span.iter().find(|&&b| b != 0).copied().unwrap_or(0)
+    );
+
+    println!("  Step 5: Verify the marker at 200KB is intact");
+    let mut marker_back = [0u8; 14];
+    read_handle
+        .read_exact_at(&mut marker_back, 200 * 1024)
+        .expect("marker read failed");
+    assert_eq!(&marker_back, b"MARKER-AT-200K");
+    drop(read_handle);
+
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+    println!(
+        "{}",
+        "SUCCESS: Sparse shrink-then-grow destroys pre-shrink bytes test passed".green()
+    );
+    Ok(())
+}
+
+async fn test_sparse_truncate_then_extend(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: Write a small file, then ftruncate up");
+    let file_path = format!("{}/sparse-shrink-grow.bin", MOUNT_POINT);
+    std::fs::write(&file_path, b"abcdefghij").expect("seed write failed");
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file_path)
+        .expect("Failed to open for set_len");
+    f.set_len(4096).expect("set_len(4096) failed");
+
+    println!("  Step 3: Read [10..4096) -- must be zeros");
+    use std::os::unix::fs::FileExt;
+    let read_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&file_path)
+        .expect("Failed to open for read");
+    let mut tail = vec![0xffu8; 4096 - 10];
+    read_handle
+        .read_exact_at(&mut tail, 10)
+        .expect("tail read failed");
+    assert!(
+        tail.iter().all(|&b| b == 0),
+        "Extended region must read as zeros"
+    );
+    drop(read_handle);
+    drop(f);
+
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: Sparse truncate-then-extend test passed".green()
+    );
+    Ok(())
+}
+
+// Override flush preserves the surrounding bytes after a partial write
+// + close + reopen + read. This exercises the path where flush keeps
+// the existing blob_guid, bumps blob_version, and writes only the
+// modified block at V+1; other blocks stay at their old version on
+// disk and remain reachable through the new layout.
+async fn test_sparse_override_flush_persists(disk_cache: bool) -> CmdResult {
+    use aws_sdk_s3::primitives::ByteStream;
+    let (ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Upload a 256KB file via S3 (spans 2 blocks)");
+    let key = "sparse-override.bin";
+    let original = generate_test_data(key, 256 * 1024);
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(original.clone()))
+        .send()
+        .await
+        .expect("put failed");
+
+    println!("  Step 2: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 3: Open RDWR, patch 32 bytes near the start of block 1, close");
+    let file_path = format!("{}/{}", MOUNT_POINT, key);
+    let patch = b"OVERRIDE-FLUSH-CHECK-32B-MARKER!";
+    let patch_offset: u64 = 128 * 1024 + 16; // 16 bytes into block 1
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        f.write_all_at(patch, patch_offset)
+            .expect("write_all_at failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Reopen and read; verify patch landed and surroundings are intact");
+    let actual = std::fs::read(&file_path).expect("read failed");
+    assert_eq!(actual.len(), original.len(), "size changed unexpectedly");
+    assert_eq!(
+        &actual[..patch_offset as usize],
+        &original[..patch_offset as usize],
+        "block 0 (or pre-patch region of block 1) corrupted"
+    );
+    assert_eq!(
+        &actual[patch_offset as usize..patch_offset as usize + patch.len()],
+        patch,
+        "patch did not land"
+    );
+    assert_eq!(
+        &actual[patch_offset as usize + patch.len()..],
+        &original[patch_offset as usize + patch.len()..],
+        "post-patch tail of block 1 corrupted"
+    );
+
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+    println!(
+        "{}",
+        "SUCCESS: Sparse override flush persists test passed".green()
+    );
+    Ok(())
+}
+
+// A sparse file written through the override flush path: ftruncate to a
+// large size, write a single small chunk near the end, close. After
+// reopen, the unwritten ranges read as zeros (BlockNotFound -> zeros)
+// and the written chunk reads correctly. This is the round-trip
+// version of test_sparse_truncate_large that actually flushes.
+async fn test_sparse_sparse_file_round_trip(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE rw and create a fresh file");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let file_path = format!("{}/sparse-roundtrip.bin", MOUNT_POINT);
+
+    println!("  Step 2: Write seed bytes, then ftruncate to 4MB, write a marker near 3MB, close");
+    let marker = b"END-MARKER-32B-XXXXXXXXXXXXXXXXX";
+    let marker_offset: u64 = 3 * 1024 * 1024;
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&file_path)
+            .expect("create failed");
+        f.write_all_at(b"head!", 0).expect("write head failed");
+        f.set_len(4 * 1024 * 1024).expect("set_len failed");
+        f.write_all_at(marker, marker_offset)
+            .expect("write marker failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 3: Reopen; verify size, head, marker, and a hole region read zeros");
+    let meta = std::fs::metadata(&file_path).expect("stat failed");
+    assert_eq!(meta.len(), 4 * 1024 * 1024, "size mismatch after flush");
+
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&file_path)
+        .expect("open ro failed");
+
+    let mut head = vec![0u8; 5];
+    f.read_exact_at(&mut head, 0).expect("read head failed");
+    assert_eq!(&head, b"head!", "head bytes lost");
+
+    let mut hole = vec![0xffu8; 4096];
+    f.read_exact_at(&mut hole, 1024 * 1024)
+        .expect("read hole failed");
+    assert!(hole.iter().all(|&b| b == 0), "hole did not read as zeros");
+
+    let mut readback = vec![0u8; marker.len()];
+    f.read_exact_at(&mut readback, marker_offset)
+        .expect("read marker failed");
+    assert_eq!(&readback, marker, "marker mismatch");
+
+    drop(f);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: Sparse sparse-file round trip test passed".green()
+    );
+    Ok(())
+}
+
+// fallocate + lseek tests
+//
+// FUSE block_size used by fs_server is 128KB (`DEFAULT_BLOCK_SIZE`).
+// Tests below assume that boundary so the aligned / edge / single-block
+// PUNCH_HOLE shapes are exercised.
+
+// Used by the fallocate / lseek tests (ported in a later phase).
+#[allow(dead_code)]
+const BLOCK_SIZE: u64 = 128 * 1024;
+
+fn do_fallocate(fd: i32, mode: i32, offset: u64, length: u64) -> Result<(), i32> {
+    let rc = unsafe { libc::fallocate(fd, mode, offset as libc::off_t, length as libc::off_t) };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
+    } else {
+        Ok(())
+    }
+}
+
+/// Wrapper around libc::lseek(2) that returns the resulting offset or errno.
+fn do_lseek(fd: i32, offset: i64, whence: i32) -> Result<i64, i32> {
+    let rc = unsafe { libc::lseek(fd, offset as libc::off_t, whence) };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
+    } else {
+        Ok(rc as i64)
+    }
+}
+
+async fn test_fallocate_extend(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    println!("  Step 1: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/fallocate-extend.bin", MOUNT_POINT);
+    println!("  Step 2: Create file with a small seed write");
+    std::fs::write(&file_path, b"hello").expect("seed write failed");
+
+    println!("  Step 3: fallocate(mode=0, offset=0, length=8KB) extends to 8KB");
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        do_fallocate(f.as_raw_fd(), 0, 0, 8 * 1024).expect("fallocate failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Reopen and verify size grew to 8KB");
+    let meta = std::fs::metadata(&file_path).expect("stat failed");
+    assert_eq!(meta.len(), 8 * 1024, "fallocate did not grow the file");
+
+    println!("  Step 5: Tail past the original write reads as zeros");
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(&file_path).expect("open ro failed");
+    let mut tail = vec![0xffu8; 8 * 1024 - 5];
+    f.read_exact_at(&mut tail, 5).expect("tail read failed");
+    assert!(
+        tail.iter().all(|&b| b == 0),
+        "fallocated tail should be zero-filled"
+    );
+    drop(f);
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: fallocate extend test passed".green());
+    Ok(())
+}
+
+async fn test_fallocate_keep_size(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    println!("  Step 1: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/fallocate-keep-size.bin", MOUNT_POINT);
+    println!("  Step 2: Create a 4KB file");
+    std::fs::write(&file_path, vec![b'x'; 4 * 1024]).expect("seed write failed");
+
+    println!("  Step 3: fallocate(KEEP_SIZE) past EOF must NOT grow the file");
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        do_fallocate(f.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, 64 * 1024)
+            .expect("fallocate KEEP_SIZE failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Verify size is still 4KB");
+    let meta = std::fs::metadata(&file_path).expect("stat failed");
+    assert_eq!(meta.len(), 4 * 1024, "KEEP_SIZE must not change file size");
+
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: fallocate KEEP_SIZE test passed".green());
+    Ok(())
+}
+
+async fn test_fallocate_punch_hole_aligned(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    println!("  Step 1: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/fallocate-punch-aligned.bin", MOUNT_POINT);
+    let total = 3 * BLOCK_SIZE as usize;
+    println!(
+        "  Step 2: Create a {}KB file with non-zero pattern",
+        total / 1024
+    );
+    let pattern: Vec<u8> = (0..total).map(|i| (i % 251 + 1) as u8).collect();
+    std::fs::write(&file_path, &pattern).expect("seed write failed");
+
+    println!("  Step 3: PUNCH_HOLE the middle block (block-aligned)");
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        do_fallocate(
+            f.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            BLOCK_SIZE,
+            BLOCK_SIZE,
+        )
+        .expect("PUNCH_HOLE failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Verify punched block reads as zeros, neighbours intact");
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(&file_path).expect("open ro failed");
+
+    let mut head = vec![0u8; BLOCK_SIZE as usize];
+    f.read_exact_at(&mut head, 0).expect("head read failed");
+    assert_eq!(
+        &head,
+        &pattern[..BLOCK_SIZE as usize],
+        "head block corrupted"
+    );
+
+    let mut hole = vec![0xffu8; BLOCK_SIZE as usize];
+    f.read_exact_at(&mut hole, BLOCK_SIZE)
+        .expect("hole read failed");
+    assert!(
+        hole.iter().all(|&b| b == 0),
+        "punched block should be zeros"
+    );
+
+    let mut tail = vec![0u8; BLOCK_SIZE as usize];
+    f.read_exact_at(&mut tail, 2 * BLOCK_SIZE)
+        .expect("tail read failed");
+    assert_eq!(
+        &tail,
+        &pattern[2 * BLOCK_SIZE as usize..],
+        "tail block corrupted"
+    );
+
+    let meta = std::fs::metadata(&file_path).expect("stat failed");
+    assert_eq!(meta.len(), total as u64, "PUNCH_HOLE must keep size");
+
+    drop(f);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: fallocate PUNCH_HOLE aligned test passed".green()
+    );
+    Ok(())
+}
+
+async fn test_fallocate_punch_hole_edge(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    println!("  Step 1: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/fallocate-punch-edge.bin", MOUNT_POINT);
+    let total = 3 * BLOCK_SIZE as usize;
+    let pattern: Vec<u8> = (0..total).map(|i| (i % 251 + 1) as u8).collect();
+    println!("  Step 2: Seed a {}KB file", total / 1024);
+    std::fs::write(&file_path, &pattern).expect("seed write failed");
+
+    let punch_offset: u64 = BLOCK_SIZE - 1024;
+    let punch_len: u64 = 2 * 1024 + BLOCK_SIZE; // crosses two block boundaries
+    println!(
+        "  Step 3: PUNCH_HOLE crossing block boundaries (offset={}, len={})",
+        punch_offset, punch_len
+    );
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        do_fallocate(
+            f.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            punch_offset,
+            punch_len,
+        )
+        .expect("PUNCH_HOLE failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Verify [punch_offset..punch_offset+punch_len) reads as zeros");
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(&file_path).expect("open ro failed");
+
+    let mut hole = vec![0xffu8; punch_len as usize];
+    f.read_exact_at(&mut hole, punch_offset)
+        .expect("hole read failed");
+    assert!(
+        hole.iter().all(|&b| b == 0),
+        "punched edge range should be zeros, first non-zero at {}",
+        hole.iter().position(|&b| b != 0).unwrap_or(usize::MAX)
+    );
+
+    println!("  Step 5: Verify pre-punch and post-punch bytes are intact");
+    let mut pre = vec![0u8; punch_offset as usize];
+    f.read_exact_at(&mut pre, 0).expect("pre read failed");
+    assert_eq!(
+        &pre,
+        &pattern[..punch_offset as usize],
+        "pre-punch corrupted"
+    );
+
+    let post_offset = punch_offset + punch_len;
+    let post_len = total as u64 - post_offset;
+    let mut post = vec![0u8; post_len as usize];
+    f.read_exact_at(&mut post, post_offset)
+        .expect("post read failed");
+    assert_eq!(
+        &post,
+        &pattern[post_offset as usize..],
+        "post-punch corrupted"
+    );
+
+    drop(f);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: fallocate PUNCH_HOLE edge test passed".green()
+    );
+    Ok(())
+}
+
+async fn test_fallocate_punch_hole_single_block(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    println!("  Step 1: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/fallocate-punch-single.bin", MOUNT_POINT);
+    let total: usize = 8 * 1024;
+    let pattern: Vec<u8> = (0..total).map(|i| ((i % 250) + 5) as u8).collect();
+    println!("  Step 2: Seed an 8KB file (single 128KB block)");
+    std::fs::write(&file_path, &pattern).expect("seed write failed");
+
+    let punch_offset: u64 = 1024;
+    let punch_len: u64 = 2 * 1024;
+    println!(
+        "  Step 3: PUNCH_HOLE confined to one block ({}, {})",
+        punch_offset, punch_len
+    );
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        do_fallocate(
+            f.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            punch_offset,
+            punch_len,
+        )
+        .expect("PUNCH_HOLE failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: Verify only [1024..3072) is zero, surroundings intact");
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(&file_path).expect("open ro failed");
+
+    let mut all = vec![0u8; total];
+    f.read_exact_at(&mut all, 0).expect("read failed");
+    assert_eq!(
+        &all[..punch_offset as usize],
+        &pattern[..punch_offset as usize],
+        "head bytes corrupted"
+    );
+    assert!(
+        all[punch_offset as usize..(punch_offset + punch_len) as usize]
+            .iter()
+            .all(|&b| b == 0),
+        "punched range must be zero"
+    );
+    assert_eq!(
+        &all[(punch_offset + punch_len) as usize..],
+        &pattern[(punch_offset + punch_len) as usize..],
+        "tail bytes corrupted"
+    );
+
+    drop(f);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: fallocate single-block PUNCH_HOLE test passed".green()
+    );
+    Ok(())
+}
+
+async fn test_lseek_seek_data_hole(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    println!("  Step 1: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/lseek-sparse.bin", MOUNT_POINT);
+
+    // The replace-flush path that handles brand-new files writes every
+    // logical block dense, so a fresh `create + set_len + write_at_3MB`
+    // sequence ends up with no actual holes on disk. To exercise lseek
+    // against real holes we seed the file first (one block becomes
+    // committed), then re-open and let the override-flush path place
+    // only the new tail block at offset 3MB. Everything between the
+    // first block and the tail block stays unallocated in BSS.
+    println!("  Step 2: Seed a tiny file so subsequent flushes use the override path");
+    std::fs::write(&file_path, b"seed-data").expect("seed write failed");
+
+    println!("  Step 3: Re-open, extend to 4MB, write at 3MB; sync");
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        f.set_len(4 * 1024 * 1024).expect("set_len failed");
+        f.write_all_at(b"data!", 3 * 1024 * 1024)
+            .expect("data write failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: SEEK_DATA from inside the hole must jump to the tail data block");
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(&file_path).expect("open ro failed");
+    let fd = f.as_raw_fd();
+
+    let data_off = do_lseek(fd, BLOCK_SIZE as i64, libc::SEEK_DATA)
+        .expect("SEEK_DATA from inside hole failed");
+    assert!(
+        data_off >= BLOCK_SIZE as i64 && data_off <= 3 * 1024 * 1024,
+        "SEEK_DATA returned {} (expected jump to the 3MB data block)",
+        data_off
+    );
+
+    println!(
+        "  Step 5: SEEK_HOLE from offset 0 (block 0 has the seed) should land in the hole region"
+    );
+    let hole_off = do_lseek(fd, 0, libc::SEEK_HOLE).expect("SEEK_HOLE from 0 failed");
+    assert!(
+        hole_off >= BLOCK_SIZE as i64 && hole_off < 3 * 1024 * 1024,
+        "SEEK_HOLE returned {} (expected first hole offset between block 1 and 3MB)",
+        hole_off
+    );
+
+    println!("  Step 6: SEEK_HOLE from offset 3MB (mid-data) should advance past the data block");
+    let after_data =
+        do_lseek(fd, 3 * 1024 * 1024, libc::SEEK_HOLE).expect("SEEK_HOLE from 3MB failed");
+    assert!(
+        after_data > 3 * 1024 * 1024,
+        "SEEK_HOLE from 3MB returned {} (must be > 3MB)",
+        after_data
+    );
+
+    println!("  Step 7: SEEK_DATA past EOF must return ENXIO");
+    let err =
+        do_lseek(fd, 4 * 1024 * 1024, libc::SEEK_DATA).expect_err("SEEK_DATA past EOF must fail");
+    assert_eq!(err, libc::ENXIO, "expected ENXIO past EOF, got {}", err);
+
+    drop(f);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: lseek SEEK_DATA / SEEK_HOLE on sparse file test passed".green()
+    );
+    Ok(())
+}
+
+async fn test_lseek_punched_hole(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    println!("  Step 1: Mount FUSE rw");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    let file_path = format!("{}/lseek-punched.bin", MOUNT_POINT);
+    let total = 3 * BLOCK_SIZE as usize;
+    println!(
+        "  Step 2: Seed a {}KB file with a non-zero pattern",
+        total / 1024
+    );
+    let pattern: Vec<u8> = (0..total).map(|i| (i % 251 + 1) as u8).collect();
+    std::fs::write(&file_path, &pattern).expect("seed write failed");
+
+    println!("  Step 3: PUNCH_HOLE the middle aligned block");
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .expect("open rdwr failed");
+        do_fallocate(
+            f.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            BLOCK_SIZE,
+            BLOCK_SIZE,
+        )
+        .expect("PUNCH_HOLE failed");
+        f.sync_all().expect("sync_all failed");
+    }
+
+    println!("  Step 4: SEEK_HOLE from offset 0 must land at the punched block");
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(&file_path).expect("open ro failed");
+    let fd = f.as_raw_fd();
+
+    let hole_off = do_lseek(fd, 0, libc::SEEK_HOLE).expect("SEEK_HOLE failed");
+    assert!(
+        hole_off >= BLOCK_SIZE as i64 && hole_off < 2 * BLOCK_SIZE as i64,
+        "SEEK_HOLE returned {}, expected within the punched range",
+        hole_off
+    );
+
+    println!("  Step 5: SEEK_DATA from inside the hole must land in the trailing data block");
+    let data_off =
+        do_lseek(fd, BLOCK_SIZE as i64, libc::SEEK_DATA).expect("SEEK_DATA from hole failed");
+    assert!(
+        data_off >= 2 * BLOCK_SIZE as i64,
+        "SEEK_DATA returned {}, expected the trailing data block",
+        data_off
+    );
+
+    drop(f);
+    unmount_fuse()?;
+    println!("{}", "SUCCESS: lseek punched-hole test passed".green());
+    Ok(())
+}
+
+async fn test_disk_cache_survives_override(disk_cache: bool) -> CmdResult {
+    assert!(disk_cache, "this test requires disk cache");
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    let dc_path = disk_cache_path();
+    let _ = std::fs::remove_dir_all(&dc_path);
+
+    println!("  Step 1: Mount RW and create a file with original bytes");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let key = "dc-survives-override.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let original = generate_test_data(key, 64 * 1024);
+    std::fs::write(&fuse_path, &original).expect("Failed to write original");
+    println!("    Wrote: {} ({} bytes)", key, original.len());
+
+    println!("  Step 2: Read once to populate the disk cache at V=1");
+    let first_read = std::fs::read(&fuse_path).expect("Failed initial read");
+    assert_eq!(first_read, original, "initial read mismatch");
+    let cache_files_v1: Vec<_> = std::fs::read_dir(&dc_path)
+        .expect("Failed to list disk cache dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        cache_files_v1.len(),
+        1,
+        "exactly one cache file at the stable path expected; got {:?}",
+        cache_files_v1
+    );
+    let cache_name = cache_files_v1[0].clone();
+    assert!(
+        !cache_name.contains("_v"),
+        "cache filename {} must not carry a version suffix under the new scheme",
+        cache_name
+    );
+    println!("    Cache file: {}", cache_name);
+
+    println!("  Step 3: Override-flush: rewrite the file with new bytes at V+1");
+    let updated = {
+        let mut v = original.clone();
+        // Mutate every byte so a stale-cache hit produces a clearly
+        // different result than the new content.
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = b.wrapping_add(((i % 251) + 1) as u8);
+        }
+        v
+    };
+    std::fs::write(&fuse_path, &updated).expect("Failed to overwrite");
+    println!("    Overwrote: {} bytes", updated.len());
+
+    println!("  Step 4: Read after override; the disk cache must serve V+1 bytes");
+    let post_read = std::fs::read(&fuse_path).expect("Failed post-override read");
+    assert_eq!(
+        post_read, updated,
+        "stale-cache regression: read returned previous-version bytes"
+    );
+
+    println!("  Step 5: Cache file path is unchanged (no rename, no new file)");
+    let cache_files_v2: Vec<_> = std::fs::read_dir(&dc_path)
+        .expect("Failed to list disk cache dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        cache_files_v2.len(),
+        1,
+        "expected exactly one cache file post-override; got {:?}",
+        cache_files_v2
+    );
+    assert_eq!(
+        cache_files_v2[0], cache_name,
+        "cache file path must be stable across the override flush"
+    );
+    println!("    Cache file (unchanged): {}", cache_files_v2[0]);
+
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: Disk cache survives override (stable path) passed".green()
+    );
+    Ok(())
+}
+
+async fn test_qemu_style_fio_workload(disk_cache: bool) -> CmdResult {
+    assert!(disk_cache, "this test requires disk cache");
+    let (_ctx, bucket) = setup_test_bucket().await;
+    let dc_path = disk_cache_path();
+    let _ = std::fs::remove_dir_all(&dc_path);
+
+    println!("  Step 1: Mount FUSE in read-write mode");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let key = "qemu-style.img";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+
+    println!("  Step 2: Create a 64 MiB seed file (dd from /dev/urandom)");
+    let seed_size: u64 = 64 * 1024 * 1024;
+    run_cmd!(dd if=/dev/urandom of=$fuse_path bs=1M count=64 conv=fsync 2>/dev/null)?;
+    let stat0 = std::fs::metadata(&fuse_path).expect("stat seed");
+    assert_eq!(stat0.len(), seed_size, "seed file size");
+
+    println!("  Step 3: Snapshot pre-fio cache state");
+    let pre_count = std::fs::read_dir(&dc_path)
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .count()
+        })
+        .unwrap_or(0);
+    println!("    pre-fio cache files: {}", pre_count);
+
+    println!("  Step 4: fio random 4 KiB writes for 10s");
+    let fio_output = run_fun!(
+        fio --name=qemu-style --filename=$fuse_path --rw=randwrite --bs=4k
+            --size=64M --iodepth=1 --numjobs=1 --runtime=10 --time_based
+            --minimal 2>&1
+    )?;
+    // The `--minimal` output is one CSV line per job; pick a couple of
+    // numbers out for the log so we have evidence the workload actually
+    // ran (some IOPS, non-zero bytes).
+    let fields: Vec<&str> = fio_output.split(';').collect();
+    if fields.len() > 30 {
+        // Field positions for minimal output are documented in fio(1).
+        // 7 = total bytes written (KB), 8 = bandwidth (KB/s),
+        // 49 = total IO time (msec), best-effort label.
+        let bytes_written = fields.get(48).copied().unwrap_or("?");
+        let iops = fields.get(49).copied().unwrap_or("?");
+        println!("    fio: writes_KB={} iops_avg={}", bytes_written, iops);
+    } else {
+        println!(
+            "    fio: completed (minimal output had {} fields)",
+            fields.len()
+        );
+    }
+
+    println!("  Step 5: Sync + verify file size unchanged");
+    run_cmd!(sync $fuse_path 2>/dev/null)?;
+    let stat1 = std::fs::metadata(&fuse_path).expect("stat post-fio");
+    assert_eq!(
+        stat1.len(),
+        seed_size,
+        "file size must be stable across the random-write workload"
+    );
+
+    println!("  Step 6: Read every block back and assert population");
+    let bytes = std::fs::read(&fuse_path).expect("read post-fio");
+    assert_eq!(bytes.len(), seed_size as usize, "read length");
+    let nonzero = bytes
+        .chunks(4096)
+        .filter(|b| b.iter().any(|&v| v != 0))
+        .count();
+    assert!(
+        nonzero > 1000,
+        "expected most 4 KiB blocks populated, got {}",
+        nonzero
+    );
+
+    println!("  Step 7: Cache stability -- exactly one file per blob (stable-path invariant)");
+    let post_files: Vec<_> = std::fs::read_dir(&dc_path)
+        .expect("read disk cache dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    println!("    post-fio cache files: {:?}", post_files);
+    let result = if post_files.len() == 1 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "expected exactly 1 cache file under stable-path scheme; got {} ({:?})",
+            post_files.len(),
+            post_files,
+        )))
+    };
+    unmount_fuse()?;
+    result?;
+
+    println!(
+        "{}",
+        "SUCCESS: qemu-style fio workload + stable-path cache invariant".green()
+    );
+    Ok(())
+}
+
+async fn test_override_survives_bss_partition_rejoin(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    let key = "partition-rejoin.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+
+    println!("  Step 1: Mount RW, create a 256 KiB file at V=1, fsync to drain to BSS");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let v1 = generate_test_data("partition-rejoin-v1", 256 * 1024);
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&fuse_path)
+            .expect("open for v1");
+        f.write_all(&v1).expect("write_all v1");
+        // sync_all forces the buffered write to land in NSS+BSS
+        // before we stop node 0 in Step 2. std::fs::write does not
+        // fsync, and default-mode release-flush is async (a spawned
+        // task) that would be killed by the upcoming unmount.
+        f.sync_all().expect("sync_all v1");
+    }
+    let meta = std::fs::metadata(&fuse_path).expect("stat v1");
+    assert_eq!(meta.len(), v1.len() as u64, "v1 file_size after release");
+    unmount_fuse()?;
+
+    println!("  Step 2: Stop BSS node 0 (one of 3 replicas)");
+    run_cmd!(systemctl --user stop bss@0.service)?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    println!("  Step 3: Remount and override-flush at V=2 with node 0 down");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let v2 = generate_test_data("partition-rejoin-v2", 256 * 1024);
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&fuse_path)
+            .expect("open for override-write");
+        f.write_all(&v2).expect("write_all v2");
+        f.sync_all().expect("sync_all v2");
+    }
+    unmount_fuse()?;
+
+    println!("  Step 4: Restart BSS node 0 (rejoins with stale V=1 bytes)");
+    run_cmd!(systemctl --user start bss@0.service)?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    if disk_cache {
+        println!("  Step 5: Wipe the disk cache so reads actually hit BSS");
+        let _ = std::fs::remove_dir_all(disk_cache_path());
+    }
+
+    println!(
+        "  Step 6: Remount read-only and read; expect V=2 bytes regardless of which replica answers"
+    );
+    mount_fuse_ro(&bucket, disk_cache)?;
+    let post = std::fs::read(&fuse_path).expect("Failed post-rejoin read");
+    let read_ok = post == v2;
+    unmount_fuse()?;
+    if !read_ok {
+        return Err(std::io::Error::other(
+            "stale-replica regression: post-rejoin read did not return V=2 content",
+        ));
+    }
+
+    println!(
+        "{}",
+        "SUCCESS: Override survives BSS partition-rejoin (3-replica fan-out + inline-repair)"
+            .green()
     );
     Ok(())
 }
