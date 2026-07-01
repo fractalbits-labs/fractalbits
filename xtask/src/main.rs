@@ -526,6 +526,12 @@ pub struct FsServerConfig {
     pub disk_cache_enabled: bool,
     pub disk_cache_path: String,
     pub disk_cache_size_gb: u64,
+    /// When true, fs_server gets `FS_SERVER_ALLOW_OTHER=true` so users
+    /// other than the mounting daemon (notably root, when the
+    /// pjdfstest harness drives the suite via `sudo`) can reach the
+    /// FUSE mount. The host's `/etc/fuse.conf` must have
+    /// `user_allow_other` enabled for this to take effect.
+    pub allow_other: bool,
 }
 
 impl Default for InitConfig {
@@ -600,9 +606,8 @@ pub enum TestType {
         disk_cache_only: bool,
     },
     /// Build (on first run) and execute the pjdfstest POSIX
-    /// compliance suite against a FUSE mount in writeback default
-    /// mode. Optionally restrict to a single subgroup with
-    /// `--subdir chmod` etc.
+    /// compliance suite against a FUSE mount. Optionally restrict to a
+    /// single subgroup with `--subdir chmod` etc.
     Pjdfstest {
         #[clap(
             long,

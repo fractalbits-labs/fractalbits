@@ -236,6 +236,17 @@ pub async fn get_object_content(
             .await?;
             Ok((Box::pin(body_stream), size))
         }
+        ObjectState::Symlink(_)
+        | ObjectState::Special(_)
+        | ObjectState::Directory(_)
+        | ObjectState::Indirect(_) => {
+            // Symlinks, special files, directory inodes and hardlink
+            // indirections are FS-only schema variants. The S3 API
+            // treats them as opaque and refuses to serve them as
+            // object bodies; clients should treat them as a different
+            // resource kind.
+            Err(S3Error::InvalidObjectState)
+        }
         ObjectState::Mpu(ref mpu_state) => match mpu_state {
             MpuState::Uploading => {
                 tracing::warn!("invalid mpu state: Uploading");
@@ -328,6 +339,15 @@ async fn get_object_range_content(
                 *trace_id,
             );
             Ok(Box::pin(body_stream))
+        }
+        ObjectState::Symlink(_)
+        | ObjectState::Special(_)
+        | ObjectState::Directory(_)
+        | ObjectState::Indirect(_) => {
+            // Range GETs on a symlink / special / directory / indirect
+            // entry have no meaningful semantics in the S3 API
+            // surface; reject.
+            Err(S3Error::InvalidObjectState)
         }
         ObjectState::Mpu(ref mpu_state) => match mpu_state {
             MpuState::Uploading => {

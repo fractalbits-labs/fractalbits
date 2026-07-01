@@ -15,6 +15,7 @@ enum Command {
   CreateRootInode = 20;
   DeleteRootInode = 21;
   Rename = 22;
+  PutInodeCas = 23;
 }
 
 // PutInode
@@ -29,6 +30,27 @@ message PutInodeResponse {
     bytes ok = 1;
     google.protobuf.Empty err_no_such_root_blob = 2;
     string err_other = 3;
+  }
+}
+
+// PutInodeCas: byte-equality compare-and-swap on the stored value.
+//
+// expected_old_value carries the bytes the caller believes are currently
+// stored at `key`. The server proceeds with the put only when the current
+// value matches byte-for-byte. The empty string requires that no live
+// entry exists for `key`.
+message PutInodeCasRequest {
+  string root_blob_name = 1;
+  string key = 2;
+  bytes value = 3;
+  bytes expected_old_value = 4;
+}
+
+message PutInodeCasResponse {
+  oneof result {
+    bytes ok = 1;        // success: returns previous value bytes (may be empty)
+    bytes conflict = 2;  // CAS failure: returns currently stored value bytes
+    string err = 3;
   }
 }
 
