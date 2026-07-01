@@ -79,6 +79,9 @@ pub enum Command {
     GetMetadataBlob = 20,
     DeleteMetadataBlob = 21,
     ListBlobs = 22,
+    // POSIX fs related commands
+    ReserveBlocks = 32,
+    ListBlobBlocks = 33,
 }
 
 #[allow(clippy::derivable_impls)]
