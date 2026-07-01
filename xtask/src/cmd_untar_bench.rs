@@ -9,7 +9,12 @@ use std::time::Instant;
 /// Untar the requested tarball onto a read-write FUSE mount and report
 /// wall-clock time per iteration. Reuses the fs_server integration harness's
 /// cluster + bucket + mount setup. Run `just build --release` first.
-pub async fn run(disk_cache: bool, tarball: String, iterations: u32) -> CmdResult {
+pub async fn run(
+    disk_cache: bool,
+    tarball: String,
+    iterations: u32,
+    writeback_mode: &str,
+) -> CmdResult {
     let mode = BuildMode::Release;
 
     if !std::path::Path::new(&tarball).exists() {
@@ -37,7 +42,7 @@ pub async fn run(disk_cache: bool, tarball: String, iterations: u32) -> CmdResul
 
     let (_ctx, bucket) = fs_server::setup_test_bucket().await;
 
-    // Mount fs_server in normal strict mode.
+    // Mount fs_server in the requested writeback mode.
     let mount_point = MOUNT_POINT;
     run_cmd! {
         ignore fusermount3 -u $mount_point 2>/dev/null;
@@ -50,6 +55,7 @@ pub async fn run(disk_cache: bool, tarball: String, iterations: u32) -> CmdResul
         bucket_name: bucket.clone(),
         mount_point: mount_point.to_string(),
         read_write: true,
+        writeback_mode: writeback_mode.to_string(),
         ..Default::default()
     };
     if disk_cache {
@@ -71,7 +77,7 @@ pub async fn run(disk_cache: bool, tarball: String, iterations: u32) -> CmdResul
     cmd_service::wait_for_service_ready(ServiceName::FsServer, 15)?;
 
     println!(
-        "=== untar bench: mode=strict disk_cache={disk_cache} tarball={tarball} iterations={iterations} ==="
+        "=== untar bench: writeback_mode={writeback_mode} disk_cache={disk_cache} tarball={tarball} iterations={iterations} ==="
     );
     for i in 0..iterations {
         let dest = format!("{mount_point}/untar{i}");

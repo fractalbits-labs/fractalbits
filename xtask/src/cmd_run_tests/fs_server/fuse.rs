@@ -33,6 +33,51 @@ fn fs_server_config(bucket: &str, read_write: bool, disk_cache: bool) -> FsServe
     cfg
 }
 
+/// Same as `mount_fuse_with_opts` but sets `writeback_mode = "default"`
+/// so the writeback queue / worker are active for this mount.
+fn mount_fuse_writeback(bucket: &str, read_write: bool, disk_cache: bool) -> CmdResult {
+    let mount_point = MOUNT_POINT;
+
+    run_cmd! {
+        ignore fusermount3 -u $mount_point 2>/dev/null;
+        ignore fusermount -u $mount_point 2>/dev/null;
+    }?;
+    run_cmd!(mkdir -p $mount_point)?;
+    if disk_cache {
+        let dc_path = disk_cache_path();
+        run_cmd!(mkdir -p $dc_path)?;
+    }
+    let mut fs_cfg = fs_server_config(bucket, read_write, disk_cache);
+    fs_cfg.writeback_mode = "default".to_string();
+    let init_config = InitConfig {
+        fs_server: fs_cfg,
+        ..Default::default()
+    };
+    cmd_service::init_service(
+        ServiceName::FsServer,
+        crate::cmd_build::BuildMode::Debug,
+        &init_config,
+    )?;
+    cmd_service::start_service(ServiceName::FsServer)?;
+
+    for i in 0..20 {
+        std::thread::sleep(Duration::from_millis(500));
+        if run_cmd!(mountpoint -q $mount_point).is_ok() {
+            println!(
+                "    FUSE (writeback=default) mounted at {} (after {}ms)",
+                mount_point,
+                (i + 1) * 500
+            );
+            return Ok(());
+        }
+    }
+
+    Err(std::io::Error::other(format!(
+        "FUSE mount at {} not ready after 10 seconds",
+        mount_point
+    )))
+}
+
 fn mount_fuse_ro(bucket: &str, disk_cache: bool) -> CmdResult {
     mount_fuse_with_opts(bucket, false, disk_cache)
 }
@@ -54,8 +99,14 @@ fn mount_fuse_with_opts(bucket: &str, read_write: bool, disk_cache: bool) -> Cmd
         let dc_path = disk_cache_path();
         run_cmd!(mkdir -p $dc_path)?;
     }
+    // Explicit strict mode: the config default is writeback-on, so without
+    // this the general FUSE suite (and this helper's callers) would never
+    // exercise the strict synchronous publish path. Default-mode coverage
+    // lives in the `mount_fuse_writeback` tests and pjdfstest.
+    let mut fs_cfg = fs_server_config(bucket, read_write, disk_cache);
+    fs_cfg.writeback_mode = "strict".to_string();
     let init_config = InitConfig {
-        fs_server: fs_server_config(bucket, read_write, disk_cache),
+        fs_server: fs_cfg,
         ..Default::default()
     };
     cmd_service::init_service(
@@ -68,15 +119,9 @@ fn mount_fuse_with_opts(bucket: &str, read_write: bool, disk_cache: bool) -> Cmd
     // Wait for mount to appear (poll up to 10 seconds)
     for i in 0..20 {
         std::thread::sleep(Duration::from_millis(500));
-        let status = std::process::Command::new("mountpoint")
-            .arg("-q")
-            .arg(mount_point)
-            .status();
-        if let Ok(s) = status
-            && s.success()
-        {
+        if run_cmd!(mountpoint -q $mount_point).is_ok() {
             println!(
-                "    FUSE mounted at {} (after {}ms)",
+                "    FUSE (writeback=strict) mounted at {} (after {}ms)",
                 mount_point,
                 (i + 1) * 500
             );
@@ -142,13 +187,7 @@ fn spawn_second_fuse(bucket: &str, read_write: bool) -> std::io::Result<Child> {
     // Wait for mount to appear
     for i in 0..20 {
         std::thread::sleep(Duration::from_millis(500));
-        let status = std::process::Command::new("mountpoint")
-            .arg("-q")
-            .arg(mount_point)
-            .status();
-        if let Ok(s) = status
-            && s.success()
-        {
+        if run_cmd!(mountpoint -q $mount_point).is_ok() {
             println!(
                 "    Second FUSE mounted at {} (after {}ms)",
                 mount_point,
@@ -246,6 +285,10 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         test_symlink_basic
     );
     run_test!(
+        "Writeback default mode (symlink commit via async worker)",
+        test_writeback_default_mode_symlink
+    );
+    run_test!(
         "Hardlink: write after link is durable on both names",
         test_hardlink_write_visible
     );
@@ -256,6 +299,26 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     run_test!(
         "Hardlink: cross-alias chmod + write both survive",
         test_hardlink_chmod_then_write
+    );
+    run_test!(
+        "Writeback default mode (async release of dirty file)",
+        test_writeback_default_mode_async_release
+    );
+    run_test!(
+        "Writeback default mode (5-level mkdir -p)",
+        test_writeback_default_mode_mkdir
+    );
+    run_test!(
+        "Writeback default mode (ancestor deps; 30 mkdirs)",
+        test_writeback_default_mode_ancestor_deps
+    );
+    run_test!(
+        "Writeback default mode (fsyncdir drains queue)",
+        test_writeback_default_mode_fsyncdir
+    );
+    run_test!(
+        "Writeback default mode (O_DSYNC per-write drain)",
+        test_writeback_default_mode_o_sync
     );
     run_test!("Rename", test_rename);
     run_test!("Unlink with Open Handle", test_unlink_open_handle);
@@ -871,6 +934,82 @@ async fn test_symlink_basic(disk_cache: bool) -> CmdResult {
     Ok(())
 }
 
+/// Exercise the writeback-default-mode path end-to-end. With
+/// `writeback_mode = "default"`, vfs_symlink enqueues the
+/// `InodeIntent::PutInode` instead of firing NSS synchronously; the
+/// background worker drains the queue ~50ms later. The test:
+///   1. Mounts FUSE in writeback default mode.
+///   2. Creates a symlink (returns immediately to the kernel).
+///   3. Verifies the local view (readlink) sees it instantly.
+///   4. Polls until the kernel-side dir listing also shows it; this
+///      proves the worker actually committed via NSS, not just the
+///      local InodeTable.
+///   5. Unmounts to flush the queue at destroy.
+///   6. Re-mounts in *strict* mode and confirms the symlink is durable
+///      (readlink succeeds against a freshly-spawned fs_server with no
+///      InodeTable cache holdover).
+async fn test_writeback_default_mode_symlink(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_writeback(&bucket, true, disk_cache)?;
+
+    println!("  Step 2: Create a symlink via FUSE_SYMLINK");
+    let link_path = format!("{}/wb-symlink", MOUNT_POINT);
+    let target = "../etc/wb-target";
+    std::os::unix::fs::symlink(target, &link_path).expect("FUSE_SYMLINK failed");
+    println!("    enqueued: wb-symlink -> {}", target);
+
+    println!("  Step 3: Local view must surface the symlink immediately");
+    let resolved = std::fs::read_link(&link_path).expect("local readlink failed");
+    assert_eq!(
+        resolved.to_str().unwrap(),
+        target,
+        "local readlink saw stale target"
+    );
+
+    println!("  Step 4: Wait for the worker to commit to NSS (poll up to 5s)");
+    let mount_point = MOUNT_POINT;
+    let mut committed = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        // dir listing goes through the FUSE -> vfs_readdir -> NSS
+        // ListInodes path; hitting a freshly-listed entry proves NSS
+        // persisted the write.
+        let entries: Vec<_> = std::fs::read_dir(mount_point)
+            .expect("readdir failed")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        if entries.iter().any(|n| n == "wb-symlink") {
+            committed = true;
+            break;
+        }
+    }
+    assert!(
+        committed,
+        "worker failed to commit symlink within 5s; default-mode pipeline broken"
+    );
+    println!("    NSS commit observed via dir listing");
+
+    println!("  Step 5: Unmount (drains residual queue, blocks new enqueues)");
+    unmount_fuse()?;
+
+    println!("  Step 6: Re-mount; symlink must be durable");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let resolved2 = std::fs::read_link(&link_path).expect("post-remount readlink failed");
+    assert_eq!(resolved2.to_str().unwrap(), target);
+
+    let _ = std::fs::remove_file(&link_path);
+    unmount_fuse()?;
+
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode symlink path passed".green()
+    );
+    Ok(())
+}
+
 /// Regression for the P0 where a write after creating a hardlink was
 /// silently discarded: hardlink promotion sets `inode_id`, and the flush
 /// then skipped publish entirely, never touching the shared blob or the
@@ -1380,7 +1519,7 @@ async fn test_rename_directory(disk_cache: bool) -> CmdResult {
     Ok(())
 }
 
-/// Test dd-style buffered write + fsync exercises the write-buffer path.
+/// Test dd-style buffered write + fsync exercises the writeback cache path.
 async fn test_dd_fsync(disk_cache: bool) -> CmdResult {
     let (_ctx, bucket) = setup_test_bucket().await;
 
@@ -1434,7 +1573,7 @@ async fn test_dd_fsync(disk_cache: bool) -> CmdResult {
     Ok(())
 }
 
-/// Test mmap write via libc exercises the write-buffer mmap path.
+/// Test mmap write via libc exercises the writeback cache mmap path.
 async fn test_mmap_write(disk_cache: bool) -> CmdResult {
     use std::os::unix::io::AsRawFd;
 
@@ -3620,7 +3759,7 @@ async fn test_override_survives_bss_partition_rejoin(disk_cache: bool) -> CmdRes
             .open(&fuse_path)
             .expect("open for v1");
         f.write_all(&v1).expect("write_all v1");
-        // sync_all forces the buffered write to land in NSS+BSS
+        // sync_all forces the writeback flush to land in NSS+BSS
         // before we stop node 0 in Step 2. std::fs::write does not
         // fsync, and default-mode release-flush is async (a spawned
         // task) that would be killed by the upcoming unmount.
@@ -3675,6 +3814,274 @@ async fn test_override_survives_bss_partition_rejoin(disk_cache: bool) -> CmdRes
         "{}",
         "SUCCESS: Override survives BSS partition-rejoin (3-replica fan-out + inline-repair)"
             .green()
+    );
+    Ok(())
+}
+
+async fn test_writeback_default_mode_async_release(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE");
+    mount_fuse_writeback(&bucket, true, disk_cache)?;
+
+    println!("  Step 2: Create + write + close a file (close returns before NSS commit)");
+    let key = "wb-async-release.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let payload = generate_test_data(key, 32 * 1024);
+    std::fs::write(&fuse_path, &payload).expect("write+close failed");
+
+    println!("  Step 3: Poll until NSS commit visible via dir listing (up to 5s)");
+    let mount_point = MOUNT_POINT;
+    let mut committed = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        let entries: Vec<_> = std::fs::read_dir(mount_point)
+            .expect("readdir failed")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        if entries.iter().any(|n| n == key) {
+            committed = true;
+            break;
+        }
+    }
+    assert!(
+        committed,
+        "async-release flush failed to commit within 5s; default-mode pipeline broken"
+    );
+    println!("    NSS commit observed via dir listing");
+
+    println!("  Step 4: Read the file back; bytes must match");
+    let read_back = std::fs::read(&fuse_path).expect("post-flush read failed");
+    assert_eq!(
+        read_back.len(),
+        payload.len(),
+        "post-flush size mismatch: expected {}, got {}",
+        payload.len(),
+        read_back.len()
+    );
+    assert_eq!(read_back, payload, "post-flush content mismatch");
+
+    let _ = std::fs::remove_file(&fuse_path);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode async release passed".green()
+    );
+    Ok(())
+}
+
+async fn test_writeback_default_mode_mkdir(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_writeback(&bucket, true, disk_cache)?;
+
+    println!("  Step 2: Create a 5-deep nested directory tree");
+    let path_a = format!("{}/wb-mkdir-a", MOUNT_POINT);
+    let path_b = format!("{}/b", path_a);
+    let path_c = format!("{}/c", path_b);
+    let path_d = format!("{}/d", path_c);
+    let path_e = format!("{}/e", path_d);
+    std::fs::create_dir_all(&path_e).expect("create_dir_all failed");
+    println!("    enqueued nested mkdirs");
+
+    println!("  Step 3: Poll until every level is visible (up to 5s)");
+    let mut all_visible = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        let levels = [&path_a, &path_b, &path_c, &path_d, &path_e];
+        let visible = levels
+            .iter()
+            .filter(|p| std::fs::metadata(p).is_ok())
+            .count();
+        if visible == levels.len() {
+            all_visible = true;
+            break;
+        }
+    }
+    assert!(
+        all_visible,
+        "default-mode mkdir failed to commit all 5 levels within 5s"
+    );
+
+    println!("  Step 4: Drop a regular file in the deepest dir");
+    let leaf_file = format!("{}/leaf.txt", path_e);
+    std::fs::write(&leaf_file, b"hello deep").expect("write leaf failed");
+    let mut leaf_committed = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        if std::fs::metadata(&leaf_file).is_ok() {
+            leaf_committed = true;
+            break;
+        }
+    }
+    assert!(leaf_committed, "leaf file did not commit within 5s");
+    let read_back = std::fs::read(&leaf_file).expect("read leaf failed");
+    assert_eq!(&read_back[..], b"hello deep");
+
+    // Cleanup: rm -rf the tree root takes leaf.txt and b/c/d/e with it.
+    run_cmd!(ignore rm -rf $path_a)?;
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode mkdir (5-level nested) passed".green()
+    );
+    Ok(())
+}
+
+async fn test_writeback_default_mode_ancestor_deps(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_writeback(&bucket, true, disk_cache)?;
+
+    println!("  Step 2: Rapid-fire 30 (mkdir, mkdir/, ) pairs");
+    let n = 30usize;
+    for i in 0..n {
+        let dir = format!("{}/wb-deps-d{:03}", MOUNT_POINT, i);
+        std::fs::create_dir(&dir).expect("mkdir wb-deps dir failed");
+    }
+    println!("    enqueued {} mkdirs", n);
+
+    println!("  Step 3: Poll until every dir is visible (up to 10s)");
+    let mount_point = MOUNT_POINT;
+    let mut all_dirs = false;
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(100));
+        let entries: Vec<_> = std::fs::read_dir(mount_point)
+            .expect("readdir failed")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let visible = (0..n)
+            .filter(|i| entries.iter().any(|nm| nm == &format!("wb-deps-d{:03}", i)))
+            .count();
+        if visible == n {
+            all_dirs = true;
+            break;
+        }
+    }
+    assert!(
+        all_dirs,
+        "default-mode mkdir burst failed to commit {} dirs",
+        n
+    );
+
+    // Cleanup
+    for i in 0..n {
+        let _ = std::fs::remove_dir(format!("{}/wb-deps-d{:03}", MOUNT_POINT, i));
+    }
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode ancestor deps (30 mkdirs) passed".green()
+    );
+    Ok(())
+}
+
+async fn test_writeback_default_mode_fsyncdir(disk_cache: bool) -> CmdResult {
+    use std::os::fd::AsRawFd;
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_writeback(&bucket, true, disk_cache)?;
+
+    println!("  Step 2: Burst-create 20 files at the mount root");
+    let n = 20usize;
+    for i in 0..n {
+        let path = format!("{}/wb-fsyncdir-{:03}.txt", MOUNT_POINT, i);
+        std::fs::write(&path, format!("payload-{}", i).as_bytes())
+            .expect("write wb-fsyncdir file failed");
+    }
+    println!("    enqueued {} files", n);
+
+    println!("  Step 3: fsync the parent directory; must block until queue drains");
+    let dir = std::fs::File::open(MOUNT_POINT).expect("open mount root");
+    let dir_fd = dir.as_raw_fd();
+    let r = unsafe { libc::fsync(dir_fd) };
+    assert_eq!(
+        r,
+        0,
+        "fsync(dir) failed: {}",
+        std::io::Error::last_os_error()
+    );
+    drop(dir);
+
+    println!("  Step 4: Without polling, every file must already be in NSS");
+    let entries: Vec<_> = std::fs::read_dir(MOUNT_POINT)
+        .expect("readdir failed")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let visible = (0..n)
+        .filter(|i| {
+            entries
+                .iter()
+                .any(|name| name == &format!("wb-fsyncdir-{:03}.txt", i))
+        })
+        .count();
+    assert_eq!(
+        visible, n,
+        "fsyncdir did not drain the queue: {}/{} files visible",
+        visible, n
+    );
+
+    // Cleanup
+    for i in 0..n {
+        let _ = std::fs::remove_file(format!("{}/wb-fsyncdir-{:03}.txt", MOUNT_POINT, i));
+    }
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode fsyncdir drain passed".green()
+    );
+    Ok(())
+}
+
+async fn test_writeback_default_mode_o_sync(disk_cache: bool) -> CmdResult {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount FUSE in writeback default mode");
+    mount_fuse_writeback(&bucket, true, disk_cache)?;
+
+    let path = format!("{}/wb-osync.txt", MOUNT_POINT);
+
+    println!("  Step 2: Pre-create the file (sets up the inode + early-publish)");
+    std::fs::write(&path, b"v0").expect("pre-create failed");
+    // Wait for that initial create's queue cycle to drain (we expect
+    // it to take one worker tick at most). Without this, the O_DSYNC
+    // open below races with the create's own put_inode.
+    std::thread::sleep(Duration::from_millis(200));
+
+    println!("  Step 3: Open with O_DSYNC and write");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_DSYNC)
+        .open(&path)
+        .expect("open O_DSYNC failed");
+    let payload = b"sync-payload";
+    f.write_all(payload).expect("write failed");
+    // Each write under O_SYNC drains the queue; close (which flushes
+    // again) is then a no-op but kept for symmetry with userspace.
+    drop(f);
+
+    println!("  Step 4: Read back via a fresh fd; bytes must match");
+    let read_back = std::fs::read(&path).expect("read failed");
+    assert_eq!(
+        &read_back[..],
+        payload,
+        "O_DSYNC write did not surface synchronously"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    unmount_fuse()?;
+    println!(
+        "{}",
+        "SUCCESS: writeback default mode O_DSYNC drain passed".green()
     );
     Ok(())
 }
