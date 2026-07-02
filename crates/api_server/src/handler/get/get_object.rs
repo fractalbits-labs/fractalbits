@@ -398,7 +398,7 @@ async fn get_object_range_content(
                 }
 
                 let trace_id = *trace_id;
-                let body_stream = stream::iter(mpu_blobs.into_iter())
+                let body_stream = stream::iter(mpu_blobs)
                     .then(
                         move |(blob_guid, part_size, part_num_blocks, blob_start, blob_end)| {
                             let blob_client = blob_client.clone();
