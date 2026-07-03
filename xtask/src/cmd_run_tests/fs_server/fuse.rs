@@ -359,6 +359,10 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         "Cross-Instance Overwrite Visibility",
         test_cross_instance_overwrite_visibility
     );
+    run_test!(
+        "Cross-Instance Directory Owner After Listing",
+        test_cross_instance_dir_owner_after_listing
+    );
 
     // Destructive: stops/starts bss@0 to exercise override durability
     // across a replica partition+rejoin. Run it ONCE (no-cache phase) and
@@ -2107,6 +2111,68 @@ async fn test_cross_instance_overwrite_visibility(disk_cache: bool) -> CmdResult
     println!(
         "{}",
         "SUCCESS: Cross-instance overwrite visibility test passed".green()
+    );
+    Ok(())
+}
+
+/// Regression: a directory first materialised on a second instance via a
+/// delimiter listing (readdir) must report its real owner, not the uid-0
+/// placeholder the common-prefix listing seeds. Before the fix nothing
+/// refreshed that placeholder, so `stat` reported uid 0 and a `chmod` /
+/// `utime` by the true owner got EPERM. This is the cross-instance analogue
+/// of the single-mount forget+relookup case (tar's dir-metadata pass
+/// failing under kernel inode-cache pressure during a large untar).
+async fn test_cross_instance_dir_owner_after_listing(disk_cache: bool) -> CmdResult {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let (_ctx, bucket) = setup_test_bucket().await;
+
+    println!("  Step 1: Mount instance A (read-write)");
+    mount_fuse_rw(&bucket, disk_cache)?;
+
+    println!("  Step 2: mkdir on A (owned by the mounting user) with a child");
+    let dir = "owned-dir";
+    let path_a = format!("{}/{}", MOUNT_POINT, dir);
+    std::fs::create_dir(&path_a).expect("mkdir on A");
+    // A child key makes the dir surface as a listing common-prefix on B.
+    std::fs::write(format!("{path_a}/child.txt"), b"x").expect("write child on A");
+
+    println!("  Step 3: Spawn instance B (read-write) on same bucket");
+    let child_b = spawn_second_fuse(&bucket, true)?;
+    std::thread::sleep(CACHE_TTL_WAIT);
+
+    println!("  Step 4: Materialise B's entry via a directory listing (readdir)");
+    let names: Vec<String> = std::fs::read_dir(MOUNT_POINT_B)
+        .expect("readdir B")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        names.contains(&dir.to_string()),
+        "dir not listed on B: {names:?}"
+    );
+
+    println!("  Step 5: stat on B reports the real owner, not the uid-0 placeholder");
+    let uid = unsafe { libc::getuid() };
+    let path_b = format!("{}/{}", MOUNT_POINT_B, dir);
+    let meta = std::fs::metadata(&path_b).expect("stat B");
+    assert_eq!(
+        meta.uid(),
+        uid,
+        "listing-materialised dir on B reports placeholder owner {} (expected {uid})",
+        meta.uid()
+    );
+
+    println!("  Step 6: chmod on B by the owner succeeds (no EPERM)");
+    std::fs::set_permissions(&path_b, std::fs::Permissions::from_mode(0o0755))
+        .expect("chmod on B must not EPERM for the real owner");
+
+    stop_second_fuse(child_b);
+    unmount_fuse()?;
+
+    println!(
+        "{}",
+        "SUCCESS: Cross-instance directory owner after listing test passed".green()
     );
     Ok(())
 }
