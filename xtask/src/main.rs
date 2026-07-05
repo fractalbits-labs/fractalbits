@@ -9,6 +9,7 @@ mod cmd_repo;
 mod cmd_run_tests;
 mod cmd_service;
 mod cmd_tool;
+mod cmd_untar_bench;
 mod docker_utils;
 mod etcd_utils;
 mod firestore_utils;
@@ -48,6 +49,18 @@ enum Cmd {
 
         #[clap(value_enum)]
         service: BenchService,
+    },
+
+    #[clap(about = "Untar a tarball onto a read-write FUSE mount and time it")]
+    UntarBench {
+        #[clap(long, long_help = "enable the fs_server disk cache")]
+        disk_cache: bool,
+
+        #[clap(long, default_value = "/tmp/fbbench/linux-6.0.tar")]
+        tarball: String,
+
+        #[clap(long, default_value = "3")]
+        iterations: u32,
     },
 
     #[clap(about = "Run nightly tests")]
@@ -897,6 +910,11 @@ async fn main() -> CmdResult {
             let test_type = test_type.unwrap_or(TestType::All);
             cmd_run_tests::run_tests(test_type).await?
         }
+        Cmd::UntarBench {
+            disk_cache,
+            tarball,
+            iterations,
+        } => cmd_untar_bench::run(disk_cache, tarball, iterations).await?,
         Cmd::Repo(repo_cmd) => cmd_repo::run_cmd_repo(repo_cmd)?,
         Cmd::Docker(docker_cmd) => cmd_docker::run_cmd_docker(docker_cmd)?,
         Cmd::Prebuilt(prebuilt_cmd) => cmd_prebuilt::run_cmd_prebuilt(prebuilt_cmd)?,
