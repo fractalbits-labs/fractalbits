@@ -29,7 +29,7 @@ pub async fn run(disk_cache: bool, tarball: String, iterations: u32) -> CmdResul
         mode,
         &InitConfig {
             data_blob_storage: DataBlobStorage::AllInBssSingleAz,
-            bss_count: 6,
+            bss_count: 1,
             ..Default::default()
         },
     )?;
