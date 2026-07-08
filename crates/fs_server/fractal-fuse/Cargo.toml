@@ -1,6 +1,6 @@
 [package]
 name = "fractal-fuse"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "Async FUSE library using io_uring (FUSE_OVER_IO_URING) and compio runtime for high-performance userspace filesystems on Linux 6.14+"
 license = "Apache-2.0"

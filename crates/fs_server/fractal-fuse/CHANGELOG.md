@@ -4,11 +4,16 @@ All notable changes to `fractal-fuse` will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-07
+
 ### Added
 - `Session::fuse_fd()`: returns a cloned `Arc<OwnedFd>` of the kernel
   `/dev/fuse` fd backing the session. Use it to build a
   [`FuseNotifier`] (e.g. `FuseNotifier::from(session.fuse_fd())`)
   or perform raw FUSE-fd operations before calling `Session::run`.
+- Filesystem callback panics are now caught and reported to the kernel
+  as `EIO` instead of aborting the worker, so a single bad request no
+  longer tears down the whole session. The panic message is logged.
 
 ### Changed
 - **Breaking:** `Filesystem::init` no longer takes the
@@ -19,6 +24,18 @@ All notable changes to `fractal-fuse` will be documented in this file.
   filesystem before calling `Session::run`. This keeps `Filesystem`
   agnostic of the transport fd and lets the notifier be constructed
   anywhere in user code, not only inside `init`.
+- Upgraded to `compio` 0.12 and `io-uring` 0.7.12, dropping the
+  hand-rolled ring/session workarounds now that upstream exposes the
+  APIs they replaced.
+- Notify struct sizes are now asserted at compile time alongside the
+  existing io_uring header size guards.
+
+### Fixed
+- FUSE notify wire format: notification names are now NUL-terminated on
+  the wire (the kernel reads `namelen + 1` bytes), and the notification
+  code is written as a positive value in `fuse_out_header.error`,
+  correcting the negative value used since 0.3.1. Names without a
+  payload (e.g. `inval_inode`) are unaffected.
 
 ## [0.4.0] - 2026-05-19
 
