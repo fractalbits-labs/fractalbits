@@ -56,6 +56,9 @@ enum Cmd {
         #[clap(long, long_help = "enable the fs_server disk cache")]
         disk_cache: bool,
 
+        #[clap(long, value_enum, default_value = "default")]
+        writeback_mode: UntarBenchWritebackMode,
+
         #[clap(long, default_value = "/tmp/fbbench/linux-6.0.tar")]
         tarball: String,
 
@@ -438,6 +441,15 @@ enum BenchWorkload {
     Write,
 }
 
+#[derive(AsRefStr, EnumString, Copy, Clone, Default, PartialEq, clap::ValueEnum)]
+#[strum(serialize_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+enum UntarBenchWritebackMode {
+    Strict,
+    #[default]
+    Default,
+}
+
 #[derive(Clone, EnumString, clap::ValueEnum)]
 enum BenchService {
     NssRpc,
@@ -539,6 +551,10 @@ pub struct FsServerConfig {
     pub disk_cache_enabled: bool,
     pub disk_cache_path: String,
     pub disk_cache_size_gb: u64,
+    /// Writeback durability mode passed through to fs_server via the
+    /// `FS_SERVER_WRITEBACK_MODE` env var. Empty string = use the
+    /// fs_server config default (`default`).
+    pub writeback_mode: String,
     /// When true, fs_server gets `FS_SERVER_ALLOW_OTHER=true` so users
     /// other than the mounting daemon (notably root, when the
     /// pjdfstest harness drives the suite via `sudo`) can reach the
@@ -619,8 +635,9 @@ pub enum TestType {
         disk_cache_only: bool,
     },
     /// Build (on first run) and execute the pjdfstest POSIX
-    /// compliance suite against a FUSE mount. Optionally restrict to a
-    /// single subgroup with `--subdir chmod` etc.
+    /// compliance suite against a FUSE mount in writeback default
+    /// mode. Optionally restrict to a single subgroup by name via
+    /// the `subdir` option (e.g. chmod).
     Pjdfstest {
         #[clap(
             long,
@@ -912,9 +929,10 @@ async fn main() -> CmdResult {
         }
         Cmd::UntarBench {
             disk_cache,
+            writeback_mode,
             tarball,
             iterations,
-        } => cmd_untar_bench::run(disk_cache, tarball, iterations).await?,
+        } => cmd_untar_bench::run(disk_cache, tarball, iterations, writeback_mode.as_ref()).await?,
         Cmd::Repo(repo_cmd) => cmd_repo::run_cmd_repo(repo_cmd)?,
         Cmd::Docker(docker_cmd) => cmd_docker::run_cmd_docker(docker_cmd)?,
         Cmd::Prebuilt(prebuilt_cmd) => cmd_prebuilt::run_cmd_prebuilt(prebuilt_cmd)?,

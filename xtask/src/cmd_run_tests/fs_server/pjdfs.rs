@@ -1,5 +1,6 @@
 //! pjdfstest driver. Clones, bootstraps, and runs the POSIX
-//! filesystem compliance suite against an fs_server FUSE mount.
+//! filesystem compliance suite against an fs_server FUSE mount in
+//! `writeback_mode=default` so the writeback queue path is exercised.
 //!
 //! pjdfstest is a third-party C + Perl test suite that walks the
 //! POSIX system-call surface (`chmod`, `chown`, `link`, `mkdir`,
@@ -31,8 +32,8 @@ const PJDFSTEST_DIR: &str = "data/third_party/pjdfstest";
 /// re-validating the full suite against the new revision.
 const PJDFSTEST_COMMIT: &str = "ededbeb2b44929972898afb87474b0937f78a877";
 
-/// Test files excluded from the run because they exercise a feature
-/// fs_server does not implement yet. Skipped (rather than left to
+/// Test files excluded from the run because they exercise a feature the
+/// writeback path does not implement yet. Skipped (rather than left to
 /// fail) so the suite stays a clean signal for what IS supported.
 ///
 /// - `rename/09.t`, `rename/10.t`: their sticky-bit matrix includes
@@ -213,6 +214,8 @@ fn mount_fuse_default(bucket: &str) -> CmdResult {
     }?;
     run_cmd!(mkdir -p $mount_point)?;
 
+    // writeback_mode left empty so fs_server uses its config default
+    // (writeback on), exercising the cache-by-default path.
     let cfg = fs_cfg(bucket);
     cmd_service::init_service(
         ServiceName::FsServer,
@@ -259,7 +262,7 @@ pub async fn run_pjdfstest(subdir: Option<&str>) -> CmdResult {
     };
 
     mount_fuse_default(bucket_name)?;
-    println!("  FUSE mounted at {MOUNT_POINT}");
+    println!("  FUSE mounted at {MOUNT_POINT} (writeback=default)");
 
     // pjdfstest expects to be run from a working dir that is itself
     // a writable test root. It creates files / dirs in `.` and
