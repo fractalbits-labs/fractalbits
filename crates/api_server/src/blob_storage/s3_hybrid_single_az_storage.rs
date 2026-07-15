@@ -1,6 +1,6 @@
 use super::{
-    BlobLocation, BlobReadContext, BlobStorageError, DataVgProxy, blob_key, chunks_to_bytestream,
-    create_s3_client,
+    BlobLocation, BlobReadContext, BlobStorageError, DataVgProxy, S3_DATA_WRITE_TOKEN, blob_key,
+    chunks_to_bytestream, create_s3_client,
 };
 use crate::config::S3HybridSingleAzConfig;
 use aws_sdk_s3::Client as S3Client;
@@ -119,7 +119,14 @@ impl S3HybridSingleAzStorage {
             // Small blob or EC-routed blob - store in DataVgProxy
             let blob_guid = DataBlobGuid { blob_id, volume_id };
             self.data_vg_proxy
-                .put_blob(blob_guid, block_number, body, 1, trace_id)
+                .put_blob(
+                    blob_guid,
+                    block_number,
+                    body,
+                    1,
+                    S3_DATA_WRITE_TOKEN,
+                    trace_id,
+                )
                 .await?;
         } else {
             // Large blob - store in S3 (volume_id doesn't matter for S3 storage, but we'll use S3_VOLUME for metadata consistency)
@@ -157,7 +164,14 @@ impl S3HybridSingleAzStorage {
         if is_small || Volume::is_ec_volume_id(volume_id) {
             let blob_guid = DataBlobGuid { blob_id, volume_id };
             self.data_vg_proxy
-                .put_blob_vectored(blob_guid, block_number, chunks, 1, trace_id)
+                .put_blob_vectored(
+                    blob_guid,
+                    block_number,
+                    chunks,
+                    1,
+                    S3_DATA_WRITE_TOKEN,
+                    trace_id,
+                )
                 .await?;
         } else {
             let s3_key = blob_key(blob_id, block_number);
@@ -196,23 +210,17 @@ impl S3HybridSingleAzStorage {
         match read.location {
             BlobLocation::DataVgProxy => {
                 // Small blob - get from DataVgProxy
-                if read.data_write_token == 0 {
-                    self.data_vg_proxy
-                        .get_blob(read.blob_guid, block_number, content_len, body, trace_id)
-                        .await?;
-                } else {
-                    self.data_vg_proxy
-                        .get_blob_at_or_before(
-                            read.blob_guid,
-                            block_number,
-                            content_len,
-                            read.blob_version,
-                            read.data_write_token,
-                            body,
-                            trace_id,
-                        )
-                        .await?;
-                }
+                self.data_vg_proxy
+                    .get_blob_at_or_before(
+                        read.blob_guid,
+                        block_number,
+                        content_len,
+                        read.blob_version,
+                        read.data_write_token,
+                        body,
+                        trace_id,
+                    )
+                    .await?;
             }
             BlobLocation::S3 => {
                 // Large blob - get from S3

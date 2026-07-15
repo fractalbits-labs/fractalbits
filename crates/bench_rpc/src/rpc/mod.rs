@@ -222,7 +222,18 @@ async fn benchmark_bss_write(
                 let request_start = Instant::now();
                 let trace_id = TraceId::new();
                 let result = rpc_client
-                    .put_data_blob(blob_guid, 0, content, body_checksum, 1, None, &trace_id, 0)
+                    .put_data_blob(
+                        blob_guid,
+                        0,
+                        content,
+                        body_checksum,
+                        1,
+                        1,
+                        false,
+                        None,
+                        &trace_id,
+                        0,
+                    )
                     .await
                     .map(|_| ()) // Map Ok(usize) to Ok(())
                     .map_err(|e| anyhow::anyhow!(e)); // Convert RpcErrorBss to anyhow::Error
@@ -264,7 +275,18 @@ async fn benchmark_bss_write(
                 let request_start = Instant::now();
                 let trace_id = TraceId::new();
                 let result = rpc_client
-                    .put_data_blob(blob_guid, 0, content, body_checksum, 1, None, &trace_id, 0)
+                    .put_data_blob(
+                        blob_guid,
+                        0,
+                        content,
+                        body_checksum,
+                        1,
+                        1,
+                        false,
+                        None,
+                        &trace_id,
+                        0,
+                    )
                     .await
                     .map(|_| ()) // Map Ok(usize) to Ok(())
                     .map_err(|e| anyhow::anyhow!(e)); // Convert RpcErrorBss to anyhow::Error
@@ -316,6 +338,8 @@ async fn benchmark_bss_read(
                         0,
                         &mut content,
                         BLOB_SIZE - 256,
+                        1,
+                        1,
                         None,
                         &trace_id,
                         0,
@@ -364,6 +388,8 @@ async fn benchmark_bss_read(
                         0,
                         &mut content,
                         BLOB_SIZE - 256,
+                        1,
+                        1,
                         None,
                         &trace_id,
                         0,

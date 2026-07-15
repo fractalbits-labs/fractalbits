@@ -237,34 +237,9 @@ impl RpcClient {
         parse_list_blobs_response(resp)
     }
 
-    /// Reserve a single block (single-op; no batch) at `expected_version`.
+    /// Reserve one exact data generation.
     #[allow(clippy::too_many_arguments)]
     pub async fn reserve_blocks(
-        &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        block_size: u32,
-        expected_version: u64,
-        timeout: Option<Duration>,
-        trace_id: &TraceId,
-        retry_count: u32,
-    ) -> Result<(), RpcError> {
-        self.reserve_blocks_generation(
-            blob_guid,
-            block_number,
-            block_size,
-            expected_version,
-            0,
-            timeout,
-            trace_id,
-            retry_count,
-        )
-        .await
-    }
-
-    /// Reserve one exact data generation. Token zero uses the legacy data key.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn reserve_blocks_generation(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
@@ -275,7 +250,7 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "reserve_blocks_generation");
+        let _guard = InflightRpcGuard::new("bss", "reserve_blocks");
         let body = ReserveBlocksRequest {
             block_count: 1,
             block_size,
@@ -370,36 +345,9 @@ impl RpcClient {
         }
     }
 
+    /// Put one exact data generation.
     #[allow(clippy::too_many_arguments)]
     pub async fn put_data_blob(
-        &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        body: Bytes,
-        body_checksum: u64,
-        version: u64,
-        timeout: Option<Duration>,
-        trace_id: &TraceId,
-        retry_count: u32,
-    ) -> Result<(), RpcError> {
-        self.put_data_blob_generation(
-            blob_guid,
-            block_number,
-            body,
-            body_checksum,
-            version,
-            0,
-            false,
-            timeout,
-            trace_id,
-            retry_count,
-        )
-        .await
-    }
-
-    /// Put one exact data generation. Token zero uses the legacy data key.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn put_data_blob_generation(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
@@ -412,7 +360,7 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "put_data_blob_generation");
+        let _guard = InflightRpcGuard::new("bss", "put_data_blob");
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
@@ -443,36 +391,9 @@ impl RpcClient {
         Ok(())
     }
 
+    /// Put one exact vectored data generation.
     #[allow(clippy::too_many_arguments)]
     pub async fn put_data_blob_vectored(
-        &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        chunks: Vec<Bytes>,
-        body_checksum: u64,
-        version: u64,
-        timeout: Option<Duration>,
-        trace_id: &TraceId,
-        retry_count: u32,
-    ) -> Result<(), RpcError> {
-        self.put_data_blob_vectored_generation(
-            blob_guid,
-            block_number,
-            chunks,
-            body_checksum,
-            version,
-            0,
-            false,
-            timeout,
-            trace_id,
-            retry_count,
-        )
-        .await
-    }
-
-    /// Put one exact vectored data generation. Token zero uses the legacy key.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn put_data_blob_vectored_generation(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
@@ -485,7 +406,7 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "put_data_blob_vectored_generation");
+        let _guard = InflightRpcGuard::new("bss", "put_data_blob_vectored");
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
@@ -517,37 +438,9 @@ impl RpcClient {
         Ok(())
     }
 
+    /// Get one exact data generation.
     #[allow(clippy::too_many_arguments)]
-    /// Issue a GetDataBlob RPC and return the BSS-reported `version` of the
-    /// returned block alongside the body. Callers that need read-side
-    /// version arbitration (see `DataVgProxy::get_blob`) compare this
-    /// against an expected version to detect lagging-replica reads.
     pub async fn get_data_blob(
-        &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        body: &mut Bytes,
-        content_len: usize,
-        timeout: Option<Duration>,
-        trace_id: &TraceId,
-        retry_count: u32,
-    ) -> Result<u64, RpcError> {
-        self.get_data_blob_impl(
-            blob_guid,
-            block_number,
-            body,
-            content_len,
-            None,
-            timeout,
-            trace_id,
-            retry_count,
-        )
-        .await
-    }
-
-    /// Get one exact data generation. Token zero uses the legacy data key.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn get_data_blob_generation(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
@@ -559,32 +452,6 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        self.get_data_blob_impl(
-            blob_guid,
-            block_number,
-            body,
-            content_len,
-            Some((version, write_token)),
-            timeout,
-            trace_id,
-            retry_count,
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn get_data_blob_impl(
-        &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        body: &mut Bytes,
-        content_len: usize,
-        generation: Option<(u64, u64)>,
-        timeout: Option<Duration>,
-        trace_id: &TraceId,
-        retry_count: u32,
-    ) -> Result<u64, RpcError> {
         let _guard = InflightRpcGuard::new("bss", "get_data_blob");
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
@@ -597,10 +464,8 @@ impl RpcClient {
         header.trace_id = trace_id.0;
         header.body_len = content_len as u32;
         header.size = size_of::<MessageHeader>() as u32;
-        if let Some((version, write_token)) = generation {
-            header.version = version;
-            header.set_data_write_token(write_token);
-        }
+        header.version = version;
+        header.set_data_write_token(write_token);
 
         let msg_frame = MessageFrame::new(header, Bytes::new());
         let resp_frame = self
@@ -613,17 +478,15 @@ impl RpcClient {
                 e
             })?;
         check_response_errno(&resp_frame.header)?;
-        let version = resp_frame.header.version;
-        if let Some((expected_version, expected_token)) = generation
-            && (version != expected_version
-                || resp_frame.header.data_write_token() != expected_token)
+        if resp_frame.header.version != version
+            || resp_frame.header.data_write_token() != write_token
         {
             return Err(RpcError::InternalResponseError(format!(
                 "BSS returned generation ({}, {}) but client requested ({}, {})",
-                version,
+                resp_frame.header.version,
                 resp_frame.header.data_write_token(),
-                expected_version,
-                expected_token
+                version,
+                write_token
             )));
         }
         *body = resp_frame.body;
@@ -640,34 +503,12 @@ impl RpcClient {
                 content_len
             )));
         }
-        Ok(version)
+        Ok(())
     }
 
+    /// Delete one exact data generation.
     #[allow(clippy::too_many_arguments)]
     pub async fn delete_data_blob(
-        &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        version: u64,
-        timeout: Option<Duration>,
-        trace_id: &TraceId,
-        retry_count: u32,
-    ) -> Result<(), RpcError> {
-        self.delete_data_blob_generation(
-            blob_guid,
-            block_number,
-            version,
-            0,
-            timeout,
-            trace_id,
-            retry_count,
-        )
-        .await
-    }
-
-    /// Delete one exact data generation. Token zero uses the legacy data key.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn delete_data_blob_generation(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
@@ -677,7 +518,7 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "delete_data_blob_generation");
+        let _guard = InflightRpcGuard::new("bss", "delete_data_blob");
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;

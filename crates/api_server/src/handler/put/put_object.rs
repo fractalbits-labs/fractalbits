@@ -20,6 +20,7 @@ use super::s3_streaming::S3StreamingPayload;
 use crate::{
     BlobStorageBackend,
     blob_client::BlobDeletionRequest,
+    blob_storage::S3_DATA_WRITE_TOKEN,
     handler::{
         ObjectRequestContext,
         common::{
@@ -443,8 +444,8 @@ async fn put_object_streaming_internal(
         block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
         timestamp,
         blob_version: 1,
-        data_write_token: 0,
-        next_data_write_token: 0,
+        data_write_token: S3_DATA_WRITE_TOKEN,
+        next_data_write_token: S3_DATA_WRITE_TOKEN + 1,
         pending_data_write: None,
         state: ObjectState::Normal(ObjectMetaData {
             blob_guid,
@@ -638,8 +639,8 @@ async fn put_object_with_no_trailer(
         block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
         timestamp,
         blob_version: 1,
-        data_write_token: 0,
-        next_data_write_token: 0,
+        data_write_token: S3_DATA_WRITE_TOKEN,
+        next_data_write_token: S3_DATA_WRITE_TOKEN + 1,
         pending_data_write: None,
         state: ObjectState::Normal(ObjectMetaData {
             blob_guid,

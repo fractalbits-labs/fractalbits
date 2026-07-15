@@ -1,4 +1,4 @@
-use super::{BlobReadContext, BlobStorageError, DataVgProxy};
+use super::{BlobReadContext, BlobStorageError, DataVgProxy, S3_DATA_WRITE_TOKEN};
 use bytes::Bytes;
 use data_types::object_layout::ObjectLayout;
 use data_types::{DataBlobGuid, DataVgInfo, TraceId};
@@ -73,7 +73,14 @@ impl AllInBssSingleAzStorage {
 
         let blob_guid = DataBlobGuid { blob_id, volume_id };
         self.data_vg_proxy
-            .put_blob(blob_guid, block_number, body, 1, trace_id)
+            .put_blob(
+                blob_guid,
+                block_number,
+                body,
+                1,
+                S3_DATA_WRITE_TOKEN,
+                trace_id,
+            )
             .await?;
 
         Ok(())
@@ -92,7 +99,14 @@ impl AllInBssSingleAzStorage {
 
         let blob_guid = DataBlobGuid { blob_id, volume_id };
         self.data_vg_proxy
-            .put_blob_vectored(blob_guid, block_number, chunks, 1, trace_id)
+            .put_blob_vectored(
+                blob_guid,
+                block_number,
+                chunks,
+                1,
+                S3_DATA_WRITE_TOKEN,
+                trace_id,
+            )
             .await?;
 
         Ok(())
@@ -106,23 +120,17 @@ impl AllInBssSingleAzStorage {
         body: &mut Bytes,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
-        if read.data_write_token == 0 {
-            self.data_vg_proxy
-                .get_blob(read.blob_guid, block_number, content_len, body, trace_id)
-                .await?;
-        } else {
-            self.data_vg_proxy
-                .get_blob_at_or_before(
-                    read.blob_guid,
-                    block_number,
-                    content_len,
-                    read.blob_version,
-                    read.data_write_token,
-                    body,
-                    trace_id,
-                )
-                .await?;
-        }
+        self.data_vg_proxy
+            .get_blob_at_or_before(
+                read.blob_guid,
+                block_number,
+                content_len,
+                read.blob_version,
+                read.data_write_token,
+                body,
+                trace_id,
+            )
+            .await?;
 
         histogram!("blob_size", "operation" => "get").record(body.len() as f64);
         Ok(())

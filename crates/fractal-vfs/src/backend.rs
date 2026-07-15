@@ -262,28 +262,21 @@ impl StorageBackend {
         trace_id: &TraceId,
     ) -> Result<(Bytes, u64), FsError> {
         let mut body = Bytes::new();
-        // Every fs-written blob carries a nonzero token and reads through the
-        // committed-identity bounded path (an unrewritten block legitimately
-        // sits at an older generation, which at-or-before resolves). A
-        // token-zero blob can only be an immutable v1 api_server write, so
-        // the plain first-success read is correct and faster.
-        if data_write_token != 0 {
-            self.data_vg_proxy
-                .get_blob_at_or_before(
-                    blob_guid,
-                    block_number,
-                    content_len,
-                    blob_version,
-                    data_write_token,
-                    &mut body,
-                    trace_id,
-                )
-                .await?;
-        } else {
-            self.data_vg_proxy
-                .get_blob(blob_guid, block_number, content_len, &mut body, trace_id)
-                .await?;
-        }
+        // Every data-volume blob carries a nonzero token; the read is
+        // bounded by the committed identity (an unrewritten block
+        // legitimately sits at an older generation, which at-or-before
+        // resolves).
+        self.data_vg_proxy
+            .get_blob_at_or_before(
+                blob_guid,
+                block_number,
+                content_len,
+                blob_version,
+                data_write_token,
+                &mut body,
+                trace_id,
+            )
+            .await?;
         let checksum = xxhash_rust::xxh3::xxh3_64(&body);
         Ok((body, checksum))
     }
@@ -305,22 +298,16 @@ impl StorageBackend {
         write_token: u64,
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
-        if write_token == 0 {
-            self.data_vg_proxy
-                .put_blob(blob_guid, block_number, body, version, trace_id)
-                .await?;
-        } else {
-            self.data_vg_proxy
-                .put_blob_prepared(
-                    blob_guid,
-                    block_number,
-                    body,
-                    version,
-                    write_token,
-                    trace_id,
-                )
-                .await?;
-        }
+        self.data_vg_proxy
+            .put_blob(
+                blob_guid,
+                block_number,
+                body,
+                version,
+                write_token,
+                trace_id,
+            )
+            .await?;
         Ok(())
     }
 
@@ -333,7 +320,7 @@ impl StorageBackend {
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
         self.data_vg_proxy
-            .put_blob_tombstone_prepared(blob_guid, block_number, version, write_token, trace_id)
+            .put_blob_tombstone(blob_guid, block_number, version, write_token, trace_id)
             .await?;
         Ok(())
     }
@@ -349,22 +336,16 @@ impl StorageBackend {
         write_token: u64,
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
-        if write_token == 0 {
-            self.data_vg_proxy
-                .reserve_blob(blob_guid, block_number, block_size, version, trace_id)
-                .await?;
-        } else {
-            self.data_vg_proxy
-                .reserve_blob_prepared(
-                    blob_guid,
-                    block_number,
-                    block_size,
-                    version,
-                    write_token,
-                    trace_id,
-                )
-                .await?;
-        }
+        self.data_vg_proxy
+            .reserve_blob(
+                blob_guid,
+                block_number,
+                block_size,
+                version,
+                write_token,
+                trace_id,
+            )
+            .await?;
         Ok(())
     }
 

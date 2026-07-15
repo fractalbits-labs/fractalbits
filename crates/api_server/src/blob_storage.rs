@@ -26,6 +26,11 @@ use uuid::Uuid;
 
 pub use data_types::object_layout::BlobLocation;
 
+/// Write token stamped on api_server whole-object writes. Every object PUT
+/// uses a fresh blob_guid and writes exactly one generation, so a constant
+/// token is sufficient; only fs overwrites allocate per-flush tokens.
+pub const S3_DATA_WRITE_TOKEN: u64 = 1;
+
 #[derive(Debug, Clone, Copy)]
 pub struct BlobReadContext {
     pub blob_guid: DataBlobGuid,

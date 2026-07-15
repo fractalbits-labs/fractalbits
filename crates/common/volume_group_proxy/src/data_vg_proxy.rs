@@ -100,15 +100,6 @@ fn parse_generation_key(key: &str) -> Option<(u32, GenerationIdentity)> {
     ))
 }
 
-fn parse_legacy_data_block_key(key: &str) -> Option<u32> {
-    let key = key.trim_end_matches('\0');
-    let (_, suffix) = key.rsplit_once("-p")?;
-    if suffix.contains('-') {
-        return None;
-    }
-    suffix.parse().ok()
-}
-
 fn select_generation_candidate<'a>(
     entries: impl IntoIterator<Item = (&'a str, bool, u32, u32)>,
     block_number: u32,
@@ -759,82 +750,12 @@ impl DataVgProxy {
     fn find_volume(&self, volume_id: u16) -> Option<&VolumeWithNodes> {
         self.volumes.iter().find(|v| v.volume_id == volume_id)
     }
-
-    async fn get_blob_from_node_instance(
-        &self,
-        bss_node: &BssNode,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        content_len: usize,
-        trace_id: &TraceId,
-        fast_path: bool,
-    ) -> Result<(Bytes, u64), RpcError> {
-        tracing::debug!(%blob_guid, bss_address=%bss_node.address, block_number, content_len, fast_path, "get_blob_from_node_instance calling BSS");
-
-        let bss_client = bss_node.get_client();
-
-        let mut body = Bytes::new();
-        let version: u64;
-
-        if fast_path {
-            // Fast path: single attempt, no retries
-            version = bss_client
-                .get_data_blob(
-                    blob_guid,
-                    block_number,
-                    &mut body,
-                    content_len,
-                    Some(self.rpc_timeout),
-                    trace_id,
-                    0,
-                )
-                .await?;
-        } else {
-            // Normal path with retries
-            let mut retries = 3;
-            let mut backoff = Duration::from_millis(5);
-            let mut retry_count = 0u32;
-
-            loop {
-                match bss_client
-                    .get_data_blob(
-                        blob_guid,
-                        block_number,
-                        &mut body,
-                        content_len,
-                        Some(self.rpc_timeout),
-                        trace_id,
-                        retry_count,
-                    )
-                    .await
-                {
-                    Ok(v) => {
-                        version = v;
-                        break;
-                    }
-                    Err(e) if e.retryable() && retries > 0 => {
-                        retries -= 1;
-                        retry_count += 1;
-                        rpc_client_common::rpc_sleep(backoff).await;
-                        backoff = backoff.saturating_mul(2);
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-
-        tracing::debug!(%blob_guid, bss_address=%bss_node.address, block_number, data_size=body.len(), version, "get_blob_from_node_instance result");
-
-        Ok((body, version))
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn get_generation_from_node_instance(
         &self,
         bss_node: &BssNode,
         blob_guid: DataBlobGuid,
         block_number: u32,
-        content_len: usize,
         committed_version: u64,
         committed_token: u64,
         trace_id: &TraceId,
@@ -886,7 +807,7 @@ impl DataVgProxy {
             let mut body = Bytes::new();
             return match bss_node
                 .get_client()
-                .get_data_blob_generation(
+                .get_data_blob(
                     blob_guid,
                     block_number,
                     &mut body,
@@ -916,29 +837,7 @@ impl DataVgProxy {
             };
         }
 
-        match self
-            .get_blob_from_node_instance(
-                bss_node,
-                blob_guid,
-                block_number,
-                content_len,
-                trace_id,
-                false,
-            )
-            .await
-        {
-            Ok((body, version)) if version < committed_version => {
-                Ok(NodeGenerationLookup::Fragment(GenerationFragment::Data {
-                    identity: GenerationIdentity {
-                        version,
-                        write_token: 0,
-                    },
-                    body,
-                }))
-            }
-            Ok(_) | Err(RpcError::NotFound) => Ok(NodeGenerationLookup::Missing),
-            Err(e) => Err(e.into()),
-        }
+        Ok(NodeGenerationLookup::Missing)
     }
 
     async fn list_generations_from_node_instance(
@@ -977,18 +876,7 @@ impl DataVgProxy {
                 if entry.is_physically_deleted {
                     continue;
                 }
-                let parsed = parse_generation_key(&entry.key).or_else(|| {
-                    parse_legacy_data_block_key(&entry.key).map(|block_number| {
-                        (
-                            block_number,
-                            GenerationIdentity {
-                                version: entry.version,
-                                write_token: 0,
-                            },
-                        )
-                    })
-                });
-                let Some((block_number, identity)) = parsed else {
+                let Some((block_number, identity)) = parse_generation_key(&entry.key) else {
                     continue;
                 };
                 if block_number < first_block || block_number >= last_block {
@@ -1076,7 +964,7 @@ impl DataVgProxy {
                 }
                 match node
                     .get_client()
-                    .delete_data_blob_generation(
+                    .delete_data_blob(
                         blob_guid,
                         block_number,
                         version,
@@ -1152,7 +1040,7 @@ impl DataVgProxy {
                 }
                 match node
                     .get_client()
-                    .delete_data_blob_generation(
+                    .delete_data_blob(
                         blob_guid,
                         block_number,
                         identity.version,
@@ -1183,23 +1071,7 @@ impl DataVgProxy {
             }
             marker = next_marker;
         }
-
-        match node
-            .get_client()
-            .delete_data_blob_generation(
-                blob_guid,
-                block_number,
-                keep_version,
-                0,
-                Some(rpc_timeout),
-                trace_id,
-                0,
-            )
-            .await
-        {
-            Ok(()) | Err(RpcError::NotFound) | Err(RpcError::VersionSkipped) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        Ok(())
     }
 
     async fn delete_all_generations_from_node(
@@ -1235,17 +1107,13 @@ impl DataVgProxy {
                 if entry.is_physically_deleted {
                     continue;
                 }
-                let (block_number, version, write_token) =
-                    if let Some((block_number, identity)) = parse_generation_key(&entry.key) {
-                        (block_number, identity.version, identity.write_token)
-                    } else if let Some(block_number) = parse_legacy_data_block_key(&entry.key) {
-                        (block_number, u64::MAX, 0)
-                    } else {
-                        continue;
-                    };
+                let Some((block_number, identity)) = parse_generation_key(&entry.key) else {
+                    continue;
+                };
+                let (version, write_token) = (identity.version, identity.write_token);
                 match node
                     .get_client()
-                    .delete_data_blob_generation(
+                    .delete_data_blob(
                         blob_guid,
                         block_number,
                         version,
@@ -1456,20 +1324,9 @@ impl DataVgProxy {
         }
     }
 
-    /// Multi-BSS put_blob with quorum-based replication or EC encoding
+    /// Multi-BSS quorum put (replicated) or EC encode of one exact data
+    /// generation. Every data-volume write carries a nonzero token.
     pub async fn put_blob(
-        &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        body: Bytes,
-        version: u64,
-        trace_id: &TraceId,
-    ) -> Result<(), DataVgError> {
-        self.put_blob_inner(blob_guid, block_number, body, version, 0, false, trace_id)
-            .await
-    }
-
-    pub async fn put_blob_prepared(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
@@ -1480,7 +1337,7 @@ impl DataVgProxy {
     ) -> Result<(), DataVgError> {
         if write_token == 0 {
             return Err(DataVgError::Internal(
-                "prepared data write requires a nonzero token".to_string(),
+                "a data write requires a nonzero token".to_string(),
             ));
         }
         self.put_blob_inner(
@@ -1495,7 +1352,7 @@ impl DataVgProxy {
         .await
     }
 
-    pub async fn put_blob_tombstone_prepared(
+    pub async fn put_blob_tombstone(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
@@ -1505,7 +1362,7 @@ impl DataVgProxy {
     ) -> Result<(), DataVgError> {
         if write_token == 0 {
             return Err(DataVgError::Internal(
-                "prepared tombstone requires a nonzero token".to_string(),
+                "a tombstone requires a nonzero token".to_string(),
             ));
         }
         self.put_blob_inner(
@@ -1685,14 +1542,21 @@ impl DataVgProxy {
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_blob_vectored(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
         chunks: Vec<Bytes>,
         version: u64,
+        write_token: u64,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
+        if write_token == 0 {
+            return Err(DataVgError::Internal(
+                "a data write requires a nonzero token".to_string(),
+            ));
+        }
         let selected_volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
             DataVgError::InitializationError(format!(
                 "Volume {} not found in DataVgProxy",
@@ -1712,7 +1576,7 @@ impl DataVgProxy {
                     block_number,
                     Bytes::from(combined),
                     version,
-                    0,
+                    write_token,
                     false,
                     trace_id,
                 )
@@ -1787,6 +1651,7 @@ impl DataVgProxy {
                 chunks.clone(),
                 body_checksum,
                 version,
+                write_token,
                 rpc_timeout,
                 trace_id,
             ));
@@ -1873,35 +1738,20 @@ impl DataVgProxy {
         let address = bss_node.address.clone();
 
         let bss_client = bss_node.get_client();
-        let result = if write_token == 0 {
-            bss_client
-                .put_data_blob(
-                    blob_guid,
-                    block_number,
-                    body,
-                    body_checksum,
-                    version,
-                    Some(rpc_timeout),
-                    &trace_id,
-                    0,
-                )
-                .await
-        } else {
-            bss_client
-                .put_data_blob_generation(
-                    blob_guid,
-                    block_number,
-                    body,
-                    body_checksum,
-                    version,
-                    write_token,
-                    is_deleted,
-                    Some(rpc_timeout),
-                    &trace_id,
-                    0,
-                )
-                .await
-        };
+        let result = bss_client
+            .put_data_blob(
+                blob_guid,
+                block_number,
+                body,
+                body_checksum,
+                version,
+                write_token,
+                is_deleted,
+                Some(rpc_timeout),
+                &trace_id,
+                0,
+            )
+            .await;
 
         let _result_label = if result.is_ok() { "success" } else { "failure" };
         histogram!("datavg_put_blob_node_nanos", "bss_node" => address.clone(), "result" => _result_label)
@@ -1911,6 +1761,7 @@ impl DataVgProxy {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn put_blob_to_node_vectored(
         bss_node: Arc<BssNode>,
         blob_guid: DataBlobGuid,
@@ -1918,6 +1769,7 @@ impl DataVgProxy {
         chunks: Vec<Bytes>,
         body_checksum: u64,
         version: u64,
+        write_token: u64,
         rpc_timeout: Duration,
         trace_id: TraceId,
     ) -> (Arc<BssNode>, String, Result<(), RpcError>) {
@@ -1932,6 +1784,8 @@ impl DataVgProxy {
                 chunks,
                 body_checksum,
                 version,
+                write_token,
+                false,
                 Some(rpc_timeout),
                 &trace_id,
                 0,
@@ -2028,7 +1882,7 @@ impl DataVgProxy {
             let mut exact = Bytes::new();
             match node
                 .get_client()
-                .get_data_blob_generation(
+                .get_data_blob(
                     blob_guid,
                     block_number,
                     &mut exact,
@@ -2070,7 +1924,6 @@ impl DataVgProxy {
                         &node,
                         blob_guid,
                         block_number,
-                        content_len,
                         committed_version,
                         committed_token,
                         trace_id,
@@ -2149,7 +2002,7 @@ impl DataVgProxy {
                     repairs.push(async move {
                         let result = node
                             .get_client()
-                            .reserve_blocks_generation(
+                            .reserve_blocks(
                                 blob_guid,
                                 block_number,
                                 content_len as u32,
@@ -2277,7 +2130,7 @@ impl DataVgProxy {
             VolumeMode::Replicated { .. } => unreachable!(),
         };
         let total = k + m;
-        let legacy_shard_size = ec_padded_len(content_len, k) / k;
+        let min_shard_size = ec_padded_len(content_len, k) / k;
         let rotation = ec_rotation(&blob_guid.blob_id, total as u32);
         let data_nodes_available = (0..k)
             .all(|shard_index| volume.bss_nodes[(shard_index + rotation) % total].is_available());
@@ -2290,11 +2143,11 @@ impl DataVgProxy {
                     let mut shard = Bytes::new();
                     let result = node
                         .get_client()
-                        .get_data_blob_generation(
+                        .get_data_blob(
                             blob_guid,
                             block_number,
                             &mut shard,
-                            legacy_shard_size,
+                            min_shard_size,
                             committed_version,
                             committed_token,
                             Some(self.rpc_timeout),
@@ -2360,7 +2213,6 @@ impl DataVgProxy {
                         &node,
                         blob_guid,
                         block_number,
-                        legacy_shard_size,
                         committed_version,
                         committed_token,
                         trace_id,
@@ -2435,7 +2287,7 @@ impl DataVgProxy {
                     repairs.push(async move {
                         let result = node
                             .get_client()
-                            .reserve_blocks_generation(
+                            .reserve_blocks(
                                 blob_guid,
                                 block_number,
                                 content_len as u32,
@@ -2620,26 +2472,8 @@ impl DataVgProxy {
     }
 
     /// Reserve a single block at the volume write quorum.
+    /// Reserve one exact data generation at the volume write quorum.
     pub async fn reserve_blob(
-        &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        block_size: u32,
-        expected_version: u64,
-        trace_id: &TraceId,
-    ) -> Result<(), DataVgError> {
-        self.reserve_blob_inner(
-            blob_guid,
-            block_number,
-            block_size,
-            expected_version,
-            0,
-            trace_id,
-        )
-        .await
-    }
-
-    pub async fn reserve_blob_prepared(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
@@ -2650,7 +2484,7 @@ impl DataVgProxy {
     ) -> Result<(), DataVgError> {
         if write_token == 0 {
             return Err(DataVgError::Internal(
-                "prepared reservation requires a nonzero token".to_string(),
+                "a reservation requires a nonzero token".to_string(),
             ));
         }
         self.reserve_blob_inner(
@@ -2704,32 +2538,19 @@ impl DataVgProxy {
             let trace_id = *trace_id;
             futures.push(async move {
                 let address = node.address.clone();
-                let result = if write_token == 0 {
-                    node.get_client()
-                        .reserve_blocks(
-                            blob_guid,
-                            block_number,
-                            block_size,
-                            expected_version,
-                            Some(rpc_timeout),
-                            &trace_id,
-                            0,
-                        )
-                        .await
-                } else {
-                    node.get_client()
-                        .reserve_blocks_generation(
-                            blob_guid,
-                            block_number,
-                            block_size,
-                            expected_version,
-                            write_token,
-                            Some(rpc_timeout),
-                            &trace_id,
-                            0,
-                        )
-                        .await
-                };
+                let result = node
+                    .get_client()
+                    .reserve_blocks(
+                        blob_guid,
+                        block_number,
+                        block_size,
+                        expected_version,
+                        write_token,
+                        Some(rpc_timeout),
+                        &trace_id,
+                        0,
+                    )
+                    .await;
                 (node, address, result)
             });
         }
@@ -2913,206 +2734,6 @@ impl DataVgProxy {
         Ok(data_blocks)
     }
 
-    /// First-success read of an immutable (token-zero, v1) block: one
-    /// random replica, then poll the remaining replicas on failure.
-    pub async fn get_blob(
-        &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        content_len: usize,
-        body: &mut Bytes,
-        trace_id: &TraceId,
-    ) -> Result<(), DataVgError> {
-        let volume_id = blob_guid.volume_id;
-        let volume = self.find_volume(volume_id).ok_or_else(|| {
-            tracing::error!(volume_id, available_volumes=?self.volumes.iter().map(|v| v.volume_id).collect::<Vec<_>>(), "Volume not found in DataVgProxy for get_blob");
-            DataVgError::InitializationError(format!("Volume {} not found", volume_id))
-        })?;
-
-        if let VolumeMode::ErasureCoded { .. } = &volume.mode {
-            return self
-                .get_blob_ec(blob_guid, block_number, content_len, body, trace_id)
-                .await;
-        }
-
-        let start = Instant::now();
-
-        let blob_id = blob_guid.blob_id;
-
-        tracing::debug!(%blob_id, volume_id, available_volumes=?self.volumes.iter().map(|v| v.volume_id).collect::<Vec<_>>(), "get_blob looking for volume");
-
-        // Filter available nodes for fast path (only try nodes with closed circuit)
-        let available_nodes: Vec<_> = volume
-            .bss_nodes
-            .iter()
-            .filter(|node| {
-                let available = node.is_available();
-                if !available {
-                    counter!("circuit_breaker_skipped", "node" => node.address.clone(), "operation" => "get_fast").increment(1);
-                    debug!("Skipping node {} for fast path due to open circuit breaker", node.address);
-                }
-                available
-            })
-            .collect();
-
-        // Fast path: try reading from a randomly selected available node.
-        if !available_nodes.is_empty() {
-            let selected_node = *available_nodes.choose(&mut rand::rng()).unwrap();
-            debug!(
-                "Attempting fast path read from BSS node: {}",
-                selected_node.address
-            );
-            match self
-                .get_blob_from_node_instance(
-                    selected_node,
-                    blob_guid,
-                    block_number,
-                    content_len,
-                    trace_id,
-                    true, // fast_path: no retries
-                )
-                .await
-            {
-                Ok((blob_data, _version)) => {
-                    selected_node.record_success();
-                    histogram!("datavg_get_blob_nanos", "result" => "fast_path_success")
-                        .record(start.elapsed().as_nanos() as f64);
-                    *body = blob_data;
-                    return Ok(());
-                }
-                Err(e) => {
-                    selected_node.record_failure();
-                    warn!(
-                        "Fast path read failed from {}: {}, falling back to quorum read",
-                        selected_node.address, e
-                    );
-                }
-            }
-        }
-
-        // Fallback: read from all available nodes using spawned tasks
-        // Re-filter available nodes (state may have changed after fast path failure)
-        let fallback_nodes: Vec<_> = volume
-            .bss_nodes
-            .iter()
-            .filter(|node| {
-                let available = node.is_available();
-                if !available {
-                    counter!("circuit_breaker_skipped", "node" => node.address.clone(), "operation" => "get_fallback").increment(1);
-                }
-                available
-            })
-            .cloned()
-            .collect();
-
-        if fallback_nodes.is_empty() {
-            histogram!("datavg_get_blob_nanos", "result" => "no_available_nodes")
-                .record(start.elapsed().as_nanos() as f64);
-            return Err(DataVgError::QuorumFailure(
-                "No available nodes for read (all circuits open)".to_string(),
-            ));
-        }
-
-        debug!(
-            "Performing quorum read from {} available nodes",
-            fallback_nodes.len()
-        );
-
-        let _read_quorum = match &volume.mode {
-            VolumeMode::Replicated { r, .. } => *r as usize,
-            VolumeMode::ErasureCoded { .. } => unreachable!(),
-        };
-
-        // Create read futures for all available nodes
-        let mut read_futures = FuturesUnordered::new();
-        for bss_node in fallback_nodes {
-            let proxy = self;
-            let node_clone = bss_node.clone();
-            read_futures.push(async move {
-                let result = proxy
-                    .get_blob_from_node_instance(
-                        &node_clone,
-                        blob_guid,
-                        block_number,
-                        content_len,
-                        trace_id,
-                        false, // not fast_path: allow retries
-                    )
-                    .await;
-                (node_clone, result)
-            });
-        }
-
-        let mut successful_reads = 0;
-        let mut successful_blob_data = None;
-        // Track whether every failure was a NotFound (sparse-file hole) so we
-        // can surface BlockNotFound rather than a generic QuorumFailure.
-        let mut saw_not_found = false;
-        let mut other_error = false;
-
-        // Wait until we get a successful read (quorum of 1) or all fail.
-        while let Some((node, result)) = read_futures.next().await {
-            match result {
-                Ok((blob_data, _version)) => {
-                    node.record_success();
-                    successful_reads += 1;
-                    debug!("Successful read from BSS node: {}", node.address);
-                    if successful_blob_data.is_none() {
-                        successful_blob_data = Some(blob_data);
-                        // For reads, we can return as soon as we get one successful result
-                        break;
-                    }
-                }
-                Err(rpc_error) => {
-                    node.record_failure();
-                    if matches!(rpc_error, RpcError::NotFound) {
-                        saw_not_found = true;
-                    } else {
-                        other_error = true;
-                    }
-                    warn!(
-                        "RPC error reading from BSS node {}: {}",
-                        node.address, rpc_error
-                    );
-                }
-            }
-        }
-
-        if let Some(blob_data) = successful_blob_data {
-            histogram!("datavg_get_blob_nanos", "result" => "success")
-                .record(start.elapsed().as_nanos() as f64);
-            debug!(
-                "Read successful from {}/{} nodes for blob {}:{}",
-                successful_reads,
-                volume.bss_nodes.len(),
-                blob_id,
-                block_number
-            );
-            *body = blob_data;
-            return Ok(());
-        }
-
-        // Every reachable replica agreed the block does not exist: a
-        // sparse-file hole. Surface BlockNotFound so the fs_server read
-        // path can substitute zeros instead of treating it as a failure.
-        if saw_not_found && !other_error {
-            histogram!("datavg_get_blob_nanos", "result" => "block_not_found")
-                .record(start.elapsed().as_nanos() as f64);
-            return Err(DataVgError::BlockNotFound);
-        }
-
-        // All reads failed
-        histogram!("datavg_get_blob_nanos", "result" => "all_failed")
-            .record(start.elapsed().as_nanos() as f64);
-        error!(
-            "All read attempts failed for blob {}:{}",
-            blob_id, block_number
-        );
-        Err(DataVgError::QuorumFailure(
-            "All read attempts failed".to_string(),
-        ))
-    }
-
     /// EC put: RS-encode block into k+m shards, send to nodes with W=k+1 quorum
     #[allow(clippy::too_many_arguments)]
     async fn put_blob_ec(
@@ -3129,8 +2750,8 @@ impl DataVgProxy {
         let trace_id = *trace_id;
         histogram!("blob_size", "operation" => "put_ec").record(body.len() as f64);
 
-        // A legacy empty write has no fragment. An MVCC tombstone is an
-        // empty generation that must still reach the EC write quorum.
+        // An empty data write has no fragment to encode. An MVCC tombstone
+        // is an empty generation that must still reach the EC write quorum.
         if body.is_empty() && !is_deleted {
             histogram!("datavg_put_blob_nanos", "result" => "ec_empty")
                 .record(start.elapsed().as_nanos() as f64);
@@ -3347,260 +2968,6 @@ impl DataVgProxy {
             errors.join("; ")
         )))
     }
-
-    /// EC get: fetch k data shards in parallel, RS-decode if degraded
-    async fn get_blob_ec(
-        &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        content_len: usize,
-        body: &mut Bytes,
-        trace_id: &TraceId,
-    ) -> Result<(), DataVgError> {
-        let start = Instant::now();
-
-        // Empty body: nothing was stored, return empty
-        if content_len == 0 {
-            *body = Bytes::new();
-            histogram!("datavg_get_blob_nanos", "result" => "ec_empty")
-                .record(start.elapsed().as_nanos() as f64);
-            return Ok(());
-        }
-
-        let ec_vol = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
-            DataVgError::InitializationError(format!("EC volume {} not found", blob_guid.volume_id))
-        })?;
-
-        let (k, m) = match &ec_vol.mode {
-            VolumeMode::ErasureCoded {
-                data_shards,
-                parity_shards,
-            } => (*data_shards as usize, *parity_shards as usize),
-            _ => unreachable!(),
-        };
-        let total = k + m;
-
-        let rotation = ec_rotation(&blob_guid.blob_id, total as u32);
-
-        // Compute shard size, matching put_blob_ec padding.
-        let padded_len = ec_padded_len(content_len, k);
-        let shard_size = padded_len / k;
-
-        // Fetch the k data shards (indices 0..k) from their rotated nodes.
-        let mut shard_results: Vec<Option<Vec<u8>>> = vec![None; total];
-        let mut data_shards_received = 0;
-        let mut data_shards_not_found = 0usize;
-        let mut data_shards_other_err = 0usize;
-        let mut fetch_futures = FuturesUnordered::new();
-        for shard_idx in 0..k {
-            let node_idx = (shard_idx + rotation) % total;
-            let node = &ec_vol.bss_nodes[node_idx];
-            if !node.is_available() {
-                continue;
-            }
-            let si = shard_idx;
-            let ni = node_idx;
-            fetch_futures.push(async move {
-                let result = self
-                    .get_blob_from_node_instance(
-                        &ec_vol.bss_nodes[ni],
-                        blob_guid,
-                        block_number,
-                        shard_size,
-                        trace_id,
-                        true, // fast path
-                    )
-                    .await;
-                (si, ni, result)
-            });
-        }
-
-        while let Some((shard_idx, node_idx, result)) = fetch_futures.next().await {
-            match result {
-                Ok((data, _version)) => {
-                    ec_vol.bss_nodes[node_idx].record_success();
-                    shard_results[shard_idx] = Some(data.to_vec());
-                    data_shards_received += 1;
-                }
-                Err(RpcError::NotFound) => {
-                    // Hole on this shard. Don't penalise the node.
-                    data_shards_not_found += 1;
-                    debug!(
-                        "EC data shard {} reports BlockNotFound from {}",
-                        shard_idx, ec_vol.bss_nodes[node_idx].address
-                    );
-                }
-                Err(e) => {
-                    ec_vol.bss_nodes[node_idx].record_failure();
-                    data_shards_other_err += 1;
-                    warn!(
-                        "EC data shard {} fetch failed from {}: {}",
-                        shard_idx, ec_vol.bss_nodes[node_idx].address, e
-                    );
-                }
-            }
-        }
-
-        // If every data-shard fetch came back as BlockNotFound (and
-        // no transient errors), the block legitimately doesn't exist
-        // on the EC volume either. Surface as BlockNotFound so the
-        // fs_server read path maps it to zeros.
-        if data_shards_received == 0 && data_shards_other_err == 0 && data_shards_not_found > 0 {
-            histogram!("datavg_get_blob_nanos", "result" => "ec_block_not_found")
-                .record(start.elapsed().as_nanos() as f64);
-            return Err(DataVgError::BlockNotFound);
-        }
-
-        if data_shards_received == k {
-            // All data shards received, concatenate directly (no RS decode needed).
-            let mut result_data = Vec::new();
-            for shard in shard_results.iter().take(k) {
-                result_data.extend_from_slice(shard.as_ref().unwrap());
-            }
-            result_data.truncate(content_len);
-            *body = Bytes::from(result_data);
-
-            histogram!("datavg_get_blob_nanos", "result" => "ec_fast_success")
-                .record(start.elapsed().as_nanos() as f64);
-            return Ok(());
-        }
-
-        // Degraded read: need parity shards to reconstruct
-        let missing_count = k - data_shards_received;
-        if missing_count > m {
-            histogram!("datavg_get_blob_nanos", "result" => "ec_too_many_failures")
-                .record(start.elapsed().as_nanos() as f64);
-            return Err(DataVgError::QuorumFailure(format!(
-                "EC read: {} data shards failed, exceeds parity count {}",
-                missing_count, m
-            )));
-        }
-
-        // Fetch all parity shards that are currently available.
-        // This avoids false negatives when one parity node fails but another can satisfy k-of-(k+m).
-        let mut parity_futures = FuturesUnordered::new();
-        for parity_idx in 0..m {
-            let shard_idx = k + parity_idx;
-            let node_idx = (shard_idx + rotation) % total;
-            let node = &ec_vol.bss_nodes[node_idx];
-            if !node.is_available() {
-                continue;
-            }
-            let si = shard_idx;
-            let ni = node_idx;
-            parity_futures.push(async move {
-                let result = self
-                    .get_blob_from_node_instance(
-                        &ec_vol.bss_nodes[ni],
-                        blob_guid,
-                        block_number,
-                        shard_size,
-                        trace_id,
-                        false, // allow retries for parity
-                    )
-                    .await;
-                (si, ni, result)
-            });
-        }
-
-        let mut parity_shards_not_found = 0usize;
-        let mut parity_shards_other_err = 0usize;
-        while let Some((shard_idx, node_idx, result)) = parity_futures.next().await {
-            match result {
-                Ok((data, _version)) => {
-                    ec_vol.bss_nodes[node_idx].record_success();
-                    shard_results[shard_idx] = Some(data.to_vec());
-                }
-                Err(RpcError::NotFound) => {
-                    parity_shards_not_found += 1;
-                    debug!(
-                        "EC parity shard {} reports BlockNotFound from {}",
-                        shard_idx, ec_vol.bss_nodes[node_idx].address
-                    );
-                }
-                Err(e) => {
-                    ec_vol.bss_nodes[node_idx].record_failure();
-                    parity_shards_other_err += 1;
-                    warn!(
-                        "EC parity shard {} fetch failed from {}: {}",
-                        shard_idx, ec_vol.bss_nodes[node_idx].address, e
-                    );
-                }
-            }
-        }
-
-        let total_shards_received = shard_results.iter().filter(|s| s.is_some()).count();
-        if total_shards_received < k {
-            // If the unrecoverable read is because every reachable
-            // shard agreed the block doesn't exist (no transient
-            // errors at all), surface BlockNotFound so the fs_server
-            // read path can map to zeros for sparse files.
-            if total_shards_received == 0
-                && data_shards_other_err == 0
-                && parity_shards_other_err == 0
-                && (data_shards_not_found > 0 || parity_shards_not_found > 0)
-            {
-                histogram!("datavg_get_blob_nanos", "result" => "ec_block_not_found")
-                    .record(start.elapsed().as_nanos() as f64);
-                return Err(DataVgError::BlockNotFound);
-            }
-            histogram!("datavg_get_blob_nanos", "result" => "ec_quorum_failure")
-                .record(start.elapsed().as_nanos() as f64);
-            return Err(DataVgError::QuorumFailure(format!(
-                "EC read: only {} shards available, need {}",
-                total_shards_received, k
-            )));
-        }
-
-        // RS reconstruct
-        let shard_size = shard_results
-            .iter()
-            .find_map(|s| s.as_ref().map(|d| d.len()))
-            .ok_or_else(|| {
-                DataVgError::Internal("EC read: no shards received at all".to_string())
-            })?;
-
-        let shards_for_rs: Vec<Option<Vec<u8>>> = shard_results
-            .into_iter()
-            .map(|s| s.filter(|d| d.len() == shard_size))
-            .collect();
-        let original_shards: Vec<_> = shards_for_rs
-            .iter()
-            .take(k)
-            .enumerate()
-            .filter_map(|(index, shard)| shard.as_deref().map(|data| (index, data)))
-            .collect();
-        let recovery_shards: Vec<_> = shards_for_rs
-            .iter()
-            .skip(k)
-            .enumerate()
-            .filter_map(|(index, shard)| shard.as_deref().map(|data| (index, data)))
-            .collect();
-        let restored_original = rs_decode(k, m, original_shards, recovery_shards)
-            .map_err(|e| DataVgError::Internal(format!("RS reconstruct failed: {}", e)))?;
-
-        // Concatenate data shards (padded; truncated to content_len
-        // before being handed to the caller).
-        let mut result_data = Vec::with_capacity(k * shard_size);
-        for (index, shard) in shards_for_rs.iter().take(k).enumerate() {
-            if let Some(shard) = shard {
-                result_data.extend_from_slice(shard);
-            } else if let Some(restored) = restored_original.get(&index) {
-                result_data.extend_from_slice(restored);
-            } else {
-                return Err(DataVgError::Internal(format!(
-                    "RS reconstruct missing shard {}",
-                    index
-                )));
-            }
-        }
-        result_data.truncate(content_len);
-        *body = Bytes::from(result_data);
-
-        histogram!("datavg_get_blob_nanos", "result" => "ec_degraded_success")
-            .record(start.elapsed().as_nanos() as f64);
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -3795,10 +3162,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_list_selection_handles_later_block_ranges() {
+    fn list_selection_handles_later_block_ranges() {
         let identity = GenerationIdentity {
             version: 12,
-            write_token: 0,
+            write_token: 7,
         };
         let entries: Vec<_> = (0..GENERATION_LIST_PAGE_SIZE)
             .map(|block_number| (block_number, identity, false))
@@ -3807,8 +3174,8 @@ mod tests {
         let indexed = index_listed_generations(entries);
         let responses = vec![indexed.clone(), indexed];
 
-        let has_data = listed_block_has_data_at_or_before(&responses, 4096, 12, 0, 2)
-            .expect("legacy generation should satisfy the read quorum");
+        let has_data = listed_block_has_data_at_or_before(&responses, 4096, 12, 7, 2)
+            .expect("committed generation should satisfy the read quorum");
 
         assert!(has_data);
     }
