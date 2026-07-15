@@ -21,7 +21,49 @@ use uuid::Uuid;
 
 /// One replica's response in a quorum/max-version read fan-out.
 type NodeReadResponse = (Arc<BssNode>, Result<(Bytes, u64), RpcError>);
+const GENERATION_LIST_PAGE_SIZE: u32 = 512;
+const SUPERSEDED_GENERATION_READER_GRACE: Duration = Duration::from_secs(15 * 60);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GenerationIdentity {
+    version: u64,
+    write_token: u64,
+}
+fn generation_key_prefix(blob_guid: DataBlobGuid, block_number: u32) -> String {
+    format!(
+        "/d{}/{}-p{:08x}-rv",
+        blob_guid.volume_id, blob_guid.blob_id, block_number
+    )
+}
+fn parse_generation_key(key: &str) -> Option<(u32, GenerationIdentity)> {
+    let key = key.trim_end_matches('\0');
+    let (_, suffix) = key.rsplit_once("-p")?;
+    if suffix.len() != 8 + 3 + 16 + 2 + 16 {
+        return None;
+    }
+    let block_number = u32::from_str_radix(&suffix[..8], 16).ok()?;
+    if &suffix[8..11] != "-rv" || &suffix[27..29] != "-t" {
+        return None;
+    }
+    let reverse_version = u64::from_str_radix(&suffix[11..27], 16).ok()?;
+    let write_token = u64::from_str_radix(&suffix[29..45], 16).ok()?;
+    Some((
+        block_number,
+        GenerationIdentity {
+            version: u64::MAX - reverse_version,
+            write_token,
+        },
+    ))
+}
+
+fn parse_legacy_data_block_key(key: &str) -> Option<u32> {
+    let key = key.trim_end_matches('\0');
+    let (_, suffix) = key.rsplit_once("-p")?;
+    if suffix.contains('-') {
+        return None;
+    }
+    suffix.parse().ok()
+}
 #[cfg(feature = "tokio-runtime")]
 fn spawn_background<F: std::future::Future<Output = ()> + Send + 'static>(fut: F) {
     tokio::spawn(fut);
@@ -290,25 +332,32 @@ impl DataVgProxy {
         for volume in data_vg_info.volumes {
             // Validate based on mode
             match &volume.mode {
-                VolumeMode::Replicated { r, w, .. } => {
-                    if *r == 0 {
+                VolumeMode::Replicated { n, r, w } => {
+                    if *n as usize != volume.bss_nodes.len() {
                         return Err(DataVgError::InitializationError(format!(
-                            "Volume {} has invalid r=0",
-                            volume.volume_id
-                        )));
-                    }
-                    if *w == 0 {
-                        return Err(DataVgError::InitializationError(format!(
-                            "Volume {} has invalid w=0",
-                            volume.volume_id
-                        )));
-                    }
-                    if *w as usize > volume.bss_nodes.len() {
-                        return Err(DataVgError::InitializationError(format!(
-                            "Volume {} has w={} but only {} nodes",
+                            "Volume {} has n={} but {} nodes",
                             volume.volume_id,
-                            w,
+                            n,
                             volume.bss_nodes.len()
+                        )));
+                    }
+                    let majority = *n / 2 + 1;
+                    if *r < majority {
+                        return Err(DataVgError::InitializationError(format!(
+                            "Volume {} has r={} below majority {}",
+                            volume.volume_id, r, majority
+                        )));
+                    }
+                    if *w < majority {
+                        return Err(DataVgError::InitializationError(format!(
+                            "Volume {} has w={} below majority {}",
+                            volume.volume_id, w, majority
+                        )));
+                    }
+                    if *r > *n || *w > *n {
+                        return Err(DataVgError::InitializationError(format!(
+                            "Volume {} has n={}, r={}, w={}",
+                            volume.volume_id, n, r, w
                         )));
                     }
                 }
@@ -566,7 +615,6 @@ impl DataVgProxy {
 
         Ok((body, version))
     }
-
     async fn delete_blob_from_node(
         bss_node: Arc<BssNode>,
         blob_guid: DataBlobGuid,
@@ -629,6 +677,429 @@ impl DataVgProxy {
         DataBlobGuid { blob_id, volume_id }
     }
 
+    async fn delete_fenced_token_from_node(
+        &self,
+        node: &BssNode,
+        blob_guid: DataBlobGuid,
+        version: u64,
+        write_token: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        let prefix = format!("/d{}/{}-p", blob_guid.volume_id, blob_guid.blob_id);
+        let mut marker = String::new();
+        loop {
+            let page = node
+                .get_client()
+                .list_data_blobs_including_fenced(
+                    blob_guid.volume_id,
+                    &prefix,
+                    &marker,
+                    GENERATION_LIST_PAGE_SIZE,
+                    Some(self.rpc_timeout),
+                    trace_id,
+                    0,
+                    true,
+                )
+                .await?;
+            let has_more = page.has_more;
+            let next_marker = if page.next_marker.is_empty() {
+                page.blobs.last().map(|entry| entry.key.clone())
+            } else {
+                Some(page.next_marker.clone())
+            };
+
+            for entry in page.blobs {
+                if entry.is_physically_deleted {
+                    continue;
+                }
+                let Some((block_number, identity)) = parse_generation_key(&entry.key) else {
+                    continue;
+                };
+                if identity.version != version || identity.write_token != write_token {
+                    continue;
+                }
+                match node
+                    .get_client()
+                    .delete_data_blob_generation(
+                        blob_guid,
+                        block_number,
+                        version,
+                        write_token,
+                        Some(self.rpc_timeout),
+                        trace_id,
+                        0,
+                    )
+                    .await
+                {
+                    Ok(()) | Err(RpcError::NotFound) | Err(RpcError::VersionSkipped) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+
+            if !has_more {
+                return Ok(());
+            }
+            let Some(next_marker) = next_marker else {
+                return Err(DataVgError::Internal(
+                    "fenced generation list has_more without a marker".to_string(),
+                ));
+            };
+            if next_marker <= marker {
+                return Err(DataVgError::Internal(
+                    "fenced generation list marker did not advance".to_string(),
+                ));
+            }
+            marker = next_marker;
+        }
+    }
+
+    async fn delete_generations_before_from_node(
+        node: &BssNode,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        keep_version: u64,
+        rpc_timeout: Duration,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        let prefix = generation_key_prefix(blob_guid, block_number);
+        let mut marker = String::new();
+        loop {
+            let page = node
+                .get_client()
+                .list_data_blobs_including_fenced(
+                    blob_guid.volume_id,
+                    &prefix,
+                    &marker,
+                    GENERATION_LIST_PAGE_SIZE,
+                    Some(rpc_timeout),
+                    trace_id,
+                    0,
+                    true,
+                )
+                .await?;
+            let has_more = page.has_more;
+            let next_marker = if page.next_marker.is_empty() {
+                page.blobs.last().map(|entry| entry.key.clone())
+            } else {
+                Some(page.next_marker.clone())
+            };
+
+            for entry in page.blobs {
+                if entry.is_physically_deleted {
+                    continue;
+                }
+                let Some((parsed_block, identity)) = parse_generation_key(&entry.key) else {
+                    continue;
+                };
+                if parsed_block != block_number || identity.version >= keep_version {
+                    continue;
+                }
+                match node
+                    .get_client()
+                    .delete_data_blob_generation(
+                        blob_guid,
+                        block_number,
+                        identity.version,
+                        identity.write_token,
+                        Some(rpc_timeout),
+                        trace_id,
+                        0,
+                    )
+                    .await
+                {
+                    Ok(()) | Err(RpcError::NotFound) | Err(RpcError::VersionSkipped) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+
+            if !has_more {
+                break;
+            }
+            let Some(next_marker) = next_marker else {
+                return Err(DataVgError::Internal(
+                    "generation GC list has_more without a marker".to_string(),
+                ));
+            };
+            if next_marker <= marker {
+                return Err(DataVgError::Internal(
+                    "generation GC list marker did not advance".to_string(),
+                ));
+            }
+            marker = next_marker;
+        }
+
+        match node
+            .get_client()
+            .delete_data_blob_generation(
+                blob_guid,
+                block_number,
+                keep_version,
+                0,
+                Some(rpc_timeout),
+                trace_id,
+                0,
+            )
+            .await
+        {
+            Ok(()) | Err(RpcError::NotFound) | Err(RpcError::VersionSkipped) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn delete_all_generations_from_node(
+        &self,
+        node: &BssNode,
+        blob_guid: DataBlobGuid,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        let prefix = format!("/d{}/{}-p", blob_guid.volume_id, blob_guid.blob_id);
+        let mut marker = String::new();
+        loop {
+            let page = node
+                .get_client()
+                .list_data_blobs_including_fenced(
+                    blob_guid.volume_id,
+                    &prefix,
+                    &marker,
+                    GENERATION_LIST_PAGE_SIZE,
+                    Some(self.rpc_timeout),
+                    trace_id,
+                    0,
+                    true,
+                )
+                .await?;
+            let has_more = page.has_more;
+            let next_marker = if page.next_marker.is_empty() {
+                page.blobs.last().map(|entry| entry.key.clone())
+            } else {
+                Some(page.next_marker.clone())
+            };
+
+            for entry in page.blobs {
+                if entry.is_physically_deleted {
+                    continue;
+                }
+                let (block_number, version, write_token) =
+                    if let Some((block_number, identity)) = parse_generation_key(&entry.key) {
+                        (block_number, identity.version, identity.write_token)
+                    } else if let Some(block_number) = parse_legacy_data_block_key(&entry.key) {
+                        (block_number, u64::MAX, 0)
+                    } else {
+                        continue;
+                    };
+                match node
+                    .get_client()
+                    .delete_data_blob_generation(
+                        blob_guid,
+                        block_number,
+                        version,
+                        write_token,
+                        Some(self.rpc_timeout),
+                        trace_id,
+                        0,
+                    )
+                    .await
+                {
+                    Ok(()) | Err(RpcError::NotFound) | Err(RpcError::VersionSkipped) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+
+            if !has_more {
+                return Ok(());
+            }
+            let Some(next_marker) = next_marker else {
+                return Err(DataVgError::Internal(
+                    "blob generation list has_more without a marker".to_string(),
+                ));
+            };
+            if next_marker <= marker {
+                return Err(DataVgError::Internal(
+                    "blob generation list marker did not advance".to_string(),
+                ));
+            }
+            marker = next_marker;
+        }
+    }
+
+    pub async fn delete_all_blob_generations(
+        &self,
+        blob_guid: DataBlobGuid,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        let volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
+            DataVgError::InitializationError(format!(
+                "Volume {} not found in DataVgProxy",
+                blob_guid.volume_id
+            ))
+        })?;
+        let mut requests = FuturesUnordered::new();
+        for node in volume.bss_nodes.iter().cloned() {
+            requests.push(async move {
+                let result = self
+                    .delete_all_generations_from_node(&node, blob_guid, trace_id)
+                    .await;
+                (node, result)
+            });
+        }
+
+        let mut failures = Vec::new();
+        while let Some((node, result)) = requests.next().await {
+            match result {
+                Ok(()) => node.record_success(),
+                Err(error) => {
+                    node.record_failure();
+                    failures.push(format!("{}: {}", node.address, error));
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(DataVgError::QuorumFailure(format!(
+                "Blob generation cleanup failed on placement nodes: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
+    pub fn enqueue_superseded_generation_gc(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_numbers: Vec<u32>,
+        keep_version: u64,
+        trace_id: TraceId,
+    ) -> Result<(), DataVgError> {
+        if block_numbers.is_empty() || keep_version == 0 {
+            return Ok(());
+        }
+        let volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
+            DataVgError::InitializationError(format!(
+                "Volume {} not found in DataVgProxy",
+                blob_guid.volume_id
+            ))
+        })?;
+        let nodes = volume.bss_nodes.clone();
+        let rpc_timeout = self.rpc_timeout;
+        let block_numbers = Arc::new(block_numbers);
+        spawn_background(async move {
+            rpc_client_common::rpc_sleep(SUPERSEDED_GENERATION_READER_GRACE).await;
+            let mut requests = FuturesUnordered::new();
+            for node in nodes {
+                let block_numbers = block_numbers.clone();
+                requests.push(async move {
+                    for block_number in block_numbers.iter().copied() {
+                        if let Err(error) = Self::delete_generations_before_from_node(
+                            &node,
+                            blob_guid,
+                            block_number,
+                            keep_version,
+                            rpc_timeout,
+                            &trace_id,
+                        )
+                        .await
+                        {
+                            node.record_failure();
+                            warn!(
+                                node = %node.address,
+                                %blob_guid,
+                                block_number,
+                                keep_version,
+                                error = %error,
+                                "superseded generation GC failed"
+                            );
+                            return;
+                        }
+                    }
+                    node.record_success();
+                });
+            }
+            while requests.next().await.is_some() {}
+        });
+        Ok(())
+    }
+
+    pub async fn fence_data_write_token(
+        &self,
+        blob_guid: DataBlobGuid,
+        version: u64,
+        write_token: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        if write_token == 0 {
+            return Err(DataVgError::Internal(
+                "data write fence requires a nonzero token".to_string(),
+            ));
+        }
+        let volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
+            DataVgError::InitializationError(format!(
+                "Volume {} not found in DataVgProxy",
+                blob_guid.volume_id
+            ))
+        })?;
+        let mut requests = FuturesUnordered::new();
+        for node in volume.bss_nodes.iter().cloned() {
+            requests.push(async move {
+                let result = node
+                    .get_client()
+                    .fence_data_write_token(
+                        blob_guid,
+                        version,
+                        write_token,
+                        Some(self.rpc_timeout),
+                        trace_id,
+                        0,
+                    )
+                    .await;
+                (node, result)
+            });
+        }
+
+        let mut failures = Vec::new();
+        while let Some((node, result)) = requests.next().await {
+            match result {
+                Ok(()) => node.record_success(),
+                Err(error) => {
+                    node.record_failure();
+                    failures.push(format!("{}: {}", node.address, error));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            return Err(DataVgError::QuorumFailure(format!(
+                "Data write fence failed on placement nodes: {}",
+                failures.join("; ")
+            )));
+        }
+
+        let mut cleanup_requests = FuturesUnordered::new();
+        for node in volume.bss_nodes.iter().cloned() {
+            cleanup_requests.push(async move {
+                let result = self
+                    .delete_fenced_token_from_node(&node, blob_guid, version, write_token, trace_id)
+                    .await;
+                (node, result)
+            });
+        }
+        while let Some((node, result)) = cleanup_requests.next().await {
+            match result {
+                Ok(()) => node.record_success(),
+                Err(error) => {
+                    node.record_failure();
+                    failures.push(format!("{}: {}", node.address, error));
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(DataVgError::QuorumFailure(format!(
+                "Fenced generation cleanup failed on placement nodes: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
     /// Multi-BSS put_blob with quorum-based replication or EC encoding
     pub async fn put_blob(
         &self,
@@ -636,6 +1107,72 @@ impl DataVgProxy {
         block_number: u32,
         body: Bytes,
         version: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        self.put_blob_inner(blob_guid, block_number, body, version, 0, false, trace_id)
+            .await
+    }
+
+    pub async fn put_blob_prepared(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        body: Bytes,
+        version: u64,
+        write_token: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        if write_token == 0 {
+            return Err(DataVgError::Internal(
+                "prepared data write requires a nonzero token".to_string(),
+            ));
+        }
+        self.put_blob_inner(
+            blob_guid,
+            block_number,
+            body,
+            version,
+            write_token,
+            false,
+            trace_id,
+        )
+        .await
+    }
+
+    pub async fn put_blob_tombstone_prepared(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        version: u64,
+        write_token: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        if write_token == 0 {
+            return Err(DataVgError::Internal(
+                "prepared tombstone requires a nonzero token".to_string(),
+            ));
+        }
+        self.put_blob_inner(
+            blob_guid,
+            block_number,
+            Bytes::new(),
+            version,
+            write_token,
+            true,
+            trace_id,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn put_blob_inner(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        body: Bytes,
+        version: u64,
+        write_token: u64,
+        is_deleted: bool,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
         let selected_volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
@@ -647,7 +1184,15 @@ impl DataVgProxy {
 
         if let VolumeMode::ErasureCoded { .. } = &selected_volume.mode {
             return self
-                .put_blob_ec(blob_guid, block_number, body, version, trace_id)
+                .put_blob_ec(
+                    blob_guid,
+                    block_number,
+                    body,
+                    version,
+                    write_token,
+                    is_deleted,
+                    trace_id,
+                )
                 .await;
         }
 
@@ -713,6 +1258,8 @@ impl DataVgProxy {
                 body.clone(),
                 body_checksum,
                 version,
+                write_token,
+                is_deleted,
                 rpc_timeout,
                 trace_id,
             ));
@@ -809,6 +1356,8 @@ impl DataVgProxy {
                     block_number,
                     Bytes::from(combined),
                     version,
+                    0,
+                    false,
                     trace_id,
                 )
                 .await;
@@ -959,6 +1508,8 @@ impl DataVgProxy {
         body: Bytes,
         body_checksum: u64,
         version: u64,
+        write_token: u64,
+        is_deleted: bool,
         rpc_timeout: Duration,
         trace_id: TraceId,
     ) -> (Arc<BssNode>, String, Result<(), RpcError>) {
@@ -966,18 +1517,35 @@ impl DataVgProxy {
         let address = bss_node.address.clone();
 
         let bss_client = bss_node.get_client();
-        let result = bss_client
-            .put_data_blob(
-                blob_guid,
-                block_number,
-                body,
-                body_checksum,
-                version,
-                Some(rpc_timeout),
-                &trace_id,
-                0,
-            )
-            .await;
+        let result = if write_token == 0 {
+            bss_client
+                .put_data_blob(
+                    blob_guid,
+                    block_number,
+                    body,
+                    body_checksum,
+                    version,
+                    Some(rpc_timeout),
+                    &trace_id,
+                    0,
+                )
+                .await
+        } else {
+            bss_client
+                .put_data_blob_generation(
+                    blob_guid,
+                    block_number,
+                    body,
+                    body_checksum,
+                    version,
+                    write_token,
+                    is_deleted,
+                    Some(rpc_timeout),
+                    &trace_id,
+                    0,
+                )
+                .await
+        };
 
         let _result_label = if result.is_ok() { "success" } else { "failure" };
         histogram!("datavg_put_blob_node_nanos", "bss_node" => address.clone(), "result" => _result_label)
@@ -1034,8 +1602,7 @@ impl DataVgProxy {
             .await
     }
 
-    /// Reserve a single block on every replica (single-op; EC volumes are a
-    /// no-op). Stamped at `expected_version`.
+    /// Reserve a single block at the volume write quorum.
     pub async fn reserve_blob(
         &self,
         blob_guid: DataBlobGuid,
@@ -1044,17 +1611,58 @@ impl DataVgProxy {
         expected_version: u64,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
+        self.reserve_blob_inner(
+            blob_guid,
+            block_number,
+            block_size,
+            expected_version,
+            0,
+            trace_id,
+        )
+        .await
+    }
+
+    pub async fn reserve_blob_prepared(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        block_size: u32,
+        expected_version: u64,
+        write_token: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        if write_token == 0 {
+            return Err(DataVgError::Internal(
+                "prepared reservation requires a nonzero token".to_string(),
+            ));
+        }
+        self.reserve_blob_inner(
+            blob_guid,
+            block_number,
+            block_size,
+            expected_version,
+            write_token,
+            trace_id,
+        )
+        .await
+    }
+
+    async fn reserve_blob_inner(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        block_size: u32,
+        expected_version: u64,
+        write_token: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
         let volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
             DataVgError::InitializationError(format!("Volume {} not found", blob_guid.volume_id))
         })?;
-        if let VolumeMode::ErasureCoded { .. } = &volume.mode {
-            return Ok(());
-        }
-
         let rpc_timeout = self.rpc_timeout;
         let write_quorum = match &volume.mode {
             VolumeMode::Replicated { w, .. } => *w as usize,
-            VolumeMode::ErasureCoded { .. } => unreachable!(),
+            VolumeMode::ErasureCoded { data_shards, .. } => *data_shards as usize + 1,
         };
 
         let available_nodes: Vec<_> = volume
@@ -1079,18 +1687,32 @@ impl DataVgProxy {
             let trace_id = *trace_id;
             futures.push(async move {
                 let address = node.address.clone();
-                let result = node
-                    .get_client()
-                    .reserve_blocks(
-                        blob_guid,
-                        block_number,
-                        block_size,
-                        expected_version,
-                        Some(rpc_timeout),
-                        &trace_id,
-                        0,
-                    )
-                    .await;
+                let result = if write_token == 0 {
+                    node.get_client()
+                        .reserve_blocks(
+                            blob_guid,
+                            block_number,
+                            block_size,
+                            expected_version,
+                            Some(rpc_timeout),
+                            &trace_id,
+                            0,
+                        )
+                        .await
+                } else {
+                    node.get_client()
+                        .reserve_blocks_generation(
+                            blob_guid,
+                            block_number,
+                            block_size,
+                            expected_version,
+                            write_token,
+                            Some(rpc_timeout),
+                            &trace_id,
+                            0,
+                        )
+                        .await
+                };
                 (node, address, result)
             });
         }
@@ -1109,6 +1731,14 @@ impl DataVgProxy {
                 }
             }
             if successes >= write_quorum {
+                spawn_background(async move {
+                    while let Some((node, _, result)) = futures.next().await {
+                        match result {
+                            Ok(()) | Err(RpcError::VersionSkipped) => node.record_success(),
+                            Err(_) => node.record_failure(),
+                        }
+                    }
+                });
                 return Ok(());
             }
         }
@@ -1180,7 +1810,6 @@ impl DataVgProxy {
             last_err.unwrap_or_default()
         )))
     }
-
     /// Variant of `get_blob` that enforces a read-side version check.
     ///
     /// When `expected_version = Some(v)`, the returned block's BSS-stamped
@@ -1626,6 +2255,8 @@ impl DataVgProxy {
                 canon_body.clone(),
                 canon_checksum,
                 max_version,
+                0,
+                false,
                 self.rpc_timeout,
                 *trace_id,
             ));
@@ -1813,20 +2444,24 @@ impl DataVgProxy {
     // ---- EC (Erasure-Coded) blob operations ----
 
     /// EC put: RS-encode block into k+m shards, send to nodes with W=k+1 quorum
+    #[allow(clippy::too_many_arguments)]
     async fn put_blob_ec(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
         body: Bytes,
         version: u64,
+        write_token: u64,
+        is_deleted: bool,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
         let start = Instant::now();
         let trace_id = *trace_id;
         histogram!("blob_size", "operation" => "put_ec").record(body.len() as f64);
 
-        // Empty body: nothing to encode or store
-        if body.is_empty() {
+        // A legacy empty write has no fragment. An MVCC tombstone is an
+        // empty generation that must still reach the EC write quorum.
+        if body.is_empty() && !is_deleted {
             histogram!("datavg_put_blob_nanos", "result" => "ec_empty")
                 .record(start.elapsed().as_nanos() as f64);
             return Ok(());
@@ -1850,6 +2485,70 @@ impl DataVgProxy {
         let _inflight = InflightGuard {
             counter: &ec_vol.inflight,
         };
+
+        if is_deleted {
+            let available_nodes: Vec<_> = ec_vol
+                .bss_nodes
+                .iter()
+                .filter(|node| node.is_available())
+                .cloned()
+                .collect();
+            if available_nodes.len() < write_quorum {
+                return Err(DataVgError::QuorumFailure(format!(
+                    "EC tombstone: insufficient available nodes ({}/{}) for write quorum ({})",
+                    available_nodes.len(),
+                    total,
+                    write_quorum
+                )));
+            }
+            let empty_checksum = xxhash_rust::xxh3::xxh3_64(&[]);
+            let mut futures = FuturesUnordered::new();
+            for node in available_nodes {
+                futures.push(Self::put_blob_to_node(
+                    node,
+                    blob_guid,
+                    block_number,
+                    Bytes::new(),
+                    empty_checksum,
+                    version,
+                    write_token,
+                    true,
+                    self.rpc_timeout,
+                    trace_id,
+                ));
+            }
+            let mut successes = 0usize;
+            let mut errors = Vec::new();
+            while let Some((node, address, result)) = futures.next().await {
+                match result {
+                    Ok(()) | Err(RpcError::VersionSkipped) => {
+                        node.record_success();
+                        successes += 1;
+                    }
+                    Err(e) => {
+                        node.record_failure();
+                        errors.push(format!("{}: {}", address, e));
+                    }
+                }
+                if successes >= write_quorum {
+                    spawn_background(async move {
+                        while let Some((node, _, result)) = futures.next().await {
+                            match result {
+                                Ok(()) | Err(RpcError::VersionSkipped) => node.record_success(),
+                                Err(_) => node.record_failure(),
+                            }
+                        }
+                    });
+                    return Ok(());
+                }
+            }
+            return Err(DataVgError::QuorumFailure(format!(
+                "EC tombstone write quorum failed ({}/{}): {}",
+                successes,
+                write_quorum,
+                errors.join("; ")
+            )));
+        }
 
         // Pad body to a full RS stripe with even shard size.
         let original_len = body.len();
@@ -1914,6 +2613,8 @@ impl DataVgProxy {
                 shard_data,
                 checksum,
                 version,
+                write_token,
+                is_deleted,
                 rpc_timeout,
                 trace_id,
             ));
@@ -2359,6 +3060,8 @@ impl DataVgProxy {
                         shard_data,
                         checksum,
                         max_version,
+                        0,
+                        false,
                         self.rpc_timeout,
                         *trace_id,
                     ));
@@ -2510,7 +3213,108 @@ impl DataVgProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use data_types::Volume;
+    use data_types::{BssNode as DataBssNode, Volume};
+
+    const TEST_BLOB_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+
+    fn replicated_info(n: u32, r: u32, w: u32) -> DataVgInfo {
+        let bss_nodes = (0..n)
+            .map(|index| DataBssNode {
+                node_id: format!("bss-{index}"),
+                ip: "127.0.0.1".to_string(),
+                port: 18088 + index as u16,
+            })
+            .collect();
+        DataVgInfo {
+            volumes: vec![Volume {
+                volume_id: 7,
+                uuid: "test-volume".to_string(),
+                bss_nodes,
+                mode: VolumeMode::Replicated { n, r, w },
+            }],
+        }
+    }
+
+    #[test]
+    fn generation_key_parses_fixed_width_boundaries() {
+        let max = parse_generation_key(&format!(
+            "/d7/{TEST_BLOB_ID}-pffffffff-rv0000000000000000-tffffffffffffffff\0"
+        ))
+        .expect("maximum generation key should parse");
+        assert_eq!(max.0, u32::MAX);
+        assert_eq!(max.1.version, u64::MAX);
+        assert_eq!(max.1.write_token, u64::MAX);
+
+        let zero = parse_generation_key(&format!(
+            "/d7/{TEST_BLOB_ID}-p00000000-rvffffffffffffffff-t0000000000000000"
+        ))
+        .expect("zero generation key should parse");
+        assert_eq!(zero.0, 0);
+        assert_eq!(zero.1.version, 0);
+        assert_eq!(zero.1.write_token, 0);
+
+        assert!(
+            parse_generation_key(&format!(
+                "/d7/{TEST_BLOB_ID}-p0000000-rvffffffffffffffff-t0000000000000000"
+            ))
+            .is_none()
+        );
+        assert!(
+            parse_generation_key(&format!(
+                "/d7/{TEST_BLOB_ID}-p00000000-vffffffffffffffff-t0000000000000000"
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn replicated_read_quorum_below_majority_is_rejected() {
+        let error = DataVgProxy::new(
+            replicated_info(3, 1, 2),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .err()
+        .expect("sub-majority read quorum should fail");
+        assert!(matches!(
+            error,
+            DataVgError::InitializationError(message)
+                if message.contains("r=1 below majority 2")
+        ));
+    }
+
+    #[test]
+    fn replicated_write_quorum_below_majority_is_rejected() {
+        let error = DataVgProxy::new(
+            replicated_info(3, 2, 1),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .err()
+        .expect("sub-majority write quorum should fail");
+        assert!(matches!(
+            error,
+            DataVgError::InitializationError(message)
+                if message.contains("w=1 below majority 2")
+        ));
+    }
+
+    #[test]
+    fn replicated_majority_and_raised_write_quorums_are_accepted() {
+        let majority = DataVgProxy::new(
+            replicated_info(3, 2, 2),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        assert!(majority.is_ok());
+
+        let raised = DataVgProxy::new(
+            replicated_info(3, 2, 3),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        assert!(raised.is_ok());
+    }
 
     #[test]
     fn ec_volume_id_range() {
