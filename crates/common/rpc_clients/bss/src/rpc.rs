@@ -135,6 +135,7 @@ impl RpcClient {
             prefix: prefix.to_string(),
             start_after: start_after.to_string(),
             include_deleted,
+            include_fenced: false,
         };
 
         let mut header = MessageHeader::default();

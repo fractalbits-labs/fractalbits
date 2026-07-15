@@ -82,6 +82,7 @@ pub enum Command {
     // POSIX fs related commands
     ReserveBlocks = 32,
     ListBlobBlocks = 33,
+    FenceDataWriteToken = 34,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -129,7 +130,22 @@ impl Default for MessageHeader {
 impl MessageHeader {
     const _SIZE_OK: () = assert!(size_of::<Self>() == 160);
     const _FENCE_TOKEN_OFFSET_OK: () = assert!(std::mem::offset_of!(Self, fence_token) == 96);
+    const DATA_WRITE_TOKEN_LEN: usize = size_of::<u64>();
     pub const PROTO_VERSION: u8 = 1;
+
+    /// Store the data-generation write token in the command-defined scratch area.
+    pub fn set_data_write_token(&mut self, write_token: u64) {
+        self.reserve1[..Self::DATA_WRITE_TOKEN_LEN].copy_from_slice(&write_token.to_le_bytes());
+    }
+
+    /// Read the data-generation write token from the command-defined scratch area.
+    pub fn data_write_token(&self) -> u64 {
+        u64::from_le_bytes(
+            self.reserve1[..Self::DATA_WRITE_TOKEN_LEN]
+                .try_into()
+                .expect("data write token has fixed width"),
+        )
+    }
 
     /// Calculate and set the body checksum field.
     /// The checksum covers the message body after this header.
@@ -181,5 +197,22 @@ impl MessageHeaderTrait for MessageHeader {
     fn verify_body_checksum(&self, body: &[u8]) -> bool {
         let calculated = xxh3_64(body);
         self.checksum_body == calculated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MessageHeader;
+
+    #[test]
+    fn data_write_token_round_trips_in_scratch_space() {
+        let mut header = MessageHeader::default();
+        header.reserve1[8] = 0xa5;
+
+        header.set_data_write_token(0x0123_4567_89ab_cdef);
+
+        assert_eq!(header.data_write_token(), 0x0123_4567_89ab_cdef);
+        assert_eq!(header.reserve1[8], 0xa5);
+        assert!(header.reserve2.iter().all(|byte| *byte == 0));
     }
 }

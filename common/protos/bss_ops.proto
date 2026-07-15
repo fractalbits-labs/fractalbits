@@ -8,6 +8,7 @@ message ListBlobsRequest {
   string prefix = 2;
   string start_after = 3;
   bool include_deleted = 4;
+  bool include_fenced = 5;
 }
 
 message ListBlobsResponse {
@@ -22,11 +23,14 @@ message ListBlobsResponse {
     uint64 checksum_body = 3;
     uint64 version = 4;
     bool is_deleted = 5;
+    uint32 entry_type = 6;
+    bool is_physically_deleted = 7;
   }
 
   message Blobs {
     repeated BlobEntry blobs = 1;
     bool has_more = 2;
+    string next_marker = 3;
   }
 }
 
@@ -69,6 +73,8 @@ message ListBlobBlocksResponse {
     // 0 = Data, 1 = Reserved.
     uint32 entry_type = 2;
     uint64 version = 3;
+    uint64 write_token = 4;
+    bool is_deleted = 5;
   }
 
   message Blocks {

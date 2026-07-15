@@ -101,6 +101,8 @@ pub enum RpcError {
     ChecksumMismatch,
     #[error("Version skipped")]
     VersionSkipped,
+    #[error("Data write token is fenced")]
+    DataWriteFenced,
 }
 
 impl<T> From<tokio::sync::mpsc::error::SendError<T>> for RpcError {
