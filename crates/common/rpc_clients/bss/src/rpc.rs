@@ -35,6 +35,7 @@ fn check_response_errno(header: &MessageHeader) -> Result<(), RpcError> {
             "BSS returned DeviceMismatch".to_string(),
         )),
         8 => Err(RpcError::VersionSkipped), // Write skipped due to version check
+        11 => Err(RpcError::DataWriteFenced),
         code => Err(RpcError::InternalResponseError(format!(
             "Unknown BSS error code: {}",
             code
@@ -94,25 +95,44 @@ impl BlobListStream {
             return Ok(None);
         }
 
-        let page = self
-            .client
-            .list_data_blobs(
-                self.volume_id,
-                &self.prefix,
-                &self.marker,
-                self.max_keys,
-                timeout,
-                trace_id,
-                retry_count,
-                self.include_deleted,
-            )
-            .await?;
+        loop {
+            let page = self
+                .client
+                .list_data_blobs(
+                    self.volume_id,
+                    &self.prefix,
+                    &self.marker,
+                    self.max_keys,
+                    timeout,
+                    trace_id,
+                    retry_count,
+                    self.include_deleted,
+                )
+                .await?;
 
-        if let Some(last) = page.blobs.last() {
-            self.marker = last.key.clone();
+            if page.has_more {
+                let next_marker = if page.next_marker.is_empty() {
+                    page.blobs.last().map(|entry| entry.key.as_str())
+                } else {
+                    Some(page.next_marker.as_str())
+                }
+                .ok_or_else(|| {
+                    RpcError::InternalResponseError(
+                        "BSS list page has_more without a next marker".to_string(),
+                    )
+                })?;
+                if next_marker <= self.marker.as_str() {
+                    return Err(RpcError::InternalResponseError(
+                        "BSS list page did not advance its marker".to_string(),
+                    ));
+                }
+                self.marker = next_marker.to_string();
+            }
+            self.done = !page.has_more;
+            if !page.blobs.is_empty() || self.done {
+                return Ok(Some(page));
+            }
         }
-        self.done = !page.has_more;
-        Ok(Some(page))
     }
 }
 
@@ -129,13 +149,66 @@ impl RpcClient {
         retry_count: u32,
         include_deleted: bool,
     ) -> Result<list_blobs_response::Blobs, RpcError> {
+        self.list_data_blobs_impl(
+            volume_id,
+            prefix,
+            start_after,
+            max_keys,
+            timeout,
+            trace_id,
+            retry_count,
+            include_deleted,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_data_blobs_including_fenced(
+        &self,
+        volume_id: u16,
+        prefix: &str,
+        start_after: &str,
+        max_keys: u32,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+        include_deleted: bool,
+    ) -> Result<list_blobs_response::Blobs, RpcError> {
+        self.list_data_blobs_impl(
+            volume_id,
+            prefix,
+            start_after,
+            max_keys,
+            timeout,
+            trace_id,
+            retry_count,
+            include_deleted,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn list_data_blobs_impl(
+        &self,
+        volume_id: u16,
+        prefix: &str,
+        start_after: &str,
+        max_keys: u32,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+        include_deleted: bool,
+        include_fenced: bool,
+    ) -> Result<list_blobs_response::Blobs, RpcError> {
         let _guard = InflightRpcGuard::new("bss", "list_data_blobs");
         let body = ListBlobsRequest {
             max_keys,
             prefix: prefix.to_string(),
             start_after: start_after.to_string(),
             include_deleted,
-            include_fenced: false,
+            include_fenced,
         };
 
         let mut header = MessageHeader::default();
@@ -176,7 +249,33 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "reserve_blocks");
+        self.reserve_blocks_generation(
+            blob_guid,
+            block_number,
+            block_size,
+            expected_version,
+            0,
+            timeout,
+            trace_id,
+            retry_count,
+        )
+        .await
+    }
+
+    /// Reserve one exact data generation. Token zero uses the legacy data key.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reserve_blocks_generation(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        block_size: u32,
+        expected_version: u64,
+        write_token: u64,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<(), RpcError> {
+        let _guard = InflightRpcGuard::new("bss", "reserve_blocks_generation");
         let body = ReserveBlocksRequest {
             block_count: 1,
             block_size,
@@ -194,6 +293,7 @@ impl RpcClient {
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
         header.version = expected_version;
+        header.set_data_write_token(write_token);
         header.set_body_checksum(&body_bytes);
 
         let msg_frame = MessageFrame::new(header, body_bytes);
@@ -282,7 +382,37 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "put_data_blob");
+        self.put_data_blob_generation(
+            blob_guid,
+            block_number,
+            body,
+            body_checksum,
+            version,
+            0,
+            false,
+            timeout,
+            trace_id,
+            retry_count,
+        )
+        .await
+    }
+
+    /// Put one exact data generation. Token zero uses the legacy data key.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_data_blob_generation(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        body: Bytes,
+        body_checksum: u64,
+        version: u64,
+        write_token: u64,
+        is_deleted: bool,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<(), RpcError> {
+        let _guard = InflightRpcGuard::new("bss", "put_data_blob_generation");
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
@@ -296,6 +426,8 @@ impl RpcClient {
         header.trace_id = trace_id.0;
         header.checksum_body = body_checksum;
         header.version = version;
+        header.is_deleted = u8::from(is_deleted);
+        header.set_data_write_token(write_token);
 
         let msg_frame = MessageFrame::new(header, body);
         let resp_frame = self
@@ -323,7 +455,37 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "put_data_blob_vectored");
+        self.put_data_blob_vectored_generation(
+            blob_guid,
+            block_number,
+            chunks,
+            body_checksum,
+            version,
+            0,
+            false,
+            timeout,
+            trace_id,
+            retry_count,
+        )
+        .await
+    }
+
+    /// Put one exact vectored data generation. Token zero uses the legacy key.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_data_blob_vectored_generation(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        chunks: Vec<Bytes>,
+        body_checksum: u64,
+        version: u64,
+        write_token: u64,
+        is_deleted: bool,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<(), RpcError> {
+        let _guard = InflightRpcGuard::new("bss", "put_data_blob_vectored_generation");
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
@@ -338,6 +500,8 @@ impl RpcClient {
         header.trace_id = trace_id.0;
         header.checksum_body = body_checksum;
         header.version = version;
+        header.is_deleted = u8::from(is_deleted);
+        header.set_data_write_token(write_token);
 
         let msg_frame = MessageFrame::new(header, chunks);
         let resp_frame = self
@@ -368,6 +532,59 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<u64, RpcError> {
+        self.get_data_blob_impl(
+            blob_guid,
+            block_number,
+            body,
+            content_len,
+            None,
+            timeout,
+            trace_id,
+            retry_count,
+        )
+        .await
+    }
+
+    /// Get one exact data generation. Token zero uses the legacy data key.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_data_blob_generation(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        body: &mut Bytes,
+        content_len: usize,
+        version: u64,
+        write_token: u64,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<(), RpcError> {
+        self.get_data_blob_impl(
+            blob_guid,
+            block_number,
+            body,
+            content_len,
+            Some((version, write_token)),
+            timeout,
+            trace_id,
+            retry_count,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn get_data_blob_impl(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        body: &mut Bytes,
+        content_len: usize,
+        generation: Option<(u64, u64)>,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<u64, RpcError> {
         let _guard = InflightRpcGuard::new("bss", "get_data_blob");
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
@@ -380,10 +597,14 @@ impl RpcClient {
         header.trace_id = trace_id.0;
         header.body_len = content_len as u32;
         header.size = size_of::<MessageHeader>() as u32;
+        if let Some((version, write_token)) = generation {
+            header.version = version;
+            header.set_data_write_token(write_token);
+        }
 
         let msg_frame = MessageFrame::new(header, Bytes::new());
         let resp_frame = self
-            .send_request( msg_frame, timeout, Some(crate::OperationType::GetData))
+            .send_request(msg_frame, timeout, Some(crate::OperationType::GetData))
             .await
             .map_err(|e| {
                 if !e.retryable() {
@@ -393,6 +614,18 @@ impl RpcClient {
             })?;
         check_response_errno(&resp_frame.header)?;
         let version = resp_frame.header.version;
+        if let Some((expected_version, expected_token)) = generation
+            && (version != expected_version
+                || resp_frame.header.data_write_token() != expected_token)
+        {
+            return Err(RpcError::InternalResponseError(format!(
+                "BSS returned generation ({}, {}) but client requested ({}, {})",
+                version,
+                resp_frame.header.data_write_token(),
+                expected_version,
+                expected_token
+            )));
+        }
         *body = resp_frame.body;
         // Block-size padding (override flush) stores every block at full
         // block_size, so a reader that knows the logical content length
@@ -420,7 +653,31 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "delete_data_blob");
+        self.delete_data_blob_generation(
+            blob_guid,
+            block_number,
+            version,
+            0,
+            timeout,
+            trace_id,
+            retry_count,
+        )
+        .await
+    }
+
+    /// Delete one exact data generation. Token zero uses the legacy data key.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn delete_data_blob_generation(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        version: u64,
+        write_token: u64,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<(), RpcError> {
+        let _guard = InflightRpcGuard::new("bss", "delete_data_blob_generation");
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
@@ -432,10 +689,11 @@ impl RpcClient {
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
         header.version = version;
+        header.set_data_write_token(write_token);
 
         let msg_frame = MessageFrame::new(header, Bytes::new());
         let resp_frame = self
-            .send_request( msg_frame, timeout, Some(crate::OperationType::DeleteData))
+            .send_request(msg_frame, timeout, Some(crate::OperationType::DeleteData))
             .await
             .map_err(|e| {
                 if !e.retryable() {
@@ -443,6 +701,46 @@ impl RpcClient {
                 }
                 e
             })?;
+        check_response_errno(&resp_frame.header)?;
+        Ok(())
+    }
+
+    pub async fn fence_data_write_token(
+        &self,
+        blob_guid: DataBlobGuid,
+        version: u64,
+        write_token: u64,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<(), RpcError> {
+        if write_token == 0 {
+            return Err(RpcError::InternalRequestError(
+                "a data write fence requires a nonzero token".to_string(),
+            ));
+        }
+
+        let _guard = InflightRpcGuard::new("bss", "fence_data_write_token");
+        let mut header = MessageHeader::default();
+        let request_id = self.gen_request_id();
+        header.id = request_id;
+        header.blob_id = blob_guid.blob_id.into_bytes();
+        header.volume_id = blob_guid.volume_id;
+        header.command = Command::FenceDataWriteToken;
+        header.size = size_of::<MessageHeader>() as u32;
+        header.retry_count = retry_count as u8;
+        header.trace_id = trace_id.0;
+        header.version = version;
+        header.skip_fence_token = 1;
+        header.set_data_write_token(write_token);
+
+        let msg_frame = MessageFrame::new(header, Bytes::new());
+        let resp_frame = self.send_request(msg_frame, timeout, None).await.map_err(|e| {
+            if !e.retryable() {
+                error!(rpc=%"fence_data_write_token", %request_id, %blob_guid, %version, %write_token, error=?e, "bss rpc failed");
+            }
+            e
+        })?;
         check_response_errno(&resp_frame.header)?;
         Ok(())
     }
@@ -574,8 +872,11 @@ impl RpcClient {
 
 #[cfg(test)]
 mod tests {
-    use super::BlobListStream;
+    use super::{BlobListStream, check_response_errno};
     use crate::client::RpcClient;
+    use bss_codec::{ListBlobBlocksResponse, MessageHeader, list_blob_blocks_response};
+    use prost::Message as PbMessage;
+    use rpc_client_common::RpcError;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -591,5 +892,50 @@ mod tests {
         assert!(!stream.done);
         assert_eq!(stream.prefix, "/d1/");
         assert_eq!(stream.max_keys, 1000);
+    }
+
+    #[test]
+    fn blob_block_entry_round_trips_generation_identity() {
+        let response = ListBlobBlocksResponse {
+            result: Some(list_blob_blocks_response::Result::Ok(
+                list_blob_blocks_response::Blocks {
+                    blocks: vec![list_blob_blocks_response::BlobBlockEntry {
+                        block_number: 17,
+                        entry_type: 0,
+                        version: 23,
+                        write_token: 29,
+                        is_deleted: true,
+                    }],
+                },
+            )),
+        };
+
+        let decoded = ListBlobBlocksResponse::decode(response.encode_to_vec().as_slice())
+            .expect("decode ListBlobBlocks response");
+        let blocks = decoded
+            .result
+            .and_then(|result| match result {
+                list_blob_blocks_response::Result::Ok(blocks) => Some(blocks),
+                list_blob_blocks_response::Result::Err(_) => None,
+            })
+            .expect("successful ListBlobBlocks response");
+
+        assert_eq!(blocks.blocks.len(), 1);
+        assert_eq!(blocks.blocks[0].write_token, 29);
+        assert!(blocks.blocks[0].is_deleted);
+    }
+
+    #[test]
+    fn fenced_errno_maps_to_a_nonretryable_error() {
+        let header = MessageHeader {
+            errno: 11,
+            ..MessageHeader::default()
+        };
+
+        assert!(matches!(
+            check_response_errno(&header),
+            Err(RpcError::DataWriteFenced)
+        ));
+        assert!(!RpcError::DataWriteFenced.retryable());
     }
 }
