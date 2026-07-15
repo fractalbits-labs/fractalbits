@@ -416,6 +416,9 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: 4096,
             blob_version: 1,
+            data_write_token: 0,
+            next_data_write_token: 0,
+            pending_data_write: None,
             state: ObjectState::Directory(DirectoryData {
                 posix: PosixAttrs {
                     mode,

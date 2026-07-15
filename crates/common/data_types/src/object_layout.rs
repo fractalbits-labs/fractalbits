@@ -6,6 +6,20 @@ use uuid::Uuid;
 pub enum ObjectLayoutError {
     #[error("invalid object state")]
     InvalidState,
+    #[error("a data write is already pending")]
+    DataWritePending,
+    #[error("invalid data write version")]
+    InvalidDataWriteVersion,
+    #[error("data write token space exhausted")]
+    DataWriteTokenExhausted,
+    #[error("data write lease does not match")]
+    DataWriteLeaseMismatch,
+    #[error("data write lease expired")]
+    DataWriteLeaseExpired,
+    #[error("data write lease is still live")]
+    DataWriteLeaseLive,
+    #[error("invalid data write lease expiry")]
+    InvalidDataWriteLeaseExpiry,
 }
 
 pub type HeaderList = Vec<(String, String)>;
@@ -28,7 +42,21 @@ pub struct ObjectLayout {
     /// Incremented by `PutInodeCas` on every flush that has pending work.
     /// `0` is reserved for legacy / pre-V1 layouts; new flushes start at `1`.
     pub blob_version: u64,
+    /// Token of the data generation committed at `blob_version`.
+    pub data_write_token: u64,
+    /// Durable next token. Preparing a write consumes this value.
+    pub next_data_write_token: u64,
+    /// Prepared data generation that may commit while its lease is live.
+    pub pending_data_write: Option<PendingDataWrite>,
     pub state: ObjectState,
+}
+
+#[derive(Archive, Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub struct PendingDataWrite {
+    pub version: u64,
+    pub token: u64,
+    pub lease_id: Uuid,
+    pub expires_at_ms: u64,
 }
 
 impl ObjectLayout {
@@ -36,6 +64,129 @@ impl ObjectLayout {
 
     pub fn gen_version_id() -> Uuid {
         Uuid::new_v4()
+    }
+
+    pub fn prepare_data_write(
+        &mut self,
+        version: u64,
+        expires_at_ms: u64,
+    ) -> Result<PendingDataWrite, ObjectLayoutError> {
+        if self.pending_data_write.is_some() {
+            return Err(ObjectLayoutError::DataWritePending);
+        }
+        if self.blob_version.checked_add(1).map(|next| next.max(2)) != Some(version) {
+            return Err(ObjectLayoutError::InvalidDataWriteVersion);
+        }
+        if expires_at_ms == 0 {
+            return Err(ObjectLayoutError::InvalidDataWriteLeaseExpiry);
+        }
+
+        let token = self
+            .next_data_write_token
+            .max(self.data_write_token.saturating_add(1))
+            .max(1);
+        self.next_data_write_token = token
+            .checked_add(1)
+            .ok_or(ObjectLayoutError::DataWriteTokenExhausted)?;
+        let pending = PendingDataWrite {
+            version,
+            token,
+            lease_id: Uuid::new_v4(),
+            expires_at_ms,
+        };
+        self.pending_data_write = Some(pending);
+        Ok(pending)
+    }
+
+    pub fn has_live_data_write_lease(&self, version: u64, token: u64, now_ms: u64) -> bool {
+        self.pending_data_write.is_some_and(|pending| {
+            pending.version == version && pending.token == token && now_ms < pending.expires_at_ms
+        })
+    }
+
+    pub fn renew_data_write_lease(
+        &mut self,
+        version: u64,
+        token: u64,
+        lease_id: Uuid,
+        now_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<(), ObjectLayoutError> {
+        let pending = self
+            .pending_data_write
+            .as_mut()
+            .ok_or(ObjectLayoutError::DataWriteLeaseMismatch)?;
+        if pending.version != version || pending.token != token || pending.lease_id != lease_id {
+            return Err(ObjectLayoutError::DataWriteLeaseMismatch);
+        }
+        if now_ms >= pending.expires_at_ms {
+            return Err(ObjectLayoutError::DataWriteLeaseExpired);
+        }
+        if expires_at_ms <= now_ms {
+            return Err(ObjectLayoutError::InvalidDataWriteLeaseExpiry);
+        }
+        pending.expires_at_ms = pending.expires_at_ms.max(expires_at_ms);
+        Ok(())
+    }
+
+    pub fn abort_data_write(
+        &mut self,
+        version: u64,
+        token: u64,
+        lease_id: Uuid,
+    ) -> Result<(), ObjectLayoutError> {
+        let pending = self
+            .pending_data_write
+            .as_mut()
+            .ok_or(ObjectLayoutError::DataWriteLeaseMismatch)?;
+        if pending.version != version || pending.token != token || pending.lease_id != lease_id {
+            return Err(ObjectLayoutError::DataWriteLeaseMismatch);
+        }
+        pending.expires_at_ms = 0;
+        Ok(())
+    }
+
+    pub fn clear_aborted_data_write(
+        &mut self,
+        version: u64,
+        token: u64,
+        lease_id: Uuid,
+        now_ms: u64,
+    ) -> Result<(), ObjectLayoutError> {
+        let pending = self
+            .pending_data_write
+            .ok_or(ObjectLayoutError::DataWriteLeaseMismatch)?;
+        if pending.version != version || pending.token != token || pending.lease_id != lease_id {
+            return Err(ObjectLayoutError::DataWriteLeaseMismatch);
+        }
+        if pending.expires_at_ms != 0 && now_ms < pending.expires_at_ms {
+            return Err(ObjectLayoutError::DataWriteLeaseLive);
+        }
+        self.pending_data_write = None;
+        Ok(())
+    }
+
+    pub fn commit_data_write(
+        &mut self,
+        version: u64,
+        token: u64,
+        lease_id: Uuid,
+        now_ms: u64,
+    ) -> Result<(), ObjectLayoutError> {
+        let pending = self
+            .pending_data_write
+            .ok_or(ObjectLayoutError::DataWriteLeaseMismatch)?;
+        if pending.version != version || pending.token != token || pending.lease_id != lease_id {
+            return Err(ObjectLayoutError::DataWriteLeaseMismatch);
+        }
+        if now_ms >= pending.expires_at_ms {
+            return Err(ObjectLayoutError::DataWriteLeaseExpired);
+        }
+
+        self.blob_version = version;
+        self.data_write_token = token;
+        self.pending_data_write = None;
+        Ok(())
     }
 
     /// `true` when this layout should appear as an entry in an
@@ -436,6 +587,9 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 1,
+            data_write_token: 0,
+            next_data_write_token: 0,
+            pending_data_write: None,
             state: ObjectState::Normal(ObjectMetaData {
                 blob_guid: DataBlobGuid {
                     blob_id: Uuid::nil(),
@@ -444,6 +598,139 @@ mod tests {
                 core_meta_data: core,
             }),
         }
+    }
+
+    #[test]
+    fn data_write_tokens_allocate_monotonically_and_commit() {
+        let mut layout = normal_layout(core_meta(7));
+
+        let first = layout
+            .prepare_data_write(2, 1_000)
+            .expect("prepare first data write");
+        assert_eq!(first.token, 1);
+        assert_eq!(layout.next_data_write_token, 2);
+        assert!(layout.has_live_data_write_lease(2, first.token, 999));
+        assert!(!layout.has_live_data_write_lease(2, first.token, 1_000));
+
+        layout
+            .commit_data_write(2, first.token, first.lease_id, 999)
+            .expect("commit live data write");
+        assert_eq!(layout.blob_version, 2);
+        assert_eq!(layout.data_write_token, first.token);
+        assert_eq!(layout.pending_data_write, None);
+
+        let second = layout
+            .prepare_data_write(3, 2_000)
+            .expect("prepare second data write");
+        assert_eq!(second.token, 2);
+        assert_eq!(layout.next_data_write_token, 3);
+    }
+
+    #[test]
+    fn legacy_data_write_starts_at_version_two() {
+        let mut layout = normal_layout(core_meta(7));
+        layout.blob_version = 0;
+
+        let pending = layout
+            .prepare_data_write(2, 1_000)
+            .expect("prepare legacy data write");
+
+        assert_eq!(pending.version, 2);
+        assert_eq!(pending.token, 1);
+    }
+
+    #[test]
+    fn pending_data_write_round_trips_through_rkyv() {
+        let mut layout = normal_layout(core_meta(11));
+        let pending = layout
+            .prepare_data_write(2, 5_000)
+            .expect("prepare data write");
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&layout).expect("serialize layout");
+        let decoded = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&bytes)
+            .expect("deserialize layout");
+
+        assert_eq!(decoded, layout);
+        assert!(decoded.has_live_data_write_lease(2, pending.token, 4_999));
+    }
+
+    #[test]
+    fn aborted_data_write_blocks_commit_until_cleanup() {
+        let mut layout = normal_layout(core_meta(11));
+        let pending = layout
+            .prepare_data_write(2, 5_000)
+            .expect("prepare data write");
+
+        layout
+            .abort_data_write(pending.version, pending.token, pending.lease_id)
+            .expect("mark data write aborted");
+
+        assert!(!layout.has_live_data_write_lease(2, pending.token, 1));
+        let error = layout
+            .commit_data_write(2, pending.token, pending.lease_id, 1)
+            .expect_err("aborted data write must not commit");
+        assert!(matches!(error, ObjectLayoutError::DataWriteLeaseExpired));
+        layout
+            .clear_aborted_data_write(pending.version, pending.token, pending.lease_id, 1)
+            .expect("clear fenced data write");
+        assert_eq!(layout.pending_data_write, None);
+        assert_eq!(layout.next_data_write_token, pending.token + 1);
+    }
+
+    #[test]
+    fn live_data_write_cannot_be_cleared() {
+        let mut layout = normal_layout(core_meta(11));
+        let pending = layout
+            .prepare_data_write(2, 5_000)
+            .expect("prepare data write");
+
+        let error = layout
+            .clear_aborted_data_write(pending.version, pending.token, pending.lease_id, 4_999)
+            .expect_err("live data write must remain prepared");
+
+        assert!(matches!(error, ObjectLayoutError::DataWriteLeaseLive));
+        assert_eq!(layout.pending_data_write, Some(pending));
+    }
+
+    #[test]
+    fn data_write_lease_renewal_requires_the_owner_nonce() {
+        let mut layout = normal_layout(core_meta(11));
+        let pending = layout
+            .prepare_data_write(2, 5_000)
+            .expect("prepare data write");
+
+        let mismatch = layout
+            .renew_data_write_lease(2, pending.token, Uuid::new_v4(), 4_000, 6_000)
+            .expect_err("foreign lease owner must not renew");
+        assert!(matches!(
+            mismatch,
+            ObjectLayoutError::DataWriteLeaseMismatch
+        ));
+        layout
+            .renew_data_write_lease(2, pending.token, pending.lease_id, 4_000, 6_000)
+            .expect("lease owner should renew");
+        assert!(layout.has_live_data_write_lease(2, pending.token, 5_999));
+    }
+
+    #[test]
+    fn data_write_prepare_validates_version_and_expiry() {
+        let mut layout = normal_layout(core_meta(11));
+
+        let version_error = layout
+            .prepare_data_write(3, 5_000)
+            .expect_err("prepare must use the next version");
+        assert!(matches!(
+            version_error,
+            ObjectLayoutError::InvalidDataWriteVersion
+        ));
+
+        let expiry_error = layout
+            .prepare_data_write(2, 0)
+            .expect_err("prepare must have a nonzero expiry");
+        assert!(matches!(
+            expiry_error,
+            ObjectLayoutError::InvalidDataWriteLeaseExpiry
+        ));
     }
 
     #[test]
@@ -513,6 +800,9 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 0,
+            data_write_token: 0,
+            next_data_write_token: 0,
+            pending_data_write: None,
             state: ObjectState::Special(SpecialData {
                 kind,
                 rdev,
@@ -527,6 +817,9 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 0,
+            data_write_token: 0,
+            next_data_write_token: 0,
+            pending_data_write: None,
             state: ObjectState::Directory(DirectoryData {
                 posix: PosixAttrs {
                     mode,
@@ -542,6 +835,9 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 0,
+            data_write_token: 0,
+            next_data_write_token: 0,
+            pending_data_write: None,
             state: ObjectState::Symlink(SymlinkData {
                 target: target.to_vec(),
                 core_meta_data: core_meta(target.len() as u64),
@@ -555,6 +851,9 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 0,
+            data_write_token: 0,
+            next_data_write_token: 0,
+            pending_data_write: None,
             state: ObjectState::Indirect(IndirectEntry {
                 inode_id: Uuid::new_v4(),
             }),
