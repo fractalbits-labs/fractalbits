@@ -21,7 +21,12 @@ use uuid::Uuid;
 
 /// One replica's response in a quorum/max-version read fan-out.
 type NodeReadResponse = (Arc<BssNode>, Result<(Bytes, u64), RpcError>);
+type ListedGeneration = (u32, GenerationIdentity, bool);
+type ListedGenerationsByBlock = std::collections::HashMap<u32, Vec<(GenerationIdentity, bool)>>;
+
 const GENERATION_LIST_PAGE_SIZE: u32 = 512;
+const GENERATION_CANDIDATE_CAP: u32 = GENERATION_LIST_PAGE_SIZE;
+const ENTRY_TYPE_RESERVED: u32 = 1;
 const SUPERSEDED_GENERATION_READER_GRACE: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -29,12 +34,53 @@ struct GenerationIdentity {
     version: u64,
     write_token: u64,
 }
+
+#[derive(Clone, Debug)]
+enum GenerationFragment {
+    Data {
+        identity: GenerationIdentity,
+        body: Bytes,
+    },
+    Tombstone {
+        identity: GenerationIdentity,
+    },
+    Reserved {
+        identity: GenerationIdentity,
+    },
+}
+
+enum NodeGenerationLookup {
+    Missing,
+    Fragment(GenerationFragment),
+    Unreadable(GenerationIdentity),
+}
+
+impl GenerationFragment {
+    fn identity(&self) -> GenerationIdentity {
+        match self {
+            Self::Data { identity, .. }
+            | Self::Tombstone { identity }
+            | Self::Reserved { identity } => *identity,
+        }
+    }
+}
+
 fn generation_key_prefix(blob_guid: DataBlobGuid, block_number: u32) -> String {
     format!(
         "/d{}/{}-p{:08x}-rv",
         blob_guid.volume_id, blob_guid.blob_id, block_number
     )
 }
+
+fn generation_scan_marker(prefix: &str, committed_version: u64) -> String {
+    let min_reverse = u64::MAX - committed_version;
+    if min_reverse == 0 {
+        String::new()
+    } else {
+        format!("{prefix}{:016x}-tffffffffffffffff", min_reverse - 1)
+    }
+}
+
 fn parse_generation_key(key: &str) -> Option<(u32, GenerationIdentity)> {
     let key = key.trim_end_matches('\0');
     let (_, suffix) = key.rsplit_once("-p")?;
@@ -64,6 +110,174 @@ fn parse_legacy_data_block_key(key: &str) -> Option<u32> {
     }
     suffix.parse().ok()
 }
+
+fn select_generation_candidate<'a>(
+    entries: impl IntoIterator<Item = (&'a str, bool, u32, u32)>,
+    block_number: u32,
+    committed_version: u64,
+    committed_token: u64,
+    has_more: bool,
+) -> Result<Option<(GenerationIdentity, bool, u32, u32)>, DataVgError> {
+    let mut chosen: Option<(GenerationIdentity, bool, u32, u32)> = None;
+    let mut older_cohort_closed = false;
+    for (key, is_deleted, total_bytes, entry_type) in entries {
+        let Some((parsed_block, identity)) = parse_generation_key(key) else {
+            continue;
+        };
+        if parsed_block != block_number || identity.version > committed_version {
+            continue;
+        }
+        if identity.version == committed_version {
+            if identity.write_token == committed_token {
+                return Ok(Some((identity, is_deleted, total_bytes, entry_type)));
+            }
+            continue;
+        }
+
+        match chosen {
+            None => chosen = Some((identity, is_deleted, total_bytes, entry_type)),
+            Some((current, _, _, _)) if identity.version == current.version => {
+                if identity.write_token != current.write_token {
+                    return Err(DataVgError::AmbiguousOlderTokens {
+                        version: identity.version,
+                    });
+                }
+            }
+            Some((current, _, _, _)) if identity.version < current.version => {
+                older_cohort_closed = true;
+                break;
+            }
+            Some(_) => {}
+        }
+    }
+
+    if has_more && (chosen.is_none() || !older_cohort_closed) {
+        return Err(DataVgError::GenerationCandidateLimit {
+            limit: GENERATION_CANDIDATE_CAP,
+        });
+    }
+    Ok(chosen)
+}
+
+fn select_observed_generation(
+    identities: &[GenerationIdentity],
+) -> Result<Option<GenerationIdentity>, DataVgError> {
+    let Some(max_version) = identities.iter().map(|identity| identity.version).max() else {
+        return Ok(None);
+    };
+    let tokens: std::collections::HashSet<u64> = identities
+        .iter()
+        .filter(|identity| identity.version == max_version)
+        .map(|identity| identity.write_token)
+        .collect();
+    if tokens.len() != 1 {
+        return Err(DataVgError::AmbiguousOlderTokens {
+            version: max_version,
+        });
+    }
+    Ok(Some(GenerationIdentity {
+        version: max_version,
+        write_token: *tokens.iter().next().expect("one token after length check"),
+    }))
+}
+
+fn listed_block_has_data_at_or_before(
+    responses: &[ListedGenerationsByBlock],
+    block_number: u32,
+    committed_version: u64,
+    committed_token: u64,
+    read_threshold: usize,
+) -> Result<bool, DataVgError> {
+    let mut candidates = Vec::new();
+    for response in responses {
+        let Some(entries) = response.get(&block_number) else {
+            continue;
+        };
+        let mut exact = None;
+        let mut older = Vec::new();
+        for &(identity, is_deleted) in entries {
+            if identity.version > committed_version {
+                continue;
+            }
+            if identity.version == committed_version {
+                if identity.write_token == committed_token {
+                    exact = Some((identity, is_deleted));
+                }
+                continue;
+            }
+            older.push((identity, is_deleted));
+        }
+        let older = if exact.is_none() {
+            let max_version = older.iter().map(|(identity, _)| identity.version).max();
+            match max_version {
+                Some(version) => {
+                    let matching: Vec<_> = older
+                        .iter()
+                        .filter(|(identity, _)| identity.version == version)
+                        .collect();
+                    let tokens: std::collections::HashSet<u64> = matching
+                        .iter()
+                        .map(|(identity, _)| identity.write_token)
+                        .collect();
+                    if tokens.len() != 1 {
+                        return Err(DataVgError::AmbiguousOlderTokens { version });
+                    }
+                    matching.first().map(|candidate| **candidate)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        if let Some(candidate) = exact.or(older) {
+            candidates.push(candidate);
+        }
+    }
+    let Some(max_version) = candidates
+        .iter()
+        .map(|(identity, _)| identity.version)
+        .max()
+    else {
+        return Ok(false);
+    };
+    let tokens: std::collections::HashSet<u64> = candidates
+        .iter()
+        .filter(|(identity, _)| identity.version == max_version)
+        .map(|(identity, _)| identity.write_token)
+        .collect();
+    if tokens.len() != 1 {
+        return Err(DataVgError::AmbiguousOlderTokens {
+            version: max_version,
+        });
+    }
+    let token = *tokens.iter().next().expect("one token after length check");
+    let cohort: Vec<_> = candidates
+        .iter()
+        .filter(|(identity, _)| identity.version == max_version && identity.write_token == token)
+        .collect();
+    if cohort.len() < read_threshold {
+        return Err(DataVgError::StaleVersion {
+            expected: max_version,
+        });
+    }
+    let deleted = cohort.iter().filter(|(_, is_deleted)| *is_deleted).count();
+    if deleted != 0 && deleted != cohort.len() {
+        return Err(DataVgError::Corrupted);
+    }
+    Ok(deleted == 0)
+}
+
+fn index_listed_generations(entries: Vec<ListedGeneration>) -> ListedGenerationsByBlock {
+    let mut by_block = ListedGenerationsByBlock::new();
+    for (block_number, identity, is_deleted) in entries {
+        by_block
+            .entry(block_number)
+            .or_default()
+            .push((identity, is_deleted));
+    }
+    by_block
+}
+
 #[cfg(feature = "tokio-runtime")]
 fn spawn_background<F: std::future::Future<Output = ()> + Send + 'static>(fut: F) {
     tokio::spawn(fut);
@@ -615,6 +829,200 @@ impl DataVgProxy {
 
         Ok((body, version))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn get_generation_from_node_instance(
+        &self,
+        bss_node: &BssNode,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        content_len: usize,
+        committed_version: u64,
+        committed_token: u64,
+        trace_id: &TraceId,
+    ) -> Result<NodeGenerationLookup, DataVgError> {
+        let prefix = generation_key_prefix(blob_guid, block_number);
+        let marker = generation_scan_marker(&prefix, committed_version);
+        let page = bss_node
+            .get_client()
+            .list_data_blobs(
+                blob_guid.volume_id,
+                &prefix,
+                &marker,
+                GENERATION_CANDIDATE_CAP,
+                Some(self.rpc_timeout),
+                trace_id,
+                0,
+                false,
+            )
+            .await?;
+
+        let chosen = select_generation_candidate(
+            page.blobs
+                .iter()
+                .filter(|entry| !entry.is_physically_deleted)
+                .map(|entry| {
+                    (
+                        entry.key.as_str(),
+                        entry.is_deleted,
+                        entry.total_bytes,
+                        entry.entry_type,
+                    )
+                }),
+            block_number,
+            committed_version,
+            committed_token,
+            page.has_more,
+        )?;
+        if let Some((identity, is_deleted, total_bytes, entry_type)) = chosen {
+            if is_deleted {
+                return Ok(NodeGenerationLookup::Fragment(
+                    GenerationFragment::Tombstone { identity },
+                ));
+            }
+            if entry_type == ENTRY_TYPE_RESERVED {
+                return Ok(NodeGenerationLookup::Fragment(
+                    GenerationFragment::Reserved { identity },
+                ));
+            }
+            let mut body = Bytes::new();
+            return match bss_node
+                .get_client()
+                .get_data_blob_generation(
+                    blob_guid,
+                    block_number,
+                    &mut body,
+                    total_bytes as usize,
+                    identity.version,
+                    identity.write_token,
+                    Some(self.rpc_timeout),
+                    trace_id,
+                    0,
+                )
+                .await
+            {
+                Ok(()) => Ok(NodeGenerationLookup::Fragment(GenerationFragment::Data {
+                    identity,
+                    body,
+                })),
+                Err(error) => {
+                    debug!(
+                        node = %bss_node.address,
+                        version = identity.version,
+                        write_token = identity.write_token,
+                        error = %error,
+                        "listed generation body is unavailable"
+                    );
+                    Ok(NodeGenerationLookup::Unreadable(identity))
+                }
+            };
+        }
+
+        match self
+            .get_blob_from_node_instance(
+                bss_node,
+                blob_guid,
+                block_number,
+                content_len,
+                trace_id,
+                false,
+            )
+            .await
+        {
+            Ok((body, version)) if version < committed_version => {
+                Ok(NodeGenerationLookup::Fragment(GenerationFragment::Data {
+                    identity: GenerationIdentity {
+                        version,
+                        write_token: 0,
+                    },
+                    body,
+                }))
+            }
+            Ok(_) | Err(RpcError::NotFound) => Ok(NodeGenerationLookup::Missing),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn list_generations_from_node_instance(
+        &self,
+        bss_node: &BssNode,
+        blob_guid: DataBlobGuid,
+        first_block: u32,
+        block_count: u32,
+        trace_id: &TraceId,
+    ) -> Result<Vec<ListedGeneration>, DataVgError> {
+        let prefix = format!("/d{}/{}-p", blob_guid.volume_id, blob_guid.blob_id);
+        let last_block = first_block.saturating_add(block_count);
+        let mut marker = String::new();
+        let mut generations = Vec::new();
+        let mut per_block_count = std::collections::HashMap::<u32, u32>::new();
+        loop {
+            let page = bss_node
+                .get_client()
+                .list_data_blobs(
+                    blob_guid.volume_id,
+                    &prefix,
+                    &marker,
+                    GENERATION_LIST_PAGE_SIZE,
+                    Some(self.rpc_timeout),
+                    trace_id,
+                    0,
+                    false,
+                )
+                .await?;
+            let next_marker = if page.next_marker.is_empty() {
+                page.blobs.last().map(|entry| entry.key.clone())
+            } else {
+                Some(page.next_marker.clone())
+            };
+            for entry in page.blobs {
+                if entry.is_physically_deleted {
+                    continue;
+                }
+                let parsed = parse_generation_key(&entry.key).or_else(|| {
+                    parse_legacy_data_block_key(&entry.key).map(|block_number| {
+                        (
+                            block_number,
+                            GenerationIdentity {
+                                version: entry.version,
+                                write_token: 0,
+                            },
+                        )
+                    })
+                });
+                let Some((block_number, identity)) = parsed else {
+                    continue;
+                };
+                if block_number < first_block || block_number >= last_block {
+                    continue;
+                }
+                let count = per_block_count.entry(block_number).or_default();
+                *count += 1;
+                if *count > GENERATION_CANDIDATE_CAP {
+                    return Err(DataVgError::GenerationCandidateLimit {
+                        limit: GENERATION_CANDIDATE_CAP,
+                    });
+                }
+                generations.push((block_number, identity, entry.is_deleted));
+            }
+            if !page.has_more {
+                break;
+            }
+            let Some(next_marker) = next_marker else {
+                return Err(DataVgError::Internal(
+                    "generation list has_more without a marker".to_string(),
+                ));
+            };
+            if next_marker <= marker {
+                return Err(DataVgError::Internal(
+                    "generation list marker did not advance".to_string(),
+                ));
+            }
+            marker = next_marker;
+        }
+        Ok(generations)
+    }
+
     async fn delete_blob_from_node(
         bss_node: Arc<BssNode>,
         blob_guid: DataBlobGuid,
@@ -1602,6 +2010,679 @@ impl DataVgProxy {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_blob_at_or_before(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        content_len: usize,
+        committed_version: u64,
+        committed_token: u64,
+        body: &mut Bytes,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        if committed_token == 0 {
+            return self
+                .get_blob_with_quorum_check(blob_guid, block_number, content_len, body, trace_id)
+                .await;
+        }
+        let volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
+            DataVgError::InitializationError(format!(
+                "Volume {} not found in DataVgProxy",
+                blob_guid.volume_id
+            ))
+        })?;
+        match volume.mode {
+            VolumeMode::Replicated { .. } => {
+                self.get_blob_replicated_at_or_before(
+                    volume,
+                    blob_guid,
+                    block_number,
+                    content_len,
+                    committed_version,
+                    committed_token,
+                    body,
+                    trace_id,
+                )
+                .await
+            }
+            VolumeMode::ErasureCoded { .. } => {
+                self.get_blob_ec_at_or_before(
+                    volume,
+                    blob_guid,
+                    block_number,
+                    content_len,
+                    committed_version,
+                    committed_token,
+                    body,
+                    trace_id,
+                )
+                .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn get_blob_replicated_at_or_before(
+        &self,
+        volume: &VolumeWithNodes,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        content_len: usize,
+        committed_version: u64,
+        committed_token: u64,
+        body: &mut Bytes,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        let (read_quorum, write_quorum) = match volume.mode {
+            VolumeMode::Replicated { r, w, .. } => (r as usize, w as usize),
+            VolumeMode::ErasureCoded { .. } => unreachable!(),
+        };
+        let available_nodes: Vec<_> = volume
+            .bss_nodes
+            .iter()
+            .filter(|node| node.is_available())
+            .cloned()
+            .collect();
+        let fast_path_node = {
+            let mut rng = rand::rng();
+            available_nodes.choose(&mut rng).cloned()
+        };
+        if let Some(node) = fast_path_node {
+            let mut exact = Bytes::new();
+            match node
+                .get_client()
+                .get_data_blob_generation(
+                    blob_guid,
+                    block_number,
+                    &mut exact,
+                    content_len,
+                    committed_version,
+                    committed_token,
+                    Some(self.rpc_timeout),
+                    trace_id,
+                    0,
+                )
+                .await
+            {
+                Ok(()) => {
+                    node.record_success();
+                    *body = exact.slice(..content_len.min(exact.len()));
+                    return Ok(());
+                }
+                Err(RpcError::NotFound) => node.record_success(),
+                Err(e) => {
+                    node.record_failure();
+                    debug!(node = %node.address, error = %e, "exact generation fast path failed");
+                }
+            }
+        }
+        if available_nodes.len() < read_quorum {
+            return Err(DataVgError::QuorumFailure(format!(
+                "Insufficient available nodes ({}/{}) for read quorum ({})",
+                available_nodes.len(),
+                volume.bss_nodes.len(),
+                read_quorum
+            )));
+        }
+
+        let mut futures = FuturesUnordered::new();
+        for node in available_nodes.iter().cloned() {
+            futures.push(async move {
+                let result = self
+                    .get_generation_from_node_instance(
+                        &node,
+                        blob_guid,
+                        block_number,
+                        content_len,
+                        committed_version,
+                        committed_token,
+                        trace_id,
+                    )
+                    .await;
+                (node, result)
+            });
+        }
+
+        let mut fragments = Vec::new();
+        let mut observed = Vec::new();
+        let mut failures = 0usize;
+        while let Some((node, result)) = futures.next().await {
+            match result {
+                Ok(NodeGenerationLookup::Fragment(fragment)) => {
+                    node.record_success();
+                    observed.push(fragment.identity());
+                    fragments.push(fragment);
+                }
+                Ok(NodeGenerationLookup::Missing) => node.record_success(),
+                Ok(NodeGenerationLookup::Unreadable(identity)) => {
+                    node.record_failure();
+                    observed.push(identity);
+                    failures += 1;
+                }
+                Err(DataVgError::AmbiguousOlderTokens { version }) => {
+                    return Err(DataVgError::AmbiguousOlderTokens { version });
+                }
+                Err(DataVgError::GenerationCandidateLimit { limit }) => {
+                    return Err(DataVgError::GenerationCandidateLimit { limit });
+                }
+                Err(e) => {
+                    node.record_failure();
+                    failures += 1;
+                    warn!(node = %node.address, error = %e, "generation lookup failed");
+                }
+            }
+        }
+        if observed.is_empty() {
+            return if failures == 0 {
+                Err(DataVgError::BlockNotFound)
+            } else {
+                Err(DataVgError::QuorumFailure(format!(
+                    "No generation found and {} node lookups failed",
+                    failures
+                )))
+            };
+        }
+
+        let identity = select_observed_generation(&observed)?.expect("observed is not empty");
+        let cohort: Vec<_> = fragments
+            .iter()
+            .filter(|fragment| fragment.identity() == identity)
+            .collect();
+        if cohort.is_empty() || (identity.version < committed_version && cohort.len() < read_quorum)
+        {
+            return Err(DataVgError::StaleVersion {
+                expected: identity.version,
+            });
+        }
+        let tombstone_count = cohort
+            .iter()
+            .filter(|fragment| matches!(fragment, GenerationFragment::Tombstone { .. }))
+            .count();
+        let reserved_count = cohort
+            .iter()
+            .filter(|fragment| matches!(fragment, GenerationFragment::Reserved { .. }))
+            .count();
+        if reserved_count != 0 {
+            if reserved_count != cohort.len() {
+                return Err(DataVgError::Corrupted);
+            }
+            if cohort.len() < write_quorum {
+                let mut repairs = FuturesUnordered::new();
+                for node in available_nodes.iter().cloned() {
+                    repairs.push(async move {
+                        let result = node
+                            .get_client()
+                            .reserve_blocks_generation(
+                                blob_guid,
+                                block_number,
+                                content_len as u32,
+                                identity.version,
+                                identity.write_token,
+                                Some(self.rpc_timeout),
+                                trace_id,
+                                0,
+                            )
+                            .await;
+                        (node, result)
+                    });
+                }
+                let mut repaired = 0usize;
+                while let Some((node, result)) = repairs.next().await {
+                    match result {
+                        Ok(()) | Err(RpcError::VersionSkipped) => {
+                            node.record_success();
+                            repaired += 1;
+                        }
+                        Err(_) => node.record_failure(),
+                    }
+                    if repaired >= write_quorum {
+                        break;
+                    }
+                }
+                if repaired < write_quorum {
+                    warn!(
+                        version = identity.version,
+                        repaired, write_quorum, "reserved generation repair incomplete"
+                    );
+                }
+            }
+            return Err(DataVgError::BlockNotFound);
+        }
+        if tombstone_count != 0 && tombstone_count != cohort.len() {
+            return Err(DataVgError::Corrupted);
+        }
+
+        let canonical_body = if tombstone_count == 0 {
+            let GenerationFragment::Data { body, .. } = cohort[0] else {
+                unreachable!()
+            };
+            let checksum = xxhash_rust::xxh3::xxh3_64(body);
+            if cohort.iter().any(|fragment| match fragment {
+                GenerationFragment::Data { body: other, .. } => {
+                    other.len() != body.len() || xxhash_rust::xxh3::xxh3_64(other) != checksum
+                }
+                GenerationFragment::Tombstone { .. } | GenerationFragment::Reserved { .. } => true,
+            }) {
+                return Err(DataVgError::Corrupted);
+            }
+            Some((body.clone(), checksum))
+        } else {
+            None
+        };
+
+        if cohort.len() < write_quorum {
+            let mut repairs = FuturesUnordered::new();
+            for node in available_nodes.iter().cloned() {
+                let (repair_body, checksum, is_deleted) = match &canonical_body {
+                    Some((data, checksum)) => (data.clone(), *checksum, false),
+                    None => (Bytes::new(), xxhash_rust::xxh3::xxh3_64(&[]), true),
+                };
+                repairs.push(Self::put_blob_to_node(
+                    node,
+                    blob_guid,
+                    block_number,
+                    repair_body,
+                    checksum,
+                    identity.version,
+                    identity.write_token,
+                    is_deleted,
+                    self.rpc_timeout,
+                    *trace_id,
+                ));
+            }
+            let mut repaired = 0usize;
+            while let Some((node, _, result)) = repairs.next().await {
+                match result {
+                    Ok(()) | Err(RpcError::VersionSkipped) => {
+                        node.record_success();
+                        repaired += 1;
+                    }
+                    Err(_) => node.record_failure(),
+                }
+                if repaired >= write_quorum {
+                    break;
+                }
+            }
+            if repaired < write_quorum {
+                warn!(
+                    version = identity.version,
+                    repaired, write_quorum, "generation repair incomplete"
+                );
+            }
+        }
+
+        match canonical_body {
+            Some((data, _)) => {
+                *body = data.slice(..content_len.min(data.len()));
+                Ok(())
+            }
+            None => Err(DataVgError::BlockNotFound),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn get_blob_ec_at_or_before(
+        &self,
+        volume: &VolumeWithNodes,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        content_len: usize,
+        committed_version: u64,
+        committed_token: u64,
+        body: &mut Bytes,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        let (k, m) = match volume.mode {
+            VolumeMode::ErasureCoded {
+                data_shards,
+                parity_shards,
+            } => (data_shards as usize, parity_shards as usize),
+            VolumeMode::Replicated { .. } => unreachable!(),
+        };
+        let total = k + m;
+        let legacy_shard_size = ec_padded_len(content_len, k) / k;
+        let rotation = ec_rotation(&blob_guid.blob_id, total as u32);
+        let data_nodes_available = (0..k)
+            .all(|shard_index| volume.bss_nodes[(shard_index + rotation) % total].is_available());
+        if data_nodes_available {
+            let mut exact_reads = FuturesUnordered::new();
+            for shard_index in 0..k {
+                let node_index = (shard_index + rotation) % total;
+                let node = volume.bss_nodes[node_index].clone();
+                exact_reads.push(async move {
+                    let mut shard = Bytes::new();
+                    let result = node
+                        .get_client()
+                        .get_data_blob_generation(
+                            blob_guid,
+                            block_number,
+                            &mut shard,
+                            legacy_shard_size,
+                            committed_version,
+                            committed_token,
+                            Some(self.rpc_timeout),
+                            trace_id,
+                            0,
+                        )
+                        .await;
+                    (shard_index, node, shard, result)
+                });
+            }
+            let mut exact_shards = vec![None; k];
+            while let Some((shard_index, node, shard, result)) = exact_reads.next().await {
+                match result {
+                    Ok(()) => {
+                        node.record_success();
+                        exact_shards[shard_index] = Some(shard);
+                    }
+                    Err(RpcError::NotFound) => node.record_success(),
+                    Err(_) => node.record_failure(),
+                }
+            }
+            if exact_shards.iter().all(Option::is_some) {
+                let shard_sizes: std::collections::HashSet<usize> = exact_shards
+                    .iter()
+                    .filter_map(|shard| shard.as_ref().map(Bytes::len))
+                    .collect();
+                if shard_sizes.len() == 1 {
+                    let mut data = Vec::with_capacity(
+                        exact_shards
+                            .iter()
+                            .filter_map(Option::as_ref)
+                            .map(Bytes::len)
+                            .sum(),
+                    );
+                    for shard in exact_shards {
+                        data.extend_from_slice(&shard.expect("all exact data shards are present"));
+                    }
+                    data.truncate(content_len);
+                    *body = Bytes::from(data);
+                    return Ok(());
+                }
+            }
+        }
+        let available_count = volume
+            .bss_nodes
+            .iter()
+            .filter(|node| node.is_available())
+            .count();
+        if available_count < k {
+            return Err(DataVgError::QuorumFailure(format!(
+                "EC read has {}/{} available nodes, needs {}",
+                available_count, total, k
+            )));
+        }
+        let mut futures = FuturesUnordered::new();
+        for (node_index, node) in volume.bss_nodes.iter().cloned().enumerate() {
+            if !node.is_available() {
+                continue;
+            }
+            futures.push(async move {
+                let result = self
+                    .get_generation_from_node_instance(
+                        &node,
+                        blob_guid,
+                        block_number,
+                        legacy_shard_size,
+                        committed_version,
+                        committed_token,
+                        trace_id,
+                    )
+                    .await;
+                (node_index, node, result)
+            });
+        }
+
+        let mut fragments = Vec::new();
+        let mut observed = Vec::new();
+        let mut failures = 0usize;
+        while let Some((node_index, node, result)) = futures.next().await {
+            match result {
+                Ok(NodeGenerationLookup::Fragment(fragment)) => {
+                    node.record_success();
+                    observed.push(fragment.identity());
+                    fragments.push((node_index, fragment));
+                }
+                Ok(NodeGenerationLookup::Missing) => node.record_success(),
+                Ok(NodeGenerationLookup::Unreadable(identity)) => {
+                    node.record_failure();
+                    observed.push(identity);
+                    failures += 1;
+                }
+                Err(DataVgError::AmbiguousOlderTokens { version }) => {
+                    return Err(DataVgError::AmbiguousOlderTokens { version });
+                }
+                Err(DataVgError::GenerationCandidateLimit { limit }) => {
+                    return Err(DataVgError::GenerationCandidateLimit { limit });
+                }
+                Err(e) => {
+                    node.record_failure();
+                    failures += 1;
+                    warn!(node = %node.address, error = %e, "EC generation lookup failed");
+                }
+            }
+        }
+        if observed.is_empty() {
+            return if failures == 0 {
+                Err(DataVgError::BlockNotFound)
+            } else {
+                Err(DataVgError::QuorumFailure(format!(
+                    "No EC generation found and {} node lookups failed",
+                    failures
+                )))
+            };
+        }
+
+        let identity = select_observed_generation(&observed)?.expect("observed is not empty");
+        let cohort: Vec<_> = fragments
+            .into_iter()
+            .filter(|(_, fragment)| fragment.identity() == identity)
+            .collect();
+        let tombstone_count = cohort
+            .iter()
+            .filter(|(_, fragment)| matches!(fragment, GenerationFragment::Tombstone { .. }))
+            .count();
+        let reserved_count = cohort
+            .iter()
+            .filter(|(_, fragment)| matches!(fragment, GenerationFragment::Reserved { .. }))
+            .count();
+        if reserved_count != 0 {
+            if reserved_count == cohort.len() && cohort.len() >= k {
+                let present: std::collections::HashSet<usize> =
+                    cohort.iter().map(|(node_index, _)| *node_index).collect();
+                let mut repairs = FuturesUnordered::new();
+                for (node_index, node) in volume.bss_nodes.iter().cloned().enumerate() {
+                    if present.contains(&node_index) || !node.is_available() {
+                        continue;
+                    }
+                    repairs.push(async move {
+                        let result = node
+                            .get_client()
+                            .reserve_blocks_generation(
+                                blob_guid,
+                                block_number,
+                                content_len as u32,
+                                identity.version,
+                                identity.write_token,
+                                Some(self.rpc_timeout),
+                                trace_id,
+                                0,
+                            )
+                            .await;
+                        (node, result)
+                    });
+                }
+                while let Some((node, result)) = repairs.next().await {
+                    match result {
+                        Ok(()) | Err(RpcError::VersionSkipped) => node.record_success(),
+                        Err(_) => node.record_failure(),
+                    }
+                }
+                return Err(DataVgError::BlockNotFound);
+            }
+            return Err(DataVgError::StaleVersion {
+                expected: identity.version,
+            });
+        }
+        if tombstone_count != 0 {
+            if tombstone_count == cohort.len() && cohort.len() >= k {
+                let present: std::collections::HashSet<usize> =
+                    cohort.iter().map(|(node_index, _)| *node_index).collect();
+                let mut repairs = FuturesUnordered::new();
+                for (node_index, node) in volume.bss_nodes.iter().cloned().enumerate() {
+                    if present.contains(&node_index) || !node.is_available() {
+                        continue;
+                    }
+                    repairs.push(Self::put_blob_to_node(
+                        node,
+                        blob_guid,
+                        block_number,
+                        Bytes::new(),
+                        xxhash_rust::xxh3::xxh3_64(&[]),
+                        identity.version,
+                        identity.write_token,
+                        true,
+                        self.rpc_timeout,
+                        *trace_id,
+                    ));
+                }
+                while let Some((node, _, result)) = repairs.next().await {
+                    match result {
+                        Ok(()) | Err(RpcError::VersionSkipped) => node.record_success(),
+                        Err(_) => node.record_failure(),
+                    }
+                }
+                return Err(DataVgError::BlockNotFound);
+            }
+            return Err(DataVgError::StaleVersion {
+                expected: identity.version,
+            });
+        }
+        if cohort.len() < k {
+            return Err(DataVgError::StaleVersion {
+                expected: identity.version,
+            });
+        }
+
+        let shard_sizes: std::collections::HashSet<usize> = cohort
+            .iter()
+            .filter_map(|(_, fragment)| match fragment {
+                GenerationFragment::Data { body, .. } => Some(body.len()),
+                GenerationFragment::Tombstone { .. } | GenerationFragment::Reserved { .. } => None,
+            })
+            .collect();
+        if shard_sizes.len() != 1 {
+            return Err(DataVgError::Corrupted);
+        }
+        let shard_size = *shard_sizes
+            .iter()
+            .next()
+            .expect("one shard size after length check");
+
+        let mut shards: Vec<Option<Vec<u8>>> = vec![None; total];
+        for (node_index, fragment) in cohort {
+            let GenerationFragment::Data { body, .. } = fragment else {
+                continue;
+            };
+            if body.len() != shard_size {
+                continue;
+            }
+            let shard_index = (node_index + total - rotation) % total;
+            shards[shard_index] = Some(body.to_vec());
+        }
+        if shards.iter().filter(|shard| shard.is_some()).count() < k {
+            return Err(DataVgError::StaleVersion {
+                expected: identity.version,
+            });
+        }
+
+        let data_shards: Vec<Vec<u8>> = if shards.iter().take(k).all(Option::is_some) {
+            shards
+                .iter()
+                .take(k)
+                .map(|shard| shard.as_ref().expect("checked data shard").clone())
+                .collect()
+        } else {
+            let original_shards: Vec<_> = shards
+                .iter()
+                .take(k)
+                .enumerate()
+                .filter_map(|(index, shard)| shard.as_deref().map(|data| (index, data)))
+                .collect();
+            let recovery_shards: Vec<_> = shards
+                .iter()
+                .skip(k)
+                .enumerate()
+                .filter_map(|(index, shard)| shard.as_deref().map(|data| (index, data)))
+                .collect();
+            let restored = rs_decode(k, m, original_shards, recovery_shards)
+                .map_err(|e| DataVgError::Internal(format!("RS reconstruct failed: {}", e)))?;
+            let mut data_shards = Vec::with_capacity(k);
+            for (index, shard) in shards.iter().take(k).enumerate() {
+                if let Some(shard) = shard {
+                    data_shards.push(shard.clone());
+                } else if let Some(shard) = restored.get(&index) {
+                    data_shards.push(shard.clone());
+                } else {
+                    return Err(DataVgError::Internal(format!(
+                        "RS reconstruct missing shard {}",
+                        index
+                    )));
+                }
+            }
+            data_shards
+        };
+
+        let missing: Vec<usize> = shards
+            .iter()
+            .enumerate()
+            .filter_map(|(index, shard)| shard.is_none().then_some(index))
+            .collect();
+        if !missing.is_empty() {
+            let parity = rs_encode(k, m, &data_shards)
+                .map_err(|e| DataVgError::Internal(format!("RS encode failed: {}", e)))?;
+            let mut all_shards = data_shards.clone();
+            all_shards.extend(parity);
+            let mut repairs = FuturesUnordered::new();
+            for shard_index in missing {
+                let node_index = (shard_index + rotation) % total;
+                let node = volume.bss_nodes[node_index].clone();
+                if !node.is_available() {
+                    continue;
+                }
+                let shard = Bytes::from(all_shards[shard_index].clone());
+                let checksum = xxhash_rust::xxh3::xxh3_64(&shard);
+                repairs.push(Self::put_blob_to_node(
+                    node,
+                    blob_guid,
+                    block_number,
+                    shard,
+                    checksum,
+                    identity.version,
+                    identity.write_token,
+                    false,
+                    self.rpc_timeout,
+                    *trace_id,
+                ));
+            }
+            while let Some((node, _, result)) = repairs.next().await {
+                match result {
+                    Ok(()) | Err(RpcError::VersionSkipped) => node.record_success(),
+                    Err(_) => node.record_failure(),
+                }
+            }
+        }
+
+        let mut result_data = Vec::with_capacity(k * shard_size);
+        for shard in data_shards {
+            result_data.extend_from_slice(&shard);
+        }
+        result_data.truncate(content_len);
+        *body = Bytes::from(result_data);
+        Ok(())
+    }
+
     /// Reserve a single block at the volume write quorum.
     pub async fn reserve_blob(
         &self,
@@ -1810,6 +2891,92 @@ impl DataVgProxy {
             last_err.unwrap_or_default()
         )))
     }
+
+    pub async fn list_blob_blocks_at_or_before(
+        &self,
+        blob_guid: DataBlobGuid,
+        first_block: u32,
+        block_count: u32,
+        committed_version: u64,
+        committed_token: u64,
+        trace_id: &TraceId,
+    ) -> Result<std::collections::BTreeSet<u32>, DataVgError> {
+        let volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
+            DataVgError::InitializationError(format!("Volume {} not found", blob_guid.volume_id))
+        })?;
+        let read_threshold = match volume.mode {
+            VolumeMode::Replicated { r, .. } => r as usize,
+            VolumeMode::ErasureCoded { data_shards, .. } => data_shards as usize,
+        };
+        let available_nodes: Vec<_> = volume
+            .bss_nodes
+            .iter()
+            .filter(|node| node.is_available())
+            .cloned()
+            .collect();
+        if available_nodes.len() < read_threshold {
+            return Err(DataVgError::QuorumFailure(format!(
+                "List has {}/{} available nodes, needs {}",
+                available_nodes.len(),
+                volume.bss_nodes.len(),
+                read_threshold
+            )));
+        }
+
+        let mut futures = FuturesUnordered::new();
+        for node in available_nodes {
+            futures.push(async move {
+                let result = self
+                    .list_generations_from_node_instance(
+                        &node,
+                        blob_guid,
+                        first_block,
+                        block_count,
+                        trace_id,
+                    )
+                    .await;
+                (node, result)
+            });
+        }
+
+        let mut responses = Vec::new();
+        while let Some((node, result)) = futures.next().await {
+            match result {
+                Ok(entries) => {
+                    node.record_success();
+                    responses.push(index_listed_generations(entries));
+                }
+                Err(e) => {
+                    node.record_failure();
+                    warn!(node = %node.address, error = %e, "generation list failed");
+                }
+            }
+        }
+        if responses.len() < read_threshold {
+            return Err(DataVgError::QuorumFailure(format!(
+                "List succeeded on {}/{} nodes, needs {}",
+                responses.len(),
+                volume.bss_nodes.len(),
+                read_threshold
+            )));
+        }
+
+        let last_block = first_block.saturating_add(block_count);
+        let mut data_blocks = std::collections::BTreeSet::new();
+        for block_number in first_block..last_block {
+            if listed_block_has_data_at_or_before(
+                &responses,
+                block_number,
+                committed_version,
+                committed_token,
+                read_threshold,
+            )? {
+                data_blocks.insert(block_number);
+            }
+        }
+        Ok(data_blocks)
+    }
+
     /// Variant of `get_blob` that enforces a read-side version check.
     ///
     /// When `expected_version = Some(v)`, the returned block's BSS-stamped
@@ -3217,6 +4384,13 @@ mod tests {
 
     const TEST_BLOB_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
 
+    fn test_generation_key(block_number: u32, version: u64, write_token: u64) -> String {
+        format!(
+            "/d7/{TEST_BLOB_ID}-p{block_number:08x}-rv{:016x}-t{write_token:016x}",
+            u64::MAX - version
+        )
+    }
+
     fn replicated_info(n: u32, r: u32, w: u32) -> DataVgInfo {
         let bss_nodes = (0..n)
             .map(|index| DataBssNode {
@@ -3265,6 +4439,171 @@ mod tests {
             ))
             .is_none()
         );
+    }
+
+    #[test]
+    fn generation_scan_marker_starts_at_the_ceiling_version() {
+        let blob_guid = DataBlobGuid {
+            blob_id: Uuid::parse_str(TEST_BLOB_ID).expect("test blob ID should parse"),
+            volume_id: 7,
+        };
+        let prefix = generation_key_prefix(blob_guid, 9);
+        let marker = generation_scan_marker(&prefix, 12);
+        assert!(test_generation_key(9, 13, u64::MAX) <= marker);
+        assert!(test_generation_key(9, 12, 0) > marker);
+        assert!(generation_scan_marker(&prefix, u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn generation_selection_enforces_ceiling_identity() {
+        let mut entries = [
+            (test_generation_key(9, 13, 1), false),
+            (test_generation_key(9, 12, 3), false),
+            (test_generation_key(9, 12, 7), true),
+            (test_generation_key(9, 11, 4), false),
+        ];
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let selected = select_generation_candidate(
+            entries
+                .iter()
+                .map(|(key, is_deleted)| (key.as_str(), *is_deleted, 0, 0)),
+            9,
+            12,
+            7,
+            false,
+        )
+        .expect("committed generation should be selected")
+        .expect("committed generation should exist");
+        assert_eq!(selected.0.version, 12);
+        assert_eq!(selected.0.write_token, 7);
+        assert!(selected.1);
+    }
+
+    #[test]
+    fn generation_selection_preserves_storage_metadata() {
+        let key = test_generation_key(9, 12, 7);
+
+        let selected = select_generation_candidate(
+            [(key.as_str(), false, 1234, ENTRY_TYPE_RESERVED)],
+            9,
+            12,
+            7,
+            false,
+        )
+        .expect("generation selection should succeed")
+        .expect("committed generation should exist");
+
+        assert_eq!(selected.2, 1234);
+        assert_eq!(selected.3, ENTRY_TYPE_RESERVED);
+    }
+
+    #[test]
+    fn generation_selection_uses_newest_eligible_older_version() {
+        let mut entries = [
+            (test_generation_key(9, 14, 1), false),
+            (test_generation_key(9, 13, 8), false),
+            (test_generation_key(9, 12, 5), false),
+            (test_generation_key(9, 11, 2), false),
+        ];
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let selected = select_generation_candidate(
+            entries
+                .iter()
+                .map(|(key, is_deleted)| (key.as_str(), *is_deleted, 0, 0)),
+            9,
+            13,
+            7,
+            true,
+        )
+        .expect("closed older cohort should not exceed the scan cap")
+        .expect("older generation should exist");
+        assert_eq!(selected.0.version, 12);
+        assert_eq!(selected.0.write_token, 5);
+    }
+
+    #[test]
+    fn generation_selection_rejects_ambiguous_older_tokens() {
+        let mut entries = [
+            (test_generation_key(9, 12, 4), false),
+            (test_generation_key(9, 12, 5), false),
+        ];
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let error = select_generation_candidate(
+            entries
+                .iter()
+                .map(|(key, is_deleted)| (key.as_str(), *is_deleted, 0, 0)),
+            9,
+            13,
+            7,
+            false,
+        )
+        .expect_err("multiple older tokens should fail");
+        assert!(matches!(
+            error,
+            DataVgError::AmbiguousOlderTokens { version: 12 }
+        ));
+    }
+
+    #[test]
+    fn generation_selection_fails_when_candidate_scan_is_incomplete() {
+        let entries = [(test_generation_key(9, 14, 1), false)];
+        let error = select_generation_candidate(
+            entries
+                .iter()
+                .map(|(key, is_deleted)| (key.as_str(), *is_deleted, 0, 0)),
+            9,
+            13,
+            7,
+            true,
+        )
+        .expect_err("incomplete candidate scan should fail");
+        assert!(matches!(
+            error,
+            DataVgError::GenerationCandidateLimit {
+                limit: GENERATION_CANDIDATE_CAP
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_list_selection_handles_later_block_ranges() {
+        let identity = GenerationIdentity {
+            version: 12,
+            write_token: 0,
+        };
+        let entries: Vec<_> = (0..GENERATION_LIST_PAGE_SIZE)
+            .map(|block_number| (block_number, identity, false))
+            .chain([(4096, identity, false)])
+            .collect();
+        let indexed = index_listed_generations(entries);
+        let responses = vec![indexed.clone(), indexed];
+
+        let has_data = listed_block_has_data_at_or_before(&responses, 4096, 12, 0, 2)
+            .expect("legacy generation should satisfy the read quorum");
+
+        assert!(has_data);
+    }
+
+    #[test]
+    fn unreadable_newer_generation_prevents_stale_descent() {
+        let selected = select_observed_generation(&[
+            GenerationIdentity {
+                version: 11,
+                write_token: 4,
+            },
+            GenerationIdentity {
+                version: 12,
+                write_token: 7,
+            },
+        ])
+        .expect("observed generations should be unambiguous")
+        .expect("an observed generation should be selected");
+
+        assert_eq!(selected.version, 12);
+        assert_eq!(selected.write_token, 7);
     }
 
     #[test]

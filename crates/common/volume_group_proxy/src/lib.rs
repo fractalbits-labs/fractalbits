@@ -18,6 +18,12 @@ pub enum DataVgError {
     #[error("Stale version: expected {expected}, all reachable replicas returned older versions")]
     StaleVersion { expected: u64 },
 
+    #[error("Multiple visible write tokens at older version {version}")]
+    AmbiguousOlderTokens { version: u64 },
+
+    #[error("Data generation scan exceeded candidate limit {limit}")]
+    GenerationCandidateLimit { limit: u32 },
+
     /// All responding replicas (or, on EC, all reachable data shards)
     /// agreed the block does not exist. The caller can treat this as a
     /// sparse-file hole and substitute zeros rather than a quorum failure.
