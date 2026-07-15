@@ -9,7 +9,6 @@ use actix_web::HttpResponse;
 use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
 use file_ops::parse_delete_inode;
 use metrics_wrapper::histogram;
-use rkyv::{self, rancor::Error};
 use rpc_client_common::nss_rpc_retry;
 use tokio::sync::mpsc::Sender;
 
@@ -92,7 +91,7 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
 
     if !object_bytes.is_empty() {
         let object: ObjectLayout =
-            rkyv::from_bytes::<ObjectLayout, Error>(&object_bytes).map_err(|e| {
+            rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&object_bytes).map_err(|e| {
                 tracing::error!("Failed to deserialize object: {e}");
                 S3Error::InternalError
             })?;
@@ -167,22 +166,11 @@ pub async fn delete_blob(
     blob_deletion: Sender<BlobDeletionRequest>,
 ) -> Result<(), S3Error> {
     let blob_guid = object.blob_guid()?;
-    let num_blocks = object.num_blocks()?;
-    let blob_location = object.get_blob_location()?;
-
-    // Send deletion request for each block
-    for block_number in 0..num_blocks {
-        let request = BlobDeletionRequest {
-            blob_guid,
-            block_number: block_number as u32,
-            location: blob_location,
-        };
-
-        if let Err(e) = blob_deletion.send(request).await {
-            tracing::warn!(
-                "Failed to send blob {blob_guid} block={block_number} for background deletion: {e}"
-            );
-        }
+    let request = BlobDeletionRequest {
+        object: object.clone(),
+    };
+    if let Err(error) = blob_deletion.send(request).await {
+        tracing::warn!("Failed to send blob {blob_guid} for background deletion: {error}");
     }
 
     Ok(())

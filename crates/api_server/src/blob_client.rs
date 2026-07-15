@@ -1,6 +1,6 @@
 use crate::{
     blob_storage::{
-        AllInBssSingleAzStorage, BlobLocation, BlobStorageError, BlobStorageImpl,
+        AllInBssSingleAzStorage, BlobReadContext, BlobStorageError, BlobStorageImpl,
         S3HybridSingleAzStorage,
     },
     config::{BlobStorageBackend, BlobStorageConfig},
@@ -13,9 +13,7 @@ use tokio::{sync::mpsc::Receiver, task::JoinHandle};
 
 #[derive(Debug)]
 pub struct BlobDeletionRequest {
-    pub blob_guid: DataBlobGuid,
-    pub block_number: u32,
-    pub location: BlobLocation,
+    pub object: ObjectLayout,
 }
 
 pub struct BlobClient {
@@ -107,22 +105,14 @@ impl BlobClient {
         mut input: Receiver<BlobDeletionRequest>,
     ) -> Result<(), BlobStorageError> {
         while let Some(request) = input.recv().await {
+            let blob_guid = request.object.blob_guid().ok();
             let res = storage
-                .delete_blob(
-                    request.blob_guid,
-                    request.block_number,
-                    request.location,
-                    &TraceId::new(),
-                )
+                .delete_layout(&request.object, &TraceId::new())
                 .await;
             match res {
                 Ok(()) => {}
                 Err(e) => {
-                    tracing::warn!(
-                        "delete {}-p{} failed: {e}",
-                        request.blob_guid,
-                        request.block_number
-                    );
+                    tracing::warn!(?blob_guid, "blob layout cleanup failed: {e}");
                 }
             }
         }
@@ -187,34 +177,14 @@ impl BlobClient {
 
     pub async fn get_blob(
         &self,
-        blob_guid: DataBlobGuid,
+        read: BlobReadContext,
         block_number: u32,
         content_len: usize,
-        location: BlobLocation,
         body: &mut Bytes,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         self.storage
-            .get_blob(
-                blob_guid,
-                block_number,
-                content_len,
-                location,
-                body,
-                trace_id,
-            )
-            .await
-    }
-
-    pub async fn delete_blob(
-        &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        location: BlobLocation,
-        trace_id: &TraceId,
-    ) -> Result<(), BlobStorageError> {
-        self.storage
-            .delete_blob(blob_guid, block_number, location, trace_id)
+            .get_blob(read, block_number, content_len, body, trace_id)
             .await
     }
 }

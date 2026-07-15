@@ -493,11 +493,11 @@ async fn put_object_streaming_internal(
 
     let is_multipart_part = ctx.key.contains('#');
     if !old_object_bytes.is_empty() && !is_multipart_part {
-        let old_object =
-            rkyv::from_bytes::<ObjectLayout, Error>(&old_object_bytes).map_err(|e| {
-                tracing::error!("Failed to deserialize old object layout: {e}");
-                S3Error::InternalError
-            })?;
+        let old_object = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_object_bytes)
+            .map_err(|e| {
+            tracing::error!("Failed to deserialize old object layout: {e}");
+            S3Error::InternalError
+        })?;
 
         if let Ok(size) = old_object.size() {
             histogram!("object_size", "operation" => "delete_old_blob").record(size as f64);
@@ -509,30 +509,12 @@ async fn put_object_streaming_internal(
 
         // Only delete old blob if it's different from the new one
         if old_blob_guid != blob_guid {
-            let num_blocks = old_object.num_blocks().map_err(|e| {
-                tracing::error!("Failed to get num_blocks from old object: {e}");
-                S3Error::InternalError
-            })?;
-
             let blob_deletion = ctx.app.get_blob_deletion();
-
-            // Send deletion request for each block
-            let blob_location = old_object.get_blob_location().map_err(|e| {
-                tracing::error!("Failed to get blob_location from old object: {e}");
-                S3Error::InternalError
-            })?;
-            for block_number in 0..num_blocks {
-                let request = BlobDeletionRequest {
-                    blob_guid: old_blob_guid,
-                    block_number: block_number as u32,
-                    location: blob_location,
-                };
-
-                if let Err(e) = blob_deletion.send(request).await {
-                    tracing::warn!(
-                        "Failed to send blob {old_blob_guid} block={block_number} for background deletion: {e}"
-                    );
-                }
+            let request = BlobDeletionRequest { object: old_object };
+            if let Err(error) = blob_deletion.send(request).await {
+                tracing::warn!(
+                    "Failed to send blob {old_blob_guid} for background deletion: {error}"
+                );
             }
         } else {
             tracing::warn!(
@@ -705,11 +687,11 @@ async fn put_object_with_no_trailer(
     let old_object_bytes = parse_put_inode(resp)?;
     let is_multipart_part = ctx.key.contains('#');
     if !old_object_bytes.is_empty() && !is_multipart_part {
-        let old_object =
-            rkyv::from_bytes::<ObjectLayout, Error>(&old_object_bytes).map_err(|e| {
-                tracing::error!("Failed to deserialize old object layout: {e}");
-                S3Error::InternalError
-            })?;
+        let old_object = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_object_bytes)
+            .map_err(|e| {
+            tracing::error!("Failed to deserialize old object layout: {e}");
+            S3Error::InternalError
+        })?;
 
         if let Ok(size) = old_object.size() {
             histogram!("object_size", "operation" => "delete_old_blob").record(size as f64);
@@ -721,30 +703,12 @@ async fn put_object_with_no_trailer(
 
         // Only delete old blob if it's different from the new one
         if old_blob_guid != blob_guid {
-            let num_blocks = old_object.num_blocks().map_err(|e| {
-                tracing::error!("Failed to get num_blocks from old object: {e}");
-                S3Error::InternalError
-            })?;
-
             let blob_deletion = ctx.app.get_blob_deletion();
-
-            // Send deletion request for each block
-            let blob_location = old_object.get_blob_location().map_err(|e| {
-                tracing::error!("Failed to get blob_location from old object: {e}");
-                S3Error::InternalError
-            })?;
-            for block_number in 0..num_blocks {
-                let request = BlobDeletionRequest {
-                    blob_guid: old_blob_guid,
-                    block_number: block_number as u32,
-                    location: blob_location,
-                };
-
-                if let Err(e) = blob_deletion.send(request).await {
-                    tracing::warn!(
-                        "Failed to send blob {old_blob_guid} block={block_number} for background deletion: {e}"
-                    );
-                }
+            let request = BlobDeletionRequest { object: old_object };
+            if let Err(error) = blob_deletion.send(request).await {
+                tracing::warn!(
+                    "Failed to send blob {old_blob_guid} for background deletion: {error}"
+                );
             }
         } else {
             tracing::warn!(

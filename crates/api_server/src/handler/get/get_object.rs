@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{AppState, blob_storage::BlobLocation};
+use crate::{AppState, blob_storage::BlobReadContext};
 use crate::{
     BlobClient,
     handler::{
@@ -17,7 +17,6 @@ use actix_web::{
     web::Query,
 };
 use bytes::Bytes;
-use data_types::DataBlobGuid;
 use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
 use data_types::{Bucket, TraceId};
 use futures::{StreamExt, TryStreamExt, stream};
@@ -55,6 +54,15 @@ pub struct HeaderOpts<'a> {
     pub x_amz_request_payer: Option<&'a HeaderValue>,
     pub x_amz_expected_bucket_owner: Option<&'a HeaderValue>,
     pub x_amz_checksum_mode_enabled: bool,
+}
+
+fn blob_read_context(object: &ObjectLayout) -> Result<BlobReadContext, S3Error> {
+    Ok(BlobReadContext {
+        blob_guid: object.blob_guid()?,
+        blob_version: object.blob_version,
+        data_write_token: object.data_write_token,
+        location: object.get_blob_location()?,
+    })
 }
 
 impl<'a> HeaderOpts<'a> {
@@ -219,18 +227,15 @@ pub async fn get_object_content(
         .map_err(|_| S3Error::InternalError)?;
     match object.state {
         ObjectState::Normal(ref _obj_data) => {
-            let blob_guid = object.blob_guid()?;
             let num_blocks = object.num_blocks()?;
             let size = object.size()?;
             let block_size = object.block_size as usize;
-            let blob_location = object.get_blob_location()?;
             let body_stream = get_full_blob_stream(
                 blob_client,
-                blob_guid,
+                blob_read_context(object)?,
                 num_blocks,
                 size,
                 block_size,
-                blob_location,
                 *trace_id,
             )
             .await?;
@@ -283,18 +288,15 @@ pub async fn get_object_content(
                     .then(move |(_key, mpu_obj)| {
                         let blob_client = blob_client.clone();
                         async move {
-                            let blob_guid = mpu_obj.blob_guid()?;
                             let num_blocks = mpu_obj.num_blocks()?;
                             let mpu_size = mpu_obj.size()?;
                             let block_size = mpu_obj.block_size as usize;
-                            let blob_location = mpu_obj.get_blob_location()?;
                             get_full_blob_stream(
                                 blob_client,
-                                blob_guid,
+                                blob_read_context(&mpu_obj)?,
                                 num_blocks,
                                 mpu_size,
                                 block_size,
-                                blob_location,
                                 trace_id,
                             )
                             .await
@@ -323,19 +325,16 @@ async fn get_object_range_content(
     let block_size = object.block_size as usize;
     match object.state {
         ObjectState::Normal(ref _obj_data) => {
-            let blob_guid = object.blob_guid()?;
-            let blob_location = object.get_blob_location()?;
             let object_size = object.size()?;
             let num_blocks = object.num_blocks()?;
             let body_stream = get_range_blob_stream(
                 blob_client,
-                blob_guid,
+                blob_read_context(object)?,
                 block_size,
                 object_size,
                 num_blocks,
                 range.start,
                 range.end,
-                blob_location,
                 *trace_id,
             );
             Ok(Box::pin(body_stream))
@@ -369,7 +368,7 @@ async fn get_object_range_content(
                 )
                 .await?;
 
-                let mut mpu_blobs: Vec<(DataBlobGuid, u64, usize, usize, usize)> = Vec::new();
+                let mut mpu_blobs = Vec::new();
                 let mut obj_offset = 0;
                 for (_mpu_key, mpu_obj) in mpus {
                     let mpu_size = mpu_obj.size()? as usize;
@@ -387,7 +386,8 @@ async fn get_object_range_content(
                         let part_size = mpu_obj.size()?;
                         let part_num_blocks = mpu_obj.num_blocks()?;
                         mpu_blobs.push((
-                            mpu_obj.blob_guid()?,
+                            blob_read_context(&mpu_obj)?,
+                            mpu_obj.block_size as usize,
                             part_size,
                             part_num_blocks,
                             blob_start,
@@ -400,20 +400,24 @@ async fn get_object_range_content(
                 let trace_id = *trace_id;
                 let body_stream = stream::iter(mpu_blobs)
                     .then(
-                        move |(blob_guid, part_size, part_num_blocks, blob_start, blob_end)| {
+                        move |(
+                            blob_read,
+                            part_block_size,
+                            part_size,
+                            part_num_blocks,
+                            blob_start,
+                            blob_end,
+                        )| {
                             let blob_client = blob_client.clone();
                             async move {
-                                // Note: In MPU range case, we need to determine blob_location from the specific MPU object
-                                // For now, assume all MPU parts use S3 storage (large objects)
                                 Ok::<_, S3Error>(get_range_blob_stream(
                                     blob_client,
-                                    blob_guid,
-                                    block_size,
+                                    blob_read,
+                                    part_block_size,
                                     part_size,
                                     part_num_blocks,
                                     blob_start,
                                     blob_end,
-                                    BlobLocation::S3,
                                     trace_id,
                                 ))
                             }
@@ -428,11 +432,10 @@ async fn get_object_range_content(
 
 async fn get_full_blob_stream(
     blob_client: Arc<BlobClient>,
-    blob_guid: DataBlobGuid,
+    blob_read: BlobReadContext,
     num_blocks: usize,
     object_size: u64,
     block_size: usize,
-    blob_location: BlobLocation,
     trace_id: TraceId,
 ) -> Result<impl stream::Stream<Item = Result<Bytes, S3Error>>, S3Error> {
     if num_blocks == 0 {
@@ -449,16 +452,15 @@ async fn get_full_blob_stream(
     let mut first_block = Bytes::new();
     blob_client
         .get_blob(
-            blob_guid,
+            blob_read,
             0,
             first_block_len,
-            blob_location,
             &mut first_block,
             &trace_id,
         )
         .await
         .map_err(|e| {
-            tracing::error!(%blob_guid, block_number=0, error=?e, "failed to get blob");
+            tracing::error!(blob_guid=%blob_read.blob_guid, block_number=0, error=?e, "failed to get blob");
             S3Error::from(e)
         })?;
 
@@ -480,17 +482,16 @@ async fn get_full_blob_stream(
             let mut block = Bytes::new();
             match blob_client
                 .get_blob(
-                    blob_guid,
+                    blob_read,
                     i as u32,
                     content_len,
-                    blob_location,
                     &mut block,
                     &trace_id,
                 )
                 .await
             {
                 Err(e) => {
-                    tracing::error!(%blob_guid, block_number=i, error=?e, "failed to get blob");
+                    tracing::error!(blob_guid=%blob_read.blob_guid, block_number=i, error=?e, "failed to get blob");
                     Err(S3Error::from(e))
                 }
                 Ok(_) => Ok(block),
@@ -505,13 +506,12 @@ async fn get_full_blob_stream(
 #[allow(clippy::too_many_arguments)]
 fn get_range_blob_stream(
     blob_client: Arc<BlobClient>,
-    blob_guid: DataBlobGuid,
+    blob_read: BlobReadContext,
     block_size: usize,
     object_size: u64,
     num_blocks: usize,
     start: usize,
     end: usize,
-    blob_location: BlobLocation,
     trace_id: TraceId,
 ) -> impl stream::Stream<Item = Result<Bytes, S3Error>> {
     let start_block_i = start / block_size;
@@ -534,17 +534,16 @@ fn get_range_blob_stream(
                 };
                 match blob_client
                     .get_blob(
-                        blob_guid,
+                        blob_read,
                         i as u32,
                         content_len,
-                        blob_location,
                         &mut block,
                         &trace_id,
                     )
                     .await
                 {
                     Err(e) => {
-                        tracing::error!(%blob_guid, block_number=i, error=?e, "failed to get blob");
+                        tracing::error!(blob_guid=%blob_read.blob_guid, block_number=i, error=?e, "failed to get blob");
                         Err(S3Error::from(e))
                     }
                     Ok(_) => Ok(block),

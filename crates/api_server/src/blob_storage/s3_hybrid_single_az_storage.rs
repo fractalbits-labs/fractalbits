@@ -1,5 +1,6 @@
 use super::{
-    BlobLocation, BlobStorageError, DataVgProxy, blob_key, chunks_to_bytestream, create_s3_client,
+    BlobLocation, BlobReadContext, BlobStorageError, DataVgProxy, blob_key, chunks_to_bytestream,
+    create_s3_client,
 };
 use crate::config::S3HybridSingleAzConfig;
 use aws_sdk_s3::Client as S3Client;
@@ -21,6 +22,45 @@ pub struct S3HybridSingleAzStorage {
 }
 
 impl S3HybridSingleAzStorage {
+    pub async fn delete_layout(
+        &self,
+        layout: &ObjectLayout,
+        trace_id: &TraceId,
+    ) -> Result<(), BlobStorageError> {
+        let blob_guid = layout
+            .blob_guid()
+            .map_err(|error| BlobStorageError::Internal(error.to_string()))?;
+        match layout
+            .get_blob_location()
+            .map_err(|error| BlobStorageError::Internal(error.to_string()))?
+        {
+            BlobLocation::DataVgProxy => {
+                // Fence only a pending prepare lease (a live fs writer must
+                // be stopped before the sweep). The committed token needs no
+                // permanent fence record: late background quorum completions
+                // can at worst resurrect invisible garbage on a never-reused
+                // blob_guid.
+                if let Some(pending) = layout.pending_data_write {
+                    self.data_vg_proxy
+                        .fence_data_write_token(blob_guid, pending.version, pending.token, trace_id)
+                        .await?;
+                }
+                self.data_vg_proxy
+                    .delete_all_blob_generations(blob_guid, trace_id)
+                    .await?;
+            }
+            BlobLocation::S3 => {
+                let num_blocks = layout
+                    .num_blocks()
+                    .map_err(|error| BlobStorageError::Internal(error.to_string()))?;
+                for block_number in 0..num_blocks {
+                    self.delete_s3_blob(blob_guid, block_number as u32).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn new_with_data_vg_info(
         data_vg_info: DataVgInfo,
         s3_hybrid_config: &S3HybridSingleAzConfig,
@@ -147,23 +187,36 @@ impl S3HybridSingleAzStorage {
 
     pub async fn get_blob(
         &self,
-        blob_guid: DataBlobGuid,
+        read: BlobReadContext,
         block_number: u32,
         content_len: usize,
-        location: BlobLocation,
         body: &mut Bytes,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
-        match location {
+        match read.location {
             BlobLocation::DataVgProxy => {
                 // Small blob - get from DataVgProxy
-                self.data_vg_proxy
-                    .get_blob(blob_guid, block_number, content_len, body, trace_id)
-                    .await?;
+                if read.data_write_token == 0 {
+                    self.data_vg_proxy
+                        .get_blob(read.blob_guid, block_number, content_len, body, trace_id)
+                        .await?;
+                } else {
+                    self.data_vg_proxy
+                        .get_blob_at_or_before(
+                            read.blob_guid,
+                            block_number,
+                            content_len,
+                            read.blob_version,
+                            read.data_write_token,
+                            body,
+                            trace_id,
+                        )
+                        .await?;
+                }
             }
             BlobLocation::S3 => {
                 // Large blob - get from S3
-                let s3_key = blob_key(blob_guid.blob_id, block_number);
+                let s3_key = blob_key(read.blob_guid.blob_id, block_number);
                 let result = self
                     .client_s3
                     .get_object()
@@ -196,35 +249,24 @@ impl S3HybridSingleAzStorage {
         Ok(())
     }
 
-    pub async fn delete_blob(
+    /// Delete one S3-located block. DataVgProxy-located blobs are torn
+    /// down through `delete_layout`'s generation sweep instead.
+    pub async fn delete_s3_blob(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
-        location: BlobLocation,
-        trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
-        match location {
-            BlobLocation::DataVgProxy => {
-                // Small blob - delete from DataVgProxy
-                self.data_vg_proxy
-                    .delete_blob(blob_guid, block_number, 1, trace_id)
-                    .await?;
-            }
-            BlobLocation::S3 => {
-                // Large blob - delete from S3
-                let s3_key = blob_key(blob_guid.blob_id, block_number);
-                self.client_s3
-                    .delete_object()
-                    .bucket(&self.data_blob_in_s3_bucket)
-                    .key(&s3_key)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!("delete {s3_key} failed: {e}");
-                        BlobStorageError::S3(e.to_string())
-                    })?;
-            }
-        }
+        let s3_key = blob_key(blob_guid.blob_id, block_number);
+        self.client_s3
+            .delete_object()
+            .bucket(&self.data_blob_in_s3_bucket)
+            .key(&s3_key)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!("delete {s3_key} failed: {e}");
+                BlobStorageError::S3(e.to_string())
+            })?;
 
         Ok(())
     }

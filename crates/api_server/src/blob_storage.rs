@@ -21,9 +21,18 @@ use aws_sdk_s3::{
 };
 use bytes::Bytes;
 use data_types::TraceId;
+use data_types::object_layout::ObjectLayout;
 use uuid::Uuid;
 
 pub use data_types::object_layout::BlobLocation;
+
+#[derive(Debug, Clone, Copy)]
+pub struct BlobReadContext {
+    pub blob_guid: DataBlobGuid,
+    pub blob_version: u64,
+    pub data_write_token: u64,
+    pub location: BlobLocation,
+}
 
 #[allow(clippy::enum_variant_names)]
 pub enum BlobStorageImpl {
@@ -118,6 +127,21 @@ impl From<SdkError<DeleteObjectError>> for BlobStorageError {
 }
 
 impl BlobStorageImpl {
+    pub async fn delete_layout(
+        &self,
+        layout: &ObjectLayout,
+        trace_id: &TraceId,
+    ) -> Result<(), BlobStorageError> {
+        match self {
+            BlobStorageImpl::HybridSingleAz(storage) => {
+                storage.delete_layout(layout, trace_id).await
+            }
+            BlobStorageImpl::AllInBssSingleAz(storage) => {
+                storage.delete_layout(layout, trace_id).await
+            }
+        }
+    }
+
     pub async fn put_blob(
         &self,
         blob_id: Uuid,
@@ -164,49 +188,22 @@ impl BlobStorageImpl {
 
     pub async fn get_blob(
         &self,
-        blob_guid: DataBlobGuid,
+        read: BlobReadContext,
         block_number: u32,
         content_len: usize,
-        location: BlobLocation,
         body: &mut Bytes,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         match self {
             BlobStorageImpl::HybridSingleAz(storage) => {
                 storage
-                    .get_blob(
-                        blob_guid,
-                        block_number,
-                        content_len,
-                        location,
-                        body,
-                        trace_id,
-                    )
+                    .get_blob(read, block_number, content_len, body, trace_id)
                     .await
             }
             BlobStorageImpl::AllInBssSingleAz(storage) => {
                 storage
-                    .get_blob(blob_guid, block_number, content_len, body, trace_id)
+                    .get_blob(read, block_number, content_len, body, trace_id)
                     .await
-            }
-        }
-    }
-
-    pub async fn delete_blob(
-        &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        location: BlobLocation,
-        trace_id: &TraceId,
-    ) -> Result<(), BlobStorageError> {
-        match self {
-            BlobStorageImpl::HybridSingleAz(storage) => {
-                storage
-                    .delete_blob(blob_guid, block_number, location, trace_id)
-                    .await
-            }
-            BlobStorageImpl::AllInBssSingleAz(storage) => {
-                storage.delete_blob(blob_guid, block_number, trace_id).await
             }
         }
     }
