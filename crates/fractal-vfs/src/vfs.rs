@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::backend::{BackendConfig, BlobInfo, StorageBackend};
+use crate::backend::{BackendConfig, StorageBackend};
 use crate::cache::{DirCache, DirEntry, DirEntryKind};
 use crate::config::WritebackMode;
 use crate::disk_cache::DiskCache;
@@ -217,6 +217,17 @@ struct FileHandle {
     layout: Option<ObjectLayout>,
     write_buf: Option<WriteBuffer>,
     backing_id: Option<i32>,
+    /// When the committed data-generation authority was last confirmed
+    /// against NSS. Read paths refresh at most once per attr TTL.
+    authority_checked_at: Option<Instant>,
+}
+
+struct DataWriteAuthority {
+    key: String,
+    layout: ObjectLayout,
+    raw: Bytes,
+    record: Option<InodeRecord>,
+    inode_id: Option<uuid::Uuid>,
 }
 
 /// A best-effort disk-cache mirror write, handed to the dedicated mirror
@@ -948,56 +959,47 @@ impl VfsCore {
 
     /// Read a block, checking disk cache first. On miss, fetches from backend
     /// and populates disk cache.
+    #[allow(clippy::too_many_arguments)]
     async fn read_block_cached(
         &self,
         blob_guid: data_types::DataBlobGuid,
         blob_version: u64,
+        data_write_token: u64,
         block_num: u32,
         block_content_len: usize,
         _file_size: u64,
         trace_id: &TraceId,
-    ) -> Result<Bytes, FsError> {
-        // Try disk cache
-        if let Some(dc) = &self.disk_cache
-            && let Some(cached) = dc.get_block(blob_guid, block_num, block_content_len).await
-        {
-            return Ok(cached);
+    ) -> Result<(Bytes, bool), FsError> {
+        if let Some(dc) = &self.disk_cache {
+            let version_matches =
+                data_write_token == 0 || dc.floor_version(blob_guid).await == Some(blob_version);
+            if version_matches
+                && let Some(cached) = dc.get_block(blob_guid, block_num, block_content_len).await
+            {
+                return Ok((cached, false));
+            }
         }
 
-        // Cache miss: fetch from backend at a version no older than the
-        // cache's floor. A reader on a stale handle still carries its open-
-        // time `blob_version`; if a newer override has since raised the
-        // floor, fetching at the stale version could trip BSS's non-quorum
-        // `v <= 1` path and return pre-override bytes. Lower-bounding by the
-        // floor matches what a cache hit would have returned (the latest
-        // this instance published).
-        let read_version = match &self.disk_cache {
-            Some(dc) => blob_version.max(dc.floor_version(blob_guid).await.unwrap_or(0)),
-            None => blob_version,
-        };
-
-        // Override (read_version > 1) blocks are zero-padded to a full
-        // block_size on disk, so the EC shard size is block_size/k;
-        // request the full block_size (otherwise the EC read derives a
-        // smaller shard size from the logical length and filters out the
-        // padded shards), then truncate to the logical content length.
-        // Non-override blocks are stored at their exact length and read
-        // as-is.
-        let read_len = if read_version > 1 {
-            (DEFAULT_BLOCK_SIZE as usize).max(block_content_len)
-        } else {
-            block_content_len
-        };
+        // Cache miss: fetch from backend. Tokenized blobs are bounded by
+        // the committed identity; token-zero blobs are immutable v1
+        // api_server writes, so no version floor or padded read applies.
         let (mut data, _checksum) = match self
             .backend()
-            .read_block(blob_guid, read_version, block_num, read_len, trace_id)
+            .read_block(
+                blob_guid,
+                blob_version,
+                data_write_token,
+                block_num,
+                block_content_len,
+                trace_id,
+            )
             .await
         {
             Ok(r) => r,
             // A missing block is a hole: serve zeros (do not cache the hole).
             Err(FsError::DataVg(volume_group_proxy::DataVgError::BlockNotFound))
             | Err(FsError::Rpc(rpc_client_common::RpcError::NotFound)) => {
-                return Ok(Bytes::from(vec![0u8; block_content_len]));
+                return Ok((Bytes::from(vec![0u8; block_content_len]), true));
             }
             Err(e) => return Err(e),
         };
@@ -1008,37 +1010,18 @@ impl VfsCore {
         // Populate disk cache at the version actually fetched.
         if let Some(dc) = &self.disk_cache {
             let _ = dc
-                .insert_block(blob_guid, block_num, read_version, &data)
+                .insert_block(blob_guid, block_num, blob_version, &data)
                 .await;
         }
 
-        Ok(data)
+        Ok((data, true))
     }
 
     // ── Read helpers ──
 
-    /// Authoritative logical file size for data reads. The geometry
-    /// sentinel (our BSS-parent-size authority) reflects the latest
-    /// committed override regardless of our cached layout version, so a
-    /// read on a handle whose cached layout lags a peer's overwrite (or
-    /// this instance's own just-committed flush) still sees the right EOF.
-    /// The cached/NSS layout size is a lazy copy. Falls back to the cached
-    /// size when no sentinel exists or it is older than the cached layout
-    /// (so a stale sentinel never shrinks a fresher local size).
+    /// ObjectLayout is the sole authority for logical file size.
     async fn authoritative_file_size(&self, layout: &ObjectLayout) -> Result<u64, FsError> {
-        let cached = layout.size()?;
-        if layout.is_symlink() || layout.special().is_some() {
-            return Ok(cached);
-        }
-        if let Ok(guid) = layout.blob_guid() {
-            let trace_id = TraceId::new();
-            if let Ok(Some(info)) = self.backend().get_blob_info(guid, &trace_id).await
-                && info.blob_version >= layout.blob_version
-            {
-                return Ok(info.total_size);
-            }
-        }
-        Ok(cached)
+        Ok(layout.size()?)
     }
 
     async fn read_mpu(
@@ -1089,10 +1072,11 @@ impl VfsCore {
                     let block_content_len =
                         std::cmp::min(block_size, part_size - block_start) as usize;
 
-                    let block_data = self
+                    let (block_data, _) = self
                         .read_block_cached(
                             blob_guid,
                             part_obj.blob_version,
+                            part_obj.data_write_token,
                             block_num,
                             block_content_len,
                             part_size,
@@ -1131,17 +1115,18 @@ impl VfsCore {
     async fn read_block_cached_into(
         &self,
         blob_guid: data_types::DataBlobGuid,
-        _blob_version: u64,
+        blob_version: u64,
+        data_write_token: u64,
         block_num: u32,
         block_content_len: usize,
         buf: &mut [u8],
     ) -> Option<usize> {
-        if let Some(dc) = &self.disk_cache {
-            dc.get_block_into(blob_guid, block_num, block_content_len, buf)
-                .await
-        } else {
-            None
+        let dc = self.disk_cache.as_ref()?;
+        if data_write_token != 0 && dc.floor_version(blob_guid).await != Some(blob_version) {
+            return None;
         }
+        dc.get_block_into(blob_guid, block_num, block_content_len, buf)
+            .await
     }
 
     /// Read a normal (non-MPU) object directly into a buffer.
@@ -1152,11 +1137,11 @@ impl VfsCore {
         layout: &ObjectLayout,
         offset: u64,
         buf: &mut [u8],
-    ) -> Result<usize, FsError> {
+    ) -> Result<(usize, bool), FsError> {
         let file_size = self.authoritative_file_size(layout).await?;
         let size = buf.len() as u32;
         if size == 0 || offset >= file_size {
-            return Ok(0);
+            return Ok((0, false));
         }
 
         let blob_guid = layout.blob_guid()?;
@@ -1191,6 +1176,7 @@ impl VfsCore {
                     .read_block_cached_into(
                         blob_guid,
                         layout.blob_version,
+                        layout.data_write_token,
                         block_num,
                         block_content_len,
                         &mut buf[written..written + chunk_len],
@@ -1209,6 +1195,7 @@ impl VfsCore {
                     .read_block_cached_into(
                         blob_guid,
                         layout.blob_version,
+                        layout.data_write_token,
                         block_num,
                         block_content_len,
                         &mut tmp,
@@ -1230,21 +1217,24 @@ impl VfsCore {
             let trace_id = TraceId::new();
             let remaining = &mut buf[written..];
             let mut remaining_offset = written;
+            let mut used_backend = false;
 
             for bn in block_num..=last_block {
                 let bs = bn as u64 * block_size;
                 let bcl = std::cmp::min(block_size, file_size - bs) as usize;
 
-                let block_data = self
+                let (block_data, backend_read) = self
                     .read_block_cached(
                         blob_guid,
                         layout.blob_version,
+                        layout.data_write_token,
                         bn,
                         bcl,
                         file_size,
                         &trace_id,
                     )
                     .await?;
+                used_backend |= backend_read;
 
                 let ss = if bn == first_block {
                     (offset - bs) as usize
@@ -1267,10 +1257,10 @@ impl VfsCore {
                 }
             }
 
-            return Ok(remaining_offset);
+            return Ok((remaining_offset, used_backend));
         }
 
-        Ok(written.min(actual_len))
+        Ok((written.min(actual_len), false))
     }
 
     /// Read data directly into a caller-provided buffer (zero-copy path).
@@ -1283,6 +1273,10 @@ impl VfsCore {
         offset: u64,
         buf: &mut [u8],
     ) -> Result<usize, FsError> {
+        let trace_id = TraceId::new();
+        let authoritative_layout = self
+            .authoritative_layout_for_handle(fh, Some(TTL), &trace_id)
+            .await?;
         let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
 
         // Dirty write buffer: merge per-block intents over the committed
@@ -1290,37 +1284,116 @@ impl VfsCore {
         if let Some(ref wb) = handle.write_buf
             && wb.dirty
         {
+            if let (Some(cached), Some(authoritative)) =
+                (handle.layout.as_ref(), authoritative_layout.as_ref())
+                && !Self::same_committed_data_generation(cached, authoritative)
+            {
+                return Err(FsError::CasConflict);
+            }
             let file_size = wb.file_size;
             let block_size = wb.block_size;
             let existing_blob_guid = wb.existing_blob_guid;
             let eof_low_watermark = wb.eof_low_watermark;
             let blocks = wb.blocks.clone();
-            let committed_blob_version =
-                handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
+            let committed_layout = authoritative_layout.as_ref().or(handle.layout.as_ref());
+            let committed_blob_version = committed_layout.map(|l| l.blob_version).unwrap_or(0);
+            let committed_data_write_token =
+                committed_layout.map(|l| l.data_write_token).unwrap_or(0);
             drop(handle);
-            return self
+            let read_result = self
                 .read_dirty_handle(
                     file_size,
                     block_size,
                     existing_blob_guid,
                     committed_blob_version,
+                    committed_data_write_token,
                     &blocks,
                     eof_low_watermark,
                     offset,
                     buf,
                 )
                 .await;
+            let (read, used_backend) = match read_result {
+                Ok(result) => result,
+                Err(error) => {
+                    let latest = self
+                        .authoritative_layout_for_handle(fh, None, &trace_id)
+                        .await?;
+                    let authority_changed = match (&authoritative_layout, latest.as_ref()) {
+                        (Some(before), Some(after)) => {
+                            !Self::same_committed_data_generation(before, after)
+                        }
+                        (None, None) => false,
+                        _ => true,
+                    };
+                    return if authority_changed {
+                        Err(FsError::CasConflict)
+                    } else {
+                        Err(error)
+                    };
+                }
+            };
+            if used_backend {
+                let latest = self
+                    .authoritative_layout_for_handle(fh, Some(TTL), &trace_id)
+                    .await?;
+                let authority_changed = match (&authoritative_layout, latest.as_ref()) {
+                    (Some(before), Some(after)) => {
+                        !Self::same_committed_data_generation(before, after)
+                    }
+                    (None, None) => false,
+                    _ => true,
+                };
+                if authority_changed {
+                    return Err(FsError::CasConflict);
+                }
+            }
+            return Ok(read);
         }
 
-        let layout = match &handle.layout {
-            Some(l) => l.clone(),
+        let mut layout = match authoritative_layout.or_else(|| handle.layout.clone()) {
+            Some(layout) => layout,
             None => return Ok(0),
         };
         let s3_key = handle.s3_key.clone();
         drop(handle);
 
         match &layout.state {
-            ObjectState::Normal(_) => self.read_normal_buf(&layout, offset, buf).await,
+            ObjectState::Normal(_) => {
+                for _ in 0..5 {
+                    let (read, used_backend) =
+                        match self.read_normal_buf(&layout, offset, buf).await {
+                            Ok(result) => result,
+                            Err(error) => {
+                                let Some(latest) = self
+                                    .authoritative_layout_for_handle(fh, None, &trace_id)
+                                    .await?
+                                else {
+                                    return Err(error);
+                                };
+                                if Self::same_committed_data_generation(&layout, &latest) {
+                                    return Err(error);
+                                }
+                                layout = latest;
+                                continue;
+                            }
+                        };
+                    if !used_backend {
+                        return Ok(read);
+                    }
+                    let Some(latest) = self
+                        .authoritative_layout_for_handle(fh, Some(TTL), &trace_id)
+                        .await?
+                    else {
+                        return Ok(read);
+                    };
+                    if Self::same_committed_data_generation(&layout, &latest) {
+                        return Ok(read);
+                    }
+                    layout = latest;
+                }
+                Err(FsError::CasConflict)
+            }
             ObjectState::Mpu(MpuState::Completed(_)) => {
                 // MPU: fall back to the Bytes path and copy
                 let data = self
@@ -1340,10 +1413,12 @@ impl VfsCore {
     /// flush tail-zero. Returns zeros (length `fallback_content_len`) for a
     /// brand-new file, a hole (`committed_content_len == 0`), or a missing
     /// block (`BlockNotFound` / `NotFound`); propagates other errors.
+    #[allow(clippy::too_many_arguments)]
     async fn lazy_load_block_for_flush(
         &self,
         existing_blob_guid: Option<data_types::DataBlobGuid>,
         committed_blob_version: u64,
+        committed_data_write_token: u64,
         block_num: u32,
         committed_content_len: usize,
         fallback_content_len: usize,
@@ -1360,6 +1435,7 @@ impl VfsCore {
             .read_block(
                 guid,
                 committed_blob_version,
+                committed_data_write_token,
                 block_num,
                 committed_content_len,
                 trace_id,
@@ -1387,13 +1463,14 @@ impl VfsCore {
         block_size: u32,
         existing_blob_guid: Option<data_types::DataBlobGuid>,
         committed_blob_version: u64,
+        committed_data_write_token: u64,
         blocks: &std::collections::BTreeMap<u32, BlockState>,
         eof_low_watermark: Option<u32>,
         offset: u64,
         buf: &mut [u8],
-    ) -> Result<usize, FsError> {
+    ) -> Result<(usize, bool), FsError> {
         if buf.is_empty() || offset >= file_size {
-            return Ok(0);
+            return Ok((0, false));
         }
         let bsz = block_size as u64;
         let read_end = std::cmp::min(offset + buf.len() as u64, file_size);
@@ -1403,6 +1480,7 @@ impl VfsCore {
         let trace_id = TraceId::new();
 
         let mut written = 0usize;
+        let mut used_backend = false;
         for b in first_block..=last_block {
             let block_start = b as u64 * bsz;
             let block_content_len = std::cmp::min(bsz, file_size - block_start) as usize;
@@ -1425,9 +1503,11 @@ impl VfsCore {
                     if eof_low_watermark.is_some_and(|low| b >= low) {
                         Bytes::from(vec![0u8; block_content_len])
                     } else {
+                        used_backend |= existing_blob_guid.is_some();
                         self.lazy_load_block_for_flush(
                             existing_blob_guid,
                             committed_blob_version,
+                            committed_data_write_token,
                             b,
                             block_content_len,
                             block_content_len,
@@ -1451,7 +1531,353 @@ impl VfsCore {
                 written += pad;
             }
         }
-        Ok(written.min(actual_len))
+        Ok((written.min(actual_len), used_backend))
+    }
+
+    async fn load_data_write_authority(
+        &self,
+        s3_key: &str,
+        inode_id: Option<uuid::Uuid>,
+        trace_id: &TraceId,
+    ) -> Result<DataWriteAuthority, FsError> {
+        if let Some(id) = inode_id {
+            let (record, raw) = self
+                .backend()
+                .get_inode_record_with_bytes(id, trace_id)
+                .await?;
+            return Ok(DataWriteAuthority {
+                key: InodeRecord::key_for(id),
+                layout: record.layout.clone(),
+                raw,
+                record: Some(record),
+                inode_id: Some(id),
+            });
+        }
+
+        let (layout, raw) = self
+            .backend()
+            .get_inode_with_bytes(s3_key, trace_id)
+            .await?;
+        if let ObjectState::Indirect(redirect) = &layout.state {
+            let id = redirect.inode_id;
+            let (record, record_raw) = self
+                .backend()
+                .get_inode_record_with_bytes(id, trace_id)
+                .await?;
+            return Ok(DataWriteAuthority {
+                key: InodeRecord::key_for(id),
+                layout: record.layout.clone(),
+                raw: record_raw,
+                record: Some(record),
+                inode_id: Some(id),
+            });
+        }
+        Ok(DataWriteAuthority {
+            key: s3_key.to_string(),
+            layout,
+            raw,
+            record: None,
+            inode_id: None,
+        })
+    }
+
+    /// Resolve the committed data-generation authority for a handle.
+    ///
+    /// With `max_age = Some(ttl)` a check newer than `ttl` short-circuits to
+    /// the handle's cached layout, so hot read paths pay at most one NSS
+    /// round trip per TTL window (the same freshness contract as the FUSE
+    /// attr TTL). Pass `None` to force a fetch on error-recovery paths.
+    async fn authoritative_layout_for_handle(
+        &self,
+        fh: FileHandleId,
+        max_age: Option<Duration>,
+        trace_id: &TraceId,
+    ) -> Result<Option<ObjectLayout>, FsError> {
+        let (ino, s3_key, cached_layout, dirty, checked_at) = {
+            let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
+            (
+                handle.ino,
+                handle.s3_key.clone(),
+                handle.layout.clone(),
+                handle
+                    .write_buf
+                    .as_ref()
+                    .is_some_and(|write_buf| write_buf.dirty),
+                handle.authority_checked_at,
+            )
+        };
+        let Some(cached_layout) = cached_layout else {
+            return Ok(None);
+        };
+        if let (Some(max_age), Some(checked_at)) = (max_age, checked_at)
+            && checked_at.elapsed() < max_age
+        {
+            return Ok(Some(cached_layout));
+        }
+        let (inode_id, name_removed) = self
+            .inodes
+            .get(ino)
+            .map(|entry| (entry.inode_id, entry.name_removed))
+            .unwrap_or((None, false));
+        if name_removed && inode_id.is_none() {
+            return Ok(Some(cached_layout));
+        }
+
+        let authority = match self
+            .load_data_write_authority(&s3_key, inode_id, trace_id)
+            .await
+        {
+            Ok(authority) => authority,
+            // The NSS record can be legitimately absent while a writeback
+            // publish is still queued, or after a cross-instance unlink; an
+            // open handle keeps serving its committed snapshot either way.
+            Err(FsError::NotFound) => return Ok(Some(cached_layout)),
+            Err(error) => return Err(error),
+        };
+        if !dirty
+            && !Self::same_committed_data_generation(&cached_layout, &authority.layout)
+            && let Some(disk_cache) = &self.disk_cache
+        {
+            let cached_blob_guid = cached_layout.blob_guid().ok();
+            let authoritative_blob_guid = authority.layout.blob_guid().ok();
+            if let Some(blob_guid) = cached_blob_guid {
+                disk_cache
+                    .drop_blob(blob_guid, authority.layout.blob_version)
+                    .await;
+            }
+            if let Some(blob_guid) = authoritative_blob_guid
+                && Some(blob_guid) != cached_blob_guid
+            {
+                disk_cache
+                    .drop_blob(blob_guid, authority.layout.blob_version)
+                    .await;
+            }
+        }
+        if let Some(mut handle) = self.file_handles.get_mut(&fh) {
+            handle.authority_checked_at = Some(Instant::now());
+            if !dirty {
+                handle.layout = Some(authority.layout.clone());
+            }
+        }
+        Ok(Some(authority.layout))
+    }
+
+    fn same_committed_data_generation(a: &ObjectLayout, b: &ObjectLayout) -> bool {
+        a.blob_guid().ok() == b.blob_guid().ok()
+            && a.blob_version == b.blob_version
+            && a.data_write_token == b.data_write_token
+    }
+
+    fn encode_data_write_authority(
+        authority: &DataWriteAuthority,
+        layout: &ObjectLayout,
+    ) -> Result<Bytes, FsError> {
+        match &authority.record {
+            Some(record) => Ok(to_bytes_in::<_, rkyv::rancor::Error>(
+                &InodeRecord {
+                    layout: layout.clone(),
+                    nlink: record.nlink,
+                    orphan_since: record.orphan_since,
+                },
+                Vec::new(),
+            )?
+            .into()),
+            None => Ok(to_bytes_in::<_, rkyv::rancor::Error>(layout, Vec::new())?.into()),
+        }
+    }
+
+    async fn fence_and_clear_data_write(
+        &self,
+        s3_key: &str,
+        inode_id: Option<uuid::Uuid>,
+        owned: Option<data_types::object_layout::PendingDataWrite>,
+        trace_id: &TraceId,
+    ) -> Result<Option<uuid::Uuid>, FsError> {
+        const MAX_CAS_RETRIES: u32 = 5;
+        let mut inode_id = inode_id;
+        let mut aborted = None;
+
+        for _ in 0..MAX_CAS_RETRIES {
+            let authority = self
+                .load_data_write_authority(s3_key, inode_id, trace_id)
+                .await?;
+            inode_id = authority.inode_id;
+            let Some(pending) = authority.layout.pending_data_write else {
+                return Ok(inode_id);
+            };
+            if let Some(owned) = owned
+                && (pending.version != owned.version || pending.token != owned.token)
+            {
+                return Err(FsError::Busy);
+            }
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            if owned.is_none() && pending.expires_at_ms != 0 && now_ms < pending.expires_at_ms {
+                return Err(FsError::Busy);
+            }
+            let blob_guid = authority.layout.blob_guid()?;
+            if pending.expires_at_ms == 0 {
+                aborted = Some((blob_guid, pending));
+                break;
+            }
+
+            let mut aborting = authority.layout.clone();
+            aborting.abort_data_write(pending.version, pending.token, pending.lease_id)?;
+            let aborting_bytes = Self::encode_data_write_authority(&authority, &aborting)?;
+            match self
+                .backend()
+                .put_inode_cas(&authority.key, aborting_bytes, authority.raw, trace_id)
+                .await
+            {
+                Ok(_) => {
+                    aborted = Some((blob_guid, pending));
+                    break;
+                }
+                Err(FsError::CasConflict) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        let Some((blob_guid, pending)) = aborted else {
+            return Err(FsError::CasConflict);
+        };
+        self.backend()
+            .fence_data_write_token(blob_guid, pending.version, pending.token, trace_id)
+            .await?;
+
+        for _ in 0..MAX_CAS_RETRIES {
+            let authority = self
+                .load_data_write_authority(s3_key, inode_id, trace_id)
+                .await?;
+            inode_id = authority.inode_id;
+            let Some(current) = authority.layout.pending_data_write else {
+                return Ok(inode_id);
+            };
+            if current.version != pending.version || current.token != pending.token {
+                return Err(FsError::Busy);
+            }
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let mut cleared = authority.layout.clone();
+            cleared.clear_aborted_data_write(
+                current.version,
+                current.token,
+                current.lease_id,
+                now_ms,
+            )?;
+            let cleared_bytes = Self::encode_data_write_authority(&authority, &cleared)?;
+            match self
+                .backend()
+                .put_inode_cas(&authority.key, cleared_bytes, authority.raw, trace_id)
+                .await
+            {
+                Ok(_) => return Ok(inode_id),
+                Err(FsError::CasConflict) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(FsError::CasConflict)
+    }
+
+    async fn resolve_or_abort_data_write(
+        &self,
+        s3_key: &str,
+        inode_id: Option<uuid::Uuid>,
+        blob_guid: data_types::DataBlobGuid,
+        pending: data_types::object_layout::PendingDataWrite,
+        trace_id: &TraceId,
+    ) -> Result<Option<ObjectLayout>, FsError> {
+        let authority = self
+            .load_data_write_authority(s3_key, inode_id, trace_id)
+            .await?;
+        if authority.layout.blob_guid().ok() == Some(blob_guid)
+            && authority.layout.blob_version == pending.version
+            && authority.layout.data_write_token == pending.token
+            && authority.layout.pending_data_write.is_none()
+        {
+            return Ok(Some(authority.layout));
+        }
+        if authority.layout.pending_data_write == Some(pending) {
+            self.fence_and_clear_data_write(s3_key, authority.inode_id, Some(pending), trace_id)
+                .await?;
+        }
+        Ok(None)
+    }
+
+    async fn renew_data_write_lease(
+        &self,
+        s3_key: &str,
+        inode_id: Option<uuid::Uuid>,
+        pending: data_types::object_layout::PendingDataWrite,
+        lease_ms: u64,
+        trace_id: &TraceId,
+    ) -> Result<Option<DataWriteAuthority>, FsError> {
+        const RENEW_WINDOW_MS: u64 = 60_000;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        if now_ms.saturating_add(RENEW_WINDOW_MS) < pending.expires_at_ms {
+            return Ok(None);
+        }
+
+        for _ in 0..5 {
+            let mut authority = self
+                .load_data_write_authority(s3_key, inode_id, trace_id)
+                .await?;
+            let Some(current) = authority.layout.pending_data_write else {
+                return Err(FsError::CasConflict);
+            };
+            if current.version != pending.version
+                || current.token != pending.token
+                || current.lease_id != pending.lease_id
+            {
+                return Err(FsError::Busy);
+            }
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            if now_ms.saturating_add(RENEW_WINDOW_MS) < current.expires_at_ms {
+                return Ok(Some(authority));
+            }
+
+            let mut renewed = authority.layout.clone();
+            renewed.renew_data_write_lease(
+                current.version,
+                current.token,
+                current.lease_id,
+                now_ms,
+                now_ms.saturating_add(lease_ms),
+            )?;
+            let renewed_bytes = Self::encode_data_write_authority(&authority, &renewed)?;
+            match self
+                .backend()
+                .put_inode_cas(
+                    &authority.key,
+                    renewed_bytes.clone(),
+                    authority.raw,
+                    trace_id,
+                )
+                .await
+            {
+                Ok(_) => {
+                    if let Some(record) = &mut authority.record {
+                        record.layout = renewed.clone();
+                    }
+                    authority.layout = renewed;
+                    authority.raw = renewed_bytes;
+                    return Ok(Some(authority));
+                }
+                Err(FsError::CasConflict) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(FsError::CasConflict)
     }
 
     /// Re-arm a flush's snapshotted buffer after a post-snapshot failure,
@@ -1561,105 +1987,380 @@ impl VfsCore {
         // shared blob_guid + blob_version) and its nlink/orphan_since are
         // preserved on republish.
         let mut promoted_record_key = promoted_inode_id.map(InodeRecord::key_for);
-        // The publish CAS guards on the fetched record re-serialized (rkyv is
-        // deterministic for these types, as the s3_key flush CAS also relies
-        // on), so we keep only the decoded record here.
-        let mut promoted_record: Option<InodeRecord> = match promoted_inode_id {
-            Some(id) => match self.backend().get_inode_record(id, &trace_id).await {
-                Ok(rec) => Some(rec),
-                Err(e) => return Err(e),
-            },
-            None => None,
-        };
+        // Keep the exact NSS bytes for byte-equality CAS, including legacy
+        // archive shapes that decode into the current in-memory layout.
+        let (mut promoted_record, mut promoted_record_raw): (Option<InodeRecord>, Option<Bytes>) =
+            match promoted_inode_id {
+                Some(id) => {
+                    let (record, raw) = self
+                        .backend()
+                        .get_inode_record_with_bytes(id, &trace_id)
+                        .await?;
+                    (Some(record), Some(raw))
+                }
+                None => (None, None),
+            };
 
-        // Override flush: reuse the file's stable blob_guid, bump
-        // blob_version, write only the dirty (`Rewrite`) blocks in place at
-        // the new version, CAS-publish the layout, then trim blocks past the
-        // (possibly shrunk) EOF and replay PUNCH_HOLE deletes. Old blocks
-        // are never blindly deleted; holes (absent blocks) are never
-        // written. The CAS guard makes a stale/cross-instance publish lose
-        // the race instead of clobbering the winner. For a promoted inode
-        // the base is the record's layout (the shared blob), not the
-        // redirect at the handle's s3_key.
-        let mut base_layout: Option<ObjectLayout> = match &promoted_record {
-            Some(rec) => Some(rec.layout.clone()),
-            None => self.file_handles.get(&fh_id).and_then(|h| h.layout.clone()),
-        };
+        let handle_layout = self.file_handles.get(&fh_id).and_then(|h| h.layout.clone());
+        let (mut base_layout, mut base_expected): (Option<ObjectLayout>, Option<Bytes>) =
+            match &promoted_record {
+                Some(rec) => (Some(rec.layout.clone()), promoted_record_raw.clone()),
+                None if handle_layout.is_some() => {
+                    let (layout, raw) = self
+                        .backend()
+                        .get_inode_with_bytes(&s3_key, &trace_id)
+                        .await?;
+                    (Some(layout), Some(raw))
+                }
+                None => (None, None),
+            };
+        if promoted_record.is_none()
+            && let Some(ObjectState::Indirect(redirect)) =
+                base_layout.as_ref().map(|layout| &layout.state)
+        {
+            let id = redirect.inode_id;
+            let (record, raw) = self
+                .backend()
+                .get_inode_record_with_bytes(id, &trace_id)
+                .await?;
+            base_layout = Some(record.layout.clone());
+            base_expected = Some(raw.clone());
+            promoted_record = Some(record);
+            promoted_record_raw = Some(raw);
+            promoted_inode_id = Some(id);
+            promoted_record_key = Some(InodeRecord::key_for(id));
+        }
+        if let (Some(handle_layout), Some(authoritative_layout)) =
+            (handle_layout.as_ref(), base_layout.as_ref())
+            && handle_layout.blob_guid().is_ok()
+            && !Self::same_committed_data_generation(handle_layout, authoritative_layout)
+        {
+            return Err(FsError::CasConflict);
+        }
+        if base_layout
+            .as_ref()
+            .and_then(|layout| layout.pending_data_write)
+            .is_some()
+        {
+            promoted_inode_id = self
+                .fence_and_clear_data_write(&s3_key, promoted_inode_id, None, &trace_id)
+                .await?;
+            let authority = self
+                .load_data_write_authority(&s3_key, promoted_inode_id, &trace_id)
+                .await?;
+            base_layout = Some(authority.layout.clone());
+            base_expected = Some(authority.raw.clone());
+            promoted_record = authority.record;
+            promoted_record_raw = promoted_record.as_ref().map(|_| authority.raw);
+            promoted_record_key = promoted_inode_id.map(InodeRecord::key_for);
+        }
 
+        // Override flushes keep the stable blob GUID and publish a new
+        // generation identity. The prepare CAS happens before any BSS write,
+        // and the commit CAS is the only visibility boundary.
         const MAX_CAS_RETRIES: u32 = 5;
+        const DATA_WRITE_LEASE_MS: u64 = 15 * 60 * 1000;
         let mut attempt: u32 = 0;
-        let (mut final_layout, final_committed_size) = loop {
+        let (mut final_layout, final_committed_size, superseded_blocks) = 'flush_attempt: loop {
             attempt += 1;
 
-            let (blob_guid, base_version, committed_size, expected_old, is_override) =
-                match base_layout
-                    .as_ref()
-                    .and_then(|l| l.blob_guid().ok().map(|g| (g, l)))
-                {
-                    Some((g, l)) => {
-                        let bytes: Bytes =
-                            match to_bytes_in::<_, rkyv::rancor::Error>(l, Vec::new()) {
-                                Ok(b) => b.into(),
-                                Err(e) => return Err(FsError::from(e)),
-                            };
-                        (g, l.blob_version, l.size().unwrap_or(0), bytes, true)
-                    }
-                    None => (self.backend().create_blob_guid(), 0, 0, Bytes::new(), false),
-                };
-            // Override versions start at 2 so a committed legacy record at
-            // blob_version 0/1 (whose BSS blocks sit at v1) can't collide
-            // with a same-version idempotency check. A brand-new file's
-            // first flush is v1 (unpadded, read at exact length).
+            let (blob_guid, base_version, committed_size, is_override) = match base_layout
+                .as_ref()
+                .and_then(|l| l.blob_guid().ok().map(|g| (g, l)))
+            {
+                Some((g, l)) => (g, l.blob_version, l.size().unwrap_or(0), true),
+                None => (self.backend().create_blob_guid(), 0, 0, false),
+            };
             let new_version = if is_override {
                 (base_version + 1).max(2)
             } else {
                 1
             };
             let pad_blocks = is_override;
+            let base_token = base_layout
+                .as_ref()
+                .map(|layout| layout.data_write_token)
+                .unwrap_or(0);
 
-            // Write only the Rewrite blocks at the new version (zero-padded
-            // to block_size on override so the EC shard size is constant).
-            let mut flush_err: Option<FsError> = None;
-            for (b, st) in snap.blocks.iter() {
-                let BlockState::Rewrite(bytes) = st else {
-                    continue;
-                };
-                let body = if pad_blocks && bytes.len() < block_size {
-                    let mut buf = BytesMut::with_capacity(block_size);
-                    buf.extend_from_slice(bytes);
-                    buf.resize(block_size, 0);
-                    buf.freeze()
-                } else {
-                    bytes.clone()
-                };
-                if let Err(e) = self
+            let (write_token, mut prepared_layout, mut commit_expected) = if is_override {
+                let current_layout = base_layout
+                    .as_ref()
+                    .expect("override requires a committed layout");
+                if current_layout.pending_data_write.is_some() {
+                    return Err(FsError::Busy);
+                }
+
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let mut prepared = current_layout.clone();
+                let pending = prepared
+                    .prepare_data_write(new_version, now_ms.saturating_add(DATA_WRITE_LEASE_MS))?;
+
+                let (prepare_key, prepare_value, prepare_expected, prepared_record) =
+                    match &promoted_record {
+                        Some(rec) => {
+                            let next_record = InodeRecord {
+                                layout: prepared.clone(),
+                                nlink: rec.nlink,
+                                orphan_since: rec.orphan_since,
+                            };
+                            let new_bytes: Bytes =
+                                to_bytes_in::<_, rkyv::rancor::Error>(&next_record, Vec::new())?
+                                    .into();
+                            let old_bytes = promoted_record_raw
+                                .clone()
+                                .expect("promoted record requires raw NSS bytes");
+                            (
+                                promoted_record_key
+                                    .clone()
+                                    .expect("promoted record requires a key"),
+                                new_bytes,
+                                old_bytes,
+                                Some(next_record),
+                            )
+                        }
+                        None => {
+                            let new_bytes: Bytes =
+                                to_bytes_in::<_, rkyv::rancor::Error>(&prepared, Vec::new())?
+                                    .into();
+                            let old_bytes = base_expected
+                                .clone()
+                                .expect("override requires raw NSS bytes");
+                            (s3_key.clone(), new_bytes, old_bytes, None)
+                        }
+                    };
+
+                match self
                     .backend()
-                    .write_block(blob_guid, *b, body, new_version, &trace_id)
+                    .put_inode_cas(
+                        &prepare_key,
+                        prepare_value.clone(),
+                        prepare_expected,
+                        &trace_id,
+                    )
                     .await
                 {
-                    flush_err = Some(e);
-                    break;
+                    Ok(_) => {
+                        if let Some(rec) = prepared_record {
+                            promoted_record = Some(rec);
+                        }
+                        base_layout = Some(prepared.clone());
+                        (pending.token, Some(prepared), prepare_value)
+                    }
+                    Err(prepare_error) => {
+                        let authority = match self
+                            .load_data_write_authority(&s3_key, promoted_inode_id, &trace_id)
+                            .await
+                        {
+                            Ok(authority) => authority,
+                            Err(_) => return Err(prepare_error),
+                        };
+                        if authority.layout.blob_guid().ok() != Some(blob_guid)
+                            || authority.layout.blob_version != base_version
+                            || authority.layout.data_write_token != base_token
+                        {
+                            return Err(FsError::CasConflict);
+                        }
+
+                        promoted_inode_id = authority.inode_id;
+                        promoted_record_key = authority.inode_id.map(InodeRecord::key_for);
+                        promoted_record = authority.record.clone();
+                        promoted_record_raw =
+                            authority.record.as_ref().map(|_| authority.raw.clone());
+                        base_layout = Some(authority.layout.clone());
+                        base_expected = Some(authority.raw.clone());
+
+                        if authority.layout.pending_data_write == Some(pending) {
+                            let now_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+                            if !authority.layout.has_live_data_write_lease(
+                                pending.version,
+                                pending.token,
+                                now_ms,
+                            ) {
+                                self.fence_and_clear_data_write(
+                                    &s3_key,
+                                    promoted_inode_id,
+                                    Some(pending),
+                                    &trace_id,
+                                )
+                                .await?;
+                                continue 'flush_attempt;
+                            }
+                            (pending.token, Some(authority.layout), authority.raw)
+                        } else {
+                            if authority.layout.pending_data_write.is_some() {
+                                return Err(FsError::Busy);
+                            }
+                            if attempt >= MAX_CAS_RETRIES {
+                                return Err(prepare_error);
+                            }
+                            continue 'flush_attempt;
+                        }
+                    }
                 }
-            }
-            if let Some(e) = flush_err {
-                // The guard restores the taken blocks on this return so a
-                // later flush can retry (CasConflict never reaches here).
-                return Err(e);
+            } else {
+                (1, None, Bytes::new())
+            };
+            let mut commit_pending = prepared_layout
+                .as_ref()
+                .and_then(|prepared| prepared.pending_data_write);
+            macro_rules! renew_lease {
+                () => {
+                    if let Some(pending) = commit_pending
+                        && let Some(authority) = self
+                            .renew_data_write_lease(
+                                &s3_key,
+                                promoted_inode_id,
+                                pending,
+                                DATA_WRITE_LEASE_MS,
+                                &trace_id,
+                            )
+                            .await?
+                    {
+                        promoted_inode_id = authority.inode_id;
+                        promoted_record_key = authority.inode_id.map(InodeRecord::key_for);
+                        promoted_record_raw =
+                            authority.record.as_ref().map(|_| authority.raw.clone());
+                        promoted_record = authority.record;
+                        commit_pending = authority.layout.pending_data_write;
+                        commit_expected = authority.raw;
+                        base_layout = Some(authority.layout.clone());
+                        prepared_layout = Some(authority.layout);
+                    }
+                };
             }
 
-            // Build + serialize the new layout at the bumped version.
+            let mut superseded_blocks = std::collections::BTreeSet::new();
+            let data_write_result = async {
+                for (b, st) in snap.blocks.iter() {
+                    renew_lease!();
+                    let BlockState::Rewrite(bytes) = st else {
+                        continue;
+                    };
+                    let body = if pad_blocks && bytes.len() < block_size {
+                        let mut buf = BytesMut::with_capacity(block_size);
+                        buf.extend_from_slice(bytes);
+                        buf.resize(block_size, 0);
+                        buf.freeze()
+                    } else {
+                        bytes.clone()
+                    };
+                    self.backend()
+                        .write_block(blob_guid, *b, body, new_version, write_token, &trace_id)
+                        .await?;
+                    superseded_blocks.insert(*b);
+                }
+
+                let committed_block_count = committed_size.div_ceil(bsz_u64) as u32;
+                let trim_lower =
+                    std::cmp::min(new_num_blocks, eof_low_watermark.unwrap_or(new_num_blocks));
+                let trim_upper = std::cmp::max(committed_block_count, trim_upper.unwrap_or(0));
+                let mut tombstones = std::collections::BTreeSet::new();
+                for block_number in trim_lower..trim_upper {
+                    if !matches!(snap.blocks.get(&block_number), Some(BlockState::Rewrite(_))) {
+                        tombstones.insert(block_number);
+                    }
+                }
+                for (block_number, state) in snap.blocks.iter() {
+                    if matches!(state, BlockState::Delete) {
+                        tombstones.insert(*block_number);
+                    }
+                }
+                for block_number in tombstones {
+                    renew_lease!();
+                    self.backend()
+                        .write_tombstone(
+                            blob_guid,
+                            block_number,
+                            new_version,
+                            write_token,
+                            &trace_id,
+                        )
+                        .await?;
+                    superseded_blocks.insert(block_number);
+                }
+
+                for block_number in snap.pending_reservations.iter() {
+                    renew_lease!();
+                    if snap.blocks.contains_key(block_number) {
+                        continue;
+                    }
+                    let block_start = *block_number as u64 * bsz_u64;
+                    let existing_data = if is_override && block_start < committed_size {
+                        let content_len =
+                            std::cmp::min(bsz_u64, committed_size - block_start) as usize;
+                        let committed_token = base_layout
+                            .as_ref()
+                            .map(|layout| layout.data_write_token)
+                            .unwrap_or(0);
+                        match self
+                            .backend()
+                            .read_block(
+                                blob_guid,
+                                base_version,
+                                committed_token,
+                                *block_number,
+                                content_len,
+                                &trace_id,
+                            )
+                            .await
+                        {
+                            Ok(_) => true,
+                            Err(FsError::DataVg(
+                                volume_group_proxy::DataVgError::BlockNotFound,
+                            ))
+                            | Err(FsError::Rpc(rpc_client_common::RpcError::NotFound)) => false,
+                            Err(e) => return Err(e),
+                        }
+                    } else {
+                        false
+                    };
+                    if existing_data {
+                        continue;
+                    }
+                    self.backend()
+                        .reserve_block(
+                            blob_guid,
+                            *block_number,
+                            block_size as u32,
+                            new_version,
+                            write_token,
+                            &trace_id,
+                        )
+                        .await?;
+                    superseded_blocks.insert(*block_number);
+                }
+                renew_lease!();
+                Ok::<(), FsError>(())
+            }
+            .await;
+            if let Err(error) = data_write_result {
+                if let Some(pending) = prepared_layout
+                    .as_ref()
+                    .and_then(|layout| layout.pending_data_write)
+                    && let Err(cleanup_error) = self
+                        .fence_and_clear_data_write(
+                            &s3_key,
+                            promoted_inode_id,
+                            Some(pending),
+                            &trace_id,
+                        )
+                        .await
+                {
+                    tracing::warn!(error = %cleanup_error, "prepared data write cleanup incomplete");
+                }
+                return Err(error);
+            }
+
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64;
-            // On the promoted (hardlink) path, carry the freshly-fetched
-            // record's posix forward, NOT the local snapshot taken before
-            // this flush: another alias may have chmod/chown'd the shared
-            // record between the snapshot and this CAS attempt, and a data
-            // write changes only size/blob_version (never posix), so the
-            // snapshot has nothing of ours to merge. Using it would undo a
-            // concurrent metadata change. The non-promoted path is
-            // single-writer-per-inode, so the local snapshot is correct.
             let effective_posix = if promoted_record.is_some() {
                 base_layout
                     .as_ref()
@@ -1668,216 +2369,311 @@ impl VfsCore {
             } else {
                 self.inodes.get(ino).map(|e| e.posix).unwrap_or_default()
             };
-            let layout = ObjectLayout {
-                version_id: ObjectLayout::gen_version_id(),
-                block_size: DEFAULT_BLOCK_SIZE,
-                timestamp,
-                blob_version: new_version,
-                data_write_token: 0,
-                next_data_write_token: 0,
-                pending_data_write: None,
-                state: ObjectState::Normal(ObjectMetaData {
-                    blob_guid,
-                    core_meta_data: ObjectCoreMetaData {
-                        size: file_size,
-                        etag: blob_guid.blob_id.simple().to_string(),
-                        headers: vec![],
-                        checksum: None,
-                        posix: Some(Box::new(effective_posix)),
-                    },
-                }),
-            };
-            // Choose the publish target. A promoted inode republishes its
-            // layout inside the shared InodeRecord at the `#hardlink/<id>`
-            // key, CAS'd on the current record bytes so a concurrent writer
-            // on another hardlink name (a different FUSE inode with its own
-            // write lock) loses the race and retries instead of clobbering.
-            // A normal file publishes the bare layout at its own s3_key.
-            let (publish_key, publish_bytes, publish_expected_old) = match &promoted_record {
-                Some(rec) => {
-                    let new_record = InodeRecord {
-                        layout: layout.clone(),
-                        nlink: rec.nlink,
-                        orphan_since: rec.orphan_since,
-                    };
-                    let new_bytes: Bytes =
-                        match to_bytes_in::<_, rkyv::rancor::Error>(&new_record, Vec::new()) {
-                            Ok(b) => b.into(),
-                            Err(e) => return Err(FsError::from(e)),
-                        };
-                    // Guard on the record as fetched (re-serialized); rkyv is
-                    // deterministic for these types.
-                    let old_bytes: Bytes =
-                        match to_bytes_in::<_, rkyv::rancor::Error>(rec, Vec::new()) {
-                            Ok(b) => b.into(),
-                            Err(e) => return Err(FsError::from(e)),
-                        };
-                    (
-                        promoted_record_key
-                            .clone()
-                            .expect("promoted_record implies a record key"),
-                        new_bytes,
-                        old_bytes,
-                    )
+            let next_state = ObjectState::Normal(ObjectMetaData {
+                blob_guid,
+                core_meta_data: ObjectCoreMetaData {
+                    size: file_size,
+                    etag: blob_guid.blob_id.simple().to_string(),
+                    headers: vec![],
+                    checksum: None,
+                    posix: Some(Box::new(effective_posix)),
+                },
+            });
+            let layout = match prepared_layout {
+                Some(mut prepared) => {
+                    let pending = prepared
+                        .pending_data_write
+                        .expect("prepared layout requires a data write lease");
+                    prepared.version_id = ObjectLayout::gen_version_id();
+                    prepared.block_size = DEFAULT_BLOCK_SIZE;
+                    prepared.timestamp = timestamp;
+                    prepared.state = next_state.clone();
+                    if let Err(error) = prepared.commit_data_write(
+                        new_version,
+                        write_token,
+                        pending.lease_id,
+                        timestamp,
+                    ) {
+                        if let Err(cleanup_error) = self
+                            .fence_and_clear_data_write(
+                                &s3_key,
+                                promoted_inode_id,
+                                Some(pending),
+                                &trace_id,
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %cleanup_error, "expired data write cleanup incomplete");
+                        }
+                        return Err(error.into());
+                    }
+                    prepared
                 }
-                None => {
-                    let layout_bytes: Bytes =
-                        match to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new()) {
-                            Ok(b) => b.into(),
-                            Err(e) => return Err(FsError::from(e)),
-                        };
-                    (s3_key.clone(), layout_bytes, expected_old)
-                }
+                None => ObjectLayout {
+                    version_id: ObjectLayout::gen_version_id(),
+                    block_size: DEFAULT_BLOCK_SIZE,
+                    timestamp,
+                    blob_version: new_version,
+                    data_write_token: write_token,
+                    next_data_write_token: write_token + 1,
+                    pending_data_write: None,
+                    state: next_state.clone(),
+                },
             };
 
-            let first_publish = promoted_record.is_none() && publish_expected_old.is_empty();
+            let first_publish = !is_override && promoted_record.is_none();
+            let publish_key = promoted_record_key
+                .clone()
+                .unwrap_or_else(|| s3_key.clone());
+            let mut commit_layout = layout;
+            let mut commit_record = promoted_record.clone();
+            let mut commit_guard = commit_expected;
+            let mut commit_attempt = 0u32;
+            loop {
+                commit_attempt += 1;
+                let publish_bytes: Bytes = match &commit_record {
+                    Some(record) => to_bytes_in::<_, rkyv::rancor::Error>(
+                        &InodeRecord {
+                            layout: commit_layout.clone(),
+                            nlink: record.nlink,
+                            orphan_since: record.orphan_since,
+                        },
+                        Vec::new(),
+                    )?
+                    .into(),
+                    None => {
+                        to_bytes_in::<_, rkyv::rancor::Error>(&commit_layout, Vec::new())?.into()
+                    }
+                };
 
-            // CAS-publish: only lands if NSS still holds `publish_expected_old`.
-            match self
-                .backend()
-                .put_inode_cas(
-                    &publish_key,
-                    publish_bytes.clone(),
-                    publish_expected_old,
-                    &trace_id,
-                )
-                .await
-            {
-                Ok(_prev) => {
-                    // EOF-trim: delete blocks in the union of the shrink
-                    // range and the committed range, excluding blocks a
-                    // Rewrite just wrote. Deleted at the bumped version so
-                    // the guard drops the now-orphaned blocks.
-                    let committed_bc = committed_size.div_ceil(bsz_u64) as u32;
-                    let lower =
-                        std::cmp::min(new_num_blocks, eof_low_watermark.unwrap_or(new_num_blocks));
-                    let upper = std::cmp::max(committed_bc, trim_upper.unwrap_or(0));
-                    // Blind-delete the trim range. Deleting a hole is now an
-                    // idempotent no-op at the DataVgProxy layer (a delete that
-                    // hits RpcError::NotFound is treated as success, not a
-                    // circuit-breaker failure), so sparse holes in [lower, upper)
-                    // no longer trip the per-node breaker.
-                    for b in lower..upper {
-                        if matches!(snap.blocks.get(&b), Some(BlockState::Rewrite(_))) {
-                            continue;
-                        }
-                        self.backend()
-                            .delete_block(blob_guid, b, new_version, &trace_id)
-                            .await;
+                match self
+                    .backend()
+                    .put_inode_cas(&publish_key, publish_bytes.clone(), commit_guard, &trace_id)
+                    .await
+                {
+                    Ok(_) => {
+                        snap.armed = false;
+                        break 'flush_attempt (commit_layout, committed_size, superseded_blocks);
                     }
-                    // Replay PUNCH_HOLE intents.
-                    for (b, st) in snap.blocks.iter() {
-                        if matches!(st, BlockState::Delete) {
-                            self.backend()
-                                .delete_block(blob_guid, *b, new_version, &trace_id)
-                                .await;
-                        }
-                    }
-                    // Reserve fallocate-claimed blocks not superseded by a
-                    // Rewrite/Delete this flush (single-op; EC is a no-op).
-                    for b in snap.pending_reservations.iter() {
-                        if snap.blocks.contains_key(b) {
-                            continue;
-                        }
-                        let _ = self
+                    Err(FsError::CasConflict) if first_publish => {
+                        match self
                             .backend()
-                            .reserve_block(blob_guid, *b, block_size as u32, new_version, &trace_id)
-                            .await;
-                    }
-                    // Publish landed: disarm the restore guard so the taken
-                    // snapshot is discarded instead of re-marking the handle
-                    // dirty.
-                    snap.armed = false;
-                    break (layout, committed_size);
-                }
-                Err(FsError::CasConflict) if first_publish => {
-                    // A first publish is a create, not an overwrite. If the
-                    // CAS reply was lost and an internal retry saw the row
-                    // present, the stored bytes match exactly and the publish
-                    // is idempotently complete. Otherwise another creator won
-                    // the name and retrying as an override would clobber it.
-                    match self.backend().get_inode(&publish_key, &trace_id).await {
-                        Ok(cur) => {
-                            let cur_bytes: Bytes =
-                                match to_bytes_in::<_, rkyv::rancor::Error>(&cur, Vec::new()) {
-                                    Ok(b) => b.into(),
-                                    Err(e) => return Err(FsError::from(e)),
-                                };
-                            if cur_bytes == publish_bytes {
+                            .get_inode_with_bytes(&publish_key, &trace_id)
+                            .await
+                        {
+                            Ok((_, current_bytes)) if current_bytes == publish_bytes => {
                                 snap.armed = false;
-                                break (layout, committed_size);
+                                break 'flush_attempt (
+                                    commit_layout,
+                                    committed_size,
+                                    superseded_blocks,
+                                );
+                            }
+                            Ok(_) | Err(FsError::NotFound) => return Err(FsError::CasConflict),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Err(FsError::CasConflict) if commit_attempt < MAX_CAS_RETRIES => {
+                        let (current, current_record, current_raw) =
+                            if let Some(id) = promoted_inode_id {
+                                let (record, raw) = self
+                                    .backend()
+                                    .get_inode_record_with_bytes(id, &trace_id)
+                                    .await?;
+                                (record.layout.clone(), Some(record), raw)
+                            } else {
+                                let (current, raw) = self
+                                    .backend()
+                                    .get_inode_with_bytes(&s3_key, &trace_id)
+                                    .await?;
+                                (current, None, raw)
+                            };
+                        if current.blob_guid().ok() == Some(blob_guid)
+                            && current.blob_version == new_version
+                            && current.data_write_token == write_token
+                            && current.pending_data_write.is_none()
+                        {
+                            snap.armed = false;
+                            break 'flush_attempt (current, committed_size, superseded_blocks);
+                        }
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+                        if current.blob_guid().ok() != Some(blob_guid)
+                            || current.blob_version != base_version
+                            || current.data_write_token != base_token
+                            || current.pending_data_write != commit_pending
+                            || !current.has_live_data_write_lease(new_version, write_token, now_ms)
+                        {
+                            if let Some(pending) = commit_pending {
+                                match self
+                                    .resolve_or_abort_data_write(
+                                        &s3_key,
+                                        promoted_inode_id,
+                                        blob_guid,
+                                        pending,
+                                        &trace_id,
+                                    )
+                                    .await
+                                {
+                                    Ok(Some(committed)) => {
+                                        snap.armed = false;
+                                        break 'flush_attempt (
+                                            committed,
+                                            committed_size,
+                                            superseded_blocks,
+                                        );
+                                    }
+                                    Ok(None) => {}
+                                    Err(cleanup_error) => {
+                                        tracing::warn!(error = %cleanup_error, "data write cleanup incomplete");
+                                    }
+                                }
                             }
                             return Err(FsError::CasConflict);
                         }
-                        Err(FsError::NotFound) => return Err(FsError::CasConflict),
-                        Err(e) => return Err(e),
-                    }
-                }
-                Err(FsError::CasConflict) => {
-                    if attempt >= MAX_CAS_RETRIES {
-                        tracing::warn!(
-                            key = %publish_key,
-                            "flush_write_buffer: CAS still conflicting after retries"
-                        );
-                        // The guard restores blocks so a later flush retries.
-                        return Err(FsError::CasConflict);
-                    }
-                    // Re-fetch the base for the next attempt: the shared
-                    // record for a promoted inode, else the s3_key layout.
-                    if let Some(id) = promoted_inode_id {
-                        match self.backend().get_inode_record(id, &trace_id).await {
-                            Ok(rec) => {
-                                base_layout = Some(rec.layout.clone());
-                                promoted_record = Some(rec);
-                            }
-                            Err(e) => return Err(e),
+
+                        let current_pending = current
+                            .pending_data_write
+                            .expect("live data write lease was checked");
+                        let mut rebased = current;
+                        let mut rebased_state = next_state.clone();
+                        if let ObjectState::Normal(metadata) = &mut rebased_state {
+                            metadata.core_meta_data.posix =
+                                Some(Box::new(crate::inode::layout_posix(&rebased)));
                         }
-                    } else {
-                        match self.backend().get_inode(&s3_key, &trace_id).await {
-                            Ok(cur) => {
-                                if let ObjectState::Indirect(redirect) = &cur.state {
-                                    // The file was promoted to a hardlink
-                                    // concurrently (another client/instance)
-                                    // since we seeded from a cached normal
-                                    // layout. Switch to the record path so we
-                                    // publish into the shared record instead
-                                    // of clobbering the redirect with a normal
-                                    // layout.
-                                    let id = redirect.inode_id;
-                                    match self.backend().get_inode_record(id, &trace_id).await {
-                                        Ok(rec) => {
-                                            base_layout = Some(rec.layout.clone());
-                                            promoted_record = Some(rec);
-                                            promoted_inode_id = Some(id);
-                                            promoted_record_key = Some(InodeRecord::key_for(id));
-                                        }
-                                        Err(e) => return Err(e),
-                                    }
-                                } else {
-                                    base_layout = Some(cur);
+                        rebased.version_id = ObjectLayout::gen_version_id();
+                        rebased.block_size = DEFAULT_BLOCK_SIZE;
+                        rebased.timestamp = now_ms;
+                        rebased.state = rebased_state;
+                        if let Err(error) = rebased.commit_data_write(
+                            new_version,
+                            write_token,
+                            current_pending.lease_id,
+                            now_ms,
+                        ) {
+                            if let Err(cleanup_error) = self
+                                .fence_and_clear_data_write(
+                                    &s3_key,
+                                    promoted_inode_id,
+                                    Some(current_pending),
+                                    &trace_id,
+                                )
+                                .await
+                            {
+                                tracing::warn!(error = %cleanup_error, "expired data write cleanup incomplete");
+                            }
+                            return Err(error.into());
+                        }
+                        commit_layout = rebased;
+                        commit_record = current_record;
+                        commit_guard = current_raw;
+                    }
+                    Err(FsError::CasConflict) => {
+                        if let Some(pending) = commit_pending {
+                            match self
+                                .resolve_or_abort_data_write(
+                                    &s3_key,
+                                    promoted_inode_id,
+                                    blob_guid,
+                                    pending,
+                                    &trace_id,
+                                )
+                                .await
+                            {
+                                Ok(Some(committed)) => {
+                                    snap.armed = false;
+                                    break 'flush_attempt (
+                                        committed,
+                                        committed_size,
+                                        superseded_blocks,
+                                    );
+                                }
+                                Ok(None) => {}
+                                Err(cleanup_error) => {
+                                    tracing::warn!(error = %cleanup_error, "data write cleanup incomplete");
                                 }
                             }
-                            Err(FsError::NotFound) => base_layout = None,
-                            Err(e) => return Err(e),
                         }
+                        return Err(FsError::CasConflict);
                     }
-                    continue;
+                    Err(error) => {
+                        if let Some(pending) = commit_pending {
+                            match self
+                                .resolve_or_abort_data_write(
+                                    &s3_key,
+                                    promoted_inode_id,
+                                    blob_guid,
+                                    pending,
+                                    &trace_id,
+                                )
+                                .await
+                            {
+                                Ok(Some(committed)) => {
+                                    snap.armed = false;
+                                    break 'flush_attempt (
+                                        committed,
+                                        committed_size,
+                                        superseded_blocks,
+                                    );
+                                }
+                                Ok(None) => {}
+                                Err(cleanup_error) => {
+                                    tracing::warn!(error = %cleanup_error, "data write cleanup incomplete");
+                                }
+                            }
+                        }
+                        return Err(error);
+                    }
                 }
-                Err(e) => return Err(e),
             }
         };
 
-        // Update file handle: install the new layout (next CAS guard),
-        // clear dirty/size_changed, reset shrink state, and point the buffer
-        // at the published blob_guid for subsequent lazy loads.
-        if let Some(mut handle) = self.file_handles.get_mut(&fh_id) {
-            handle.layout = Some(final_layout.clone());
-            if let Some(ref mut wb) = handle.write_buf {
-                wb.dirty = false;
-                wb.size_changed = false;
-                wb.eof_low_watermark = None;
-                wb.trim_upper = None;
-                wb.existing_blob_guid = final_layout.blob_guid().ok();
+        // Advance local readers of this inode or hardlink-shared blob to the
+        // committed ceiling. Leave a concurrent dirty hardlink writer on its
+        // original snapshot so its prepare CAS detects the conflict.
+        let final_blob_guid = final_layout.blob_guid().ok();
+        if final_layout.blob_version > 1
+            && let Some(blob_guid) = final_blob_guid
+            && !superseded_blocks.is_empty()
+            && let Err(error) = self.backend().enqueue_superseded_generation_gc(
+                blob_guid,
+                superseded_blocks.into_iter().collect(),
+                final_layout.blob_version,
+                trace_id,
+            )
+        {
+            tracing::warn!(%blob_guid, error = %error, "failed to enqueue generation GC");
+        }
+        for mut entry in self.file_handles.iter_mut() {
+            let same_blob = final_blob_guid.is_some()
+                && entry
+                    .layout
+                    .as_ref()
+                    .and_then(|layout| layout.blob_guid().ok())
+                    == final_blob_guid;
+            if entry.ino != ino && !same_blob {
+                continue;
+            }
+            if *entry.key() != fh_id
+                && entry
+                    .write_buf
+                    .as_ref()
+                    .is_some_and(|write_buf| write_buf.dirty)
+            {
+                continue;
+            }
+            entry.layout = Some(final_layout.clone());
+            entry.authority_checked_at = Some(Instant::now());
+            if let Some(write_buf) = &mut entry.write_buf {
+                write_buf.file_size = file_size;
+                write_buf.block_size = final_layout.block_size;
+                write_buf.dirty = false;
+                write_buf.size_changed = false;
+                write_buf.eof_low_watermark = None;
+                write_buf.trim_upper = None;
+                write_buf.existing_blob_guid = final_blob_guid;
             }
         }
 
@@ -2026,35 +2822,6 @@ impl VfsCore {
                         }
                     }
                 }
-            }
-        }
-
-        // Publish the authoritative blob-geometry sentinel so a peer instance
-        // serving vfs_getattr from a stale cached layout still observes the
-        // latest cross-instance size override (the inode size+blob_version it
-        // cached may lag this flush). Initial creates use a fresh blob_guid
-        // and publish exact size in NSS, so only override versions need this
-        // extra BSS write.
-        if final_layout.blob_version > 1
-            && let Ok(geom_guid) = final_layout.blob_guid()
-        {
-            let new_bc = file_size.div_ceil(block_size as u64) as u32;
-            let info = BlobInfo {
-                total_size: file_size,
-                block_count: new_bc,
-                blob_version: final_layout.blob_version,
-            };
-            if let Err(e) = self
-                .backend()
-                .write_blob_info(geom_guid, info, final_layout.blob_version, &trace_id)
-                .await
-            {
-                tracing::warn!(
-                    %geom_guid,
-                    blob_version = final_layout.blob_version,
-                    error = %e,
-                    "write_blob_info (geometry sentinel) failed; cross-instance size may lag until next flush"
-                );
             }
         }
 
@@ -2378,14 +3145,10 @@ impl VfsCore {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let mut record = self.backend().get_inode_record(inode_id, trace_id).await?;
-            // Re-serialize the fetched record as the CAS guard. rkyv output is
-            // deterministic for these map-free layout types, and the override
-            // flush's own CAS already relies on exactly that, so this matches
-            // the stored bytes without a separate raw-bytes fetch.
-            let old_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&record, Vec::new())
-                .map_err(FsError::from)?
-                .into();
+            let (mut record, old_bytes) = self
+                .backend()
+                .get_inode_record_with_bytes(inode_id, trace_id)
+                .await?;
             // A fallible mutate lets the caller abort against the freshly
             // fetched record (e.g. `link` refusing to revive a record whose
             // last link is already gone) without publishing anything.
@@ -2561,7 +3324,10 @@ impl VfsCore {
             let mut attempt = 0;
             loop {
                 attempt += 1;
-                let src_layout = self.backend().get_inode(&src_key, &trace_id).await?;
+                let (src_layout, src_bytes) = self
+                    .backend()
+                    .get_inode_with_bytes(&src_key, &trace_id)
+                    .await?;
                 match &src_layout.state {
                     ObjectState::Indirect(redirect) => {
                         let id = redirect.inode_id;
@@ -2618,10 +3384,6 @@ impl VfsCore {
                         // delete here: loop and re-read. The next iteration
                         // recovers (Indirect == new_id), joins (Indirect !=
                         // new_id), or re-promotes (still Normal).
-                        let src_bytes: Bytes =
-                            to_bytes_in::<_, rkyv::rancor::Error>(&src_layout, Vec::new())
-                                .map_err(FsError::from)?
-                                .into();
                         self.backend()
                             .put_inode_record(new_id, &record, &trace_id)
                             .await?;
@@ -3058,47 +3820,6 @@ impl VfsCore {
                         }
                     }
                     let mut attr = self.make_file_attr(inode, &layout)?;
-                    // Cross-instance size authority: this entry's cached layout
-                    // (size + blob_version) may lag a peer instance's most
-                    // recent overwrite, so make_file_attr's size can be stale.
-                    // Re-read the authoritative geometry sentinel from BSS via a
-                    // max-version quorum read, which reflects the latest
-                    // published override regardless of our cached layout
-                    // version. Skips symlinks/special files (they report their
-                    // own size and have no data blob). getattr is gated by the
-                    // 1s FUSE attr TTL, so this BSS read happens at most about
-                    // once/sec/inode: a bounded, throttled extra read.
-                    if !layout.is_symlink()
-                        && layout.special().is_none()
-                        && let Ok(geom_guid) = layout.blob_guid()
-                    {
-                        let trace_id = TraceId::new();
-                        match self.backend().get_blob_info(geom_guid, &trace_id).await {
-                            // Only let the sentinel move size FORWARD: apply it
-                            // when it is at least as new as our cached layout
-                            // (vfs_lookup refreshes the cached layout from NSS,
-                            // so a stale sentinel must never downgrade a fresh
-                            // size back to an older value).
-                            Ok(Some(info)) if info.blob_version >= layout.blob_version => {
-                                attr.size = info.total_size;
-                                // make_file_attr derives st_blocks from size
-                                // (512-byte units) for regular files; keep it
-                                // consistent with the refreshed size.
-                                attr.blocks = info.total_size.div_ceil(512);
-                            }
-                            // Sentinel older than our cached layout: keep the
-                            // (fresher) cached-layout size.
-                            Ok(Some(_)) => {}
-                            // No sentinel yet: keep the cached-layout size.
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "getattr get_blob_info failed; using cached size"
-                                );
-                            }
-                        }
-                    }
                     if name_removed {
                         // POSIX: an open-but-unlinked file with no
                         // remaining links reports nlink=0 (unlink/14.t).
@@ -3155,8 +3876,8 @@ impl VfsCore {
     /// keeps current under the single-writer lock). Used on the setattr
     /// path (both the permission precheck and the post-mutation reply),
     /// so a `chmod`/`chown`/`utimensat` does not pay the two
-    /// cross-instance coherency round-trips `vfs_getattr` makes
-    /// (`get_inode` on a cold layout, `get_blob_info` size sentinel).
+    /// cross-instance coherency round-trip `vfs_getattr` makes
+    /// (`get_inode` on a cold layout).
     /// This is the dominant per-file cost on create-heavy workloads
     /// (tar -xf issues one `utimensat` per file). Cross-instance
     /// freshness is still provided by the 1s FUSE attr TTL, after which
@@ -3268,6 +3989,7 @@ impl VfsCore {
             committed_size,
             existing_blob_guid,
             committed_blob_version,
+            committed_data_write_token,
             tail_zero_target,
         ) = {
             let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
@@ -3284,6 +4006,11 @@ impl VfsCore {
             let existing_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
             let committed_blob_version =
                 handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
+            let committed_data_write_token = handle
+                .layout
+                .as_ref()
+                .map(|l| l.data_write_token)
+                .unwrap_or(0);
             let wb = handle.write_buf.get_or_insert_with(|| {
                 WriteBuffer::new(existing_blob_guid, committed_size, block_size)
             });
@@ -3326,6 +4053,7 @@ impl VfsCore {
                 committed_size,
                 existing_blob_guid,
                 committed_blob_version,
+                committed_data_write_token,
                 tail_zero_target,
             )
         };
@@ -3347,6 +4075,7 @@ impl VfsCore {
                     self.lazy_load_block_for_flush(
                         existing_blob_guid,
                         committed_blob_version,
+                        committed_data_write_token,
                         last,
                         committed_content_len,
                         bsz_usize,
@@ -4157,6 +4886,7 @@ impl VfsCore {
                 layout,
                 write_buf,
                 backing_id: None,
+                authority_checked_at: None,
             },
         );
 
@@ -4184,6 +4914,7 @@ impl VfsCore {
             existing_blob_guid,
             committed_size,
             committed_blob_version,
+            committed_data_write_token,
             blocks_to_load,
         ) = {
             let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
@@ -4200,6 +4931,11 @@ impl VfsCore {
             let layout_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
             let committed_blob_version =
                 handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
+            let committed_data_write_token = handle
+                .layout
+                .as_ref()
+                .map(|l| l.data_write_token)
+                .unwrap_or(0);
             let wb = handle
                 .write_buf
                 .get_or_insert_with(|| WriteBuffer::new(layout_blob_guid, committed_size, bsize));
@@ -4230,6 +4966,7 @@ impl VfsCore {
                 wb.existing_blob_guid,
                 committed_size,
                 committed_blob_version,
+                committed_data_write_token,
                 to_load,
             )
         };
@@ -4249,6 +4986,7 @@ impl VfsCore {
                 .lazy_load_block_for_flush(
                     existing_blob_guid,
                     committed_blob_version,
+                    committed_data_write_token,
                     b,
                     committed_content_len,
                     block_size as usize,
@@ -4341,7 +5079,14 @@ impl VfsCore {
 
         // Phase 1: snapshot enough state to compute the touched range
         // and decide which blocks need a lazy load for edge zeroing.
-        let (block_size, existing_blob_guid, committed_size, committed_blob_version, edge_loads) = {
+        let (
+            block_size,
+            existing_blob_guid,
+            committed_size,
+            committed_blob_version,
+            committed_data_write_token,
+            edge_loads,
+        ) = {
             let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
             let block_size = handle
                 .layout
@@ -4356,6 +5101,11 @@ impl VfsCore {
             let layout_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
             let committed_blob_version =
                 handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
+            let committed_data_write_token = handle
+                .layout
+                .as_ref()
+                .map(|l| l.data_write_token)
+                .unwrap_or(0);
             let wb = handle.write_buf.get_or_insert_with(|| {
                 WriteBuffer::new(layout_blob_guid, committed_size, block_size)
             });
@@ -4411,6 +5161,7 @@ impl VfsCore {
                 wb.existing_blob_guid,
                 committed_size,
                 committed_blob_version,
+                committed_data_write_token,
                 edge_loads,
             )
         };
@@ -4431,6 +5182,7 @@ impl VfsCore {
                     .lazy_load_block_for_flush(
                         existing_blob_guid,
                         committed_blob_version,
+                        committed_data_write_token,
                         b,
                         committed_content_len,
                         block_size as usize,
@@ -4556,122 +5308,182 @@ impl VfsCore {
         if !seek_data && !seek_hole {
             return Err(FsError::InvalidArg);
         }
-
-        // Snapshot the bits we need without holding the guard across awaits.
-        let (
-            file_size,
-            block_size,
-            probe_blob_guid,
-            blocks,
-            pending_reservations,
-            eof_low_watermark,
-        ) = {
-            let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
-            let layout_block_size = handle
-                .layout
-                .as_ref()
-                .map(|l| l.block_size)
-                .unwrap_or(DEFAULT_BLOCK_SIZE);
-            let layout_size = handle
-                .layout
-                .as_ref()
-                .and_then(|l| l.size().ok())
-                .unwrap_or(0);
-            let layout_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
-            if let Some(ref wb) = handle.write_buf {
-                (
-                    wb.file_size,
-                    wb.block_size,
-                    wb.existing_blob_guid,
-                    wb.blocks.clone(),
-                    wb.pending_reservations.clone(),
-                    wb.eof_low_watermark,
-                )
-            } else {
-                (
-                    layout_size,
-                    layout_block_size,
-                    layout_blob_guid,
-                    std::collections::BTreeMap::new(),
-                    std::collections::BTreeSet::new(),
-                    None,
-                )
-            }
-        };
-
-        // Match Linux semantics: offset >= file_size returns ENXIO for both
-        // SEEK_HOLE and SEEK_DATA.
-        if offset >= file_size {
-            return Err(FsError::NoData);
-        }
-
-        let bsz_u64 = block_size as u64;
-        let first_block = (offset / bsz_u64) as u32;
-        let last_block_excl = file_size.div_ceil(bsz_u64) as u32;
-
-        // Per-block classifier. `Some(true)` -> data, `Some(false)` -> hole,
-        // `None` -> not buffered, fall through to the BSS probe.
-        let buffered_kind = |b: u32| -> Option<bool> {
-            match blocks.get(&b) {
-                Some(BlockState::Rewrite(_)) => Some(true),
-                Some(BlockState::Delete) => Some(false),
-                None => {
-                    if pending_reservations.contains(&b) {
-                        return Some(true);
-                    }
-                    if eof_low_watermark.is_some_and(|low| b >= low) {
-                        return Some(false);
-                    }
-                    None
-                }
-            }
-        };
-
-        // BSS-side classification: one ListBlobBlocks call covers the whole
-        // walk range. Reserved entries count as data (Linux SEEK_DATA
-        // convention), Data is data, anything not returned is a hole.
         let trace_id = TraceId::new();
-        let block_map: std::collections::BTreeSet<u32> = match probe_blob_guid {
-            Some(guid) => {
-                let count = last_block_excl.saturating_sub(first_block);
-                if count == 0 {
-                    std::collections::BTreeSet::new()
+        for _ in 0..5 {
+            let authoritative_layout = self
+                .authoritative_layout_for_handle(fh, Some(TTL), &trace_id)
+                .await?;
+
+            // Snapshot the bits we need without holding the guard across awaits.
+            let (
+                file_size,
+                block_size,
+                probe_blob_guid,
+                blocks,
+                pending_reservations,
+                eof_low_watermark,
+                committed_version,
+                committed_token,
+            ) = {
+                let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
+                if handle
+                    .write_buf
+                    .as_ref()
+                    .is_some_and(|write_buf| write_buf.dirty)
+                    && let (Some(cached), Some(authoritative)) =
+                        (handle.layout.as_ref(), authoritative_layout.as_ref())
+                    && !Self::same_committed_data_generation(cached, authoritative)
+                {
+                    return Err(FsError::CasConflict);
+                }
+                let committed_layout = authoritative_layout.as_ref().or(handle.layout.as_ref());
+                let layout_block_size = committed_layout
+                    .map(|l| l.block_size)
+                    .unwrap_or(DEFAULT_BLOCK_SIZE);
+                let layout_size = committed_layout.and_then(|l| l.size().ok()).unwrap_or(0);
+                let layout_blob_guid = committed_layout.and_then(|l| l.blob_guid().ok());
+                let committed_version = committed_layout
+                    .map(|layout| layout.blob_version)
+                    .unwrap_or(0);
+                let committed_token = committed_layout
+                    .map(|layout| layout.data_write_token)
+                    .unwrap_or(0);
+                if let Some(ref wb) = handle.write_buf {
+                    (
+                        wb.file_size,
+                        wb.block_size,
+                        wb.existing_blob_guid,
+                        wb.blocks.clone(),
+                        wb.pending_reservations.clone(),
+                        wb.eof_low_watermark,
+                        committed_version,
+                        committed_token,
+                    )
                 } else {
-                    let entries = self
-                        .backend()
-                        .list_blob_blocks(guid, first_block, count, &trace_id)
-                        .await?;
-                    entries.into_iter().map(|e| e.block_number).collect()
+                    (
+                        layout_size,
+                        layout_block_size,
+                        layout_blob_guid,
+                        std::collections::BTreeMap::new(),
+                        std::collections::BTreeSet::new(),
+                        None,
+                        committed_version,
+                        committed_token,
+                    )
+                }
+            };
+
+            // Match Linux semantics: offset >= file_size returns ENXIO for both
+            // SEEK_HOLE and SEEK_DATA.
+            if offset >= file_size {
+                return Err(FsError::NoData);
+            }
+
+            let bsz_u64 = block_size as u64;
+            let first_block = (offset / bsz_u64) as u32;
+            let last_block_excl = file_size.div_ceil(bsz_u64) as u32;
+
+            // Per-block classifier. `Some(true)` -> data, `Some(false)` -> hole,
+            // `None` -> not buffered, fall through to the BSS probe.
+            let buffered_kind = |b: u32| -> Option<bool> {
+                match blocks.get(&b) {
+                    Some(BlockState::Rewrite(_)) => Some(true),
+                    Some(BlockState::Delete) => Some(false),
+                    None => {
+                        if pending_reservations.contains(&b) {
+                            return Some(true);
+                        }
+                        if eof_low_watermark.is_some_and(|low| b >= low) {
+                            return Some(false);
+                        }
+                        None
+                    }
+                }
+            };
+
+            // BSS-side classification: one ListBlobBlocks call covers the whole
+            // walk range. Reserved entries count as data (Linux SEEK_DATA
+            // convention), Data is data, anything not returned is a hole.
+            let block_map: std::collections::BTreeSet<u32> = match probe_blob_guid {
+                Some(guid) => {
+                    let count = last_block_excl.saturating_sub(first_block);
+                    if count == 0 {
+                        std::collections::BTreeSet::new()
+                    } else {
+                        match self
+                            .backend()
+                            .list_blob_blocks_at_or_before(
+                                guid,
+                                first_block,
+                                count,
+                                committed_version,
+                                committed_token,
+                                &trace_id,
+                            )
+                            .await
+                        {
+                            Ok(blocks) => blocks,
+                            Err(error) => {
+                                let latest_layout = self
+                                    .authoritative_layout_for_handle(fh, None, &trace_id)
+                                    .await?;
+                                let authority_changed =
+                                    match (&authoritative_layout, &latest_layout) {
+                                        (Some(before), Some(after)) => {
+                                            !Self::same_committed_data_generation(before, after)
+                                        }
+                                        (None, None) => false,
+                                        _ => true,
+                                    };
+                                if authority_changed {
+                                    continue;
+                                }
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+                None => std::collections::BTreeSet::new(),
+            };
+            let latest_layout = self
+                .authoritative_layout_for_handle(fh, Some(TTL), &trace_id)
+                .await?;
+            let authority_changed = match (&authoritative_layout, &latest_layout) {
+                (Some(before), Some(after)) => !Self::same_committed_data_generation(before, after),
+                (None, None) => false,
+                _ => true,
+            };
+            if authority_changed {
+                continue;
+            }
+
+            for b in first_block..last_block_excl {
+                let is_data = match buffered_kind(b) {
+                    Some(d) => d,
+                    None => block_map.contains(&b),
+                };
+                let result_offset = if b == first_block {
+                    offset
+                } else {
+                    b as u64 * bsz_u64
+                };
+                if seek_data && is_data {
+                    return Ok(result_offset);
+                }
+                if seek_hole && !is_data {
+                    return Ok(result_offset);
                 }
             }
-            None => std::collections::BTreeSet::new(),
-        };
 
-        for b in first_block..last_block_excl {
-            let is_data = match buffered_kind(b) {
-                Some(d) => d,
-                None => block_map.contains(&b),
-            };
-            let result_offset = if b == first_block {
-                offset
+            if seek_hole {
+                // No further data in the file; SEEK_HOLE returns the EOF.
+                return Ok(file_size);
             } else {
-                b as u64 * bsz_u64
-            };
-            if seek_data && is_data {
-                return Ok(result_offset);
-            }
-            if seek_hole && !is_data {
-                return Ok(result_offset);
+                // SEEK_DATA hit no data: ENXIO.
+                return Err(FsError::NoData);
             }
         }
-
-        if seek_hole {
-            // No further data in the file; SEEK_HOLE returns the EOF.
-            Ok(file_size)
-        } else {
-            // SEEK_DATA hit no data: ENXIO.
-            Err(FsError::NoData)
-        }
+        Err(FsError::CasConflict)
     }
 
     pub async fn vfs_flush(&self, fh: FileHandleId) -> Result<(), FsError> {
@@ -5136,10 +5948,12 @@ impl VfsCore {
                 let trace_id = TraceId::new();
                 if let Ok(old_layout) =
                     rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
-                {
-                    self.backend()
+                    && let Err(error) = self
+                        .backend()
                         .delete_blob_blocks(&old_layout, &trace_id)
-                        .await;
+                        .await
+                {
+                    tracing::warn!(error = %error, "deferred blob cleanup failed");
                 }
             } else {
                 // Still more handles open, re-insert
@@ -5203,6 +6017,7 @@ impl VfsCore {
                     wb
                 }),
                 backing_id: None,
+                authority_checked_at: None,
             },
         );
 
@@ -5397,17 +6212,29 @@ impl VfsCore {
         };
         match &old_layout.state {
             ObjectState::Normal(_) => {
-                self.backend()
+                if let Err(error) = self
+                    .backend()
                     .delete_blob_blocks(&old_layout, trace_id)
-                    .await;
+                    .await
+                {
+                    tracing::warn!(error = %error, "blob cleanup failed");
+                }
             }
             ObjectState::Mpu(MpuState::Completed(_)) => {
                 if let Ok(parts) = self.backend().list_mpu_parts(key, trace_id).await {
                     for (part_key, part_layout) in &parts {
-                        self.backend()
+                        match self
+                            .backend()
                             .delete_blob_blocks(part_layout, trace_id)
-                            .await;
-                        let _ = self.backend().delete_inode(part_key, trace_id).await;
+                            .await
+                        {
+                            Ok(()) => {
+                                let _ = self.backend().delete_inode(part_key, trace_id).await;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%part_key, error = %error, "MPU part cleanup failed");
+                            }
+                        }
                     }
                 }
             }
@@ -5447,10 +6274,21 @@ impl VfsCore {
                         if let Ok(fresh) = self.backend().get_inode_record(inode_id, trace_id).await
                             && fresh.nlink == 0
                         {
-                            self.backend()
+                            match self
+                                .backend()
                                 .delete_blob_blocks(&fresh.layout, trace_id)
-                                .await;
-                            let _ = self.backend().delete_inode_record(inode_id, trace_id).await;
+                                .await
+                            {
+                                Ok(()) => {
+                                    let _ = self
+                                        .backend()
+                                        .delete_inode_record(inode_id, trace_id)
+                                        .await;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%inode_id, error = %error, "hardlink blob cleanup failed");
+                                }
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -6133,28 +6971,24 @@ async fn spawn_prefetch_task(
         // If another path has already populated this block (e.g. a
         // racing read), the cache hit short-circuits the BSS round
         // trip.
-        if disk_cache
-            .get_block(blob_guid, block_num, block_content_len)
-            .await
-            .is_some()
+        let version_matches = layout.data_write_token == 0
+            || disk_cache.floor_version(blob_guid).await == Some(layout.blob_version);
+        if version_matches
+            && disk_cache
+                .get_block(blob_guid, block_num, block_content_len)
+                .await
+                .is_some()
         {
             continue;
         }
 
-        // Override (blob_version > 1) blocks are padded to block_size on
-        // disk; request the full block so the EC shard size matches, then
-        // truncate to the logical content length (mirrors read_block_cached).
-        let read_len = if layout.blob_version > 1 {
-            (DEFAULT_BLOCK_SIZE as usize).max(block_content_len)
-        } else {
-            block_content_len
-        };
         let (mut data, _checksum) = match backend
             .read_block(
                 blob_guid,
                 layout.blob_version,
+                layout.data_write_token,
                 block_num,
-                read_len,
+                block_content_len,
                 &trace_id,
             )
             .await
@@ -6463,8 +7297,8 @@ async fn publish_set_posix(
     }
     const MAX_CAS_RETRIES: u32 = 4;
     for _ in 0..MAX_CAS_RETRIES {
-        let cur = match backend.get_inode(key, trace_id).await {
-            Ok(l) => l,
+        let (cur, cur_bytes) = match backend.get_inode_with_bytes(key, trace_id).await {
+            Ok(value) => value,
             Err(FsError::NotFound) => return Ok(()),
             Err(e) => return Err(e),
         };
@@ -6474,9 +7308,6 @@ async fn publish_set_posix(
         if let ObjectState::Indirect(redirect) = &cur.state {
             return publish_set_posix_record(backend, redirect.inode_id, posix, trace_id).await;
         }
-        let cur_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&cur, Vec::new())
-            .map_err(FsError::from)?
-            .into();
         let new_layout = crate::inode::layout_with_posix(cur, *posix);
         let new_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&new_layout, Vec::new())
             .map_err(FsError::from)?
@@ -6503,14 +7334,14 @@ async fn publish_set_posix_record(
     const MAX_CAS_RETRIES: u32 = 4;
     let key = InodeRecord::key_for(inode_id);
     for _ in 0..MAX_CAS_RETRIES {
-        let mut record = match backend.get_inode_record(inode_id, trace_id).await {
-            Ok(record) => record,
+        let (mut record, old_bytes) = match backend
+            .get_inode_record_with_bytes(inode_id, trace_id)
+            .await
+        {
+            Ok(value) => value,
             Err(FsError::NotFound) => return Ok(()),
             Err(e) => return Err(e),
         };
-        let old_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&record, Vec::new())
-            .map_err(FsError::from)?
-            .into();
         record.layout = crate::inode::layout_with_posix(record.layout.clone(), *posix);
         let new_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&record, Vec::new())
             .map_err(FsError::from)?

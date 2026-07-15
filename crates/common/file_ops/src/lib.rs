@@ -51,6 +51,12 @@ pub struct ListInodesResult {
 }
 
 pub fn parse_get_inode(resp: GetInodeResponse) -> Result<ObjectLayout, NssError> {
+    parse_get_inode_with_bytes(resp).map(|(layout, _)| layout)
+}
+
+pub fn parse_get_inode_with_bytes(
+    resp: GetInodeResponse,
+) -> Result<(ObjectLayout, Bytes), NssError> {
     let object_bytes = match resp.result.unwrap() {
         get_inode_response::Result::Ok(res) => res,
         get_inode_response::Result::ErrNotFound(()) => {
@@ -65,8 +71,9 @@ pub fn parse_get_inode(resp: GetInodeResponse) -> Result<ObjectLayout, NssError>
         }
     };
 
-    rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&object_bytes)
-        .map_err(|e| NssError::Deserialization(e.to_string()))
+    let layout = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&object_bytes)
+        .map_err(|e| NssError::Deserialization(e.to_string()))?;
+    Ok((layout, object_bytes))
 }
 
 pub fn parse_list_inodes(resp: ListInodesResponse) -> Result<ListInodesResult, NssError> {
@@ -215,18 +222,4 @@ pub fn create_dir_marker_layout() -> ObjectLayout {
             },
         }),
     }
-}
-
-/// Enumerate (blob_guid, block_number) pairs that should be deleted for a given ObjectLayout.
-/// Returns an empty vec if the layout has no valid blob_guid or num_blocks.
-pub fn blob_blocks_to_delete(layout: &ObjectLayout) -> Vec<(data_types::DataBlobGuid, u32)> {
-    let blob_guid = match layout.blob_guid() {
-        Ok(g) => g,
-        Err(_) => return vec![],
-    };
-    let num_blocks = match layout.num_blocks() {
-        Ok(n) => n,
-        Err(_) => return vec![],
-    };
-    (0..num_blocks).map(|i| (blob_guid, i as u32)).collect()
 }
