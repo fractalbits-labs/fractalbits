@@ -101,6 +101,11 @@ pub enum RpcError {
     ChecksumMismatch,
     #[error("Version skipped")]
     VersionSkipped,
+    /// Write-once violation: a put addressed an existing versioned data key
+    /// with different bytes. The stored content is untouched; never retry
+    /// the same identity with these bytes.
+    #[error("Write-once key mismatch")]
+    Mismatch,
 }
 
 impl<T> From<tokio::sync::mpsc::error::SendError<T>> for RpcError {

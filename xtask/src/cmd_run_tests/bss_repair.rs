@@ -691,6 +691,7 @@ async fn read_blob_from_node(
         .get_data_blob(
             blob_guid,
             block_number,
+            1,
             &mut body,
             content_len,
             Some(Duration::from_secs(5)),
@@ -1378,6 +1379,7 @@ async fn test_ec_repair_reconstructs_missing_shards() -> TestResult {
             .get_data_blob(
                 blob_guid,
                 0,
+                1,
                 &mut shard_body,
                 shard_size,
                 Some(Duration::from_secs(5)),
@@ -1506,6 +1508,7 @@ async fn test_ec_repair_overwrites_corrupt_shard() -> TestResult {
         .get_data_blob(
             blob_guid,
             0,
+            1,
             &mut repaired_shard,
             shard_size,
             Some(Duration::from_secs(5)),

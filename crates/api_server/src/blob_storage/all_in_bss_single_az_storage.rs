@@ -83,7 +83,7 @@ impl AllInBssSingleAzStorage {
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         self.data_vg_proxy
-            .get_blob(blob_guid, block_number, content_len, body, trace_id)
+            .get_blob(blob_guid, block_number, 1, content_len, body, trace_id)
             .await?;
 
         histogram!("blob_size", "operation" => "get").record(body.len() as f64);

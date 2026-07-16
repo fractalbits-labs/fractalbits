@@ -61,6 +61,8 @@ pub async fn create_multipart_upload_handler(
         block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
         timestamp,
         blob_version: 1,
+        block_map: None,
+        pending_write: None,
         state: ObjectState::Mpu(MpuState::Uploading),
     };
     let object_layout_bytes: Bytes = to_bytes_in::<_, Error>(&object_layout, Vec::new())?.into();

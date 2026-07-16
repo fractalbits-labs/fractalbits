@@ -1,5 +1,6 @@
 mod api_key;
 mod blob_guid;
+pub mod block_map;
 mod bss_repair_report;
 mod bucket;
 pub mod ec_utils;

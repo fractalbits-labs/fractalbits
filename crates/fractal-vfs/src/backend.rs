@@ -3,9 +3,8 @@
 use bytes::Bytes;
 use data_types::{Bucket, DataBlobGuid, DataVgInfo, RoutingKey, TraceId};
 use file_ops::{
-    ListEntry, blob_blocks_to_delete, create_dir_marker_layout, mpu_get_part_prefix,
-    parse_delete_inode, parse_get_inode, parse_list_inodes, parse_mpu_parts, parse_put_inode,
-    parse_put_inode_cas,
+    ListEntry, create_dir_marker_layout, mpu_get_part_prefix, parse_delete_inode, parse_get_inode,
+    parse_list_inodes, parse_mpu_parts, parse_put_inode, parse_put_inode_cas,
 };
 use rpc_client_common::RpcError;
 use rpc_client_common::nss_rpc_retry;
@@ -18,38 +17,6 @@ use crate::config::Config;
 use crate::error::FsError;
 use data_types::object_layout::{InodeRecord, ObjectLayout};
 
-/// Per-blob geometry sentinel block index. u32::MAX is reserved and never a
-/// real data block (data blocks are [0, block_count)); list_blob_blocks only
-/// ever queries bounded [first, first+count) ranges so it never returns this.
-pub const GEOMETRY_SENTINEL_BLOCK: u32 = u32::MAX;
-
-/// Authoritative blob geometry, stored in the sentinel block via the normal
-/// KV/block path (no batch RPC). Fixed 20-byte little-endian layout.
-#[derive(Debug, Clone, Copy)]
-pub struct BlobInfo {
-    pub total_size: u64,
-    pub block_count: u32,
-    pub blob_version: u64,
-}
-impl BlobInfo {
-    pub fn encode(&self) -> [u8; 20] {
-        let mut out = [0u8; 20];
-        out[0..8].copy_from_slice(&self.total_size.to_le_bytes());
-        out[8..12].copy_from_slice(&self.block_count.to_le_bytes());
-        out[12..20].copy_from_slice(&self.blob_version.to_le_bytes());
-        out
-    }
-    pub fn decode(buf: &[u8]) -> Option<BlobInfo> {
-        if buf.len() < 20 {
-            return None;
-        }
-        Some(BlobInfo {
-            total_size: u64::from_le_bytes(buf[0..8].try_into().ok()?),
-            block_count: u32::from_le_bytes(buf[8..12].try_into().ok()?),
-            blob_version: u64::from_le_bytes(buf[12..20].try_into().ok()?),
-        })
-    }
-}
 /// Discovered configuration from RSS (shared across threads).
 pub struct BackendConfig {
     pub nss_address: String,
@@ -216,6 +183,33 @@ impl StorageBackend {
         Ok(parse_get_inode(resp)?)
     }
 
+    /// Fetch the raw bytes of an NSS record at `key` without decoding them
+    /// as an `ObjectLayout`. Used for side records in the NSS keyspace that
+    /// carry their own schema (`#bmap/...` block-map chunks).
+    pub async fn get_inode_raw(&self, key: &str, trace_id: &TraceId) -> Result<Bytes, FsError> {
+        let resp = nss_rpc_retry!(
+            self.nss_client.borrow(),
+            get_inode(
+                &self.root_blob_name,
+                key,
+                Some(self.config.rpc_request_timeout()),
+                trace_id
+            ),
+            self,
+            trace_id
+        )
+        .await?;
+        match resp.result {
+            Some(nss_codec::get_inode_response::Result::Ok(b)) => Ok(b),
+            Some(nss_codec::get_inode_response::Result::ErrNotFound(()))
+            | Some(nss_codec::get_inode_response::Result::ErrNoSuchRootBlob(())) => {
+                Err(FsError::NotFound)
+            }
+            Some(nss_codec::get_inode_response::Result::ErrOther(e)) => Err(FsError::Internal(e)),
+            None => Err(FsError::Internal("empty GetInodeResponse".into())),
+        }
+    }
+
     /// List inodes from NSS. Returns (key, Option<ObjectLayout>).
     /// Empty inode data means common prefix (directory).
     pub async fn list_inodes(
@@ -246,6 +240,45 @@ impl StorageBackend {
         Ok(parse_list_inodes(resp)?.entries)
     }
 
+    /// List only the KEYS under an NSS prefix, without decoding values as
+    /// `ObjectLayout` (side records like `#bmap/...` chunks carry their own
+    /// schema and would fail the typed list parse).
+    pub async fn list_inode_keys(
+        &self,
+        prefix: &str,
+        max_keys: u32,
+        trace_id: &TraceId,
+    ) -> Result<Vec<String>, FsError> {
+        let resp = nss_rpc_retry!(
+            self.nss_client.borrow(),
+            list_inodes(
+                &self.root_blob_name,
+                max_keys,
+                prefix,
+                "",
+                "",
+                true,
+                Some(self.config.rpc_request_timeout()),
+                trace_id
+            ),
+            self,
+            trace_id
+        )
+        .await?;
+        match resp.result {
+            Some(nss_codec::list_inodes_response::Result::Ok(res)) => Ok(res
+                .inodes
+                .into_iter()
+                .map(|i| i.key.trim_end_matches('\0').to_string())
+                .collect()),
+            Some(nss_codec::list_inodes_response::Result::ErrNoSuchRootBlob(())) => {
+                Err(FsError::NotFound)
+            }
+            Some(nss_codec::list_inodes_response::Result::ErrOther(e)) => Err(FsError::Internal(e)),
+            None => Err(FsError::Internal("empty ListInodesResponse".into())),
+        }
+    }
+
     /// List MPU parts for a completed multipart upload
     pub async fn list_mpu_parts(
         &self,
@@ -273,43 +306,30 @@ impl StorageBackend {
         Ok(parse_mpu_parts(parse_list_inodes(resp)?)?)
     }
 
-    /// Read a single block from a data blob via DataVgProxy.
+    /// Read one exact generation `(blob_guid, block_number, version)` via
+    /// DataVgProxy. The version comes from the committed block map (or 1
+    /// for unmapped blocks), so there is no version selection: any replica
+    /// holding the key answers authoritatively.
     /// Returns `(data, xxh3_64_checksum)`.
     pub async fn read_block(
         &self,
         blob_guid: DataBlobGuid,
-        blob_version: u64,
+        version: u64,
         block_number: u32,
         content_len: usize,
         trace_id: &TraceId,
     ) -> Result<(Bytes, u64), FsError> {
         let mut body = Bytes::new();
-        // Do NOT enforce strict block-version == file-version equality: under
-        // the sparse override model an unrewritten block legitimately sits at
-        // an older blob_version than the file's current version (a flush bumps
-        // the file version but only rewrites dirty blocks).
-        //
-        // For an overridden file (blob_version > 1) use the max-version
-        // (quorum-check) read so a lagging replica / EC shard can't serve a
-        // pre-override block: it picks the highest version available across
-        // replicas (replicated) or reconstructs from the max-version shard
-        // cohort (EC). The initial-create version (<= 1) has no override
-        // history, so the plain first-success read is correct and faster.
-        if blob_version > 1 {
-            self.data_vg_proxy
-                .get_blob_with_quorum_check(
-                    blob_guid,
-                    block_number,
-                    content_len,
-                    &mut body,
-                    trace_id,
-                )
-                .await?;
-        } else {
-            self.data_vg_proxy
-                .get_blob(blob_guid, block_number, content_len, &mut body, trace_id)
-                .await?;
-        }
+        self.data_vg_proxy
+            .get_blob(
+                blob_guid,
+                block_number,
+                version,
+                content_len,
+                &mut body,
+                trace_id,
+            )
+            .await?;
         let checksum = xxhash_rust::xxh3::xxh3_64(&body);
         Ok((body, checksum))
     }
@@ -334,49 +354,6 @@ impl StorageBackend {
             .put_blob(blob_guid, block_number, body, version, trace_id)
             .await?;
         Ok(())
-    }
-
-    /// Write the geometry sentinel for `guid` at `version` (single block put).
-    pub async fn write_blob_info(
-        &self,
-        guid: DataBlobGuid,
-        info: BlobInfo,
-        version: u64,
-        trace_id: &TraceId,
-    ) -> Result<(), FsError> {
-        self.write_block(
-            guid,
-            GEOMETRY_SENTINEL_BLOCK,
-            Bytes::copy_from_slice(&info.encode()),
-            version,
-            trace_id,
-        )
-        .await
-    }
-
-    /// Read the LATEST geometry sentinel via a max-version quorum read, so a
-    /// caller holding a stale layout version still observes the most recent
-    /// cross-instance override. Returns Ok(None) if no sentinel exists yet.
-    pub async fn get_blob_info(
-        &self,
-        guid: DataBlobGuid,
-        trace_id: &TraceId,
-    ) -> Result<Option<BlobInfo>, FsError> {
-        let mut body = Bytes::new();
-        match self
-            .data_vg_proxy
-            .get_blob_with_quorum_check(guid, GEOMETRY_SENTINEL_BLOCK, 20, &mut body, trace_id)
-            .await
-        {
-            Ok(()) => Ok(BlobInfo::decode(&body)),
-            // No sentinel published yet. The quorum-check read path normalizes
-            // an all-replicas/all-shards not-found into BlockNotFound (it never
-            // surfaces a raw BssRpc(NotFound) here), so this single arm covers
-            // "no geometry override exists", mirroring read_block_cached's
-            // hole mapping. Report None and let the caller keep its cached size.
-            Err(volume_group_proxy::DataVgError::BlockNotFound) => Ok(None),
-            Err(e) => Err(FsError::DataVg(e)),
-        }
     }
 
     /// Reserve a single block (single-op, no batch) at `version`. Used by
@@ -655,20 +632,34 @@ impl StorageBackend {
 
     /// Delete blob blocks for a given ObjectLayout. Fire-and-forget: logs
     /// warnings on failure but does not return errors.
-    pub async fn delete_blob_blocks(&self, layout: &ObjectLayout, trace_id: &TraceId) {
-        let version = layout.blob_version;
-        // NOTE: the per-blob geometry sentinel (block GEOMETRY_SENTINEL_BLOCK)
-        // is intentionally NOT deleted here. It is a tiny (20-byte) record and
-        // an unconditional delete of it almost always misses, most blobs
-        // never publish a sentinel, and even when one exists it sits at a
-        // single version. DataVgProxy::delete_blob feeds every NotFound into
-        // the per-node circuit breaker (failure_threshold=3), so issuing a
-        // guaranteed-miss delete on every blob teardown primes the breaker and,
-        // on a single-node BSS, trips it, after which all reads/writes fail
-        // QuorumFailure and unrelated files start reporting ENOENT/EIO
-        // (observed as open/25.t flakiness). Leaking the sentinel is harmless;
-        // a later overwrite of the same blob_guid republishes it in place.
-        for (blob_guid, block_number) in blob_blocks_to_delete(layout) {
+    /// Delete every committed generation of a blob: each in-size block at
+    /// the exact identity its map resolves (or version 1 when unmapped).
+    /// Map holes have no key; superseded/orphaned generations not referenced
+    /// by the map are not enumerable here and leak until a scanner exists
+    /// (invisible garbage; the blob_guid is never reused).
+    pub async fn delete_blob_blocks(
+        &self,
+        layout: &ObjectLayout,
+        map: Option<&data_types::block_map::BlockMap>,
+        trace_id: &TraceId,
+    ) {
+        let Ok(blob_guid) = layout.blob_guid() else {
+            return;
+        };
+        let num_blocks = layout.num_blocks().unwrap_or(0) as u32;
+        for block_number in 0..num_blocks {
+            use data_types::block_map::RangeState;
+            let version = match map {
+                None => Some(1),
+                Some(m) => match m.lookup(block_number) {
+                    Some(RangeState::Written(v)) | Some(RangeState::Reserved(v)) => Some(v),
+                    Some(RangeState::Hole) => None,
+                    None => Some(1),
+                },
+            };
+            let Some(version) = version else {
+                continue;
+            };
             if let Err(e) = self
                 .data_vg_proxy
                 .delete_blob(blob_guid, block_number, version, trace_id)
@@ -677,6 +668,7 @@ impl StorageBackend {
                 tracing::warn!(
                     %blob_guid,
                     block_number,
+                    version,
                     error = %e,
                     "Failed to delete blob block"
                 );

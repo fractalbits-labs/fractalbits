@@ -35,6 +35,7 @@ fn check_response_errno(header: &MessageHeader) -> Result<(), RpcError> {
             "BSS returned DeviceMismatch".to_string(),
         )),
         8 => Err(RpcError::VersionSkipped), // Write skipped due to version check
+        11 => Err(RpcError::Mismatch),      // Write-once key violation
         code => Err(RpcError::InternalResponseError(format!(
             "Unknown BSS error code: {}",
             code
@@ -357,10 +358,15 @@ impl RpcClient {
     /// returned block alongside the body. Callers that need read-side
     /// version arbitration (see `DataVgProxy::get_blob`) compare this
     /// against an expected version to detect lagging-replica reads.
+    /// Exact-identity read: data keys are versioned
+    /// (`/d{vol}/{uuid}-p{block}-v{version}`), so the request must name the
+    /// generation to fetch; there is no "latest version" read.
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_data_blob(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         body: &mut Bytes,
         content_len: usize,
         timeout: Option<Duration>,
@@ -378,6 +384,7 @@ impl RpcClient {
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
         header.body_len = content_len as u32;
+        header.version = version;
         header.size = size_of::<MessageHeader>() as u32;
 
         let msg_frame = MessageFrame::new(header, Bytes::new());

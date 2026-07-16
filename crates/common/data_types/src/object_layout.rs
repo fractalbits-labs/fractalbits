@@ -24,11 +24,53 @@ pub struct ObjectLayout {
     pub timestamp: u64,
     pub version_id: Uuid, // v4
     pub block_size: u32,
-    /// Monotonic version for in-place block override (V1 sparse + override).
-    /// Incremented by `PutInodeCas` on every flush that has pending work.
-    /// `0` is reserved for legacy / pre-V1 layouts; new flushes start at `1`.
+    /// Burned-version watermark: the highest data-generation version ever
+    /// issued for this blob. Bumped by the prepare CAS BEFORE any fragment
+    /// is written, so an aborted attempt's version is never reused and two
+    /// attempts can never disagree on the bytes of one versioned BSS key.
+    /// Nothing on the read path consults this; per-block visibility comes
+    /// from `block_map` (absent entry = version 1).
     pub blob_version: u64,
+    /// Pointer to the per-block version map, stored as immutable chunk
+    /// records in the NSS keyspace (`#bmap/{blob_id}/{map_id}-{chunk}`).
+    /// `None` means every written block is at version 1 (a file that was
+    /// only created/appended, never overwritten). Only meaningful for
+    /// `ObjectState::Normal`.
+    pub block_map: Option<BlockMapRef>,
+    /// The single in-flight write attempt (prepare lease). A flush installs
+    /// it with the prepare CAS and clears it with the commit CAS or the
+    /// abort CAS. Metadata updates (chmod/utimensat/link) must carry it
+    /// forward unchanged.
+    pub pending_write: Option<Box<PendingWrite>>,
     pub state: ObjectState,
+}
+
+/// Reference to one immutable version of a blob's per-block version map.
+/// The chunks live at `#bmap/{blob_id}/{map_id}-{chunk_no}` and never
+/// change once written, so readers may cache a map by `map_id` forever.
+#[derive(Debug, Archive, Deserialize, Serialize, PartialEq, Eq, Clone, Copy)]
+pub struct BlockMapRef {
+    pub map_id: Uuid,
+    pub chunk_count: u32,
+}
+
+/// The prepare record for one flush attempt. Doubles as a short renewable
+/// lease: a foreign live pending makes a competing flush fail busy, and an
+/// expired one is taken over (abort + poison of its append range).
+#[derive(Debug, Archive, Deserialize, Serialize, PartialEq, Eq, Clone, Copy)]
+pub struct PendingWrite {
+    /// The burned version this attempt writes its rewrite blocks at.
+    pub version: u64,
+    /// Writer instance nonce: the same instance may resume or abort its
+    /// own pending immediately instead of waiting for expiry.
+    pub owner: Uuid,
+    /// Inclusive block span this attempt writes at version 1 (first writes
+    /// beyond the committed EOF). On abort this span is poisoned (mapped
+    /// as holes) so a later attempt can never reuse those v1 keys with
+    /// different bytes.
+    pub append_range: Option<(u32, u32)>,
+    /// Wall-clock ms; a foreign pending may be taken over after this.
+    pub expires_at_ms: u64,
 }
 
 impl ObjectLayout {
@@ -436,6 +478,8 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 1,
+            block_map: None,
+            pending_write: None,
             state: ObjectState::Normal(ObjectMetaData {
                 blob_guid: DataBlobGuid {
                     blob_id: Uuid::nil(),
@@ -513,6 +557,8 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 0,
+            block_map: None,
+            pending_write: None,
             state: ObjectState::Special(SpecialData {
                 kind,
                 rdev,
@@ -527,6 +573,8 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 0,
+            block_map: None,
+            pending_write: None,
             state: ObjectState::Directory(DirectoryData {
                 posix: PosixAttrs {
                     mode,
@@ -542,6 +590,8 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 0,
+            block_map: None,
+            pending_write: None,
             state: ObjectState::Symlink(SymlinkData {
                 target: target.to_vec(),
                 core_meta_data: core_meta(target.len() as u64),
@@ -555,6 +605,8 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 0,
+            block_map: None,
+            pending_write: None,
             state: ObjectState::Indirect(IndirectEntry {
                 inode_id: Uuid::new_v4(),
             }),

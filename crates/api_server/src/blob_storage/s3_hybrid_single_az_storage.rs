@@ -158,7 +158,7 @@ impl S3HybridSingleAzStorage {
             BlobLocation::DataVgProxy => {
                 // Small blob - get from DataVgProxy
                 self.data_vg_proxy
-                    .get_blob(blob_guid, block_number, content_len, body, trace_id)
+                    .get_blob(blob_guid, block_number, 1, content_len, body, trace_id)
                     .await?;
             }
             BlobLocation::S3 => {

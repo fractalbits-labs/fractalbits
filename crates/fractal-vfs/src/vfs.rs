@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::backend::{BackendConfig, BlobInfo, StorageBackend};
+use crate::backend::{BackendConfig, StorageBackend};
 use crate::cache::{DirCache, DirEntry, DirEntryKind};
 use crate::config::WritebackMode;
 use crate::disk_cache::DiskCache;
@@ -19,10 +19,13 @@ use crate::inode::{EntryType, ForgetOutcome, InodeTable, ROOT_INODE};
 use crate::writeback::{
     CoalesceOutcome, DrainableInodeIntent, Generation, InodeOp as WbInodeOp, WritebackQueue,
 };
+use data_types::block_map::{BlockMap, RangeState, bmap_chunk_key, bmap_prefix};
 use data_types::object_layout::{
-    DirectoryData, IndirectEntry, InodeRecord, MpuState, ObjectCoreMetaData, ObjectLayout,
-    ObjectMetaData, ObjectState, PosixAttrs, SpecialData, SpecialKind, SymlinkData,
+    BlockMapRef, DirectoryData, IndirectEntry, InodeRecord, MpuState, ObjectCoreMetaData,
+    ObjectLayout, ObjectMetaData, ObjectState, PendingWrite, PosixAttrs, SpecialData, SpecialKind,
+    SymlinkData,
 };
+use uuid::Uuid;
 pub const TTL: Duration = Duration::from_secs(1);
 pub const DEFAULT_BLOCK_SIZE: u32 = 128 * 1024;
 /// Upper bound on a single file's in-memory write buffer. The buffer is
@@ -343,6 +346,15 @@ pub struct VfsCore {
     // the best-effort local-cache write off the FUSE worker threads so it
     // does not steal foreground cycles on a create-heavy workload.
     mirror: Option<MirrorHandle>,
+    /// Per-block version maps by `map_id`. Map chunks are immutable once
+    /// written (a flush publishes a whole new map under a fresh id), so a
+    /// cached entry never goes stale; entries for superseded maps age out
+    /// when nothing references them anymore.
+    block_maps: DashMap<Uuid, Arc<BlockMap>>,
+    /// This writer instance's nonce, stamped into `PendingWrite.owner` so
+    /// the same instance can resume/abort its own pending immediately
+    /// instead of waiting out the lease expiry.
+    writer_id: Uuid,
 }
 
 impl VfsCore {
@@ -425,6 +437,8 @@ impl VfsCore {
             deferred_blob_cleanup: DashMap::new(),
             inode_write_owner: DashMap::new(),
             mirror,
+            block_maps: DashMap::new(),
+            writer_id: Uuid::new_v4(),
         }
     }
 
@@ -946,57 +960,211 @@ impl VfsCore {
 
     // ── Cache helpers ──
 
-    /// Read a block, checking disk cache first. On miss, fetches from backend
-    /// and populates disk cache.
+    /// Fetch (and cache) the per-block version map referenced by a layout.
+    /// Chunks are immutable per `map_id`, so a cached entry is valid
+    /// forever; the in-memory cache is bounded crudely by a full clear.
+    async fn layout_block_map(
+        &self,
+        layout: &ObjectLayout,
+    ) -> Result<Option<Arc<BlockMap>>, FsError> {
+        let Some(map_ref) = layout.block_map else {
+            return Ok(None);
+        };
+        if let Some(m) = self.block_maps.get(&map_ref.map_id) {
+            return Ok(Some(m.clone()));
+        }
+        let blob_guid = layout.blob_guid().map_err(|_| FsError::InvalidState)?;
+        let trace_id = TraceId::new();
+        let mut chunks: Vec<Bytes> = Vec::with_capacity(map_ref.chunk_count as usize);
+        for chunk_no in 0..map_ref.chunk_count {
+            let key = bmap_chunk_key(&blob_guid, map_ref.map_id, chunk_no);
+            chunks.push(self.backend().get_inode_raw(&key, &trace_id).await?);
+        }
+        let map = Arc::new(
+            BlockMap::from_chunks(&chunks)
+                .map_err(|e| FsError::Internal(format!("block map decode: {e}")))?,
+        );
+        if self.block_maps.len() >= 4096 {
+            self.block_maps.clear();
+        }
+        self.block_maps.insert(map_ref.map_id, map.clone());
+        Ok(Some(map))
+    }
+
+    /// Serialize a block map into immutable chunk records under a fresh
+    /// `map_id` and return the reference the commit CAS publishes. Losing
+    /// (CAS-conflicted) chunk sets are invisible garbage reclaimed by the
+    /// sweep of whatever commit supersedes them, or by unlink.
+    async fn publish_block_map(
+        &self,
+        blob_guid: &data_types::DataBlobGuid,
+        map: &BlockMap,
+        trace_id: &TraceId,
+    ) -> Result<BlockMapRef, FsError> {
+        let chunks = map
+            .to_chunks()
+            .map_err(|e| FsError::Internal(format!("block map encode: {e}")))?;
+        let map_id = Uuid::new_v4();
+        for (chunk_no, chunk) in chunks.iter().enumerate() {
+            let key = bmap_chunk_key(blob_guid, map_id, chunk_no as u32);
+            self.backend()
+                .put_inode(&key, Bytes::from(chunk.clone()), trace_id)
+                .await?;
+        }
+        let map_ref = BlockMapRef {
+            map_id,
+            chunk_count: chunks.len() as u32,
+        };
+        if self.block_maps.len() >= 4096 {
+            self.block_maps.clear();
+        }
+        self.block_maps.insert(map_id, Arc::new(map.clone()));
+        Ok(map_ref)
+    }
+
+    /// Delete superseded generations (and the replaced map's chunk rows)
+    /// after a reader grace comfortably above the attr-TTL staleness bound:
+    /// a reader may hold the previous committed identity for up to one TTL,
+    /// and deleting under it would turn a valid stale read into zeros or a
+    /// false loss alarm. Exact keys, best-effort per node; a down node only
+    /// delays reclamation of its own copies.
+    fn enqueue_superseded_sweep(
+        &self,
+        blob_guid: data_types::DataBlobGuid,
+        victims: Vec<(u32, u64)>,
+        old_map: Option<BlockMapRef>,
+    ) {
+        if victims.is_empty() && old_map.is_none() {
+            return;
+        }
+        const SWEEP_GRACE: Duration = Duration::from_secs(10);
+        // The per-thread backend is a leaked &'static; backend() elides the
+        // lifetime to &self, so populate the thread-local first and re-read
+        // the 'static reference from it for the detached task.
+        let _ = self.backend();
+        let backend: &'static StorageBackend = THREAD_BACKEND
+            .with(|cell| cell.get())
+            .expect("backend() populates the thread-local");
+        compio_runtime::spawn(async move {
+            rpc_client_common::rpc_sleep(SWEEP_GRACE).await;
+            let trace_id = TraceId::new();
+            for (block, version) in victims {
+                backend
+                    .delete_block(blob_guid, block, version, &trace_id)
+                    .await;
+            }
+            if let Some(map_ref) = old_map {
+                for chunk_no in 0..map_ref.chunk_count {
+                    let key = bmap_chunk_key(&blob_guid, map_ref.map_id, chunk_no);
+                    let _ = backend.delete_inode(&key, &trace_id).await;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Tear down a blob's storage: delete every committed generation the
+    /// layout+map reference, then every `#bmap/{blob}/` chunk row (all map
+    /// versions, including orphaned ones from CAS-losing publishes).
+    async fn teardown_blob(&self, layout: &ObjectLayout, trace_id: &TraceId) {
+        let map = self.layout_block_map(layout).await.ok().flatten();
+        self.backend()
+            .delete_blob_blocks(layout, map.as_deref(), trace_id)
+            .await;
+        if let Ok(blob_guid) = layout.blob_guid() {
+            let prefix = bmap_prefix(&blob_guid);
+            match self
+                .backend()
+                .list_inode_keys(&prefix, 10000, trace_id)
+                .await
+            {
+                Ok(keys) => {
+                    for key in keys {
+                        let _ = self.backend().delete_inode(&key, trace_id).await;
+                    }
+                }
+                Err(FsError::NotFound) => {}
+                Err(e) => {
+                    tracing::warn!(%blob_guid, error = %e, "bmap teardown list failed");
+                }
+            }
+        }
+    }
+
+    /// The exact BSS identity of one committed block, resolved from the
+    /// block map: `Some((version, mapped))` to fetch, `None` for zeros with
+    /// no BSS access (hole / reserved). Unmapped blocks are version 1
+    /// (write-once first writes); `mapped` distinguishes "all replicas
+    /// missing" semantics: a mapped generation must exist (detected data
+    /// loss), an unmapped v1 miss is a legitimate sparse hole.
+    fn resolve_block_source(map: Option<&BlockMap>, block: u32) -> Option<(u64, bool)> {
+        match map {
+            None => Some((1, false)),
+            Some(m) => match m.lookup(block) {
+                Some(RangeState::Written(v)) => Some((v, true)),
+                Some(RangeState::Hole) | Some(RangeState::Reserved(_)) => None,
+                None => Some((1, false)),
+            },
+        }
+    }
+
+    /// Read a block, checking disk cache first. On miss, fetches the exact
+    /// committed generation from the backend and populates the disk cache.
     async fn read_block_cached(
         &self,
         blob_guid: data_types::DataBlobGuid,
-        blob_version: u64,
+        map: Option<&BlockMap>,
         block_num: u32,
         block_content_len: usize,
         _file_size: u64,
         trace_id: &TraceId,
     ) -> Result<Bytes, FsError> {
-        // Try disk cache
+        let Some((version, mapped)) = Self::resolve_block_source(map, block_num) else {
+            // Hole / reserved range: zeros straight from metadata.
+            return Ok(Bytes::from(vec![0u8; block_content_len]));
+        };
+
+        // Disk cache hit is valid only for the exact committed identity.
         if let Some(dc) = &self.disk_cache
+            && dc.get_block_version(blob_guid, block_num).await == Some(version)
             && let Some(cached) = dc.get_block(blob_guid, block_num, block_content_len).await
         {
             return Ok(cached);
         }
 
-        // Cache miss: fetch from backend at a version no older than the
-        // cache's floor. A reader on a stale handle still carries its open-
-        // time `blob_version`; if a newer override has since raised the
-        // floor, fetching at the stale version could trip BSS's non-quorum
-        // `v <= 1` path and return pre-override bytes. Lower-bounding by the
-        // floor matches what a cache hit would have returned (the latest
-        // this instance published).
-        let read_version = match &self.disk_cache {
-            Some(dc) => blob_version.max(dc.floor_version(blob_guid).await.unwrap_or(0)),
-            None => blob_version,
-        };
-
-        // Override (read_version > 1) blocks are zero-padded to a full
+        // Rewrite generations (version > 1) are zero-padded to a full
         // block_size on disk, so the EC shard size is block_size/k;
         // request the full block_size (otherwise the EC read derives a
         // smaller shard size from the logical length and filters out the
         // padded shards), then truncate to the logical content length.
-        // Non-override blocks are stored at their exact length and read
-        // as-is.
-        let read_len = if read_version > 1 {
+        // Version-1 blocks are stored at their exact length and read as-is.
+        let read_len = if version > 1 {
             (DEFAULT_BLOCK_SIZE as usize).max(block_content_len)
         } else {
             block_content_len
         };
         let (mut data, _checksum) = match self
             .backend()
-            .read_block(blob_guid, read_version, block_num, read_len, trace_id)
+            .read_block(blob_guid, version, block_num, read_len, trace_id)
             .await
         {
             Ok(r) => r,
-            // A missing block is a hole: serve zeros (do not cache the hole).
             Err(FsError::DataVg(volume_group_proxy::DataVgError::BlockNotFound))
             | Err(FsError::Rpc(rpc_client_common::RpcError::NotFound)) => {
+                if mapped {
+                    // The map committed this exact generation; nobody
+                    // holding it is data loss, never a hole. Fail loudly
+                    // instead of serving zeros or older bytes.
+                    tracing::error!(
+                        %blob_guid,
+                        block_num,
+                        version,
+                        "DATA LOSS: map-committed generation missing on every replica"
+                    );
+                    return Err(FsError::DataVg(volume_group_proxy::DataVgError::Corrupted));
+                }
+                // Unmapped v1 miss is a sparse hole: serve zeros (do not
+                // cache the hole).
                 return Ok(Bytes::from(vec![0u8; block_content_len]));
             }
             Err(e) => return Err(e),
@@ -1005,11 +1173,9 @@ impl VfsCore {
             data = data.slice(0..block_content_len);
         }
 
-        // Populate disk cache at the version actually fetched.
+        // Populate disk cache at the exact identity fetched.
         if let Some(dc) = &self.disk_cache {
-            let _ = dc
-                .insert_block(blob_guid, block_num, read_version, &data)
-                .await;
+            let _ = dc.insert_block(blob_guid, block_num, version, &data).await;
         }
 
         Ok(data)
@@ -1017,28 +1183,12 @@ impl VfsCore {
 
     // ── Read helpers ──
 
-    /// Authoritative logical file size for data reads. The geometry
-    /// sentinel (our BSS-parent-size authority) reflects the latest
-    /// committed override regardless of our cached layout version, so a
-    /// read on a handle whose cached layout lags a peer's overwrite (or
-    /// this instance's own just-committed flush) still sees the right EOF.
-    /// The cached/NSS layout size is a lazy copy. Falls back to the cached
-    /// size when no sentinel exists or it is older than the cached layout
-    /// (so a stale sentinel never shrinks a fresher local size).
+    /// Authoritative logical file size for data reads: the NSS layout is
+    /// the sole size authority (the BSS geometry sentinel is gone with the
+    /// versioned-key design). Cross-instance freshness comes from the
+    /// attr-TTL-bounded layout refresh, same as every other attribute.
     async fn authoritative_file_size(&self, layout: &ObjectLayout) -> Result<u64, FsError> {
-        let cached = layout.size()?;
-        if layout.is_symlink() || layout.special().is_some() {
-            return Ok(cached);
-        }
-        if let Ok(guid) = layout.blob_guid() {
-            let trace_id = TraceId::new();
-            if let Ok(Some(info)) = self.backend().get_blob_info(guid, &trace_id).await
-                && info.blob_version >= layout.blob_version
-            {
-                return Ok(info.total_size);
-            }
-        }
-        Ok(cached)
+        layout.size().map_err(FsError::from)
     }
 
     async fn read_mpu(
@@ -1072,6 +1222,7 @@ impl VfsCore {
 
             if part_end > offset {
                 let blob_guid = part_obj.blob_guid()?;
+                let part_map = self.layout_block_map(part_obj).await?;
                 let block_size = part_obj.block_size as u64;
 
                 let part_read_start = offset.saturating_sub(obj_offset);
@@ -1092,7 +1243,7 @@ impl VfsCore {
                     let block_data = self
                         .read_block_cached(
                             blob_guid,
-                            part_obj.blob_version,
+                            part_map.as_deref(),
                             block_num,
                             block_content_len,
                             part_size,
@@ -1126,17 +1277,27 @@ impl VfsCore {
 
     // ── Zero-copy read helpers (direct-to-buffer) ──
 
-    /// Read a cached block directly into `buf`. Returns bytes written on hit,
-    /// or `None` on cache miss (caller should fall back to the Bytes path).
+    /// Read a cached block directly into `buf`. Returns bytes written on hit
+    /// (or a metadata-resolved hole), `None` on cache miss (caller should
+    /// fall back to the Bytes path). A hit counts only if the cached entry
+    /// carries the block's exact committed identity.
     async fn read_block_cached_into(
         &self,
         blob_guid: data_types::DataBlobGuid,
-        _blob_version: u64,
+        map: Option<&BlockMap>,
         block_num: u32,
         block_content_len: usize,
         buf: &mut [u8],
     ) -> Option<usize> {
+        let Some((version, _mapped)) = Self::resolve_block_source(map, block_num) else {
+            let n = block_content_len.min(buf.len());
+            buf[..n].fill(0);
+            return Some(n);
+        };
         if let Some(dc) = &self.disk_cache {
+            if dc.get_block_version(blob_guid, block_num).await != Some(version) {
+                return None;
+            }
             dc.get_block_into(blob_guid, block_num, block_content_len, buf)
                 .await
         } else {
@@ -1160,6 +1321,7 @@ impl VfsCore {
         }
 
         let blob_guid = layout.blob_guid()?;
+        let map = self.layout_block_map(layout).await?;
         let block_size = layout.block_size as u64;
         let read_end = std::cmp::min(offset.saturating_add(size as u64), file_size);
         let actual_len = (read_end - offset) as usize;
@@ -1190,7 +1352,7 @@ impl VfsCore {
                 if let Some(n) = self
                     .read_block_cached_into(
                         blob_guid,
-                        layout.blob_version,
+                        map.as_deref(),
                         block_num,
                         block_content_len,
                         &mut buf[written..written + chunk_len],
@@ -1208,7 +1370,7 @@ impl VfsCore {
                 if let Some(n) = self
                     .read_block_cached_into(
                         blob_guid,
-                        layout.blob_version,
+                        map.as_deref(),
                         block_num,
                         block_content_len,
                         &mut tmp,
@@ -1236,14 +1398,7 @@ impl VfsCore {
                 let bcl = std::cmp::min(block_size, file_size - bs) as usize;
 
                 let block_data = self
-                    .read_block_cached(
-                        blob_guid,
-                        layout.blob_version,
-                        bn,
-                        bcl,
-                        file_size,
-                        &trace_id,
-                    )
+                    .read_block_cached(blob_guid, map.as_deref(), bn, bcl, file_size, &trace_id)
                     .await?;
 
                 let ss = if bn == first_block {
@@ -1295,15 +1450,18 @@ impl VfsCore {
             let existing_blob_guid = wb.existing_blob_guid;
             let eof_low_watermark = wb.eof_low_watermark;
             let blocks = wb.blocks.clone();
-            let committed_blob_version =
-                handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
+            let committed_layout = handle.layout.clone();
             drop(handle);
+            let committed_map = match &committed_layout {
+                Some(l) => self.layout_block_map(l).await?,
+                None => None,
+            };
             return self
                 .read_dirty_handle(
                     file_size,
                     block_size,
                     existing_blob_guid,
-                    committed_blob_version,
+                    committed_map.as_deref(),
                     &blocks,
                     eof_low_watermark,
                     offset,
@@ -1337,13 +1495,15 @@ impl VfsCore {
     // ── Write helpers ──
 
     /// Load one block's committed bytes from BSS for an RMW / dirty read /
-    /// flush tail-zero. Returns zeros (length `fallback_content_len`) for a
-    /// brand-new file, a hole (`committed_content_len == 0`), or a missing
-    /// block (`BlockNotFound` / `NotFound`); propagates other errors.
+    /// flush tail-zero, at the exact identity the committed map resolves.
+    /// Returns zeros (length `fallback_content_len`) for a brand-new file,
+    /// a hole (map hole / `committed_content_len == 0` / an unmapped v1
+    /// miss); propagates other errors. A map-committed generation that is
+    /// missing everywhere is data loss and fails the load.
     async fn lazy_load_block_for_flush(
         &self,
         existing_blob_guid: Option<data_types::DataBlobGuid>,
-        committed_blob_version: u64,
+        committed_map: Option<&BlockMap>,
         block_num: u32,
         committed_content_len: usize,
         fallback_content_len: usize,
@@ -1355,22 +1515,35 @@ impl VfsCore {
         if committed_content_len == 0 {
             return Ok(Bytes::from(vec![0u8; fallback_content_len]));
         }
+        let Some((version, mapped)) = Self::resolve_block_source(committed_map, block_num) else {
+            return Ok(Bytes::from(vec![0u8; fallback_content_len]));
+        };
+        let read_len = if version > 1 {
+            (DEFAULT_BLOCK_SIZE as usize).max(committed_content_len)
+        } else {
+            committed_content_len
+        };
         match self
             .backend()
-            .read_block(
-                guid,
-                committed_blob_version,
-                block_num,
-                committed_content_len,
-                trace_id,
-            )
+            .read_block(guid, version, block_num, read_len, trace_id)
             .await
         {
-            Ok((data, _)) => Ok(data),
-            Err(FsError::DataVg(volume_group_proxy::DataVgError::BlockNotFound)) => {
-                Ok(Bytes::from(vec![0u8; fallback_content_len]))
-            }
-            Err(FsError::Rpc(rpc_client_common::RpcError::NotFound)) => {
+            Ok((data, _)) => Ok(if data.len() > committed_content_len {
+                data.slice(0..committed_content_len)
+            } else {
+                data
+            }),
+            Err(FsError::DataVg(volume_group_proxy::DataVgError::BlockNotFound))
+            | Err(FsError::Rpc(rpc_client_common::RpcError::NotFound)) => {
+                if mapped {
+                    tracing::error!(
+                        %guid,
+                        block_num,
+                        version,
+                        "DATA LOSS: map-committed generation missing during flush load"
+                    );
+                    return Err(FsError::DataVg(volume_group_proxy::DataVgError::Corrupted));
+                }
                 Ok(Bytes::from(vec![0u8; fallback_content_len]))
             }
             Err(e) => Err(e),
@@ -1386,7 +1559,7 @@ impl VfsCore {
         file_size: u64,
         block_size: u32,
         existing_blob_guid: Option<data_types::DataBlobGuid>,
-        committed_blob_version: u64,
+        committed_map: Option<&BlockMap>,
         blocks: &std::collections::BTreeMap<u32, BlockState>,
         eof_low_watermark: Option<u32>,
         offset: u64,
@@ -1427,7 +1600,7 @@ impl VfsCore {
                     } else {
                         self.lazy_load_block_for_flush(
                             existing_blob_guid,
-                            committed_blob_version,
+                            committed_map,
                             b,
                             block_content_len,
                             block_content_len,
@@ -1587,240 +1760,42 @@ impl VfsCore {
         };
 
         const MAX_CAS_RETRIES: u32 = 5;
+        /// Prepare-lease lifetime. Kept short so a writer killed between its
+        /// prepare CAS and its abort CAS (crash, SIGTERM mid-flush) blocks a
+        /// takeover for seconds, not minutes; a live flush that outlasts it
+        /// renews the lease from its block-write loop.
+        const PENDING_LEASE_MS: u64 = 10_000;
+        /// How long a flush polls a live foreign lease before giving up
+        /// with Busy. Covers one full lease (a crashed owner expires) plus
+        /// slack; a healthy concurrent writer clears the slot much sooner
+        /// by committing.
+        const FOREIGN_PENDING_WAIT_MS: u64 = 15_000;
         let mut attempt: u32 = 0;
+        let mut foreign_wait_started: Option<Instant> = None;
+        // Reclamation input recorded by the winning attempt: superseded
+        // exact identities plus the replaced map version, deleted by the
+        // post-commit sweep after the reader grace.
+        let mut sweep_victims: Vec<(u32, u64)> = Vec::new();
+        let mut sweep_old_map: Option<BlockMapRef> = None;
+        // Blocks this flush wrote at version 1 (appends); the disk-cache
+        // mirror stamps them separately from the burned-version rewrites.
+        let mut append_blocks: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
         let (mut final_layout, final_committed_size) = loop {
             attempt += 1;
-
-            let (blob_guid, base_version, committed_size, expected_old, is_override) =
-                match base_layout
-                    .as_ref()
-                    .and_then(|l| l.blob_guid().ok().map(|g| (g, l)))
-                {
-                    Some((g, l)) => {
-                        let bytes: Bytes =
-                            match to_bytes_in::<_, rkyv::rancor::Error>(l, Vec::new()) {
-                                Ok(b) => b.into(),
-                                Err(e) => return Err(FsError::from(e)),
-                            };
-                        (g, l.blob_version, l.size().unwrap_or(0), bytes, true)
-                    }
-                    None => (self.backend().create_blob_guid(), 0, 0, Bytes::new(), false),
-                };
-            // Override versions start at 2 so a committed legacy record at
-            // blob_version 0/1 (whose BSS blocks sit at v1) can't collide
-            // with a same-version idempotency check. A brand-new file's
-            // first flush is v1 (unpadded, read at exact length).
-            let new_version = if is_override {
-                (base_version + 1).max(2)
-            } else {
-                1
-            };
-            let pad_blocks = is_override;
-
-            // Write only the Rewrite blocks at the new version (zero-padded
-            // to block_size on override so the EC shard size is constant).
-            let mut flush_err: Option<FsError> = None;
-            for (b, st) in snap.blocks.iter() {
-                let BlockState::Rewrite(bytes) = st else {
-                    continue;
-                };
-                let body = if pad_blocks && bytes.len() < block_size {
-                    let mut buf = BytesMut::with_capacity(block_size);
-                    buf.extend_from_slice(bytes);
-                    buf.resize(block_size, 0);
-                    buf.freeze()
-                } else {
-                    bytes.clone()
-                };
-                if let Err(e) = self
-                    .backend()
-                    .write_block(blob_guid, *b, body, new_version, &trace_id)
-                    .await
-                {
-                    flush_err = Some(e);
-                    break;
-                }
-            }
-            if let Some(e) = flush_err {
-                // The guard restores the taken blocks on this return so a
-                // later flush can retry (CasConflict never reaches here).
-                return Err(e);
+            if attempt > MAX_CAS_RETRIES {
+                tracing::warn!(
+                    key = %s3_key,
+                    "flush_write_buffer: CAS still conflicting after retries"
+                );
+                // The guard restores blocks so a later flush retries.
+                return Err(FsError::CasConflict);
             }
 
-            // Build + serialize the new layout at the bumped version.
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            // On the promoted (hardlink) path, carry the freshly-fetched
-            // record's posix forward, NOT the local snapshot taken before
-            // this flush: another alias may have chmod/chown'd the shared
-            // record between the snapshot and this CAS attempt, and a data
-            // write changes only size/blob_version (never posix), so the
-            // snapshot has nothing of ours to merge. Using it would undo a
-            // concurrent metadata change. The non-promoted path is
-            // single-writer-per-inode, so the local snapshot is correct.
-            let effective_posix = if promoted_record.is_some() {
-                base_layout
-                    .as_ref()
-                    .map(crate::inode::layout_posix)
-                    .unwrap_or_else(|| self.inodes.get(ino).map(|e| e.posix).unwrap_or_default())
-            } else {
-                self.inodes.get(ino).map(|e| e.posix).unwrap_or_default()
-            };
-            let layout = ObjectLayout {
-                version_id: ObjectLayout::gen_version_id(),
-                block_size: DEFAULT_BLOCK_SIZE,
-                timestamp,
-                blob_version: new_version,
-                state: ObjectState::Normal(ObjectMetaData {
-                    blob_guid,
-                    core_meta_data: ObjectCoreMetaData {
-                        size: file_size,
-                        etag: blob_guid.blob_id.simple().to_string(),
-                        headers: vec![],
-                        checksum: None,
-                        posix: Some(Box::new(effective_posix)),
-                    },
-                }),
-            };
-            // Choose the publish target. A promoted inode republishes its
-            // layout inside the shared InodeRecord at the `#hardlink/<id>`
-            // key, CAS'd on the current record bytes so a concurrent writer
-            // on another hardlink name (a different FUSE inode with its own
-            // write lock) loses the race and retries instead of clobbering.
-            // A normal file publishes the bare layout at its own s3_key.
-            let (publish_key, publish_bytes, publish_expected_old) = match &promoted_record {
-                Some(rec) => {
-                    let new_record = InodeRecord {
-                        layout: layout.clone(),
-                        nlink: rec.nlink,
-                        orphan_since: rec.orphan_since,
-                    };
-                    let new_bytes: Bytes =
-                        match to_bytes_in::<_, rkyv::rancor::Error>(&new_record, Vec::new()) {
-                            Ok(b) => b.into(),
-                            Err(e) => return Err(FsError::from(e)),
-                        };
-                    // Guard on the record as fetched (re-serialized); rkyv is
-                    // deterministic for these types.
-                    let old_bytes: Bytes =
-                        match to_bytes_in::<_, rkyv::rancor::Error>(rec, Vec::new()) {
-                            Ok(b) => b.into(),
-                            Err(e) => return Err(FsError::from(e)),
-                        };
-                    (
-                        promoted_record_key
-                            .clone()
-                            .expect("promoted_record implies a record key"),
-                        new_bytes,
-                        old_bytes,
-                    )
-                }
-                None => {
-                    let layout_bytes: Bytes =
-                        match to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new()) {
-                            Ok(b) => b.into(),
-                            Err(e) => return Err(FsError::from(e)),
-                        };
-                    (s3_key.clone(), layout_bytes, expected_old)
-                }
-            };
-
-            let first_publish = promoted_record.is_none() && publish_expected_old.is_empty();
-
-            // CAS-publish: only lands if NSS still holds `publish_expected_old`.
-            match self
-                .backend()
-                .put_inode_cas(
-                    &publish_key,
-                    publish_bytes.clone(),
-                    publish_expected_old,
-                    &trace_id,
-                )
-                .await
-            {
-                Ok(_prev) => {
-                    // EOF-trim: delete blocks in the union of the shrink
-                    // range and the committed range, excluding blocks a
-                    // Rewrite just wrote. Deleted at the bumped version so
-                    // the guard drops the now-orphaned blocks.
-                    let committed_bc = committed_size.div_ceil(bsz_u64) as u32;
-                    let lower =
-                        std::cmp::min(new_num_blocks, eof_low_watermark.unwrap_or(new_num_blocks));
-                    let upper = std::cmp::max(committed_bc, trim_upper.unwrap_or(0));
-                    // Blind-delete the trim range. Deleting a hole is now an
-                    // idempotent no-op at the DataVgProxy layer (a delete that
-                    // hits RpcError::NotFound is treated as success, not a
-                    // circuit-breaker failure), so sparse holes in [lower, upper)
-                    // no longer trip the per-node breaker.
-                    for b in lower..upper {
-                        if matches!(snap.blocks.get(&b), Some(BlockState::Rewrite(_))) {
-                            continue;
-                        }
-                        self.backend()
-                            .delete_block(blob_guid, b, new_version, &trace_id)
-                            .await;
-                    }
-                    // Replay PUNCH_HOLE intents.
-                    for (b, st) in snap.blocks.iter() {
-                        if matches!(st, BlockState::Delete) {
-                            self.backend()
-                                .delete_block(blob_guid, *b, new_version, &trace_id)
-                                .await;
-                        }
-                    }
-                    // Reserve fallocate-claimed blocks not superseded by a
-                    // Rewrite/Delete this flush (single-op; EC is a no-op).
-                    for b in snap.pending_reservations.iter() {
-                        if snap.blocks.contains_key(b) {
-                            continue;
-                        }
-                        let _ = self
-                            .backend()
-                            .reserve_block(blob_guid, *b, block_size as u32, new_version, &trace_id)
-                            .await;
-                    }
-                    // Publish landed: disarm the restore guard so the taken
-                    // snapshot is discarded instead of re-marking the handle
-                    // dirty.
-                    snap.armed = false;
-                    break (layout, committed_size);
-                }
-                Err(FsError::CasConflict) if first_publish => {
-                    // A first publish is a create, not an overwrite. If the
-                    // CAS reply was lost and an internal retry saw the row
-                    // present, the stored bytes match exactly and the publish
-                    // is idempotently complete. Otherwise another creator won
-                    // the name and retrying as an override would clobber it.
-                    match self.backend().get_inode(&publish_key, &trace_id).await {
-                        Ok(cur) => {
-                            let cur_bytes: Bytes =
-                                match to_bytes_in::<_, rkyv::rancor::Error>(&cur, Vec::new()) {
-                                    Ok(b) => b.into(),
-                                    Err(e) => return Err(FsError::from(e)),
-                                };
-                            if cur_bytes == publish_bytes {
-                                snap.armed = false;
-                                break (layout, committed_size);
-                            }
-                            return Err(FsError::CasConflict);
-                        }
-                        Err(FsError::NotFound) => return Err(FsError::CasConflict),
-                        Err(e) => return Err(e),
-                    }
-                }
-                Err(FsError::CasConflict) => {
-                    if attempt >= MAX_CAS_RETRIES {
-                        tracing::warn!(
-                            key = %publish_key,
-                            "flush_write_buffer: CAS still conflicting after retries"
-                        );
-                        // The guard restores blocks so a later flush retries.
-                        return Err(FsError::CasConflict);
-                    }
-                    // Re-fetch the base for the next attempt: the shared
-                    // record for a promoted inode, else the s3_key layout.
+            // Shared refetch used by every CAS-conflict arm: the shared
+            // record for a promoted inode, else the s3_key layout (which may
+            // reveal a concurrent promotion to Indirect).
+            macro_rules! refetch_base_and_continue {
+                () => {{
                     if let Some(id) = promoted_inode_id {
                         match self.backend().get_inode_record(id, &trace_id).await {
                             Ok(rec) => {
@@ -1833,13 +1808,11 @@ impl VfsCore {
                         match self.backend().get_inode(&s3_key, &trace_id).await {
                             Ok(cur) => {
                                 if let ObjectState::Indirect(redirect) = &cur.state {
-                                    // The file was promoted to a hardlink
-                                    // concurrently (another client/instance)
-                                    // since we seeded from a cached normal
-                                    // layout. Switch to the record path so we
-                                    // publish into the shared record instead
-                                    // of clobbering the redirect with a normal
-                                    // layout.
+                                    // Promoted concurrently by another
+                                    // client/instance: switch to the record
+                                    // path so we publish into the shared
+                                    // record instead of clobbering the
+                                    // redirect.
                                     let id = redirect.inode_id;
                                     match self.backend().get_inode_record(id, &trace_id).await {
                                         Ok(rec) => {
@@ -1859,6 +1832,523 @@ impl VfsCore {
                         }
                     }
                     continue;
+                }};
+            }
+
+            // Serialize `layout` as the publish value/guard for this file:
+            // bare layout at the s3_key, or wrapped in the shared
+            // InodeRecord for a promoted inode (rkyv is deterministic for
+            // these types, which is what makes byte-equality CAS sound).
+            fn wrap_for_publish(
+                rec: Option<&InodeRecord>,
+                layout: &ObjectLayout,
+            ) -> Result<Bytes, FsError> {
+                match rec {
+                    Some(rec) => {
+                        let record = InodeRecord {
+                            layout: layout.clone(),
+                            nlink: rec.nlink,
+                            orphan_since: rec.orphan_since,
+                        };
+                        Ok(to_bytes_in::<_, rkyv::rancor::Error>(&record, Vec::new())
+                            .map_err(FsError::from)?
+                            .into())
+                    }
+                    None => Ok(to_bytes_in::<_, rkyv::rancor::Error>(layout, Vec::new())
+                        .map_err(FsError::from)?
+                        .into()),
+                }
+            }
+            let publish_key = promoted_record_key
+                .clone()
+                .unwrap_or_else(|| s3_key.clone());
+
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            // On the promoted (hardlink) path, carry the freshly-fetched
+            // record's posix forward, NOT the local snapshot taken before
+            // this flush: another alias may have chmod/chown'd the shared
+            // record between the snapshot and this CAS attempt, and a data
+            // write changes only size/data fields (never posix).
+            let effective_posix = if promoted_record.is_some() {
+                base_layout
+                    .as_ref()
+                    .map(crate::inode::layout_posix)
+                    .unwrap_or_else(|| self.inodes.get(ino).map(|e| e.posix).unwrap_or_default())
+            } else {
+                self.inodes.get(ino).map(|e| e.posix).unwrap_or_default()
+            };
+            let build_final_layout =
+                |blob_guid: data_types::DataBlobGuid,
+                 blob_version: u64,
+                 block_map: Option<BlockMapRef>| {
+                    ObjectLayout {
+                        version_id: ObjectLayout::gen_version_id(),
+                        block_size: DEFAULT_BLOCK_SIZE,
+                        timestamp,
+                        blob_version,
+                        block_map,
+                        pending_write: None,
+                        state: ObjectState::Normal(ObjectMetaData {
+                            blob_guid,
+                            core_meta_data: ObjectCoreMetaData {
+                                size: file_size,
+                                etag: blob_guid.blob_id.simple().to_string(),
+                                headers: vec![],
+                                checksum: None,
+                                posix: Some(Box::new(effective_posix)),
+                            },
+                        }),
+                    }
+                };
+
+            let base = base_layout
+                .as_ref()
+                .and_then(|l| l.blob_guid().ok().map(|g| (g, l.clone())));
+
+            // ---- Create path: no committed base. A fresh blob_guid is
+            // minted per attempt, so no key this attempt writes can ever
+            // collide with another attempt's bytes: everything lands at
+            // version 1, unpadded, with no map and no pending record.
+            let Some((blob_guid, base)) = base else {
+                let blob_guid = self.backend().create_blob_guid();
+                let mut flush_err: Option<FsError> = None;
+                for (b, st) in snap.blocks.iter() {
+                    let BlockState::Rewrite(bytes) = st else {
+                        continue;
+                    };
+                    if let Err(e) = self
+                        .backend()
+                        .write_block(blob_guid, *b, bytes.clone(), 1, &trace_id)
+                        .await
+                    {
+                        flush_err = Some(e);
+                        break;
+                    }
+                }
+                if let Some(e) = flush_err {
+                    // Nothing was published: the fresh blob is invisible
+                    // garbage, and the guard restores the taken blocks so a
+                    // later flush retries (with another fresh blob).
+                    return Err(e);
+                }
+
+                let layout = build_final_layout(blob_guid, 1, None);
+                let publish_bytes = wrap_for_publish(promoted_record.as_ref(), &layout)?;
+                match self
+                    .backend()
+                    .put_inode_cas(&publish_key, publish_bytes.clone(), Bytes::new(), &trace_id)
+                    .await
+                {
+                    Ok(_prev) => {
+                        // Reserve fallocate-claimed blocks not superseded by
+                        // a Rewrite this flush (single-op; EC is a no-op).
+                        for b in snap.pending_reservations.iter() {
+                            if snap.blocks.contains_key(b) {
+                                continue;
+                            }
+                            let _ = self
+                                .backend()
+                                .reserve_block(blob_guid, *b, block_size as u32, 1, &trace_id)
+                                .await;
+                        }
+                        snap.armed = false;
+                        break (layout, 0);
+                    }
+                    Err(FsError::CasConflict) => {
+                        // A first publish is a create, not an overwrite. If
+                        // the CAS reply was lost and an internal retry saw
+                        // the row present, the stored bytes match exactly and
+                        // the publish is idempotently complete. Otherwise
+                        // another creator won the name; retry as an override
+                        // against the winner.
+                        match self.backend().get_inode(&publish_key, &trace_id).await {
+                            Ok(cur) => {
+                                let cur_bytes: Bytes =
+                                    match to_bytes_in::<_, rkyv::rancor::Error>(&cur, Vec::new()) {
+                                        Ok(b) => b.into(),
+                                        Err(e) => return Err(FsError::from(e)),
+                                    };
+                                if cur_bytes == publish_bytes {
+                                    snap.armed = false;
+                                    break (layout, 0);
+                                }
+                                return Err(FsError::CasConflict);
+                            }
+                            Err(FsError::NotFound) => return Err(FsError::CasConflict),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+
+            // ---- Overwrite/append path against a committed base. ----
+            let committed_size = base.size().unwrap_or(0);
+            let committed_bc = committed_size.div_ceil(bsz_u64) as u32;
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+
+            // Step 0: resolve an existing pending record. Our own leftover
+            // (a failed attempt whose abort CAS never landed, or a commit
+            // conflict) and an expired foreign one are aborted here: poison
+            // the recorded v1 append span so those keys are never rewritten
+            // with different bytes, then clear the slot, all in one CAS. A
+            // live foreign lease is polled bounded: a healthy concurrent
+            // writer commits (clearing the slot) within seconds, and a
+            // crashed one expires within one short lease; only sustained
+            // contention past the bound fails Busy (the snapshot guard
+            // re-arms the buffer so a later fsync retries).
+            if let Some(p) = base.pending_write.as_deref().copied() {
+                if p.owner != self.writer_id && p.expires_at_ms > now_ms {
+                    let waited = foreign_wait_started
+                        .get_or_insert_with(Instant::now)
+                        .elapsed();
+                    if waited > Duration::from_millis(FOREIGN_PENDING_WAIT_MS) {
+                        tracing::warn!(
+                            key = %s3_key,
+                            pending_version = p.version,
+                            "flush: foreign pending lease still live after wait; returning Busy"
+                        );
+                        return Err(FsError::Busy);
+                    }
+                    rpc_client_common::rpc_sleep(Duration::from_millis(500)).await;
+                    attempt -= 1;
+                    refetch_base_and_continue!();
+                }
+                let mut cleared = base.clone();
+                cleared.pending_write = None;
+                if let Some((s, e)) = p.append_range {
+                    let mut poisoned = match self.layout_block_map(&base).await? {
+                        Some(m) => (*m).clone(),
+                        None => BlockMap::new(),
+                    };
+                    poisoned.overlay(s, e, RangeState::Hole);
+                    cleared.block_map = Some(
+                        self.publish_block_map(&blob_guid, &poisoned, &trace_id)
+                            .await?,
+                    );
+                }
+                let old_bytes = wrap_for_publish(promoted_record.as_ref(), &base)?;
+                let new_bytes = wrap_for_publish(promoted_record.as_ref(), &cleared)?;
+                match self
+                    .backend()
+                    .put_inode_cas(&publish_key, new_bytes, old_bytes, &trace_id)
+                    .await
+                {
+                    Ok(_) => {
+                        if let Some(rec) = promoted_record.as_mut() {
+                            rec.layout = cleared.clone();
+                        }
+                        base_layout = Some(cleared);
+                        // Restart the attempt against the cleaned base; do
+                        // not charge this against the retry budget.
+                        attempt -= 1;
+                        continue;
+                    }
+                    Err(FsError::CasConflict) => refetch_base_and_continue!(),
+                    Err(e) => return Err(e),
+                }
+            }
+
+            let base_map_arc = self.layout_block_map(&base).await?;
+            let base_map: Option<&BlockMap> = base_map_arc.as_deref();
+
+            // Step 1: classify the dirty blocks. First writes strictly
+            // beyond the committed EOF that no map range covers go to
+            // version 1 (map-free appends); everything else is a rewrite at
+            // the burned version. Map coverage includes poison/hole entries
+            // from aborted appends, punches, and shrink trims, which is
+            // exactly what forbids v1 reuse.
+            let version = base.blob_version + 1;
+            let is_append = |b: u32| -> bool {
+                b >= committed_bc && base_map.is_none_or(|m| m.lookup(b).is_none())
+            };
+            let mut append_range: Option<(u32, u32)> = None;
+            for (b, st) in snap.blocks.iter() {
+                if matches!(st, BlockState::Rewrite(_)) && is_append(*b) {
+                    append_range = Some(match append_range {
+                        None => (*b, *b),
+                        Some((lo, hi)) => (lo.min(*b), hi.max(*b)),
+                    });
+                }
+            }
+
+            // Step 2: prepare CAS. Burns `version` durably (an aborted
+            // attempt's version is never reused, so two attempts can never
+            // disagree on one key's bytes) and declares the v1 territory
+            // this attempt may touch.
+            let mut prepare = base.clone();
+            prepare.blob_version = version;
+            prepare.pending_write = Some(Box::new(PendingWrite {
+                version,
+                owner: self.writer_id,
+                append_range,
+                expires_at_ms: now_ms + PENDING_LEASE_MS,
+            }));
+            {
+                let old_bytes = wrap_for_publish(promoted_record.as_ref(), &base)?;
+                let new_bytes = wrap_for_publish(promoted_record.as_ref(), &prepare)?;
+                match self
+                    .backend()
+                    .put_inode_cas(&publish_key, new_bytes, old_bytes, &trace_id)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(FsError::CasConflict) => refetch_base_and_continue!(),
+                    Err(e) => return Err(e),
+                }
+            }
+            if let Some(rec) = promoted_record.as_mut() {
+                rec.layout = prepare.clone();
+            }
+
+            // Best-effort abort of this prepared attempt: poison the append
+            // span and clear the slot in one CAS. If the CAS conflicts the
+            // pending simply survives; the next flush's step 0 (or a
+            // takeover after expiry) resumes the obligation, so it is never
+            // lost.
+            macro_rules! abort_prepared_and_return {
+                ($err:expr) => {{
+                    let mut aborted = prepare.clone();
+                    aborted.pending_write = None;
+                    if let Some((s, e)) = append_range {
+                        let mut poisoned = match base_map_arc.as_deref() {
+                            Some(m) => m.clone(),
+                            None => BlockMap::new(),
+                        };
+                        poisoned.overlay(s, e, RangeState::Hole);
+                        match self.publish_block_map(&blob_guid, &poisoned, &trace_id).await {
+                            Ok(r) => aborted.block_map = Some(r),
+                            Err(e2) => {
+                                tracing::warn!(error = %e2, "abort: poison map publish failed; pending survives for takeover");
+                                return Err($err);
+                            }
+                        }
+                    }
+                    let old_bytes = wrap_for_publish(promoted_record.as_ref(), &prepare)?;
+                    let new_bytes = wrap_for_publish(promoted_record.as_ref(), &aborted)?;
+                    if let Err(e2) = self
+                        .backend()
+                        .put_inode_cas(&publish_key, new_bytes, old_bytes, &trace_id)
+                        .await
+                    {
+                        tracing::warn!(error = %e2, "abort CAS failed; pending survives for takeover");
+                    }
+                    return Err($err);
+                }};
+            }
+
+            // Step 3: write the dirty blocks. Rewrites go to the burned
+            // version zero-padded to block_size (constant EC shard size);
+            // v1 appends are stored at their exact length, like the create
+            // path (the read side derives the request length from the
+            // version for the same reason). A flush whose write phase
+            // outlasts half the (short) lease renews it in place, so a
+            // slow flush is never taken over mid-flight.
+            let mut flush_err: Option<FsError> = None;
+            for (b, st) in snap.blocks.iter() {
+                let BlockState::Rewrite(bytes) = st else {
+                    continue;
+                };
+                let lease_now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let expires = prepare
+                    .pending_write
+                    .as_deref()
+                    .map(|p| p.expires_at_ms)
+                    .unwrap_or(0);
+                if lease_now_ms + PENDING_LEASE_MS / 2 > expires {
+                    let mut renewed = prepare.clone();
+                    if let Some(p) = renewed.pending_write.as_deref_mut() {
+                        p.expires_at_ms = lease_now_ms + PENDING_LEASE_MS;
+                    }
+                    let old_bytes = wrap_for_publish(promoted_record.as_ref(), &prepare)?;
+                    let new_bytes = wrap_for_publish(promoted_record.as_ref(), &renewed)?;
+                    match self
+                        .backend()
+                        .put_inode_cas(&publish_key, new_bytes, old_bytes, &trace_id)
+                        .await
+                    {
+                        Ok(_) => {
+                            if let Some(rec) = promoted_record.as_mut() {
+                                rec.layout = renewed.clone();
+                            }
+                            prepare = renewed;
+                        }
+                        Err(e) => {
+                            // A concurrent metadata CAS moved the record;
+                            // the commit CAS will conflict and the attempt
+                            // restarts through step 0. Keep writing (the
+                            // burned version stays uniquely ours).
+                            tracing::debug!(error = %e, "lease renewal CAS lost; continuing");
+                        }
+                    }
+                }
+                let (write_version, pad) = if is_append(*b) {
+                    (1, false)
+                } else {
+                    (version, true)
+                };
+                let body = if pad && bytes.len() < block_size {
+                    let mut buf = BytesMut::with_capacity(block_size);
+                    buf.extend_from_slice(bytes);
+                    buf.resize(block_size, 0);
+                    buf.freeze()
+                } else {
+                    bytes.clone()
+                };
+                if let Err(e) = self
+                    .backend()
+                    .write_block(blob_guid, *b, body, write_version, &trace_id)
+                    .await
+                {
+                    flush_err = Some(e);
+                    break;
+                }
+            }
+            if let Some(e) = flush_err {
+                abort_prepared_and_return!(e);
+            }
+
+            // Step 4: build the new map. Order matters: shrink/trim poison
+            // first, then this flush's rewrites/punches/reservations on top
+            // (main's trim skipped rewritten blocks; overlay order encodes
+            // the same rule). Trimmed ranges become Hole entries rather
+            // than map gaps: a later regrow must classify those blocks as
+            // rewrites, never as fresh v1 appends, because their old keys
+            // may survive until the sweep.
+            let mut new_map = match base_map {
+                Some(m) => m.clone(),
+                None => BlockMap::new(),
+            };
+            let trim_lo =
+                std::cmp::min(new_num_blocks, eof_low_watermark.unwrap_or(new_num_blocks));
+            let trim_hi = std::cmp::max(committed_bc, trim_upper.unwrap_or(0));
+            if trim_lo < trim_hi {
+                new_map.overlay(trim_lo, trim_hi - 1, RangeState::Hole);
+            }
+            for (b, st) in snap.blocks.iter() {
+                match st {
+                    BlockState::Rewrite(_) if !is_append(*b) => {
+                        new_map.overlay(*b, *b, RangeState::Written(version));
+                    }
+                    BlockState::Rewrite(_) => {
+                        // v1 append: absence from the map IS its identity,
+                        // but an inherited hole/trim entry over this block
+                        // cannot happen (is_append excludes covered blocks).
+                    }
+                    BlockState::Delete => {
+                        new_map.overlay(*b, *b, RangeState::Hole);
+                    }
+                }
+            }
+            let reservation_eligible = |b: u32| is_append(b) && !snap.blocks.contains_key(&b);
+            for b in snap.pending_reservations.iter() {
+                if reservation_eligible(*b) {
+                    new_map.overlay(*b, *b, RangeState::Reserved(version));
+                }
+            }
+
+            // Superseded identities this commit replaces or drops: the
+            // committed source of every rewritten / punched / trimmed block
+            // that existed, deleted after the reader grace.
+            let mut victims: Vec<(u32, u64)> = Vec::new();
+            let mut consider_victim = |b: u32| {
+                let old = match base_map.and_then(|m| m.lookup(b)) {
+                    Some(RangeState::Written(v)) => Some(v),
+                    // A superseded fallocate claim is a real BSS key
+                    // (space reservation) and must be reclaimed too.
+                    Some(RangeState::Reserved(v)) => Some(v),
+                    Some(RangeState::Hole) => None,
+                    None if b < committed_bc => Some(1),
+                    None => None,
+                };
+                if let Some(v) = old {
+                    victims.push((b, v));
+                }
+            };
+            for (b, st) in snap.blocks.iter() {
+                match st {
+                    BlockState::Rewrite(_) if !is_append(*b) => consider_victim(*b),
+                    BlockState::Delete => consider_victim(*b),
+                    _ => {}
+                }
+            }
+            for b in trim_lo..trim_hi {
+                if !snap.blocks.contains_key(&b) {
+                    consider_victim(b);
+                }
+            }
+
+            // Step 5: publish the new map chunks (immutable, under a fresh
+            // map_id) when the map changed.
+            let map_changed = match base_map {
+                Some(m) => *m != new_map,
+                None => !new_map.is_empty(),
+            };
+            let new_map_ref = if !map_changed {
+                base.block_map
+            } else if new_map.is_empty() {
+                None
+            } else {
+                match self
+                    .publish_block_map(&blob_guid, &new_map, &trace_id)
+                    .await
+                {
+                    Ok(r) => Some(r),
+                    Err(e) => abort_prepared_and_return!(e),
+                }
+            };
+
+            // Step 6: commit CAS (prepare -> final). The single visibility
+            // boundary: after it, every dirty block's exact identity is in
+            // the map (or is a v1 append inside the new size).
+            let layout = build_final_layout(blob_guid, version, new_map_ref);
+            let old_bytes = wrap_for_publish(promoted_record.as_ref(), &prepare)?;
+            let new_bytes = wrap_for_publish(promoted_record.as_ref(), &layout)?;
+            match self
+                .backend()
+                .put_inode_cas(&publish_key, new_bytes, old_bytes, &trace_id)
+                .await
+            {
+                Ok(_prev) => {
+                    // Reserve fallocate-claimed blocks not superseded by a
+                    // Rewrite/Delete this flush (single-op; EC is a no-op).
+                    for b in snap.pending_reservations.iter() {
+                        if reservation_eligible(*b) {
+                            let _ = self
+                                .backend()
+                                .reserve_block(blob_guid, *b, block_size as u32, version, &trace_id)
+                                .await;
+                        }
+                    }
+                    sweep_victims = victims;
+                    if map_changed {
+                        sweep_old_map = base.block_map;
+                    }
+                    for (b, st) in snap.blocks.iter() {
+                        if matches!(st, BlockState::Rewrite(_)) && is_append(*b) {
+                            append_blocks.insert(*b);
+                        }
+                    }
+                    snap.armed = false;
+                    break (layout, committed_size);
+                }
+                Err(FsError::CasConflict) => {
+                    // A metadata CAS (chmod/utimensat/link) landed between
+                    // prepare and commit, or our lease was taken over. The
+                    // refetched base either still carries our pending (step
+                    // 0 aborts it and the attempt restarts with a fresh
+                    // burned version; blocks rewritten idempotently or at
+                    // the new version) or someone else owns the file now.
+                    refetch_base_and_continue!()
                 }
                 Err(e) => return Err(e),
             }
@@ -1932,7 +2422,19 @@ impl VfsCore {
                 .blocks
                 .iter()
                 .filter_map(|(b, s)| match s {
-                    BlockState::Rewrite(bytes) => Some((*b, bytes.clone())),
+                    BlockState::Rewrite(bytes) if !append_blocks.contains(b) => {
+                        Some((*b, bytes.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let appends: Vec<(u32, Bytes)> = snap
+                .blocks
+                .iter()
+                .filter_map(|(b, s)| match s {
+                    BlockState::Rewrite(bytes) if append_blocks.contains(b) => {
+                        Some((*b, bytes.clone()))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -1965,6 +2467,15 @@ impl VfsCore {
                 // version floor, which fences any still-queued OLDER create
                 // job for this blob. fdatasync is still dropped, so this is
                 // page-cache-cheap; overrides are not the create-storm path.
+                if !appends.is_empty()
+                    && let Err(e) = dc.sync_after_flush(final_blob_guid, 1, &appends, &[]).await
+                {
+                    tracing::warn!(
+                        %final_blob_guid,
+                        error = %e,
+                        "disk cache append mirror failed (best-effort)"
+                    );
+                }
                 if let Err(e) = dc
                     .sync_after_flush(final_blob_guid, blob_version, &rewrites, &deletes)
                     .await
@@ -2026,33 +2537,17 @@ impl VfsCore {
             }
         }
 
-        // Publish the authoritative blob-geometry sentinel so a peer instance
-        // serving vfs_getattr from a stale cached layout still observes the
-        // latest cross-instance size override (the inode size+blob_version it
-        // cached may lag this flush). Initial creates use a fresh blob_guid
-        // and publish exact size in NSS, so only override versions need this
-        // extra BSS write.
-        if final_layout.blob_version > 1
-            && let Ok(geom_guid) = final_layout.blob_guid()
-        {
-            let new_bc = file_size.div_ceil(block_size as u64) as u32;
-            let info = BlobInfo {
-                total_size: file_size,
-                block_count: new_bc,
-                blob_version: final_layout.blob_version,
-            };
-            if let Err(e) = self
-                .backend()
-                .write_blob_info(geom_guid, info, final_layout.blob_version, &trace_id)
-                .await
-            {
-                tracing::warn!(
-                    %geom_guid,
-                    blob_version = final_layout.blob_version,
-                    error = %e,
-                    "write_blob_info (geometry sentinel) failed; cross-instance size may lag until next flush"
-                );
-            }
+        // Reclaim the identities this commit superseded (rewritten, punched
+        // and trimmed blocks' old generations, plus the replaced map's chunk
+        // rows) after a reader grace that exceeds the attr-TTL staleness
+        // bound. Best-effort and off the flush path; a crash before the
+        // sweep leaks invisible garbage until unlink.
+        if let Ok(final_blob_guid) = final_layout.blob_guid() {
+            self.enqueue_superseded_sweep(
+                final_blob_guid,
+                std::mem::take(&mut sweep_victims),
+                sweep_old_map.take(),
+            );
         }
 
         // Update inode table layout
@@ -2518,6 +3013,8 @@ impl VfsCore {
                 version_id: ObjectLayout::gen_version_id(),
                 block_size: DEFAULT_BLOCK_SIZE,
                 blob_version: 0,
+                block_map: None,
+                pending_write: None,
                 state: ObjectState::Indirect(IndirectEntry { inode_id: id }),
             };
             let b: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&l, Vec::new())
@@ -3054,41 +3551,40 @@ impl VfsCore {
                     let mut attr = self.make_file_attr(inode, &layout)?;
                     // Cross-instance size authority: this entry's cached layout
                     // (size + blob_version) may lag a peer instance's most
-                    // recent overwrite, so make_file_attr's size can be stale.
-                    // Re-read the authoritative geometry sentinel from BSS via a
-                    // max-version quorum read, which reflects the latest
-                    // published override regardless of our cached layout
-                    // version. Skips symlinks/special files (they report their
-                    // own size and have no data blob). getattr is gated by the
-                    // 1s FUSE attr TTL, so this BSS read happens at most about
-                    // once/sec/inode: a bounded, throttled extra read.
+                    // recent overwrite. The NSS layout is the sole size
+                    // authority (the BSS geometry sentinel is gone with the
+                    // versioned-key design), so refresh it here. getattr is
+                    // gated by the 1s FUSE attr TTL, so this NSS read happens
+                    // at most about once/sec/inode: a bounded, throttled read.
+                    // Only move forward (a racing older fetch must never
+                    // downgrade a fresher local size), and skip symlinks /
+                    // special files (they report their own size).
                     if !layout.is_symlink()
                         && layout.special().is_none()
-                        && let Ok(geom_guid) = layout.blob_guid()
+                        && !name_removed
+                        && let Some(key) = self.inodes.get_s3_key(inode)
                     {
                         let trace_id = TraceId::new();
-                        match self.backend().get_blob_info(geom_guid, &trace_id).await {
-                            // Only let the sentinel move size FORWARD: apply it
-                            // when it is at least as new as our cached layout
-                            // (vfs_lookup refreshes the cached layout from NSS,
-                            // so a stale sentinel must never downgrade a fresh
-                            // size back to an older value).
-                            Ok(Some(info)) if info.blob_version >= layout.blob_version => {
-                                attr.size = info.total_size;
-                                // make_file_attr derives st_blocks from size
-                                // (512-byte units) for regular files; keep it
-                                // consistent with the refreshed size.
-                                attr.blocks = info.total_size.div_ceil(512);
+                        match self.backend().get_inode(&key, &trace_id).await {
+                            Ok(fresh) if fresh.blob_version >= layout.blob_version => {
+                                if let Ok(sz) = fresh.size() {
+                                    attr.size = sz;
+                                    // make_file_attr derives st_blocks from
+                                    // size (512-byte units); keep consistent.
+                                    attr.blocks = sz.div_ceil(512);
+                                    if let Some(mut e) = self.inodes.get_mut(inode) {
+                                        e.layout = Some(fresh);
+                                    }
+                                }
                             }
-                            // Sentinel older than our cached layout: keep the
-                            // (fresher) cached-layout size.
-                            Ok(Some(_)) => {}
-                            // No sentinel yet: keep the cached-layout size.
-                            Ok(None) => {}
+                            // Older than (or unrelated to) our cached layout:
+                            // keep the fresher cached size. NotFound: a queued
+                            // writeback publish may not have landed yet.
+                            Ok(_) | Err(FsError::NotFound) => {}
                             Err(e) => {
                                 tracing::warn!(
                                     error = %e,
-                                    "getattr get_blob_info failed; using cached size"
+                                    "getattr layout refresh failed; using cached size"
                                 );
                             }
                         }
@@ -3257,13 +3753,7 @@ impl VfsCore {
         // shrink-destroys watermark, and decide whether the surviving last
         // block of a non-block-aligned shrink needs a synthesized
         // tail-zero `Rewrite`. Releases the guard before any await.
-        let (
-            block_size,
-            committed_size,
-            existing_blob_guid,
-            committed_blob_version,
-            tail_zero_target,
-        ) = {
+        let (block_size, committed_size, existing_blob_guid, committed_layout, tail_zero_target) = {
             let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
             let block_size = handle
                 .layout
@@ -3276,8 +3766,7 @@ impl VfsCore {
                 .and_then(|l| l.size().ok())
                 .unwrap_or(0);
             let existing_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
-            let committed_blob_version =
-                handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
+            let committed_layout = handle.layout.clone();
             let wb = handle.write_buf.get_or_insert_with(|| {
                 WriteBuffer::new(existing_blob_guid, committed_size, block_size)
             });
@@ -3319,7 +3808,7 @@ impl VfsCore {
                 block_size,
                 committed_size,
                 existing_blob_guid,
-                committed_blob_version,
+                committed_layout,
                 tail_zero_target,
             )
         };
@@ -3338,9 +3827,13 @@ impl VfsCore {
                     } else {
                         0
                     };
+                    let committed_map = match &committed_layout {
+                        Some(l) => self.layout_block_map(l).await?,
+                        None => None,
+                    };
                     self.lazy_load_block_for_flush(
                         existing_blob_guid,
-                        committed_blob_version,
+                        committed_map.as_deref(),
                         last,
                         committed_content_len,
                         bsz_usize,
@@ -3885,6 +4378,8 @@ impl VfsCore {
             block_size: DEFAULT_BLOCK_SIZE,
             timestamp: now_ns() / 1_000_000,
             blob_version: 0,
+            block_map: None,
+            pending_write: None,
             state: ObjectState::Special(SpecialData {
                 kind,
                 rdev,
@@ -4170,13 +4665,7 @@ impl VfsCore {
         // Phase 1: snapshot block_size, committed geometry, and which
         // partially-touched blocks need a lazy read-modify-write load.
         // Releases the guard before any await.
-        let (
-            block_size,
-            existing_blob_guid,
-            committed_size,
-            committed_blob_version,
-            blocks_to_load,
-        ) = {
+        let (block_size, existing_blob_guid, committed_size, committed_layout, blocks_to_load) = {
             let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
             let bsize = handle
                 .layout
@@ -4189,8 +4678,7 @@ impl VfsCore {
                 .and_then(|l| l.size().ok())
                 .unwrap_or(0);
             let layout_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
-            let committed_blob_version =
-                handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
+            let committed_layout = handle.layout.clone();
             let wb = handle
                 .write_buf
                 .get_or_insert_with(|| WriteBuffer::new(layout_blob_guid, committed_size, bsize));
@@ -4220,7 +4708,7 @@ impl VfsCore {
                 wb.block_size,
                 wb.existing_blob_guid,
                 committed_size,
-                committed_blob_version,
+                committed_layout,
                 to_load,
             )
         };
@@ -4228,6 +4716,10 @@ impl VfsCore {
         // Phase 2: lazy-load the partial blocks outside the guard.
         let trace_id = TraceId::new();
         let mut loaded: std::collections::BTreeMap<u32, Bytes> = std::collections::BTreeMap::new();
+        let committed_map = match &committed_layout {
+            Some(l) => self.layout_block_map(l).await?,
+            None => None,
+        };
         let bsz_u64 = block_size as u64;
         for b in blocks_to_load {
             let block_start = b as u64 * bsz_u64;
@@ -4239,7 +4731,7 @@ impl VfsCore {
             let bytes = self
                 .lazy_load_block_for_flush(
                     existing_blob_guid,
-                    committed_blob_version,
+                    committed_map.as_deref(),
                     b,
                     committed_content_len,
                     block_size as usize,
@@ -4332,7 +4824,7 @@ impl VfsCore {
 
         // Phase 1: snapshot enough state to compute the touched range
         // and decide which blocks need a lazy load for edge zeroing.
-        let (block_size, existing_blob_guid, committed_size, committed_blob_version, edge_loads) = {
+        let (block_size, existing_blob_guid, committed_size, committed_layout, edge_loads) = {
             let mut handle = self.file_handles.get_mut(&fh).ok_or(FsError::BadFd)?;
             let block_size = handle
                 .layout
@@ -4345,8 +4837,7 @@ impl VfsCore {
                 .and_then(|l| l.size().ok())
                 .unwrap_or(0);
             let layout_blob_guid = handle.layout.as_ref().and_then(|l| l.blob_guid().ok());
-            let committed_blob_version =
-                handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
+            let committed_layout = handle.layout.clone();
             let wb = handle.write_buf.get_or_insert_with(|| {
                 WriteBuffer::new(layout_blob_guid, committed_size, block_size)
             });
@@ -4401,7 +4892,7 @@ impl VfsCore {
                 block_size,
                 wb.existing_blob_guid,
                 committed_size,
-                committed_blob_version,
+                committed_layout,
                 edge_loads,
             )
         };
@@ -4410,6 +4901,10 @@ impl VfsCore {
         let trace_id = TraceId::new();
         let mut loaded: std::collections::BTreeMap<u32, Bytes> = std::collections::BTreeMap::new();
         if punch_hole {
+            let committed_map = match &committed_layout {
+                Some(l) => self.layout_block_map(l).await?,
+                None => None,
+            };
             let bsz_u64 = block_size as u64;
             for b in edge_loads {
                 let block_start = b as u64 * bsz_u64;
@@ -4421,7 +4916,7 @@ impl VfsCore {
                 let bytes = self
                     .lazy_load_block_for_flush(
                         existing_blob_guid,
-                        committed_blob_version,
+                        committed_map.as_deref(),
                         b,
                         committed_content_len,
                         block_size as usize,
@@ -4549,6 +5044,12 @@ impl VfsCore {
         }
 
         // Snapshot the bits we need without holding the guard across awaits.
+        let committed_layout = self
+            .file_handles
+            .get(&fh)
+            .ok_or(FsError::BadFd)?
+            .layout
+            .clone();
         let (
             file_size,
             block_size,
@@ -4618,11 +5119,29 @@ impl VfsCore {
             }
         };
 
-        // BSS-side classification: one ListBlobBlocks call covers the whole
-        // walk range. Reserved entries count as data (Linux SEEK_DATA
-        // convention), Data is data, anything not returned is a hole.
+        // Committed classification. The version map answers for every
+        // covered block without touching BSS (Written and Reserved count
+        // as data per the Linux SEEK_DATA convention, Hole is a hole);
+        // only unmapped blocks fall through to the BSS probe, where they
+        // are data exactly if a version-1 key exists. Listed entries at
+        // other versions are pre-sweep superseded garbage of map-covered
+        // blocks and must not override the map's answer.
+        let committed_map = match &committed_layout {
+            Some(l) => self.layout_block_map(l).await?,
+            None => None,
+        };
+        let mapped_kind = |b: u32| -> Option<bool> {
+            committed_map.as_deref().and_then(|m| match m.lookup(b) {
+                Some(RangeState::Written(_)) | Some(RangeState::Reserved(_)) => Some(true),
+                Some(RangeState::Hole) => Some(false),
+                None => None,
+            })
+        };
+
+        // BSS-side classification for unmapped blocks: one ListBlobBlocks
+        // call covers the whole walk range.
         let trace_id = TraceId::new();
-        let block_map: std::collections::BTreeSet<u32> = match probe_blob_guid {
+        let v1_present: std::collections::BTreeSet<u32> = match probe_blob_guid {
             Some(guid) => {
                 let count = last_block_excl.saturating_sub(first_block);
                 if count == 0 {
@@ -4632,7 +5151,11 @@ impl VfsCore {
                         .backend()
                         .list_blob_blocks(guid, first_block, count, &trace_id)
                         .await?;
-                    entries.into_iter().map(|e| e.block_number).collect()
+                    entries
+                        .into_iter()
+                        .filter(|e| e.version == 1)
+                        .map(|e| e.block_number)
+                        .collect()
                 }
             }
             None => std::collections::BTreeSet::new(),
@@ -4641,7 +5164,10 @@ impl VfsCore {
         for b in first_block..last_block_excl {
             let is_data = match buffered_kind(b) {
                 Some(d) => d,
-                None => block_map.contains(&b),
+                None => match mapped_kind(b) {
+                    Some(d) => d,
+                    None => v1_present.contains(&b),
+                },
             };
             let result_offset = if b == first_block {
                 offset
@@ -5128,9 +5654,7 @@ impl VfsCore {
                 if let Ok(old_layout) =
                     rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
                 {
-                    self.backend()
-                        .delete_blob_blocks(&old_layout, &trace_id)
-                        .await;
+                    self.teardown_blob(&old_layout, &trace_id).await;
                 }
             } else {
                 // Still more handles open, re-insert
@@ -5258,6 +5782,8 @@ impl VfsCore {
             block_size: DEFAULT_BLOCK_SIZE,
             timestamp,
             blob_version: 0,
+            block_map: None,
+            pending_write: None,
             state: ObjectState::Symlink(SymlinkData {
                 target: target.to_vec(),
                 core_meta_data: ObjectCoreMetaData {
@@ -5385,16 +5911,12 @@ impl VfsCore {
         };
         match &old_layout.state {
             ObjectState::Normal(_) => {
-                self.backend()
-                    .delete_blob_blocks(&old_layout, trace_id)
-                    .await;
+                self.teardown_blob(&old_layout, trace_id).await;
             }
             ObjectState::Mpu(MpuState::Completed(_)) => {
                 if let Ok(parts) = self.backend().list_mpu_parts(key, trace_id).await {
                     for (part_key, part_layout) in &parts {
-                        self.backend()
-                            .delete_blob_blocks(part_layout, trace_id)
-                            .await;
+                        self.teardown_blob(part_layout, trace_id).await;
                         let _ = self.backend().delete_inode(part_key, trace_id).await;
                     }
                 }
@@ -5435,9 +5957,7 @@ impl VfsCore {
                         if let Ok(fresh) = self.backend().get_inode_record(inode_id, trace_id).await
                             && fresh.nlink == 0
                         {
-                            self.backend()
-                                .delete_blob_blocks(&fresh.layout, trace_id)
-                                .await;
+                            self.teardown_blob(&fresh.layout, trace_id).await;
                             let _ = self.backend().delete_inode_record(inode_id, trace_id).await;
                         }
                     }
@@ -5575,6 +6095,8 @@ impl VfsCore {
             block_size: DEFAULT_BLOCK_SIZE,
             timestamp: now / 1_000_000,
             blob_version: 1,
+            block_map: None,
+            pending_write: None,
             state: ObjectState::Directory(DirectoryData { posix }),
         };
         let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())
