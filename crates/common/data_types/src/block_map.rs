@@ -2,8 +2,8 @@
 //!
 //! Sparse, range-encoded record of which BSS generation holds each block of
 //! a blob. Blocks not covered by any range are at version 1 if they were
-//! ever written (the map exists only when overwrite, punch, poison, or
-//! fallocate happened). The map is stored as immutable chunk records in the
+//! ever written (the map exists once an existing blob is mutated or
+//! fallocate is used). The map is stored as immutable chunk records in the
 //! NSS keyspace at `#bmap/{blob_id}/{map_id}-{chunk_no}`; a flush that
 //! changes the map writes a complete new chunk set under a fresh `map_id`
 //! and the inode CAS flips the `BlockMapRef` pointer.
@@ -18,8 +18,8 @@ pub enum RangeState {
     /// Committed generation: the block's body is exactly
     /// `(blob_guid, block, version)` and must exist on the read rule.
     Written(u64),
-    /// Punched hole or poisoned aborted-append range: reads as zeros with
-    /// no BSS access; writers must never write these blocks at version 1.
+    /// Punched, trimmed, or conversion-safe hole: reads as zeros with no BSS
+    /// access.
     Hole,
     /// fallocate claim at the given version: reads as zeros; the BSS holds
     /// a space reservation at `(blob_guid, block, version)`.
@@ -54,6 +54,16 @@ pub fn bmap_chunk_key(blob_guid: &DataBlobGuid, map_id: Uuid, chunk_no: u32) -> 
 /// Prefix of every chunk of every map version of a blob (unlink teardown).
 pub fn bmap_prefix(blob_guid: &DataBlobGuid) -> String {
     format!("#bmap/{}/", blob_guid.blob_id)
+}
+
+/// Prefix for active reader leases that pin this blob's generations.
+pub fn block_reader_prefix(blob_guid: &DataBlobGuid) -> String {
+    format!("#bmap-reader/{}/", blob_guid.blob_id)
+}
+
+/// NSS key for one active reader lease.
+pub fn block_reader_key(blob_guid: &DataBlobGuid, reader_id: Uuid) -> String {
+    format!("{}{reader_id}", block_reader_prefix(blob_guid))
 }
 
 /// In-memory per-block version map: sorted, non-overlapping, adjacent

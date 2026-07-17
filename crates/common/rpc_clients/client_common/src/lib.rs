@@ -101,6 +101,8 @@ pub enum RpcError {
     ChecksumMismatch,
     #[error("Version skipped")]
     VersionSkipped,
+    #[error("No space left on BSS volume")]
+    NoSpace,
     /// Write-once violation: a put addressed an existing versioned data key
     /// with different bytes. The stored content is untouched; never retry
     /// the same identity with these bytes.
