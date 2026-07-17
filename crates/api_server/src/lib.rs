@@ -9,6 +9,7 @@ pub mod unified_stats;
 pub use blob_client::BlobClient;
 use blob_client::BlobDeletionRequest;
 pub use config::{BlobStorageBackend, BlobStorageConfig, Config, S3HybridSingleAzConfig};
+use data_types::block_map::BlockMap;
 use data_types::{ApiKey, Bucket, RoutingKey, TraceId, Versioned};
 use handler::common::s3_error::S3Error;
 use metrics_wrapper::counter;
@@ -32,6 +33,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub cache: Arc<Cache<String, Versioned<String>>>,
     pub worker_id: u16,
+    pub(crate) block_maps: Cache<uuid::Uuid, Arc<BlockMap>>,
 
     // Per-routing-key NSS clients, lazily populated as buckets are resolved.
     // A single api_server instance can cache clients for multiple distinct
@@ -51,6 +53,7 @@ pub struct NssEntry {
 
 impl AppState {
     const PER_CORE_CACHE_CAPACITY: u64 = 10_000;
+    const PER_CORE_BLOCK_MAP_CACHE_CAPACITY: u64 = 4_096;
     const BLOB_DELETION_QUEUE_CAPACITY: usize = 4_096;
 
     pub fn new_per_core_sync(
@@ -70,6 +73,9 @@ impl AppState {
                 .max_capacity(Self::PER_CORE_CACHE_CAPACITY)
                 .build(),
         );
+        let block_maps = Cache::builder()
+            .max_capacity(Self::PER_CORE_BLOCK_MAP_CACHE_CAPACITY)
+            .build();
 
         debug!("Per-core AppState initialized with lazy BlobClient initialization");
 
@@ -86,6 +92,7 @@ impl AppState {
             blob_deletion_tx: tx,
             blob_deletion_rx: Mutex::new(Some(rx)),
             cache,
+            block_maps,
             worker_id,
         }
     }

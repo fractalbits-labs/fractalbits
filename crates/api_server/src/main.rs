@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use actix_files::Files;
 use actix_web::HttpResponse;
 use actix_web::{App, HttpServer, middleware::Logger, rt::System, web};
