@@ -51,6 +51,7 @@ pub struct NssEntry {
 
 impl AppState {
     const PER_CORE_CACHE_CAPACITY: u64 = 10_000;
+    const BLOB_DELETION_QUEUE_CAPACITY: usize = 4_096;
 
     pub fn new_per_core_sync(
         config: Arc<Config>,
@@ -61,7 +62,7 @@ impl AppState {
     ) -> Self {
         debug!("Initializing per-core AppState with lazy RPC client connections");
 
-        let (tx, rx) = mpsc::channel(1024 * 1024);
+        let (tx, rx) = mpsc::channel(Self::BLOB_DELETION_QUEUE_CAPACITY);
 
         let cache = Arc::new(
             Cache::builder()
@@ -248,13 +249,6 @@ impl AppState {
             .get_or_try_init(|| async {
                 debug!("Creating per-worker BlobClient on-demand");
 
-                let rx = self
-                    .blob_deletion_rx
-                    .lock()
-                    .await
-                    .take()
-                    .ok_or_else(|| "BlobClient already initialized".to_string())?;
-
                 debug!(
                     "Fetching DataVgInfo from RSS at {:?}",
                     self.config.rss_addrs
@@ -271,9 +265,8 @@ impl AppState {
                     data_vg_info.volumes.len()
                 );
 
-                let blob_client = BlobClient::new_with_data_vg_info(
+                let storage = BlobClient::create_storage_with_data_vg_info(
                     &self.config.blob_storage,
-                    rx,
                     self.config.rss_rpc_timeout(),
                     self.config.rpc_connection_timeout(),
                     data_vg_info,
@@ -281,7 +274,14 @@ impl AppState {
                 .await
                 .map_err(|e| e.to_string())?;
 
-                Ok(Arc::new(blob_client))
+                let rx = self
+                    .blob_deletion_rx
+                    .lock()
+                    .await
+                    .take()
+                    .ok_or_else(|| "BlobClient already initialized".to_string())?;
+
+                Ok(Arc::new(BlobClient::new_with_storage(storage, rx)))
             })
             .await
             .cloned()
@@ -289,6 +289,14 @@ impl AppState {
 
     pub fn get_blob_deletion(&self) -> Sender<BlobDeletionRequest> {
         self.blob_deletion_tx.clone()
+    }
+
+    pub async fn shutdown_blob_deletions(&self) {
+        if let Some(blob_client) = self.blob_client.get() {
+            debug!(worker_id = self.worker_id, "draining blob deletion worker");
+            blob_client.shutdown().await;
+            debug!(worker_id = self.worker_id, "blob deletion worker stopped");
+        }
     }
 }
 
