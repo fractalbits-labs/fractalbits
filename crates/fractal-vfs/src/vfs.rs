@@ -335,6 +335,93 @@ fn reservation_abort_map(
     abort_map
 }
 
+/// True when `current` differs from `expected` only in posix attributes:
+/// the async SetPosix worker (or a chmod/utimensat) republished the row
+/// between this flush's base snapshot and its CAS. Metadata updates clone
+/// the fetched layout and carry `block_map` and `prepared_write` forward
+/// unchanged, so a data flush can rebase over them; any other divergence
+/// is a foreign writer and stays a hard conflict.
+fn posix_only_moved(expected: &ObjectLayout, current: &ObjectLayout) -> bool {
+    let ObjectState::Normal(expected_meta) = &expected.state else {
+        return false;
+    };
+    let mut normalized = current.clone();
+    let ObjectState::Normal(normalized_meta) = &mut normalized.state else {
+        return false;
+    };
+    normalized_meta.core_meta_data.posix = expected_meta.core_meta_data.posix.clone();
+    // rkyv encoding is deterministic for these types (the CAS guard itself
+    // relies on this), so byte equality is exact structural equality.
+    let expected_bytes = to_bytes_in::<_, rkyv::rancor::Error>(expected, Vec::new());
+    let normalized_bytes = to_bytes_in::<_, rkyv::rancor::Error>(&normalized, Vec::new());
+    match (expected_bytes, normalized_bytes) {
+        (Ok(expected_bytes), Ok(normalized_bytes)) => expected_bytes == normalized_bytes,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod posix_only_moved_tests {
+    use super::*;
+    use data_types::object_layout::{ObjectCoreMetaData, ObjectMetaData, PosixAttrs};
+
+    fn layout_with(mtime_ns: u64, blob_version: u64) -> ObjectLayout {
+        ObjectLayout {
+            timestamp: 1,
+            version_id: uuid::Uuid::nil(),
+            block_size: DEFAULT_BLOCK_SIZE,
+            blob_version,
+            block_map: None,
+            prepared_write: None,
+            state: ObjectState::Normal(ObjectMetaData {
+                blob_guid: DataBlobGuid {
+                    blob_id: uuid::Uuid::nil(),
+                    volume_id: 1,
+                },
+                core_meta_data: ObjectCoreMetaData {
+                    size: 2,
+                    etag: "etag".to_string(),
+                    headers: vec![],
+                    checksum: None,
+                    posix: Some(Box::new(PosixAttrs {
+                        mode: 0o100644,
+                        uid: 1000,
+                        gid: 1000,
+                        mtime_ns,
+                        ctime_ns: mtime_ns,
+                    })),
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn posix_republish_is_benign() {
+        let base = layout_with(100, 1);
+        let moved = layout_with(200, 1);
+        assert!(posix_only_moved(&base, &moved), "mtime-only move rebases");
+        assert!(posix_only_moved(&base, &base), "identical rows rebase");
+    }
+
+    #[test]
+    fn structural_divergence_stays_a_conflict() {
+        let base = layout_with(100, 1);
+        let mut advanced = layout_with(100, 2);
+        assert!(
+            !posix_only_moved(&base, &advanced),
+            "blob_version change is a real writer"
+        );
+        advanced = layout_with(100, 1);
+        if let ObjectState::Normal(meta) = &mut advanced.state {
+            meta.core_meta_data.size = 3;
+        }
+        assert!(
+            !posix_only_moved(&base, &advanced),
+            "size change is a real writer"
+        );
+    }
+}
+
 #[cfg(test)]
 mod mapped_trim_tests {
     use super::*;
@@ -2523,6 +2610,34 @@ impl VfsCore {
         }
     }
 
+    /// After a lost inode CAS, fetch the stored row and return the current
+    /// layout iff it diverged from `expected` only by a posix republish
+    /// (see `posix_only_moved`); a promoted record must also keep its
+    /// nlink and orphan_since. Any real conflict returns None.
+    async fn refetch_posix_moved_base(
+        &self,
+        publish_key: &str,
+        promoted_record: Option<&InodeRecord>,
+        promoted_inode_id: Option<Uuid>,
+        expected: &ObjectLayout,
+        trace_id: &TraceId,
+    ) -> Option<ObjectLayout> {
+        match promoted_inode_id {
+            Some(id) => {
+                let record = self.backend().get_inode_record(id, trace_id).await.ok()?;
+                let unchanged_record = promoted_record.is_some_and(|prev| {
+                    prev.nlink == record.nlink && prev.orphan_since == record.orphan_since
+                });
+                (unchanged_record && posix_only_moved(expected, &record.layout))
+                    .then_some(record.layout)
+            }
+            None => {
+                let current = self.backend().get_inode(publish_key, trace_id).await.ok()?;
+                posix_only_moved(expected, &current).then_some(current)
+            }
+        }
+    }
+
     async fn flush_write_buffer(&self, fh_id: FileHandleId) -> Result<(), FsError> {
         let operation_lock = self
             .file_handles
@@ -2646,6 +2761,11 @@ impl VfsCore {
         let mut sweep_victims: Vec<(u32, u64)> = Vec::new();
         let mut sweep_old_map: Option<BlockMapRef> = None;
         let mut unused_prepare_map: Option<BlockMapRef> = None;
+        // A CAS that loses only to a posix republish (the async SetPosix
+        // worker racing this same handle's flush) rebases and retries;
+        // bounded so a pathological utimensat storm still errors out.
+        const MAX_POSIX_REBASE_ATTEMPTS: u32 = 16;
+        let mut posix_rebase_attempts = 0u32;
         let mut append_blocks = std::collections::BTreeSet::new();
         let mut committed_write_versions: std::collections::BTreeMap<u32, u64> =
             std::collections::BTreeMap::new();
@@ -2977,6 +3097,33 @@ impl VfsCore {
                             .is_some_and(|current| current == new_bytes),
                     };
                     if !landed {
+                        if posix_rebase_attempts < MAX_POSIX_REBASE_ATTEMPTS
+                            && let Some(current) = self
+                                .refetch_posix_moved_base(
+                                    &publish_key,
+                                    promoted_record.as_ref(),
+                                    promoted_inode_id,
+                                    &base,
+                                    &trace_id,
+                                )
+                                .await
+                        {
+                            posix_rebase_attempts += 1;
+                            if recovery.append_range.is_some()
+                                && let Some(map_ref) = recovered.block_map
+                            {
+                                self.enqueue_unreferenced_map_delete(blob_guid, map_ref);
+                            }
+                            if let Some(mut handle) = self.file_handles.get_mut(&fh_id) {
+                                handle.layout = Some(current.clone());
+                                handle.layout_refreshed_at = Instant::now();
+                            }
+                            if let Some(mut entry) = self.inodes.get_mut(ino) {
+                                entry.layout = Some(current.clone());
+                            }
+                            base_layout = Some(current);
+                            continue;
+                        }
                         return Err(error);
                     }
                 }
@@ -3146,6 +3293,31 @@ impl VfsCore {
                             .is_some_and(|current| current == new_bytes),
                     };
                     if !landed {
+                        if posix_rebase_attempts < MAX_POSIX_REBASE_ATTEMPTS
+                            && let Some(current) = self
+                                .refetch_posix_moved_base(
+                                    &publish_key,
+                                    promoted_record.as_ref(),
+                                    promoted_inode_id,
+                                    &base,
+                                    &trace_id,
+                                )
+                                .await
+                        {
+                            posix_rebase_attempts += 1;
+                            if let Some(map_ref) = reservation_abort_map_ref {
+                                self.enqueue_unreferenced_map_delete(blob_guid, map_ref);
+                            }
+                            if let Some(mut handle) = self.file_handles.get_mut(&fh_id) {
+                                handle.layout = Some(current.clone());
+                                handle.layout_refreshed_at = Instant::now();
+                            }
+                            if let Some(mut entry) = self.inodes.get_mut(ino) {
+                                entry.layout = Some(current.clone());
+                            }
+                            base_layout = Some(current);
+                            continue;
+                        }
                         return Err(error);
                     }
                 }
@@ -3362,13 +3534,15 @@ impl VfsCore {
             // Step 6: commit CAS from the prepared layout to the final map.
             // After it, every dirty block's exact identity is visible.
             let layout = build_final_layout(blob_guid, version, new_map_ref);
-            let old_bytes = wrap_for_publish(promoted_record.as_ref(), &prepare)?;
             let new_bytes = wrap_for_publish(promoted_record.as_ref(), &layout)?;
-            let commit_result = self
-                .backend()
-                .put_inode_cas(&publish_key, new_bytes.clone(), old_bytes, &trace_id)
-                .await;
-            if let Err(error) = commit_result {
+            let mut commit_guard = prepare.clone();
+            loop {
+                let old_bytes = wrap_for_publish(promoted_record.as_ref(), &commit_guard)?;
+                let commit_result = self
+                    .backend()
+                    .put_inode_cas(&publish_key, new_bytes.clone(), old_bytes, &trace_id)
+                    .await;
+                let Err(error) = commit_result else { break };
                 let landed = match promoted_inode_id {
                     Some(id) => self
                         .backend()
@@ -3385,9 +3559,25 @@ impl VfsCore {
                         .and_then(|layout| wrap_for_publish(None, &layout).ok())
                         .is_some_and(|current| current == new_bytes),
                 };
-                if !landed {
-                    return Err(error);
+                if landed {
+                    break;
                 }
+                if posix_rebase_attempts < MAX_POSIX_REBASE_ATTEMPTS
+                    && let Some(current) = self
+                        .refetch_posix_moved_base(
+                            &publish_key,
+                            promoted_record.as_ref(),
+                            promoted_inode_id,
+                            &commit_guard,
+                            &trace_id,
+                        )
+                        .await
+                {
+                    posix_rebase_attempts += 1;
+                    commit_guard = current;
+                    continue;
+                }
+                return Err(error);
             }
             sweep_victims = victims;
             if map_changed {
