@@ -2,6 +2,7 @@ use crate::DataVgError;
 use bytes::Bytes;
 use data_types::ec_utils::{ec_padded_len, ec_rotation};
 use data_types::{DataBlobGuid, DataVgInfo, TraceId, Volume, VolumeMode};
+use futures::future::Either;
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics_wrapper::{counter, histogram};
 use rand::RngExt;
@@ -33,6 +34,10 @@ static EPOCH: OnceLock<Instant> = OnceLock::new();
 
 fn current_timestamp_nanos() -> u64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+fn delete_result_succeeded(result: &Result<(), RpcError>) -> bool {
+    matches!(result, Ok(()) | Err(RpcError::NotFound))
 }
 
 /// Configuration for circuit breaker behavior
@@ -610,7 +615,11 @@ impl DataVgProxy {
         }
         .await;
 
-        let _result_label = if result.is_ok() { "success" } else { "failure" };
+        let _result_label = if delete_result_succeeded(&result) {
+            "success"
+        } else {
+            "failure"
+        };
         histogram!("datavg_delete_blob_node_nanos", "bss_node" => address.clone(), "result" => _result_label)
             .record(start_node.elapsed().as_nanos() as f64);
 
@@ -638,6 +647,33 @@ impl DataVgProxy {
         version: u64,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
+        self.put_blob_inner(blob_guid, block_number, body, version, trace_id, false)
+            .await
+    }
+
+    /// Fill a previously committed reservation without allocating a second
+    /// block. The caller must name the exact Reserved identity.
+    pub async fn put_reserved_blob(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        body: Bytes,
+        version: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        self.put_blob_inner(blob_guid, block_number, body, version, trace_id, true)
+            .await
+    }
+
+    async fn put_blob_inner(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        body: Bytes,
+        version: u64,
+        trace_id: &TraceId,
+        consume_reserved: bool,
+    ) -> Result<(), DataVgError> {
         let selected_volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
             DataVgError::InitializationError(format!(
                 "Volume {} not found in DataVgProxy",
@@ -647,7 +683,14 @@ impl DataVgProxy {
 
         if let VolumeMode::ErasureCoded { .. } = &selected_volume.mode {
             return self
-                .put_blob_ec(blob_guid, block_number, body, version, trace_id)
+                .put_blob_ec(
+                    blob_guid,
+                    block_number,
+                    body,
+                    version,
+                    trace_id,
+                    consume_reserved,
+                )
                 .await;
         }
 
@@ -715,6 +758,7 @@ impl DataVgProxy {
                 version,
                 rpc_timeout,
                 trace_id,
+                consume_reserved,
             ));
         }
 
@@ -728,6 +772,14 @@ impl DataVgProxy {
                     node.record_success();
                     successful_writes += 1;
                     debug!("Successful write to BSS node: {}", address);
+                }
+                Err(RpcError::Mismatch) => {
+                    node.record_failure();
+                    error!(
+                        "Write-once mismatch from BSS node {} for blob {}:{} v{}",
+                        address, blob_guid.blob_id, block_number, version
+                    );
+                    return Err(RpcError::Mismatch.into());
                 }
                 Err(rpc_error) => {
                     node.record_failure();
@@ -745,6 +797,10 @@ impl DataVgProxy {
                             Ok(()) | Err(RpcError::VersionSkipped) => {
                                 bg_node.record_success();
                                 debug!("Background write to {} completed", addr);
+                            }
+                            Err(RpcError::Mismatch) => {
+                                bg_node.record_failure();
+                                error!("Background write-once mismatch from BSS node {}", addr);
                             }
                             Err(e) => {
                                 bg_node.record_failure();
@@ -810,6 +866,7 @@ impl DataVgProxy {
                     Bytes::from(combined),
                     version,
                     trace_id,
+                    false,
                 )
                 .await;
         }
@@ -897,6 +954,14 @@ impl DataVgProxy {
                     successful_writes += 1;
                     debug!("Successful vectored write to BSS node: {}", address);
                 }
+                Err(RpcError::Mismatch) => {
+                    node.record_failure();
+                    error!(
+                        "Write-once mismatch from BSS node {} for blob {}:{} v{}",
+                        address, blob_guid.blob_id, block_number, version
+                    );
+                    return Err(RpcError::Mismatch.into());
+                }
                 Err(rpc_error) => {
                     node.record_failure();
                     warn!("RPC error writing to BSS node {}: {}", address, rpc_error);
@@ -911,6 +976,13 @@ impl DataVgProxy {
                             Ok(()) | Err(RpcError::VersionSkipped) => {
                                 bg_node.record_success();
                                 debug!("Background vectored write to {} completed", addr);
+                            }
+                            Err(RpcError::Mismatch) => {
+                                bg_node.record_failure();
+                                error!(
+                                    "Background vectored write-once mismatch from BSS node {}",
+                                    addr
+                                );
                             }
                             Err(e) => {
                                 bg_node.record_failure();
@@ -961,23 +1033,39 @@ impl DataVgProxy {
         version: u64,
         rpc_timeout: Duration,
         trace_id: TraceId,
+        consume_reserved: bool,
     ) -> (Arc<BssNode>, String, Result<(), RpcError>) {
         let start_node = Instant::now();
         let address = bss_node.address.clone();
 
         let bss_client = bss_node.get_client();
-        let result = bss_client
-            .put_data_blob(
-                blob_guid,
-                block_number,
-                body,
-                body_checksum,
-                version,
-                Some(rpc_timeout),
-                &trace_id,
-                0,
-            )
-            .await;
+        let result = if consume_reserved {
+            bss_client
+                .put_reserved_data_blob(
+                    blob_guid,
+                    block_number,
+                    body,
+                    body_checksum,
+                    version,
+                    Some(rpc_timeout),
+                    &trace_id,
+                    0,
+                )
+                .await
+        } else {
+            bss_client
+                .put_data_blob(
+                    blob_guid,
+                    block_number,
+                    body,
+                    body_checksum,
+                    version,
+                    Some(rpc_timeout),
+                    &trace_id,
+                    0,
+                )
+                .await
+        };
 
         let _result_label = if result.is_ok() { "success" } else { "failure" };
         histogram!("datavg_put_blob_node_nanos", "bss_node" => address.clone(), "result" => _result_label)
@@ -1062,6 +1150,10 @@ impl DataVgProxy {
         let start = Instant::now();
 
         let blob_id = blob_guid.blob_id;
+        let write_quorum = match &volume.mode {
+            VolumeMode::Replicated { w, .. } => *w as usize,
+            VolumeMode::ErasureCoded { .. } => unreachable!(),
+        };
 
         // Filter available nodes for fast path (only try nodes with closed circuit)
         let available_nodes: Vec<_> = volume
@@ -1159,11 +1251,9 @@ impl DataVgProxy {
         }
 
         let mut successful_blob_data = None;
-        // Track whether every failure was a NotFound (generation absent on
-        // every replica) so we can surface BlockNotFound rather than a
-        // generic QuorumFailure.
-        let mut saw_not_found = false;
-        let mut other_error = false;
+        // A sparse-hole answer requires an explicit absence quorum.
+        let mut not_found_count = 0usize;
+        let absence_quorum = volume.bss_nodes.len() - write_quorum + 1;
 
         while let Some((node, result)) = read_futures.next().await {
             match result {
@@ -1177,10 +1267,14 @@ impl DataVgProxy {
                         // Absence of a versioned key is an answer, not a
                         // node fault.
                         node.record_success();
-                        saw_not_found = true;
+                        not_found_count += 1;
+                        if not_found_count >= absence_quorum {
+                            histogram!("datavg_get_blob_nanos", "result" => "block_not_found")
+                                .record(start.elapsed().as_nanos() as f64);
+                            return Err(DataVgError::BlockNotFound);
+                        }
                     } else {
                         node.record_failure();
-                        other_error = true;
                         warn!(
                             "RPC error reading from BSS node {}: {}",
                             node.address, rpc_error
@@ -1197,8 +1291,10 @@ impl DataVgProxy {
             return Ok(());
         }
 
-        // Every reachable replica agreed the generation does not exist.
-        if saw_not_found && !other_error {
+        // Any absence quorum intersects every successful write quorum. The
+        // fallback includes the fast-path node again, so each node
+        // contributes at most one answer to this count.
+        if not_found_count >= absence_quorum {
             histogram!("datavg_get_blob_nanos", "result" => "block_not_found")
                 .record(start.elapsed().as_nanos() as f64);
             return Err(DataVgError::BlockNotFound);
@@ -1215,8 +1311,7 @@ impl DataVgProxy {
         ))
     }
 
-    /// Reserve a single block on every replica (single-op; EC volumes are a
-    /// no-op). Stamped at `expected_version`.
+    /// Reserve a single block at `expected_version`.
     pub async fn reserve_blob(
         &self,
         blob_guid: DataBlobGuid,
@@ -1229,7 +1324,15 @@ impl DataVgProxy {
             DataVgError::InitializationError(format!("Volume {} not found", blob_guid.volume_id))
         })?;
         if let VolumeMode::ErasureCoded { .. } = &volume.mode {
-            return Ok(());
+            return self
+                .reserve_blob_ec(
+                    blob_guid,
+                    block_number,
+                    block_size,
+                    expected_version,
+                    trace_id,
+                )
+                .await;
         }
 
         let rpc_timeout = self.rpc_timeout;
@@ -1277,6 +1380,7 @@ impl DataVgProxy {
         }
 
         let mut successes = 0usize;
+        let mut no_space = 0usize;
         let mut errors = Vec::new();
         while let Some((node, address, result)) = futures.next().await {
             match result {
@@ -1284,14 +1388,34 @@ impl DataVgProxy {
                     node.record_success();
                     successes += 1;
                 }
+                Err(RpcError::NoSpace) => {
+                    node.record_failure();
+                    no_space += 1;
+                    errors.push(format!("{}: no space", address));
+                }
                 Err(e) => {
                     node.record_failure();
                     errors.push(format!("{}: {}", address, e));
                 }
             }
             if successes >= write_quorum {
+                spawn_background(async move {
+                    while let Some((node, address, result)) = futures.next().await {
+                        match result {
+                            Ok(()) | Err(RpcError::VersionSkipped) => node.record_success(),
+                            Err(error) => {
+                                node.record_failure();
+                                warn!("Background reservation on {} failed: {}", address, error);
+                            }
+                        }
+                    }
+                });
                 return Ok(());
             }
+        }
+
+        if volume.bss_nodes.len().saturating_sub(no_space) < write_quorum {
+            return Err(RpcError::NoSpace.into());
         }
 
         Err(DataVgError::QuorumFailure(format!(
@@ -1303,14 +1427,40 @@ impl DataVgProxy {
     }
 
     /// Enumerate the BSS-visible block entries for one blob over
-    /// `[first_block, first_block + block_count)`. The first available node
-    /// responds; absent blocks are holes.
+    /// `[first_block, first_block + block_count)`.
+    ///
+    /// Results are unioned across the responding placement nodes. Absence is
+    /// safe once enough successful listings intersect every write quorum.
     pub async fn list_blob_blocks(
         &self,
         blob_guid: DataBlobGuid,
         first_block: u32,
         block_count: u32,
         trace_id: &TraceId,
+    ) -> Result<Vec<bss_codec::list_blob_blocks_response::BlobBlockEntry>, DataVgError> {
+        self.list_blob_blocks_inner(blob_guid, first_block, block_count, trace_id, false)
+            .await
+    }
+
+    /// Enumerate every physical entry for a blob. Unlike the read-oriented
+    /// range listing, reclamation must include keys left on fewer than a write
+    /// quorum by an abandoned write, so every placement node must respond.
+    pub async fn list_all_blob_blocks(
+        &self,
+        blob_guid: DataBlobGuid,
+        trace_id: &TraceId,
+    ) -> Result<Vec<bss_codec::list_blob_blocks_response::BlobBlockEntry>, DataVgError> {
+        self.list_blob_blocks_inner(blob_guid, 0, 0, trace_id, true)
+            .await
+    }
+
+    async fn list_blob_blocks_inner(
+        &self,
+        blob_guid: DataBlobGuid,
+        first_block: u32,
+        block_count: u32,
+        trace_id: &TraceId,
+        require_all_nodes: bool,
     ) -> Result<Vec<bss_codec::list_blob_blocks_response::BlobBlockEntry>, DataVgError> {
         let volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
             DataVgError::InitializationError(format!("Volume {} not found", blob_guid.volume_id))
@@ -1324,42 +1474,74 @@ impl DataVgProxy {
             .collect();
         available_nodes.shuffle(&mut rand::rng());
 
-        if available_nodes.is_empty() {
-            return Err(DataVgError::QuorumFailure(
-                "No available BSS nodes for list_blob_blocks".to_string(),
-            ));
+        let write_quorum = match &volume.mode {
+            VolumeMode::Replicated { w, .. } => *w as usize,
+            VolumeMode::ErasureCoded { data_shards, .. } => *data_shards as usize + 1,
+        };
+        let absence_quorum = volume.bss_nodes.len() - write_quorum + 1;
+        let required_responses = if require_all_nodes {
+            volume.bss_nodes.len()
+        } else {
+            absence_quorum
+        };
+        if available_nodes.len() < required_responses {
+            return Err(DataVgError::QuorumFailure(format!(
+                "list_blob_blocks requires {} responses ({}/{} available)",
+                required_responses,
+                available_nodes.len(),
+                volume.bss_nodes.len()
+            )));
         }
 
         let trace_id = *trace_id;
         let rpc_timeout = self.rpc_timeout;
-        let mut last_err: Option<String> = None;
-        for node in &available_nodes {
-            let result = node
-                .get_client()
-                .list_blob_blocks(
-                    blob_guid,
-                    first_block,
-                    block_count,
-                    Some(rpc_timeout),
-                    &trace_id,
-                    0,
-                )
-                .await;
+        let mut futures = FuturesUnordered::new();
+        for node in available_nodes {
+            futures.push(async move {
+                let result = node
+                    .get_client()
+                    .list_blob_blocks(
+                        blob_guid,
+                        first_block,
+                        block_count,
+                        Some(rpc_timeout),
+                        &trace_id,
+                        0,
+                    )
+                    .await;
+                (node, result)
+            });
+        }
+
+        let mut entries = std::collections::BTreeMap::new();
+        let mut errors = Vec::new();
+        let mut successful_responses = 0usize;
+        while let Some((node, result)) = futures.next().await {
             match result {
-                Ok(entries) => {
+                Ok(node_entries) => {
                     node.record_success();
-                    return Ok(entries);
+                    successful_responses += 1;
+                    for entry in node_entries {
+                        let key = (entry.block_number, entry.version, entry.entry_type);
+                        entries.entry(key).or_insert(entry);
+                    }
+                    if successful_responses >= required_responses {
+                        return Ok(entries.into_values().collect());
+                    }
                 }
                 Err(e) => {
                     node.record_failure();
-                    last_err = Some(format!("{}: {}", node.address, e));
+                    errors.push(format!("{}: {}", node.address, e));
                 }
             }
         }
-        Err(DataVgError::QuorumFailure(format!(
-            "list_blob_blocks: every replica failed ({})",
-            last_err.unwrap_or_default()
-        )))
+        if successful_responses < required_responses {
+            return Err(DataVgError::QuorumFailure(format!(
+                "list_blob_blocks received {successful_responses}/{required_responses} required responses: {}",
+                errors.join("; ")
+            )));
+        }
+        Ok(entries.into_values().collect())
     }
 
     pub async fn delete_blob(
@@ -1383,10 +1565,6 @@ impl DataVgProxy {
         let trace_id = *trace_id;
 
         let rpc_timeout = self.rpc_timeout;
-        let write_quorum = match &volume.mode {
-            VolumeMode::Replicated { w, .. } => *w as usize,
-            VolumeMode::ErasureCoded { .. } => unreachable!(),
-        };
 
         // Filter available nodes based on circuit breaker state
         let available_nodes: Vec<_> = volume
@@ -1403,15 +1581,15 @@ impl DataVgProxy {
             .cloned()
             .collect();
 
-        // Check if we have enough available nodes for quorum
-        if available_nodes.len() < write_quorum {
+        let required_deletes = volume.bss_nodes.len();
+        if available_nodes.len() < required_deletes {
             histogram!("datavg_delete_blob_nanos", "result" => "insufficient_nodes")
                 .record(start.elapsed().as_nanos() as f64);
             return Err(DataVgError::QuorumFailure(format!(
-                "Insufficient available nodes ({}/{}) for delete quorum ({})",
+                "Insufficient available nodes ({}/{}) for exact deletion ({})",
                 available_nodes.len(),
                 volume.bss_nodes.len(),
-                write_quorum
+                required_deletes
             )));
         }
 
@@ -1462,56 +1640,144 @@ impl DataVgProxy {
                     errors.push(format!("{}: {}", address, rpc_error));
                 }
             }
+        }
 
-            if successful_deletes >= write_quorum {
-                // Spawn remaining deletes as background task for eventual consistency
-                spawn_background(async move {
-                    while let Some((bg_node, addr, res)) = delete_futures.next().await {
-                        match res {
-                            Ok(()) => {
-                                bg_node.record_success();
-                                debug!("Background delete to {} completed", addr);
-                            }
-                            Err(RpcError::NotFound) => {
-                                // Idempotent: absent block is the desired state.
-                                bg_node.record_success();
-                            }
-                            Err(e) => {
-                                bg_node.record_failure();
-                                warn!("Background delete to {} failed: {}", addr, e);
-                            }
-                        }
-                    }
-                });
-
-                histogram!("datavg_delete_blob_nanos", "result" => "success")
-                    .record(start.elapsed().as_nanos() as f64);
-                debug!(
-                    "Delete quorum achieved ({}/{}) for blob {}:{}",
-                    successful_deletes,
-                    available_nodes.len(),
-                    blob_guid.blob_id,
-                    block_number
-                );
-                return Ok(());
-            }
+        if successful_deletes == required_deletes {
+            histogram!("datavg_delete_blob_nanos", "result" => "success")
+                .record(start.elapsed().as_nanos() as f64);
+            debug!(
+                "Exact delete completed ({}/{}) for blob {}:{}",
+                successful_deletes, required_deletes, blob_guid.blob_id, block_number
+            );
+            return Ok(());
         }
 
         histogram!("datavg_delete_blob_nanos", "result" => "quorum_failure")
             .record(start.elapsed().as_nanos() as f64);
         error!(
-            "Delete quorum failed ({}/{}). Errors: {:?}",
-            successful_deletes, write_quorum, errors
+            "Exact delete failed ({}/{}). Errors: {:?}",
+            successful_deletes, required_deletes, errors
         );
         Err(DataVgError::QuorumFailure(format!(
-            "Delete quorum failed ({}/{}): {}",
+            "Exact delete failed ({}/{}): {}",
             successful_deletes,
-            write_quorum,
+            required_deletes,
             errors.join("; ")
         )))
     }
 
     // ---- EC (Erasure-Coded) blob operations ----
+
+    /// Reserve one EC block on every available shard node and require the
+    /// same k+1 durability quorum as a data put. Each node reserves its
+    /// encoded shard length, not the full logical block length.
+    async fn reserve_blob_ec(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        block_size: u32,
+        version: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), DataVgError> {
+        let volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
+            DataVgError::InitializationError(format!("EC volume {} not found", blob_guid.volume_id))
+        })?;
+        let (k, m) = match &volume.mode {
+            VolumeMode::ErasureCoded {
+                data_shards,
+                parity_shards,
+            } => (*data_shards as usize, *parity_shards as usize),
+            VolumeMode::Replicated { .. } => unreachable!(),
+        };
+        let total = k + m;
+        let write_quorum = k + 1;
+        let shard_size = ec_padded_len(block_size as usize, k) / k;
+        let shard_size = u32::try_from(shard_size)
+            .map_err(|_| DataVgError::Internal("EC reserve shard size overflow".to_string()))?;
+
+        let available_nodes: Vec<_> = volume
+            .bss_nodes
+            .iter()
+            .filter(|node| node.is_available())
+            .cloned()
+            .collect();
+        if available_nodes.len() < write_quorum {
+            return Err(DataVgError::QuorumFailure(format!(
+                "EC reserve: insufficient available nodes ({}/{}) for quorum ({})",
+                available_nodes.len(),
+                total,
+                write_quorum
+            )));
+        }
+
+        let rpc_timeout = self.rpc_timeout;
+        let trace_id = *trace_id;
+        let mut futures = FuturesUnordered::new();
+        for node in available_nodes {
+            futures.push(async move {
+                let result = node
+                    .get_client()
+                    .reserve_blocks(
+                        blob_guid,
+                        block_number,
+                        shard_size,
+                        version,
+                        Some(rpc_timeout),
+                        &trace_id,
+                        0,
+                    )
+                    .await;
+                (node, result)
+            });
+        }
+
+        let mut successes = 0usize;
+        let mut no_space = 0usize;
+        let mut errors = Vec::new();
+        while let Some((node, result)) = futures.next().await {
+            match result {
+                Ok(()) | Err(RpcError::VersionSkipped) => {
+                    node.record_success();
+                    successes += 1;
+                }
+                Err(RpcError::NoSpace) => {
+                    node.record_failure();
+                    no_space += 1;
+                    errors.push(format!("{}: no space", node.address));
+                }
+                Err(e) => {
+                    node.record_failure();
+                    errors.push(format!("{}: {}", node.address, e));
+                }
+            }
+            if successes >= write_quorum {
+                spawn_background(async move {
+                    while let Some((node, result)) = futures.next().await {
+                        match result {
+                            Ok(()) | Err(RpcError::VersionSkipped) => node.record_success(),
+                            Err(error) => {
+                                node.record_failure();
+                                warn!(
+                                    "EC background reservation on {} failed: {}",
+                                    node.address, error
+                                );
+                            }
+                        }
+                    }
+                });
+                return Ok(());
+            }
+        }
+        if total.saturating_sub(no_space) < write_quorum {
+            return Err(RpcError::NoSpace.into());
+        }
+        Err(DataVgError::QuorumFailure(format!(
+            "EC reserve quorum failed ({}/{}): {}",
+            successes,
+            write_quorum,
+            errors.join("; ")
+        )))
+    }
 
     /// EC put: RS-encode block into k+m shards, send to nodes with W=k+1 quorum
     async fn put_blob_ec(
@@ -1521,6 +1787,7 @@ impl DataVgProxy {
         body: Bytes,
         version: u64,
         trace_id: &TraceId,
+        consume_reserved: bool,
     ) -> Result<(), DataVgError> {
         let start = Instant::now();
         let trace_id = *trace_id;
@@ -1617,6 +1884,7 @@ impl DataVgProxy {
                 version,
                 rpc_timeout,
                 trace_id,
+                consume_reserved,
             ));
         }
 
@@ -1629,6 +1897,14 @@ impl DataVgProxy {
                     node.record_success();
                     successful_writes += 1;
                     debug!("EC shard write success to {}", address);
+                }
+                Err(RpcError::Mismatch) => {
+                    node.record_failure();
+                    error!(
+                        "EC write-once mismatch from BSS node {} for blob {}:{} v{}",
+                        address, blob_guid.blob_id, block_number, version
+                    );
+                    return Err(RpcError::Mismatch.into());
                 }
                 Err(rpc_error) => {
                     node.record_failure();
@@ -1645,6 +1921,10 @@ impl DataVgProxy {
                             Ok(()) | Err(RpcError::VersionSkipped) => {
                                 bg_node.record_success();
                                 debug!("EC background write to {} completed", addr);
+                            }
+                            Err(RpcError::Mismatch) => {
+                                bg_node.record_failure();
+                                error!("EC background write-once mismatch from BSS node {}", addr);
                             }
                             Err(e) => {
                                 bg_node.record_failure();
@@ -1716,6 +1996,7 @@ impl DataVgProxy {
             _ => unreachable!(),
         };
         let total = k + m;
+        let absence_quorum = m;
 
         let rotation = ec_rotation(&blob_guid.blob_id, total as u32);
 
@@ -1723,12 +2004,14 @@ impl DataVgProxy {
         let padded_len = ec_padded_len(content_len, k);
         let shard_size = padded_len / k;
 
-        // Fetch the k data shards (indices 0..k) from their rotated nodes.
+        // Fetch data shards first, then hedge with parity after a short delay
+        // or the first failed data response. This preserves the normal k-read
+        // fast path without letting one slow data node hold reconstruction to
+        // the full RPC timeout.
         let mut shard_results: Vec<Option<Vec<u8>>> = vec![None; total];
         let mut shard_missing: Vec<bool> = vec![false; total];
         let mut data_shards_received = 0;
-        let mut data_shards_not_found = 0usize;
-        let mut data_shards_other_err = 0usize;
+        let mut shards_not_found = 0usize;
         let mut fetch_futures = FuturesUnordered::new();
         for shard_idx in 0..k {
             let node_idx = (shard_idx + rotation) % total;
@@ -1754,7 +2037,22 @@ impl DataVgProxy {
             });
         }
 
-        while let Some((shard_idx, node_idx, result)) = fetch_futures.next().await {
+        let mut hedge_delay = Box::pin(rpc_client_common::rpc_sleep(Duration::from_millis(5)));
+        while !fetch_futures.is_empty() {
+            let next_data = Box::pin(fetch_futures.next());
+            let (next_result, remaining_delay) =
+                match futures::future::select(next_data, hedge_delay).await {
+                    Either::Left((next_result, remaining_delay)) => (next_result, remaining_delay),
+                    Either::Right(((), pending_data)) => {
+                        drop(pending_data);
+                        break;
+                    }
+                };
+            hedge_delay = remaining_delay;
+            let Some((shard_idx, node_idx, result)) = next_result else {
+                break;
+            };
+            let should_hedge = result.is_err();
             match result {
                 Ok(data) => {
                     ec_vol.bss_nodes[node_idx].record_success();
@@ -1766,31 +2064,31 @@ impl DataVgProxy {
                     // answered correctly; do not penalise it.
                     ec_vol.bss_nodes[node_idx].record_success();
                     shard_missing[shard_idx] = true;
-                    data_shards_not_found += 1;
+                    shards_not_found += 1;
                     debug!(
                         "EC data shard {} reports BlockNotFound from {}",
                         shard_idx, ec_vol.bss_nodes[node_idx].address
                     );
+                    if data_shards_received == 0 && shards_not_found >= absence_quorum {
+                        histogram!("datavg_get_blob_nanos", "result" => "ec_block_not_found")
+                            .record(start.elapsed().as_nanos() as f64);
+                        return Err(DataVgError::BlockNotFound);
+                    }
                 }
                 Err(e) => {
                     ec_vol.bss_nodes[node_idx].record_failure();
-                    data_shards_other_err += 1;
                     warn!(
                         "EC data shard {} fetch failed from {}: {}",
                         shard_idx, ec_vol.bss_nodes[node_idx].address, e
                     );
                 }
             }
-        }
-
-        // If every data-shard fetch came back as BlockNotFound (and
-        // no transient errors), the generation doesn't exist on the
-        // EC volume. The caller maps that to zeros (v1 sparse probe)
-        // or detected loss (map-committed generation).
-        if data_shards_received == 0 && data_shards_other_err == 0 && data_shards_not_found > 0 {
-            histogram!("datavg_get_blob_nanos", "result" => "ec_block_not_found")
-                .record(start.elapsed().as_nanos() as f64);
-            return Err(DataVgError::BlockNotFound);
+            if data_shards_received == k {
+                break;
+            }
+            if should_hedge {
+                break;
+            }
         }
 
         if data_shards_received == k {
@@ -1807,20 +2105,9 @@ impl DataVgProxy {
             return Ok(());
         }
 
-        // Degraded read: need parity shards to reconstruct
-        let missing_count = k - data_shards_received;
-        if missing_count > m {
-            histogram!("datavg_get_blob_nanos", "result" => "ec_too_many_failures")
-                .record(start.elapsed().as_nanos() as f64);
-            return Err(DataVgError::QuorumFailure(format!(
-                "EC read: {} data shards failed, exceeds parity count {}",
-                missing_count, m
-            )));
-        }
-
-        // Fetch all parity shards that are currently available.
-        // This avoids false negatives when one parity node fails but another can satisfy k-of-(k+m).
-        let mut parity_futures = FuturesUnordered::new();
+        // Fetch parity shards that are currently available and keep polling
+        // outstanding data reads. Stop as soon as any k positions arrive.
+        let parity_futures = FuturesUnordered::new();
         for parity_idx in 0..m {
             let shard_idx = k + parity_idx;
             let node_idx = (shard_idx + rotation) % total;
@@ -1846,9 +2133,9 @@ impl DataVgProxy {
             });
         }
 
-        let mut parity_shards_not_found = 0usize;
-        let mut parity_shards_other_err = 0usize;
-        while let Some((shard_idx, node_idx, result)) = parity_futures.next().await {
+        let mut shard_futures = futures::stream::select(fetch_futures, parity_futures);
+        while let Some((shard_idx, node_idx, result)) = shard_futures.next().await {
+            let shard_kind = if shard_idx < k { "data" } else { "parity" };
             match result {
                 Ok(data) => {
                     ec_vol.bss_nodes[node_idx].record_success();
@@ -1857,33 +2144,38 @@ impl DataVgProxy {
                 Err(RpcError::NotFound) => {
                     ec_vol.bss_nodes[node_idx].record_success();
                     shard_missing[shard_idx] = true;
-                    parity_shards_not_found += 1;
+                    shards_not_found += 1;
                     debug!(
-                        "EC parity shard {} reports BlockNotFound from {}",
-                        shard_idx, ec_vol.bss_nodes[node_idx].address
+                        "EC {} shard {} reports BlockNotFound from {}",
+                        shard_kind, shard_idx, ec_vol.bss_nodes[node_idx].address
                     );
                 }
                 Err(e) => {
                     ec_vol.bss_nodes[node_idx].record_failure();
-                    parity_shards_other_err += 1;
                     warn!(
-                        "EC parity shard {} fetch failed from {}: {}",
-                        shard_idx, ec_vol.bss_nodes[node_idx].address, e
+                        "EC {} shard {} fetch failed from {}: {}",
+                        shard_kind, shard_idx, ec_vol.bss_nodes[node_idx].address, e
                     );
                 }
+            }
+            let total_shards_received =
+                shard_results.iter().filter(|shard| shard.is_some()).count();
+            if total_shards_received >= k {
+                break;
+            }
+            if total_shards_received == 0 && shards_not_found >= absence_quorum {
+                histogram!("datavg_get_blob_nanos", "result" => "ec_block_not_found")
+                    .record(start.elapsed().as_nanos() as f64);
+                return Err(DataVgError::BlockNotFound);
             }
         }
 
         let total_shards_received = shard_results.iter().filter(|s| s.is_some()).count();
         if total_shards_received < k {
-            // If the unrecoverable read is because every reachable
-            // shard agreed the generation doesn't exist (no transient
-            // errors at all), surface BlockNotFound.
-            if total_shards_received == 0
-                && data_shards_other_err == 0
-                && parity_shards_other_err == 0
-                && (data_shards_not_found > 0 || parity_shards_not_found > 0)
-            {
+            // An explicit absence quorum intersects every successful EC
+            // write quorum. A partial surviving shard set is an error, not
+            // a sparse hole.
+            if total_shards_received == 0 && shards_not_found >= absence_quorum {
                 histogram!("datavg_get_blob_nanos", "result" => "ec_block_not_found")
                     .record(start.elapsed().as_nanos() as f64);
                 return Err(DataVgError::BlockNotFound);
@@ -1985,20 +2277,23 @@ impl DataVgProxy {
                     version,
                     self.rpc_timeout,
                     *trace_id,
+                    true,
                 ));
             }
-            while let Some((node, address, result)) = repair_futs.next().await {
-                match result {
-                    Ok(()) | Err(RpcError::VersionSkipped) => {
-                        node.record_success();
-                        debug!("EC inline-repair: shard write succeeded on {}", address);
-                    }
-                    Err(e) => {
-                        node.record_failure();
-                        warn!("EC inline-repair: shard write failed on {}: {}", address, e);
+            spawn_background(async move {
+                while let Some((node, address, result)) = repair_futs.next().await {
+                    match result {
+                        Ok(()) | Err(RpcError::VersionSkipped) => {
+                            node.record_success();
+                            debug!("EC inline-repair: shard write succeeded on {}", address);
+                        }
+                        Err(e) => {
+                            node.record_failure();
+                            warn!("EC inline-repair: shard write failed on {}: {}", address, e);
+                        }
                     }
                 }
-            }
+            });
         }
 
         histogram!("datavg_get_blob_nanos", "result" => "ec_degraded_success")
@@ -2006,7 +2301,7 @@ impl DataVgProxy {
         Ok(())
     }
 
-    /// EC delete: send delete to all k+m nodes, wait for k+1 acks
+    /// EC delete: remove the exact shard key from every placement node.
     async fn delete_blob_ec(
         &self,
         blob_guid: DataBlobGuid,
@@ -2029,7 +2324,6 @@ impl DataVgProxy {
             _ => unreachable!(),
         };
         let total = k + m;
-        let write_quorum = k + 1;
 
         let rpc_timeout = self.rpc_timeout;
 
@@ -2048,14 +2342,14 @@ impl DataVgProxy {
             .cloned()
             .collect();
 
-        if available_nodes.len() < write_quorum {
+        if available_nodes.len() < total {
             histogram!("datavg_delete_blob_nanos", "result" => "ec_insufficient_nodes")
                 .record(start.elapsed().as_nanos() as f64);
             return Err(DataVgError::QuorumFailure(format!(
-                "EC delete: insufficient available nodes ({}/{}) for quorum ({})",
+                "EC delete: insufficient available nodes ({}/{}) for exact deletion ({})",
                 available_nodes.len(),
                 total,
-                write_quorum
+                total
             )));
         }
 
@@ -2082,49 +2376,42 @@ impl DataVgProxy {
                     successful_deletes += 1;
                     debug!("EC delete success from {}", address);
                 }
+                Err(RpcError::NotFound) => {
+                    node.record_success();
+                    successful_deletes += 1;
+                    debug!(
+                        "EC delete of absent shard on {} completed idempotently",
+                        address
+                    );
+                }
                 Err(rpc_error) => {
                     node.record_failure();
                     warn!("EC delete failed from {}: {}", address, rpc_error);
                     errors.push(format!("{}: {}", address, rpc_error));
                 }
             }
+        }
 
-            if successful_deletes >= write_quorum {
-                spawn_background(async move {
-                    while let Some((bg_node, addr, res)) = delete_futures.next().await {
-                        match res {
-                            Ok(()) => {
-                                bg_node.record_success();
-                                debug!("EC background delete to {} completed", addr);
-                            }
-                            Err(e) => {
-                                bg_node.record_failure();
-                                warn!("EC background delete to {} failed: {}", addr, e);
-                            }
-                        }
-                    }
-                });
-
-                histogram!("datavg_delete_blob_nanos", "result" => "ec_success")
-                    .record(start.elapsed().as_nanos() as f64);
-                debug!(
-                    "EC delete quorum achieved ({}/{}) for blob {}:{}",
-                    successful_deletes, total, blob_guid.blob_id, block_number
-                );
-                return Ok(());
-            }
+        if successful_deletes == total {
+            histogram!("datavg_delete_blob_nanos", "result" => "ec_success")
+                .record(start.elapsed().as_nanos() as f64);
+            debug!(
+                "EC exact delete completed ({}/{}) for blob {}:{}",
+                successful_deletes, total, blob_guid.blob_id, block_number
+            );
+            return Ok(());
         }
 
         histogram!("datavg_delete_blob_nanos", "result" => "ec_quorum_failure")
             .record(start.elapsed().as_nanos() as f64);
         error!(
-            "EC delete quorum failed ({}/{}). Errors: {:?}",
-            successful_deletes, write_quorum, errors
+            "EC exact delete failed ({}/{}). Errors: {:?}",
+            successful_deletes, total, errors
         );
         Err(DataVgError::QuorumFailure(format!(
-            "EC delete quorum failed ({}/{}): {}",
+            "EC exact delete failed ({}/{}): {}",
             successful_deletes,
-            write_quorum,
+            total,
             errors.join("; ")
         )))
     }
@@ -2134,6 +2421,13 @@ impl DataVgProxy {
 mod tests {
     use super::*;
     use data_types::Volume;
+
+    #[test]
+    fn exact_delete_not_found_is_idempotent_success() {
+        assert!(delete_result_succeeded(&Ok(())));
+        assert!(delete_result_succeeded(&Err(RpcError::NotFound)));
+        assert!(!delete_result_succeeded(&Err(RpcError::ConnectionClosed)));
+    }
 
     #[test]
     fn ec_volume_id_range() {
