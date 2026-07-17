@@ -342,14 +342,16 @@ fn reservation_abort_map(
 /// unchanged, so a data flush can rebase over them; any other divergence
 /// is a foreign writer and stays a hard conflict.
 fn posix_only_moved(expected: &ObjectLayout, current: &ObjectLayout) -> bool {
-    let ObjectState::Normal(expected_meta) = &expected.state else {
+    if !matches!(expected.state, ObjectState::Normal(_))
+        || !matches!(current.state, ObjectState::Normal(_))
+    {
         return false;
-    };
+    }
+    // `set_fs_posix` re-normalizes the fs_ext box, so a republish that
+    // only touched posix collapses back to the expected shape (including
+    // the ext disappearing entirely when nothing else is in it).
     let mut normalized = current.clone();
-    let ObjectState::Normal(normalized_meta) = &mut normalized.state else {
-        return false;
-    };
-    normalized_meta.core_meta_data.posix = expected_meta.core_meta_data.posix.clone();
+    normalized.set_fs_posix(expected.fs_posix());
     // rkyv encoding is deterministic for these types (the CAS guard itself
     // relies on this), so byte equality is exact structural equality.
     let expected_bytes = to_bytes_in::<_, rkyv::rancor::Error>(expected, Vec::new());
@@ -371,8 +373,17 @@ mod posix_only_moved_tests {
             version_id: uuid::Uuid::nil(),
             block_size: DEFAULT_BLOCK_SIZE,
             blob_version,
-            block_map: None,
-            prepared_write: None,
+            fs_ext: ObjectLayout::fs_ext_from(
+                Some(PosixAttrs {
+                    mode: 0o100644,
+                    uid: 1000,
+                    gid: 1000,
+                    mtime_ns,
+                    ctime_ns: mtime_ns,
+                }),
+                None,
+                None,
+            ),
             state: ObjectState::Normal(ObjectMetaData {
                 blob_guid: DataBlobGuid {
                     blob_id: uuid::Uuid::nil(),
@@ -383,13 +394,6 @@ mod posix_only_moved_tests {
                     etag: "etag".to_string(),
                     headers: vec![],
                     checksum: None,
-                    posix: Some(Box::new(PosixAttrs {
-                        mode: 0o100644,
-                        uid: 1000,
-                        gid: 1000,
-                        mtime_ns,
-                        ctime_ns: mtime_ns,
-                    })),
                 },
             }),
         }
@@ -1447,7 +1451,7 @@ impl VfsCore {
         // Passthrough bypasses the per-read exact-version check. Until the
         // kernel backing-file path can validate every cached block against a
         // map, only arm it for map-free committed layouts.
-        if layout.block_map.is_some() || layout.prepared_write.is_some() {
+        if layout.block_map().is_some() || layout.prepared_write().is_some() {
             return (0, 0);
         }
 
@@ -1518,7 +1522,7 @@ impl VfsCore {
         &self,
         layout: &ObjectLayout,
     ) -> Result<Option<Arc<BlockMap>>, FsError> {
-        let Some(map_ref) = layout.block_map else {
+        let Some(map_ref) = layout.block_map() else {
             return Ok(None);
         };
         let blob_guid = layout.blob_guid().map_err(|_| FsError::InvalidState)?;
@@ -2825,8 +2829,7 @@ impl VfsCore {
                         block_size: block_size as u32,
                         timestamp,
                         blob_version,
-                        block_map,
-                        prepared_write: None,
+                        fs_ext: ObjectLayout::fs_ext_from(Some(effective_posix), block_map, None),
                         state: ObjectState::Normal(ObjectMetaData {
                             blob_guid,
                             core_meta_data: ObjectCoreMetaData {
@@ -2834,7 +2837,6 @@ impl VfsCore {
                                 etag: blob_guid.blob_id.simple().to_string(),
                                 headers: vec![],
                                 checksum: None,
-                                posix: Some(Box::new(effective_posix)),
                             },
                         }),
                     }
@@ -3049,9 +3051,9 @@ impl VfsCore {
             // unreachable, clear the recovery record, and start this flush
             // from that valid state. This is crash recovery, not writer
             // ownership or conflict coordination.
-            if let Some(recovery) = base.prepared_write.as_deref().copied() {
+            if let Some(recovery) = base.prepared_write() {
                 let mut recovered = base.clone();
-                recovered.prepared_write = None;
+                recovered.set_prepared_write(None);
                 recovered.blob_version = recovered.blob_version.max(recovery.version);
                 if recovery.reservation_abort_map.is_some() || recovery.append_range.is_some() {
                     let mut recovery_map = match recovery.reservation_abort_map {
@@ -3064,14 +3066,14 @@ impl VfsCore {
                         },
                     };
                     apply_append_recovery(&mut recovery_map, recovery.append_range);
-                    recovered.block_map = if recovery.append_range.is_none() {
+                    recovered.set_block_map(if recovery.append_range.is_none() {
                         recovery.reservation_abort_map
                     } else {
                         Some(
                             self.publish_block_map(&blob_guid, &recovery_map, &trace_id)
                                 .await?,
                         )
-                    };
+                    });
                 }
                 let old_bytes = wrap_for_publish(promoted_record.as_ref(), &base)?;
                 let new_bytes = wrap_for_publish(promoted_record.as_ref(), &recovered)?;
@@ -3110,7 +3112,7 @@ impl VfsCore {
                         {
                             posix_rebase_attempts += 1;
                             if recovery.append_range.is_some()
-                                && let Some(map_ref) = recovered.block_map
+                                && let Some(map_ref) = recovered.block_map()
                             {
                                 self.enqueue_unreferenced_map_delete(blob_guid, map_ref);
                             }
@@ -3127,12 +3129,12 @@ impl VfsCore {
                         return Err(error);
                     }
                 }
-                if recovered.block_map != base.block_map {
+                if recovered.block_map() != base.block_map() {
                     self.enqueue_superseded_sweep(
                         blob_guid,
                         recovered.blob_version,
                         Vec::new(),
-                        base.block_map,
+                        base.block_map(),
                     );
                 }
                 if recovery.append_range.is_some()
@@ -3263,7 +3265,7 @@ impl VfsCore {
             // generation until commit. The record deliberately has no owner,
             // lease, or expiry.
             let mut prepare = base.clone();
-            prepare.prepared_write = Some(Box::new(PreparedWrite {
+            prepare.set_prepared_write(Some(PreparedWrite {
                 version,
                 append_range,
                 reservation_abort_map: reservation_abort_map_ref,
@@ -3521,7 +3523,7 @@ impl VfsCore {
                 None => !new_map.is_empty(),
             };
             let new_map_ref = if !map_changed {
-                base.block_map
+                base.block_map()
             } else if new_map.is_empty() {
                 None
             } else {
@@ -3581,7 +3583,7 @@ impl VfsCore {
             }
             sweep_victims = victims;
             if map_changed {
-                sweep_old_map = base.block_map;
+                sweep_old_map = base.block_map();
             }
             unused_prepare_map = reservation_abort_map_ref;
             for (b, st) in snap.blocks.iter() {
@@ -4440,8 +4442,7 @@ impl VfsCore {
                 version_id: ObjectLayout::gen_version_id(),
                 block_size: DEFAULT_BLOCK_SIZE,
                 blob_version: 0,
-                block_map: None,
-                prepared_write: None,
+                fs_ext: None,
                 state: ObjectState::Indirect(IndirectEntry { inode_id: id }),
             };
             let b: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&l, Vec::new())
@@ -5816,8 +5817,7 @@ impl VfsCore {
             block_size: DEFAULT_BLOCK_SIZE,
             timestamp: now_ns() / 1_000_000,
             blob_version: 0,
-            block_map: None,
-            prepared_write: None,
+            fs_ext: ObjectLayout::fs_ext_from(Some(posix), None, None),
             state: ObjectState::Special(SpecialData {
                 kind,
                 rdev,
@@ -5826,7 +5826,6 @@ impl VfsCore {
                     etag: String::new(),
                     headers: vec![],
                     checksum: None,
-                    posix: Some(Box::new(posix)),
                 },
             }),
         };
@@ -7333,8 +7332,7 @@ impl VfsCore {
             block_size: DEFAULT_BLOCK_SIZE,
             timestamp,
             blob_version: 0,
-            block_map: None,
-            prepared_write: None,
+            fs_ext: ObjectLayout::fs_ext_from(Some(posix), None, None),
             state: ObjectState::Symlink(SymlinkData {
                 target: target.to_vec(),
                 core_meta_data: ObjectCoreMetaData {
@@ -7342,7 +7340,6 @@ impl VfsCore {
                     etag: String::new(),
                     headers: vec![],
                     checksum: None,
-                    posix: Some(Box::new(posix)),
                 },
             }),
         };
@@ -7655,8 +7652,7 @@ impl VfsCore {
             block_size: DEFAULT_BLOCK_SIZE,
             timestamp: now / 1_000_000,
             blob_version: 1,
-            block_map: None,
-            prepared_write: None,
+            fs_ext: None,
             state: ObjectState::Directory(DirectoryData { posix }),
         };
         let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())

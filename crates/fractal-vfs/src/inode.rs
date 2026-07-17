@@ -19,28 +19,11 @@ pub enum EntryType {
 /// "uninitialised, fall back to defaults" sentinel.
 pub fn layout_posix(layout: &ObjectLayout) -> PosixAttrs {
     match &layout.state {
-        ObjectState::Normal(data) => data
-            .core_meta_data
-            .posix
-            .as_deref()
-            .copied()
-            .unwrap_or_default(),
-        ObjectState::Mpu(MpuState::Completed(data)) => {
-            data.posix.as_deref().copied().unwrap_or_default()
-        }
-        ObjectState::Symlink(data) => data
-            .core_meta_data
-            .posix
-            .as_deref()
-            .copied()
-            .unwrap_or_default(),
-        ObjectState::Special(data) => data
-            .core_meta_data
-            .posix
-            .as_deref()
-            .copied()
-            .unwrap_or_default(),
         ObjectState::Directory(data) => data.posix,
+        ObjectState::Normal(_)
+        | ObjectState::Mpu(MpuState::Completed(_))
+        | ObjectState::Symlink(_)
+        | ObjectState::Special(_) => layout.fs_posix().unwrap_or_default(),
         _ => PosixAttrs::default(),
     }
 }
@@ -52,13 +35,18 @@ pub fn layout_posix(layout: &ObjectLayout) -> PosixAttrs {
 /// against a file with no pending flush still survives a
 /// forget+relookup.
 pub fn layout_with_posix(mut layout: ObjectLayout, new_posix: PosixAttrs) -> ObjectLayout {
-    match &mut layout.state {
-        ObjectState::Normal(data) => data.core_meta_data.posix = Some(Box::new(new_posix)),
-        ObjectState::Mpu(MpuState::Completed(data)) => data.posix = Some(Box::new(new_posix)),
-        ObjectState::Symlink(data) => data.core_meta_data.posix = Some(Box::new(new_posix)),
-        ObjectState::Special(data) => data.core_meta_data.posix = Some(Box::new(new_posix)),
-        ObjectState::Directory(data) => data.posix = new_posix,
-        _ => {}
+    if let ObjectState::Directory(data) = &mut layout.state {
+        data.posix = new_posix;
+        return layout;
+    }
+    if matches!(
+        &layout.state,
+        ObjectState::Normal(_)
+            | ObjectState::Mpu(MpuState::Completed(_))
+            | ObjectState::Symlink(_)
+            | ObjectState::Special(_)
+    ) {
+        layout.set_fs_posix(Some(new_posix));
     }
     layout
 }
@@ -415,8 +403,7 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: 4096,
             blob_version: 1,
-            block_map: None,
-            prepared_write: None,
+            fs_ext: None,
             state: ObjectState::Directory(DirectoryData {
                 posix: PosixAttrs {
                     mode,

@@ -476,8 +476,7 @@ async fn put_object_streaming_internal(
         block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
         timestamp,
         blob_version: 1,
-        block_map: None,
-        prepared_write: None,
+        fs_ext: None,
         state: ObjectState::Normal(ObjectMetaData {
             blob_guid,
             core_meta_data: ObjectCoreMetaData {
@@ -485,7 +484,6 @@ async fn put_object_streaming_internal(
                 etag: etag.clone(),
                 headers,
                 checksum: calculated_checksum,
-                ..Default::default()
             },
         }),
     };
@@ -644,8 +642,7 @@ async fn put_object_with_no_trailer(
         block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
         timestamp,
         blob_version: 1,
-        block_map: None,
-        prepared_write: None,
+        fs_ext: None,
         state: ObjectState::Normal(ObjectMetaData {
             blob_guid,
             core_meta_data: ObjectCoreMetaData {
@@ -653,7 +650,6 @@ async fn put_object_with_no_trailer(
                 etag: etag.clone(),
                 headers,
                 checksum: calculated_checksum,
-                ..Default::default()
             },
         }),
     };

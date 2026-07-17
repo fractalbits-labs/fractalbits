@@ -198,8 +198,7 @@ pub fn create_dir_marker_layout() -> ObjectLayout {
         version_id: ObjectLayout::gen_version_id(),
         block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
         blob_version: 1,
-        block_map: None,
-        prepared_write: None,
+        fs_ext: None,
         state: ObjectState::Normal(ObjectMetaData {
             blob_guid: DataBlobGuid {
                 blob_id: uuid::Uuid::nil(),
@@ -210,7 +209,6 @@ pub fn create_dir_marker_layout() -> ObjectLayout {
                 etag: String::new(),
                 headers: vec![],
                 checksum: None,
-                ..Default::default()
             },
         }),
     }

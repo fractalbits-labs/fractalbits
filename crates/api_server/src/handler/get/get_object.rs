@@ -791,7 +791,7 @@ async fn load_block_map(
     layout: &ObjectLayout,
     trace_id: &TraceId,
 ) -> Result<Option<Arc<BlockMap>>, S3Error> {
-    let Some(map_ref) = layout.block_map else {
+    let Some(map_ref) = layout.block_map() else {
         return Ok(None);
     };
     let blob_guid = layout.blob_guid()?;
