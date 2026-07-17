@@ -444,7 +444,7 @@ async fn put_object_streaming_internal(
         timestamp,
         blob_version: 1,
         block_map: None,
-        pending_write: None,
+        prepared_write: None,
         state: ObjectState::Normal(ObjectMetaData {
             blob_guid,
             core_meta_data: ObjectCoreMetaData {
@@ -656,7 +656,7 @@ async fn put_object_with_no_trailer(
         timestamp,
         blob_version: 1,
         block_map: None,
-        pending_write: None,
+        prepared_write: None,
         state: ObjectState::Normal(ObjectMetaData {
             blob_guid,
             core_meta_data: ObjectCoreMetaData {

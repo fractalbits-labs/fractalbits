@@ -1,9 +1,11 @@
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
-use data_types::TraceId;
+use data_types::{DataBlobGuid, TraceId};
 use fractal_fuse::{FileHandleId, InodeId};
+use futures::{FutureExt, StreamExt, TryStreamExt, channel::oneshot, stream};
 use rkyv::api::high::to_bytes_in;
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -19,15 +21,20 @@ use crate::inode::{EntryType, ForgetOutcome, InodeTable, ROOT_INODE};
 use crate::writeback::{
     CoalesceOutcome, DrainableInodeIntent, Generation, InodeOp as WbInodeOp, WritebackQueue,
 };
-use data_types::block_map::{BlockMap, RangeState, bmap_chunk_key, bmap_prefix};
+use data_types::block_map::{
+    BlockMap, RangeState, block_reader_key, block_reader_prefix, bmap_chunk_key, bmap_prefix,
+};
 use data_types::object_layout::{
     BlockMapRef, DirectoryData, IndirectEntry, InodeRecord, MpuState, ObjectCoreMetaData,
-    ObjectLayout, ObjectMetaData, ObjectState, PendingWrite, PosixAttrs, SpecialData, SpecialKind,
+    ObjectLayout, ObjectMetaData, ObjectState, PosixAttrs, PreparedWrite, SpecialData, SpecialKind,
     SymlinkData,
 };
 use uuid::Uuid;
 pub const TTL: Duration = Duration::from_secs(1);
 pub const DEFAULT_BLOCK_SIZE: u32 = 128 * 1024;
+const VFS_READER_LEASE_MIN_TTL: Duration = Duration::from_secs(15);
+const VFS_READER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(5);
+const VFS_READER_LEASE_CONCURRENCY: usize = 16;
 /// Upper bound on a single file's in-memory write buffer. The buffer is
 /// a flat `BytesMut`, so a truncate/extend allocates the whole size; a
 /// target beyond this is rejected with EINVAL rather than attempting a
@@ -214,12 +221,456 @@ impl WriteBuffer {
     }
 }
 
+fn mapped_trim_ranges(
+    map: Option<&BlockMap>,
+    trim_lo: u32,
+    committed_trim_hi: u32,
+) -> Vec<data_types::block_map::BlockRange> {
+    map.into_iter()
+        .flat_map(BlockMap::ranges)
+        .filter_map(|range| {
+            let start = range.start.max(trim_lo).max(committed_trim_hi);
+            (start <= range.end).then_some(data_types::block_map::BlockRange {
+                start,
+                end: range.end,
+                state: range.state,
+            })
+        })
+        .collect()
+}
+
+const DIRECT_TRIM_VICTIM_LIMIT: u64 = 4096;
+
+fn trim_victim_spans(
+    trim_lo: u32,
+    trim_hi: u32,
+    mapped_trims: &[data_types::block_map::BlockRange],
+) -> Vec<(u32, u32)> {
+    let mut spans = Vec::with_capacity(mapped_trims.len() + 1);
+    if trim_lo < trim_hi {
+        spans.push((trim_lo, trim_hi - 1));
+    }
+    spans.extend(mapped_trims.iter().map(|range| (range.start, range.end)));
+    spans.sort_unstable_by_key(|span| span.0);
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some((_, previous_end)) if previous_end.saturating_add(1) >= start => {
+                *previous_end = (*previous_end).max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+fn trim_span_block_count(spans: &[(u32, u32)]) -> u64 {
+    spans.iter().fold(0_u64, |count, (start, end)| {
+        count.saturating_add(u64::from(*end) - u64::from(*start) + 1)
+    })
+}
+
+fn block_in_trim_spans(block: u32, spans: &[(u32, u32)]) -> bool {
+    let index = spans.partition_point(|(_, end)| *end < block);
+    spans
+        .get(index)
+        .is_some_and(|(start, end)| *start <= block && block <= *end)
+}
+
+fn existing_write_identity(
+    map: Option<&BlockMap>,
+    block: u32,
+    committed_blocks: u32,
+    burned_version: u64,
+) -> (u64, bool) {
+    match map.and_then(|map| map.lookup(block)) {
+        Some(RangeState::Reserved(version)) => (version, true),
+        None if block >= committed_blocks => (1, false),
+        _ => (burned_version, true),
+    }
+}
+
+fn apply_append_recovery(map: &mut BlockMap, append_range: Option<(u32, u32)>) {
+    if let Some((start, end)) = append_range {
+        map.overlay(start, end, RangeState::Hole);
+    }
+}
+
+fn map_free_append_range(
+    base_map: Option<&BlockMap>,
+    blocks: impl IntoIterator<Item = u32>,
+) -> Option<(u32, u32)> {
+    let mut range: Option<(u32, u32)> = None;
+    for block in blocks {
+        range = Some(match range {
+            None => (block, block),
+            Some((start, end)) => (start.min(block), end.max(block)),
+        });
+    }
+    let (start, end) = range?;
+    let covered = base_map.is_some_and(|map| {
+        let index = map.ranges().partition_point(|entry| entry.end < start);
+        map.ranges()
+            .get(index)
+            .is_some_and(|entry| entry.start <= end)
+    });
+    (!covered).then_some((start, end))
+}
+
+fn reservation_abort_map(
+    base_map: Option<&BlockMap>,
+    rewritten_blocks: impl IntoIterator<Item = u32>,
+) -> Option<BlockMap> {
+    let mut abort_map = None;
+    for block in rewritten_blocks {
+        if !matches!(
+            base_map.and_then(|map| map.lookup(block)),
+            Some(RangeState::Reserved(_))
+        ) {
+            continue;
+        }
+        let map = abort_map.get_or_insert_with(|| base_map.cloned().unwrap_or_default());
+        map.overlay(block, block, RangeState::Hole);
+    }
+    abort_map
+}
+
+#[cfg(test)]
+mod mapped_trim_tests {
+    use super::*;
+    use data_types::block_map::BlockRange;
+
+    #[test]
+    fn far_keep_size_reservation_does_not_expand_trim_walk() {
+        let far_block = u32::MAX - 1;
+        let mut map = BlockMap::new();
+        map.overlay(far_block, far_block, RangeState::Reserved(2));
+
+        assert_eq!(
+            mapped_trim_ranges(Some(&map), 0, 1),
+            vec![BlockRange {
+                start: far_block,
+                end: far_block,
+                state: RangeState::Reserved(2),
+            }]
+        );
+    }
+
+    #[test]
+    fn far_trim_ranges_stay_structural() {
+        let far_block = u32::MAX - 1;
+        let mapped = vec![BlockRange {
+            start: far_block,
+            end: far_block,
+            state: RangeState::Reserved(2),
+        }];
+
+        let spans = trim_victim_spans(2, 4, &mapped);
+
+        assert_eq!(spans, vec![(2, 3), (far_block, far_block)]);
+        assert_eq!(trim_span_block_count(&spans), 3);
+        assert!(block_in_trim_spans(3, &spans));
+        assert!(!block_in_trim_spans(4, &spans));
+        assert!(block_in_trim_spans(far_block, &spans));
+    }
+
+    #[test]
+    fn huge_trim_range_selects_actual_key_listing() {
+        let mapped = vec![BlockRange {
+            start: 10,
+            end: u32::MAX - 1,
+            state: RangeState::Reserved(2),
+        }];
+
+        let spans = trim_victim_spans(0, 0, &mapped);
+
+        assert_eq!(spans, vec![(10, u32::MAX - 1)]);
+        assert!(trim_span_block_count(&spans) > DIRECT_TRIM_VICTIM_LIMIT);
+    }
+
+    #[test]
+    fn existing_appends_stay_map_free_at_version_one() {
+        assert_eq!(existing_write_identity(None, 4, 4, 2), (1, false));
+        assert_eq!(existing_write_identity(None, 5, 5, 3), (1, false));
+
+        let mut map = BlockMap::new();
+        map.overlay(6, 6, RangeState::Hole);
+        assert_eq!(existing_write_identity(Some(&map), 6, 5, 4), (4, true));
+    }
+
+    #[test]
+    fn interrupted_append_range_becomes_holes() {
+        let mut map = BlockMap::new();
+        map.overlay(0, 2, RangeState::Written(3));
+
+        apply_append_recovery(&mut map, Some((8, 10)));
+
+        assert_eq!(map.lookup(8), Some(RangeState::Hole));
+        assert_eq!(map.lookup(10), Some(RangeState::Hole));
+        assert_eq!(map.lookup(7), None);
+    }
+
+    #[test]
+    fn append_recovery_does_not_cover_committed_map_state() {
+        let mut map = BlockMap::new();
+        map.overlay(9, 9, RangeState::Reserved(7));
+
+        let append_range = map_free_append_range(Some(&map), [8, 10]);
+        apply_append_recovery(&mut map, append_range);
+
+        assert_eq!(append_range, None);
+        assert_eq!(map.lookup(9), Some(RangeState::Reserved(7)));
+    }
+
+    #[test]
+    fn contiguous_map_free_append_keeps_recovery_range() {
+        let map = BlockMap::new();
+
+        assert_eq!(map_free_append_range(Some(&map), [8, 9, 10]), Some((8, 10)));
+    }
+
+    #[test]
+    fn interrupted_reservation_conversion_uses_abort_map() {
+        let mut map = BlockMap::new();
+        map.overlay(4, 4, RangeState::Reserved(7));
+        map.overlay(5, 5, RangeState::Written(3));
+
+        let abort = reservation_abort_map(Some(&map), [4, 5])
+            .expect("reserved rewrite should produce an abort map");
+
+        assert_eq!(abort.lookup(4), Some(RangeState::Hole));
+        assert_eq!(abort.lookup(5), Some(RangeState::Written(3)));
+        assert_eq!(existing_write_identity(Some(&abort), 4, 6, 8), (8, true));
+    }
+}
+
 struct FileHandle {
     ino: InodeId,
     s3_key: String,
     layout: Option<ObjectLayout>,
+    layout_refreshed_at: Instant,
+    operation_lock: Arc<futures::lock::Mutex<()>>,
     write_buf: Option<WriteBuffer>,
     backing_id: Option<i32>,
+    reader_lease: Option<VfsReaderLeaseGuard>,
+}
+
+#[derive(Clone)]
+struct VfsReaderLeaseRecord {
+    key: String,
+    value: Bytes,
+    blob_version: u64,
+}
+
+struct VfsReaderLeaseGuard {
+    shutdown_tx: Option<oneshot::Sender<bool>>,
+    confirmed_until_ms: Arc<AtomicU64>,
+    lost: Arc<AtomicBool>,
+    identities: Vec<BlobReaderIdentity>,
+    keys: Vec<String>,
+}
+
+impl VfsReaderLeaseGuard {
+    fn valid(&self) -> bool {
+        !self.lost.load(Ordering::Acquire)
+            && self.confirmed_until_ms.load(Ordering::Acquire) > wall_clock_ms()
+    }
+
+    fn covers(&self, identities: &[BlobReaderIdentity]) -> bool {
+        self.identities.len() == identities.len()
+            && identities
+                .iter()
+                .all(|identity| self.identities.contains(identity))
+    }
+
+    fn shutdown(mut self) -> Vec<String> {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(true);
+        }
+        std::mem::take(&mut self.keys)
+    }
+}
+
+impl Drop for VfsReaderLeaseGuard {
+    fn drop(&mut self) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(true);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BlobReaderIdentity {
+    blob_guid: DataBlobGuid,
+    blob_version: u64,
+}
+
+#[derive(Debug)]
+struct SweepWork {
+    victims: HashSet<(u32, u64)>,
+    map_rows: HashMap<Uuid, u32>,
+    reader_wait: Option<SweepReaderWait>,
+    grace_until: Option<Instant>,
+    delete_all_blocks: bool,
+    delete_all_maps: bool,
+    retry_count: u32,
+    ready_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepReaderWait {
+    Before(u64),
+    All,
+}
+
+impl SweepWork {
+    fn new() -> Self {
+        Self {
+            victims: HashSet::new(),
+            map_rows: HashMap::new(),
+            reader_wait: None,
+            grace_until: None,
+            delete_all_blocks: false,
+            delete_all_maps: false,
+            retry_count: 0,
+            ready_at: Instant::now(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.victims.is_empty()
+            && self.map_rows.is_empty()
+            && self.reader_wait.is_none()
+            && self.grace_until.is_none()
+            && !self.delete_all_blocks
+            && !self.delete_all_maps
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        self.victims.extend(other.victims.drain());
+        self.map_rows.extend(other.map_rows.drain());
+        self.reader_wait = match (self.reader_wait, other.reader_wait) {
+            (Some(SweepReaderWait::All), _) | (_, Some(SweepReaderWait::All)) => {
+                Some(SweepReaderWait::All)
+            }
+            (Some(SweepReaderWait::Before(left)), Some(SweepReaderWait::Before(right))) => {
+                Some(SweepReaderWait::Before(left.max(right)))
+            }
+            (wait @ Some(_), None) | (None, wait @ Some(_)) => wait,
+            (None, None) => None,
+        };
+        self.delete_all_blocks |= other.delete_all_blocks;
+        self.delete_all_maps |= other.delete_all_maps;
+        self.grace_until = match (self.grace_until, other.grace_until) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (deadline @ Some(_), None) | (None, deadline @ Some(_)) => deadline,
+            (None, None) => None,
+        };
+        self.retry_count = self.retry_count.max(other.retry_count);
+        self.ready_at = self.ready_at.min(other.ready_at);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepAttempt {
+    Complete,
+    ReaderBlocked,
+    GracePending,
+    Failed,
+}
+
+#[derive(Default)]
+struct SweepQueue {
+    pending: HashMap<DataBlobGuid, SweepWork>,
+    active: HashSet<DataBlobGuid>,
+}
+
+#[derive(Default)]
+struct SweepCoordinator {
+    queue: parking_lot::Mutex<SweepQueue>,
+    worker_started: AtomicBool,
+}
+
+struct SweepClaim {
+    blob_guid: DataBlobGuid,
+    work: SweepWork,
+    coordinator: Arc<SweepCoordinator>,
+}
+
+impl SweepClaim {
+    fn take_ready(coordinator: &Arc<SweepCoordinator>) -> Option<Self> {
+        let mut queue = coordinator.queue.lock();
+        if queue.active.len() >= SWEEP_CONCURRENCY {
+            return None;
+        }
+        let now = Instant::now();
+        let blob_guid = queue
+            .pending
+            .iter()
+            .find(|(blob_guid, work)| !queue.active.contains(blob_guid) && work.ready_at <= now)
+            .map(|(blob_guid, _)| *blob_guid)?;
+        let work = queue
+            .pending
+            .remove(&blob_guid)
+            .expect("ready sweep selected above");
+        queue.active.insert(blob_guid);
+        drop(queue);
+        Some(Self {
+            blob_guid,
+            work,
+            coordinator: coordinator.clone(),
+        })
+    }
+
+    fn schedule_retry(&mut self, attempt: SweepAttempt) {
+        let now = Instant::now();
+        match attempt {
+            SweepAttempt::Complete => {}
+            SweepAttempt::ReaderBlocked => {
+                self.work.retry_count = 0;
+                self.work.ready_at = now.checked_add(READER_LEASE_RECHECK).unwrap_or(now);
+            }
+            SweepAttempt::GracePending => {
+                self.work.retry_count = 0;
+                self.work.ready_at = self.work.grace_until.unwrap_or(now);
+            }
+            SweepAttempt::Failed => {
+                self.work.retry_count = self.work.retry_count.saturating_add(1);
+                let shift = self.work.retry_count.min(6);
+                self.work.ready_at = now
+                    .checked_add(Duration::from_secs(1_u64 << shift))
+                    .unwrap_or(now);
+                tracing::warn!(
+                    blob_guid = %self.blob_guid,
+                    victims = self.work.victims.len(),
+                    maps = self.work.map_rows.len(),
+                    delete_all_blocks = self.work.delete_all_blocks,
+                    delete_all_maps = self.work.delete_all_maps,
+                    retry = self.work.retry_count,
+                    "blob reclamation incomplete; queued retry"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for SweepClaim {
+    fn drop(&mut self) {
+        let mut queue = self.coordinator.queue.lock();
+        queue.active.remove(&self.blob_guid);
+        if self.work.is_empty() {
+            return;
+        }
+        let work = std::mem::replace(&mut self.work, SweepWork::new());
+        match queue.pending.entry(self.blob_guid) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().merge(work);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(work);
+            }
+        }
+    }
 }
 
 /// A best-effort disk-cache mirror write, handed to the dedicated mirror
@@ -246,6 +697,7 @@ struct MirrorHandle {
 /// block cold-fills from BSS on the next read) instead of blocking a FUSE
 /// worker.
 const MIRROR_QUEUE_CAP: usize = 4096;
+const RESERVATION_CONCURRENCY: usize = 16;
 
 /// Byte bound on the mirror queue. A job retains its rewritten `Bytes`
 /// until the mirror thread writes them, so a slow cache device could
@@ -277,7 +729,6 @@ fn spawn_mirror_worker(dc: Arc<DiskCache>) -> Option<MirrorHandle> {
                 }
             };
             rt.block_on(async move {
-                use futures::StreamExt;
                 while let Some(job) = rx.next().await {
                     if let Err(e) = dc
                         .sync_after_flush(
@@ -351,10 +802,9 @@ pub struct VfsCore {
     /// cached entry never goes stale; entries for superseded maps age out
     /// when nothing references them anymore.
     block_maps: DashMap<Uuid, Arc<BlockMap>>,
-    /// This writer instance's nonce, stamped into `PendingWrite.owner` so
-    /// the same instance can resume/abort its own pending immediately
-    /// instead of waiting out the lease expiry.
-    writer_id: Uuid,
+    /// Coalesces per-blob reclamation and bounds the number of cleanup tasks
+    /// that may wait on long-lived readers at once.
+    sweep_coordinator: Arc<SweepCoordinator>,
 }
 
 impl VfsCore {
@@ -395,7 +845,14 @@ impl VfsCore {
             .as_ref()
             .and_then(|dc| spawn_mirror_worker(dc.clone()));
 
-        let passthrough_enabled = config.passthrough_enabled;
+        // A passthrough backing fd cannot be revoked when another instance
+        // commits a new block map and the cache mirror changes the stable
+        // file in place. Keep the raw-fd path disabled until cache files are
+        // generation-specific or FUSE can revoke active backing mappings.
+        let passthrough_enabled = false;
+        if config.passthrough_enabled {
+            tracing::warn!("FUSE passthrough disabled for mutable versioned blobs");
+        }
         let passthrough_max_object_size =
             config.passthrough_max_object_size_gb * 1024 * 1024 * 1024;
         let prefetch_policy = crate::prefetch::PrefetchPolicy::from_config(config);
@@ -438,7 +895,7 @@ impl VfsCore {
             inode_write_owner: DashMap::new(),
             mirror,
             block_maps: DashMap::new(),
-            writer_id: Uuid::new_v4(),
+            sweep_coordinator: Arc::new(SweepCoordinator::default()),
         }
     }
 
@@ -457,7 +914,7 @@ impl VfsCore {
     /// The backend is leaked into 'static storage because each compio thread
     /// runs for the lifetime of the process and we need references that can
     /// be held across await points.
-    fn backend(&self) -> &StorageBackend {
+    fn backend(&self) -> &'static StorageBackend {
         THREAD_BACKEND.with(|cell| match cell.get() {
             Some(b) => b,
             None => {
@@ -900,6 +1357,13 @@ impl VfsCore {
             Err(_) => return (0, 0),
         };
 
+        // Passthrough bypasses the per-read exact-version check. Until the
+        // kernel backing-file path can validate every cached block against a
+        // map, only arm it for map-free committed layouts.
+        if layout.block_map.is_some() || layout.prepared_write.is_some() {
+            return (0, 0);
+        }
+
         // Check if fully cached
         if !dc.is_complete(blob_guid, file_size) {
             return (0, 0);
@@ -958,7 +1422,7 @@ impl VfsCore {
         }
     }
 
-    // ── Cache helpers ──
+    // Cache helpers
 
     /// Fetch (and cache) the per-block version map referenced by a layout.
     /// Chunks are immutable per `map_id`, so a cached entry is valid
@@ -970,16 +1434,181 @@ impl VfsCore {
         let Some(map_ref) = layout.block_map else {
             return Ok(None);
         };
-        if let Some(m) = self.block_maps.get(&map_ref.map_id) {
-            return Ok(Some(m.clone()));
-        }
         let blob_guid = layout.blob_guid().map_err(|_| FsError::InvalidState)?;
-        let trace_id = TraceId::new();
-        let mut chunks: Vec<Bytes> = Vec::with_capacity(map_ref.chunk_count as usize);
-        for chunk_no in 0..map_ref.chunk_count {
-            let key = bmap_chunk_key(&blob_guid, map_ref.map_id, chunk_no);
-            chunks.push(self.backend().get_inode_raw(&key, &trace_id).await?);
+        Ok(Some(self.load_block_map_ref(blob_guid, map_ref).await?))
+    }
+
+    async fn data_blob_identities_for_layout(
+        &self,
+        _key: &str,
+        layout: &ObjectLayout,
+        trace_id: &TraceId,
+    ) -> Result<Vec<BlobReaderIdentity>, FsError> {
+        let resolved_layout;
+        let layout = if let ObjectState::Indirect(redirect) = &layout.state {
+            resolved_layout = self
+                .backend()
+                .get_inode_record(redirect.inode_id, trace_id)
+                .await?
+                .layout;
+            &resolved_layout
+        } else {
+            layout
+        };
+        match &layout.state {
+            ObjectState::Normal(_) => Ok(vec![BlobReaderIdentity {
+                blob_guid: layout.blob_guid()?,
+                blob_version: layout.blob_version,
+            }]),
+            _ => Ok(Vec::new()),
         }
+    }
+
+    async fn ensure_data_layout_supported(
+        &self,
+        key: &str,
+        layout: &ObjectLayout,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        if self
+            .data_blob_identities_for_layout(key, layout, trace_id)
+            .await?
+            .into_iter()
+            .any(|identity| identity.blob_guid.volume_id == DataBlobGuid::S3_VOLUME)
+        {
+            return Err(FsError::InvalidState);
+        }
+        Ok(())
+    }
+
+    fn reader_lease_ttl(&self) -> Duration {
+        VFS_READER_LEASE_MIN_TTL.max(
+            self.backend_config
+                .config
+                .rpc_request_timeout()
+                .saturating_add(VFS_READER_LEASE_RENEW_INTERVAL.saturating_mul(2)),
+        )
+    }
+
+    async fn acquire_reader_leases(
+        &self,
+        identities: Vec<BlobReaderIdentity>,
+    ) -> Result<Option<VfsReaderLeaseGuard>, FsError> {
+        let mut seen = HashSet::with_capacity(identities.len());
+        let identities = identities
+            .into_iter()
+            .filter(|identity| seen.insert(*identity))
+            .collect::<Vec<_>>();
+        if identities.is_empty() {
+            return Ok(None);
+        }
+
+        let backend = self.backend();
+        let ttl = self.reader_lease_ttl();
+        let expires_at_ms = wall_clock_ms().saturating_add(ttl.as_millis() as u64);
+        let records = identities
+            .iter()
+            .map(|identity| VfsReaderLeaseRecord {
+                key: block_reader_key(&identity.blob_guid, Uuid::new_v4()),
+                value: encode_reader_lease(expires_at_ms, identity.blob_version),
+                blob_version: identity.blob_version,
+            })
+            .collect::<Vec<_>>();
+        let trace_id = TraceId::new();
+        let results = stream::iter(records.iter().cloned())
+            .map(|record| async move {
+                let result = backend
+                    .put_inode_cas(&record.key, record.value.clone(), Bytes::new(), &trace_id)
+                    .await;
+                (record, result)
+            })
+            .buffer_unordered(VFS_READER_LEASE_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        let mut acquired = Vec::new();
+        let mut failed = false;
+        for (record, result) in results {
+            match result {
+                Ok(_) => acquired.push(record),
+                Err(error) => {
+                    failed = true;
+                    tracing::warn!(%error, key = %record.key, "VFS reader lease acquisition failed");
+                }
+            }
+        }
+        if failed {
+            cleanup_vfs_reader_leases(backend, &acquired).await;
+            return Err(FsError::Internal(
+                "VFS reader lease acquisition failed".to_string(),
+            ));
+        }
+
+        let mut records = records;
+        let lease_keys = records
+            .iter()
+            .map(|record| record.key.clone())
+            .collect::<Vec<_>>();
+        let mut confirmed_until_ms = expires_at_ms;
+        if confirmed_until_ms
+            <= wall_clock_ms().saturating_add(
+                VFS_READER_LEASE_RENEW_INTERVAL
+                    .saturating_mul(2)
+                    .as_millis() as u64,
+            )
+        {
+            confirmed_until_ms = renew_vfs_reader_leases(backend, &mut records, ttl).await?;
+        }
+        let confirmed_until_ms = Arc::new(AtomicU64::new(confirmed_until_ms));
+        let lost = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        compio_runtime::spawn(maintain_vfs_reader_leases(
+            backend,
+            records,
+            ttl,
+            confirmed_until_ms.clone(),
+            lost.clone(),
+            shutdown_rx,
+        ))
+        .detach();
+        Ok(Some(VfsReaderLeaseGuard {
+            shutdown_tx: Some(shutdown_tx),
+            confirmed_until_ms,
+            lost,
+            identities,
+            keys: lease_keys,
+        }))
+    }
+
+    fn ensure_reader_lease_valid(&self, fh: FileHandleId) -> Result<(), FsError> {
+        let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
+        if handle
+            .reader_lease
+            .as_ref()
+            .is_some_and(|reader_lease| !reader_lease.valid())
+        {
+            return Err(FsError::Internal("VFS reader lease lost".to_string()));
+        }
+        Ok(())
+    }
+
+    async fn load_block_map_ref(
+        &self,
+        blob_guid: data_types::DataBlobGuid,
+        map_ref: BlockMapRef,
+    ) -> Result<Arc<BlockMap>, FsError> {
+        if let Some(m) = self.block_maps.get(&map_ref.map_id) {
+            return Ok(m.clone());
+        }
+        let trace_id = TraceId::new();
+        let backend = self.backend();
+        let chunks: Vec<Bytes> = stream::iter(0..map_ref.chunk_count)
+            .map(|chunk_no| async move {
+                let key = bmap_chunk_key(&blob_guid, map_ref.map_id, chunk_no);
+                backend.get_inode_raw(&key, &trace_id).await
+            })
+            .buffered(16)
+            .try_collect()
+            .await?;
         let map = Arc::new(
             BlockMap::from_chunks(&chunks)
                 .map_err(|e| FsError::Internal(format!("block map decode: {e}")))?,
@@ -988,7 +1617,7 @@ impl VfsCore {
             self.block_maps.clear();
         }
         self.block_maps.insert(map_ref.map_id, map.clone());
-        Ok(Some(map))
+        Ok(map)
     }
 
     /// Serialize a block map into immutable chunk records under a fresh
@@ -1005,12 +1634,16 @@ impl VfsCore {
             .to_chunks()
             .map_err(|e| FsError::Internal(format!("block map encode: {e}")))?;
         let map_id = Uuid::new_v4();
-        for (chunk_no, chunk) in chunks.iter().enumerate() {
-            let key = bmap_chunk_key(blob_guid, map_id, chunk_no as u32);
-            self.backend()
-                .put_inode(&key, Bytes::from(chunk.clone()), trace_id)
-                .await?;
-        }
+        stream::iter(chunks.iter().enumerate())
+            .map(|(chunk_no, chunk)| async move {
+                let key = bmap_chunk_key(blob_guid, map_id, chunk_no as u32);
+                self.backend()
+                    .put_inode(&key, Bytes::from(chunk.clone()), trace_id)
+                    .await
+            })
+            .buffer_unordered(16)
+            .try_collect::<Vec<_>>()
+            .await?;
         let map_ref = BlockMapRef {
             map_id,
             chunk_count: chunks.len() as u32,
@@ -1022,73 +1655,86 @@ impl VfsCore {
         Ok(map_ref)
     }
 
-    /// Delete superseded generations (and the replaced map's chunk rows)
-    /// after a reader grace comfortably above the attr-TTL staleness bound:
-    /// a reader may hold the previous committed identity for up to one TTL,
-    /// and deleting under it would turn a valid stale read into zeros or a
-    /// false loss alarm. Exact keys, best-effort per node; a down node only
-    /// delays reclamation of its own copies.
+    /// Queue superseded generations and replaced map rows for coalesced,
+    /// bounded background reclamation. A sweep for version V waits only for
+    /// active readers of versions older than V.
     fn enqueue_superseded_sweep(
         &self,
         blob_guid: data_types::DataBlobGuid,
+        committed_version: u64,
         victims: Vec<(u32, u64)>,
         old_map: Option<BlockMapRef>,
     ) {
         if victims.is_empty() && old_map.is_none() {
             return;
         }
-        const SWEEP_GRACE: Duration = Duration::from_secs(10);
-        // The per-thread backend is a leaked &'static; backend() elides the
-        // lifetime to &self, so populate the thread-local first and re-read
-        // the 'static reference from it for the detached task.
-        let _ = self.backend();
-        let backend: &'static StorageBackend = THREAD_BACKEND
-            .with(|cell| cell.get())
-            .expect("backend() populates the thread-local");
-        compio_runtime::spawn(async move {
-            rpc_client_common::rpc_sleep(SWEEP_GRACE).await;
-            let trace_id = TraceId::new();
-            for (block, version) in victims {
-                backend
-                    .delete_block(blob_guid, block, version, &trace_id)
-                    .await;
-            }
-            if let Some(map_ref) = old_map {
-                for chunk_no in 0..map_ref.chunk_count {
-                    let key = bmap_chunk_key(&blob_guid, map_ref.map_id, chunk_no);
-                    let _ = backend.delete_inode(&key, &trace_id).await;
-                }
-            }
-        })
-        .detach();
+        let mut work = SweepWork::new();
+        work.victims.extend(victims);
+        work.reader_wait = Some(SweepReaderWait::Before(committed_version));
+        if let Some(map_ref) = old_map {
+            work.map_rows.insert(map_ref.map_id, map_ref.chunk_count);
+        }
+        self.enqueue_sweep_work(blob_guid, work);
     }
 
-    /// Tear down a blob's storage: delete every committed generation the
-    /// layout+map reference, then every `#bmap/{blob}/` chunk row (all map
-    /// versions, including orphaned ones from CAS-losing publishes).
-    async fn teardown_blob(&self, layout: &ObjectLayout, trace_id: &TraceId) {
-        let map = self.layout_block_map(layout).await.ok().flatten();
-        self.backend()
-            .delete_blob_blocks(layout, map.as_deref(), trace_id)
-            .await;
-        if let Ok(blob_guid) = layout.blob_guid() {
-            let prefix = bmap_prefix(&blob_guid);
-            match self
-                .backend()
-                .list_inode_keys(&prefix, 10000, trace_id)
-                .await
-            {
-                Ok(keys) => {
-                    for key in keys {
-                        let _ = self.backend().delete_inode(&key, trace_id).await;
-                    }
-                }
-                Err(FsError::NotFound) => {}
-                Err(e) => {
-                    tracing::warn!(%blob_guid, error = %e, "bmap teardown list failed");
-                }
+    /// Delete a map that was prepared only for abort recovery after the
+    /// corresponding write commits successfully. No layout ever references
+    /// this map, so it needs no reader grace.
+    fn enqueue_unreferenced_map_delete(
+        &self,
+        blob_guid: data_types::DataBlobGuid,
+        map_ref: BlockMapRef,
+    ) {
+        let mut work = SweepWork::new();
+        work.map_rows.insert(map_ref.map_id, map_ref.chunk_count);
+        self.enqueue_sweep_work(blob_guid, work);
+    }
+
+    fn enqueue_sweep_work(&self, blob_guid: DataBlobGuid, work: SweepWork) {
+        let mut queue = self.sweep_coordinator.queue.lock();
+        match queue.pending.entry(blob_guid) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().merge(work);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(work);
             }
         }
+    }
+
+    async fn cleanup_unpublished_blob(
+        &self,
+        blob_guid: data_types::DataBlobGuid,
+        identities: Vec<(u32, u64)>,
+        _trace_id: &TraceId,
+    ) {
+        let mut work = SweepWork::new();
+        work.victims.extend(identities);
+        let now = Instant::now();
+        let grace_until = now
+            .checked_add(reclamation_grace(
+                self.backend_config.config.rpc_request_timeout(),
+            ))
+            .unwrap_or(now);
+        work.grace_until = Some(grace_until);
+        work.ready_at = grace_until;
+        work.delete_all_blocks = true;
+        work.delete_all_maps = true;
+        self.enqueue_sweep_work(blob_guid, work);
+    }
+
+    /// Tear down every exact data, reservation, and block-map key belonging
+    /// to a blob. The data listing is proportional to physical keys, so a
+    /// sparse file does not trigger a logical-size walk.
+    async fn teardown_blob(&self, layout: &ObjectLayout, _trace_id: &TraceId) {
+        let Ok(blob_guid) = layout.blob_guid() else {
+            return;
+        };
+        let mut work = SweepWork::new();
+        work.reader_wait = Some(SweepReaderWait::All);
+        work.delete_all_blocks = true;
+        work.delete_all_maps = true;
+        self.enqueue_sweep_work(blob_guid, work);
     }
 
     /// The exact BSS identity of one committed block, resolved from the
@@ -1110,13 +1756,15 @@ impl VfsCore {
 
     /// Read a block, checking disk cache first. On miss, fetches the exact
     /// committed generation from the backend and populates the disk cache.
+    #[allow(clippy::too_many_arguments)]
     async fn read_block_cached(
         &self,
         blob_guid: data_types::DataBlobGuid,
         map: Option<&BlockMap>,
         block_num: u32,
         block_content_len: usize,
-        _file_size: u64,
+        block_size: usize,
+        validated_sparse_blocks: &HashSet<(data_types::DataBlobGuid, u32)>,
         trace_id: &TraceId,
     ) -> Result<Bytes, FsError> {
         let Some((version, mapped)) = Self::resolve_block_source(map, block_num) else {
@@ -1126,8 +1774,9 @@ impl VfsCore {
 
         // Disk cache hit is valid only for the exact committed identity.
         if let Some(dc) = &self.disk_cache
-            && dc.get_block_version(blob_guid, block_num).await == Some(version)
-            && let Some(cached) = dc.get_block(blob_guid, block_num, block_content_len).await
+            && let Some(cached) = dc
+                .get_block_exact(blob_guid, block_num, version, block_content_len)
+                .await
         {
             return Ok(cached);
         }
@@ -1139,7 +1788,7 @@ impl VfsCore {
         // padded shards), then truncate to the logical content length.
         // Version-1 blocks are stored at their exact length and read as-is.
         let read_len = if version > 1 {
-            (DEFAULT_BLOCK_SIZE as usize).max(block_content_len)
+            block_size.max(block_content_len)
         } else {
             block_content_len
         };
@@ -1163,9 +1812,12 @@ impl VfsCore {
                     );
                     return Err(FsError::DataVg(volume_group_proxy::DataVgError::Corrupted));
                 }
-                // Unmapped v1 miss is a sparse hole: serve zeros (do not
-                // cache the hole).
-                return Ok(Bytes::from(vec![0u8; block_content_len]));
+                // Unmapped v1 miss is a sparse hole only after NSS confirms
+                // this handle still names the layout that issued the miss.
+                if validated_sparse_blocks.contains(&(blob_guid, block_num)) {
+                    return Ok(Bytes::from(vec![0u8; block_content_len]));
+                }
+                return Err(FsError::StaleLayout(blob_guid, block_num));
             }
             Err(e) => return Err(e),
         };
@@ -1191,12 +1843,145 @@ impl VfsCore {
         layout.size().map_err(FsError::from)
     }
 
+    /// Refresh a clean handle's committed layout on the same TTL used for
+    /// inode attributes. Open file handles otherwise pin a map forever,
+    /// while the superseded-generation sweep reclaims that map and its data
+    /// after the reader grace. A forced refresh is used to retry a read that
+    /// raced reclamation.
+    async fn refresh_handle_layout(&self, fh: FileHandleId, force: bool) -> Result<(), FsError> {
+        let (ino, s3_key, version_id) = {
+            let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
+            if handle.write_buf.as_ref().is_some_and(|wb| wb.dirty) {
+                return Ok(());
+            }
+            let Some(layout) = handle.layout.as_ref() else {
+                return Ok(());
+            };
+            if !force && handle.layout_refreshed_at.elapsed() < TTL {
+                return Ok(());
+            }
+            (handle.ino, handle.s3_key.clone(), layout.version_id)
+        };
+
+        let (inode_id, name_removed) = self
+            .inodes
+            .get(ino)
+            .map(|entry| (entry.inode_id, entry.name_removed))
+            .unwrap_or((None, false));
+        if name_removed && inode_id.is_none() {
+            if let Some(mut handle) = self.file_handles.get_mut(&fh) {
+                handle.layout_refreshed_at = Instant::now();
+            }
+            return Ok(());
+        }
+
+        let trace_id = TraceId::new();
+        let (fresh, resolved_id) = if let Some(id) = inode_id {
+            (
+                self.backend().get_inode_record(id, &trace_id).await?.layout,
+                Some(id),
+            )
+        } else {
+            let layout = match self.backend().get_inode(&s3_key, &trace_id).await {
+                Ok(layout) => layout,
+                // A rename can remove the original name while an open fd
+                // legitimately keeps the old blob alive. Retain that handle
+                // snapshot; rename does not enqueue a data sweep.
+                Err(FsError::NotFound) => {
+                    if let Some(mut handle) = self.file_handles.get_mut(&fh)
+                        && handle.layout.as_ref().map(|l| l.version_id) == Some(version_id)
+                    {
+                        handle.layout_refreshed_at = Instant::now();
+                    }
+                    return self.ensure_reader_lease_valid(fh);
+                }
+                Err(e) => return Err(e),
+            };
+            let (layout, id, _) = self.resolve_indirect(layout, &trace_id).await?;
+            (layout, id)
+        };
+
+        let retain_open_identity = self
+            .file_handles
+            .get(&fh)
+            .and_then(|handle| handle.layout.clone())
+            .is_some_and(|current| match &current.state {
+                ObjectState::Normal(_) => current.blob_guid().ok() != fresh.blob_guid().ok(),
+                _ => false,
+            });
+        if retain_open_identity {
+            if let Some(mut handle) = self.file_handles.get_mut(&fh) {
+                handle.layout_refreshed_at = Instant::now();
+            }
+            return self.ensure_reader_lease_valid(fh);
+        }
+
+        let fresh_identities = self
+            .data_blob_identities_for_layout(&s3_key, &fresh, &trace_id)
+            .await?;
+        let rotate_reader_lease =
+            self.file_handles
+                .get(&fh)
+                .is_some_and(|handle| match handle.reader_lease.as_ref() {
+                    Some(reader_lease) => !reader_lease.covers(&fresh_identities),
+                    None => !fresh_identities.is_empty(),
+                });
+        let replacement_reader_lease = if rotate_reader_lease {
+            let replacement = self.acquire_reader_leases(fresh_identities).await?;
+            let confirmed = if let Some(id) = resolved_id {
+                self.backend().get_inode_record(id, &trace_id).await?.layout
+            } else {
+                match self.backend().get_inode(&s3_key, &trace_id).await {
+                    Ok(layout) => self.resolve_indirect(layout, &trace_id).await?.0,
+                    Err(FsError::NotFound) => return self.ensure_reader_lease_valid(fh),
+                    Err(error) => return Err(error),
+                }
+            };
+            if confirmed.version_id != fresh.version_id {
+                return self.ensure_reader_lease_valid(fh);
+            }
+            Some(replacement)
+        } else {
+            None
+        };
+
+        let mut updated = false;
+        if let Some(mut handle) = self.file_handles.get_mut(&fh)
+            && handle.layout.as_ref().map(|l| l.version_id) == Some(version_id)
+        {
+            handle.layout = Some(fresh.clone());
+            handle.layout_refreshed_at = Instant::now();
+            if let Some(replacement) = replacement_reader_lease {
+                handle.reader_lease = replacement;
+            }
+            if let Some(wb) = handle.write_buf.as_mut()
+                && !wb.dirty
+            {
+                wb.file_size = fresh.size()?;
+                wb.existing_blob_guid = fresh.blob_guid().ok();
+                wb.block_size = fresh.block_size;
+                wb.size_changed = false;
+                wb.eof_low_watermark = None;
+                wb.trim_upper = None;
+            }
+            updated = true;
+        }
+        if updated && let Some(mut entry) = self.inodes.get_mut(ino) {
+            entry.layout = Some(fresh);
+            if let Some(id) = resolved_id {
+                entry.inode_id = Some(id);
+            }
+        }
+        self.ensure_reader_lease_valid(fh)
+    }
+
     async fn read_mpu(
         &self,
         key: &str,
         layout: &ObjectLayout,
         offset: u64,
         size: u32,
+        validated_sparse_blocks: &HashSet<(data_types::DataBlobGuid, u32)>,
     ) -> Result<Bytes, FsError> {
         let file_size = layout.size()?;
         if size == 0 || offset >= file_size {
@@ -1246,7 +2031,8 @@ impl VfsCore {
                             part_map.as_deref(),
                             block_num,
                             block_content_len,
-                            part_size,
+                            block_size as usize,
+                            validated_sparse_blocks,
                             &trace_id,
                         )
                         .await?;
@@ -1295,10 +2081,7 @@ impl VfsCore {
             return Some(n);
         };
         if let Some(dc) = &self.disk_cache {
-            if dc.get_block_version(blob_guid, block_num).await != Some(version) {
-                return None;
-            }
-            dc.get_block_into(blob_guid, block_num, block_content_len, buf)
+            dc.get_block_into_exact(blob_guid, block_num, version, block_content_len, buf)
                 .await
         } else {
             None
@@ -1313,6 +2096,7 @@ impl VfsCore {
         layout: &ObjectLayout,
         offset: u64,
         buf: &mut [u8],
+        validated_sparse_blocks: &HashSet<(data_types::DataBlobGuid, u32)>,
     ) -> Result<usize, FsError> {
         let file_size = self.authoritative_file_size(layout).await?;
         let size = buf.len() as u32;
@@ -1398,7 +2182,15 @@ impl VfsCore {
                 let bcl = std::cmp::min(block_size, file_size - bs) as usize;
 
                 let block_data = self
-                    .read_block_cached(blob_guid, map.as_deref(), bn, bcl, file_size, &trace_id)
+                    .read_block_cached(
+                        blob_guid,
+                        map.as_deref(),
+                        bn,
+                        bcl,
+                        block_size as usize,
+                        validated_sparse_blocks,
+                        &trace_id,
+                    )
                     .await?;
 
                 let ss = if bn == first_block {
@@ -1428,6 +2220,44 @@ impl VfsCore {
         Ok(written.min(actual_len))
     }
 
+    async fn read_clean_handle(
+        &self,
+        fh: FileHandleId,
+        offset: u64,
+        buf: &mut [u8],
+        validated_sparse_blocks: &HashSet<(data_types::DataBlobGuid, u32)>,
+    ) -> Result<usize, FsError> {
+        let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
+        let layout = match &handle.layout {
+            Some(layout) => layout.clone(),
+            None => return Ok(0),
+        };
+        let s3_key = handle.s3_key.clone();
+        drop(handle);
+
+        match &layout.state {
+            ObjectState::Normal(_) => {
+                self.read_normal_buf(&layout, offset, buf, validated_sparse_blocks)
+                    .await
+            }
+            ObjectState::Mpu(MpuState::Completed(_)) => {
+                let data = self
+                    .read_mpu(
+                        &s3_key,
+                        &layout,
+                        offset,
+                        buf.len() as u32,
+                        validated_sparse_blocks,
+                    )
+                    .await?;
+                let n = data.len().min(buf.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                Ok(n)
+            }
+            _ => Err(FsError::InvalidState),
+        }
+    }
+
     /// Read data directly into a caller-provided buffer (zero-copy path).
     ///
     /// Tries to read from disk cache directly into `buf`. For cache misses
@@ -1438,6 +2268,14 @@ impl VfsCore {
         offset: u64,
         buf: &mut [u8],
     ) -> Result<usize, FsError> {
+        let operation_lock = self
+            .file_handles
+            .get(&fh)
+            .ok_or(FsError::BadFd)?
+            .operation_lock
+            .clone();
+        let _operation_guard = operation_lock.lock().await;
+        self.ensure_reader_lease_valid(fh)?;
         let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
 
         // Dirty write buffer: merge per-block intents over the committed
@@ -1456,7 +2294,7 @@ impl VfsCore {
                 Some(l) => self.layout_block_map(l).await?,
                 None => None,
             };
-            return self
+            let result = self
                 .read_dirty_handle(
                     file_size,
                     block_size,
@@ -1468,27 +2306,58 @@ impl VfsCore {
                     buf,
                 )
                 .await;
+            if result.is_ok() {
+                self.ensure_reader_lease_valid(fh)?;
+            }
+            return result;
         }
-
-        let layout = match &handle.layout {
-            Some(l) => l.clone(),
-            None => return Ok(0),
-        };
-        let s3_key = handle.s3_key.clone();
         drop(handle);
 
-        match &layout.state {
-            ObjectState::Normal(_) => self.read_normal_buf(&layout, offset, buf).await,
-            ObjectState::Mpu(MpuState::Completed(_)) => {
-                // MPU: fall back to the Bytes path and copy
-                let data = self
-                    .read_mpu(&s3_key, &layout, offset, buf.len() as u32)
-                    .await?;
-                let n = data.len().min(buf.len());
-                buf[..n].copy_from_slice(&data[..n]);
-                Ok(n)
+        self.refresh_handle_layout(fh, false).await?;
+        let mut validated_sparse_blocks = HashSet::new();
+        let mut retried_corruption = false;
+        let mut refresh_attempts = 0u32;
+        loop {
+            let version_id = self
+                .file_handles
+                .get(&fh)
+                .and_then(|handle| handle.layout.as_ref().map(|layout| layout.version_id));
+            let result = self
+                .read_clean_handle(fh, offset, buf, &validated_sparse_blocks)
+                .await;
+            match result {
+                Err(FsError::StaleLayout(blob_guid, block_number)) => {
+                    refresh_attempts += 1;
+                    if refresh_attempts > 64 {
+                        return Err(FsError::StaleLayout(blob_guid, block_number));
+                    }
+                    self.refresh_handle_layout(fh, true).await?;
+                    let refreshed_version = self
+                        .file_handles
+                        .get(&fh)
+                        .and_then(|handle| handle.layout.as_ref().map(|layout| layout.version_id));
+                    if refreshed_version == version_id {
+                        if !validated_sparse_blocks.insert((blob_guid, block_number)) {
+                            return Err(FsError::StaleLayout(blob_guid, block_number));
+                        }
+                    } else {
+                        validated_sparse_blocks.clear();
+                    }
+                }
+                Err(FsError::DataVg(volume_group_proxy::DataVgError::Corrupted))
+                    if !retried_corruption =>
+                {
+                    self.refresh_handle_layout(fh, true).await?;
+                    validated_sparse_blocks.clear();
+                    retried_corruption = true;
+                }
+                other => {
+                    if other.is_ok() {
+                        self.ensure_reader_lease_valid(fh)?;
+                    }
+                    return other;
+                }
             }
-            _ => Err(FsError::InvalidState),
         }
     }
 
@@ -1500,12 +2369,14 @@ impl VfsCore {
     /// a hole (map hole / `committed_content_len == 0` / an unmapped v1
     /// miss); propagates other errors. A map-committed generation that is
     /// missing everywhere is data loss and fails the load.
+    #[allow(clippy::too_many_arguments)]
     async fn lazy_load_block_for_flush(
         &self,
         existing_blob_guid: Option<data_types::DataBlobGuid>,
         committed_map: Option<&BlockMap>,
         block_num: u32,
         committed_content_len: usize,
+        block_size: usize,
         fallback_content_len: usize,
         trace_id: &TraceId,
     ) -> Result<Bytes, FsError> {
@@ -1519,7 +2390,7 @@ impl VfsCore {
             return Ok(Bytes::from(vec![0u8; fallback_content_len]));
         };
         let read_len = if version > 1 {
-            (DEFAULT_BLOCK_SIZE as usize).max(committed_content_len)
+            block_size.max(committed_content_len)
         } else {
             committed_content_len
         };
@@ -1603,6 +2474,7 @@ impl VfsCore {
                             committed_map,
                             b,
                             block_content_len,
+                            block_size as usize,
                             block_content_len,
                             &trace_id,
                         )
@@ -1652,6 +2524,15 @@ impl VfsCore {
     }
 
     async fn flush_write_buffer(&self, fh_id: FileHandleId) -> Result<(), FsError> {
+        let operation_lock = self
+            .file_handles
+            .get(&fh_id)
+            .ok_or(FsError::BadFd)?
+            .operation_lock
+            .clone();
+        let _operation_guard = operation_lock.lock().await;
+        self.ensure_reader_lease_valid(fh_id)?;
+
         // Snapshot the sparse buffer under the guard and clear `dirty` so a
         // concurrent flush of the same fh sees a clean buffer and
         // early-returns rather than racing in to republish.
@@ -1697,7 +2578,7 @@ impl VfsCore {
         // blob and the other names still reference it, so the write must
         // still flush (routed to the record below, not this s3_key, whose
         // NSS row holds only an Indirect redirect).
-        let (name_removed, mut promoted_inode_id) = self
+        let (name_removed, promoted_inode_id) = self
             .inodes
             .get(ino)
             .map(|e| (e.name_removed, e.inode_id))
@@ -1733,7 +2614,7 @@ impl VfsCore {
         // record up front: its layout seeds the override-flush base (the
         // shared blob_guid + blob_version) and its nlink/orphan_since are
         // preserved on republish.
-        let mut promoted_record_key = promoted_inode_id.map(InodeRecord::key_for);
+        let promoted_record_key = promoted_inode_id.map(InodeRecord::key_for);
         // The publish CAS guards on the fetched record re-serialized (rkyv is
         // deterministic for these types, as the s3_key flush CAS also relies
         // on), so we keep only the decoded record here.
@@ -1759,82 +2640,17 @@ impl VfsCore {
             None => self.file_handles.get(&fh_id).and_then(|h| h.layout.clone()),
         };
 
-        const MAX_CAS_RETRIES: u32 = 5;
-        /// Prepare-lease lifetime. Kept short so a writer killed between its
-        /// prepare CAS and its abort CAS (crash, SIGTERM mid-flush) blocks a
-        /// takeover for seconds, not minutes; a live flush that outlasts it
-        /// renews the lease from its block-write loop.
-        const PENDING_LEASE_MS: u64 = 10_000;
-        /// How long a flush polls a live foreign lease before giving up
-        /// with Busy. Covers one full lease (a crashed owner expires) plus
-        /// slack; a healthy concurrent writer clears the slot much sooner
-        /// by committing.
-        const FOREIGN_PENDING_WAIT_MS: u64 = 15_000;
-        let mut attempt: u32 = 0;
-        let mut foreign_wait_started: Option<Instant> = None;
-        // Reclamation input recorded by the winning attempt: superseded
+        // Reclamation input recorded by the commit: superseded
         // exact identities plus the replaced map version, deleted by the
         // post-commit sweep after the reader grace.
         let mut sweep_victims: Vec<(u32, u64)> = Vec::new();
         let mut sweep_old_map: Option<BlockMapRef> = None;
-        // Blocks this flush wrote at version 1 (appends); the disk-cache
-        // mirror stamps them separately from the burned-version rewrites.
-        let mut append_blocks: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut unused_prepare_map: Option<BlockMapRef> = None;
+        let mut append_blocks = std::collections::BTreeSet::new();
+        let mut committed_write_versions: std::collections::BTreeMap<u32, u64> =
+            std::collections::BTreeMap::new();
+        let mut create_reader_lease = None;
         let (mut final_layout, final_committed_size) = loop {
-            attempt += 1;
-            if attempt > MAX_CAS_RETRIES {
-                tracing::warn!(
-                    key = %s3_key,
-                    "flush_write_buffer: CAS still conflicting after retries"
-                );
-                // The guard restores blocks so a later flush retries.
-                return Err(FsError::CasConflict);
-            }
-
-            // Shared refetch used by every CAS-conflict arm: the shared
-            // record for a promoted inode, else the s3_key layout (which may
-            // reveal a concurrent promotion to Indirect).
-            macro_rules! refetch_base_and_continue {
-                () => {{
-                    if let Some(id) = promoted_inode_id {
-                        match self.backend().get_inode_record(id, &trace_id).await {
-                            Ok(rec) => {
-                                base_layout = Some(rec.layout.clone());
-                                promoted_record = Some(rec);
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    } else {
-                        match self.backend().get_inode(&s3_key, &trace_id).await {
-                            Ok(cur) => {
-                                if let ObjectState::Indirect(redirect) = &cur.state {
-                                    // Promoted concurrently by another
-                                    // client/instance: switch to the record
-                                    // path so we publish into the shared
-                                    // record instead of clobbering the
-                                    // redirect.
-                                    let id = redirect.inode_id;
-                                    match self.backend().get_inode_record(id, &trace_id).await {
-                                        Ok(rec) => {
-                                            base_layout = Some(rec.layout.clone());
-                                            promoted_record = Some(rec);
-                                            promoted_inode_id = Some(id);
-                                            promoted_record_key = Some(InodeRecord::key_for(id));
-                                        }
-                                        Err(e) => return Err(e),
-                                    }
-                                } else {
-                                    base_layout = Some(cur);
-                                }
-                            }
-                            Err(FsError::NotFound) => base_layout = None,
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    continue;
-                }};
-            }
-
             // Serialize `layout` as the publish value/guard for this file:
             // bare layout at the s3_key, or wrapped in the shared
             // InodeRecord for a promoted inode (rkyv is deterministic for
@@ -1886,11 +2702,11 @@ impl VfsCore {
                  block_map: Option<BlockMapRef>| {
                     ObjectLayout {
                         version_id: ObjectLayout::gen_version_id(),
-                        block_size: DEFAULT_BLOCK_SIZE,
+                        block_size: block_size as u32,
                         timestamp,
                         blob_version,
                         block_map,
-                        pending_write: None,
+                        prepared_write: None,
                         state: ObjectState::Normal(ObjectMetaData {
                             blob_guid,
                             core_meta_data: ObjectCoreMetaData {
@@ -1908,12 +2724,25 @@ impl VfsCore {
                 .as_ref()
                 .and_then(|l| l.blob_guid().ok().map(|g| (g, l.clone())));
 
-            // ---- Create path: no committed base. A fresh blob_guid is
+            // Create path: no committed base. A fresh blob_guid is
             // minted per attempt, so no key this attempt writes can ever
             // collide with another attempt's bytes: everything lands at
-            // version 1, unpadded, with no map and no pending record.
+            // version 1, unpadded, with no map.
             let Some((blob_guid, base)) = base else {
                 let blob_guid = self.backend().create_blob_guid();
+                let attempt_reader_lease = self
+                    .acquire_reader_leases(vec![BlobReaderIdentity {
+                        blob_guid,
+                        blob_version: 1,
+                    }])
+                    .await?;
+                let mut unpublished_identities: Vec<(u32, u64)> = snap
+                    .blocks
+                    .iter()
+                    .filter_map(|(block, state)| {
+                        matches!(state, BlockState::Rewrite(_)).then_some((*block, 1))
+                    })
+                    .collect();
                 let mut flush_err: Option<FsError> = None;
                 for (b, st) in snap.blocks.iter() {
                     let BlockState::Rewrite(bytes) = st else {
@@ -1929,32 +2758,102 @@ impl VfsCore {
                     }
                 }
                 if let Some(e) = flush_err {
-                    // Nothing was published: the fresh blob is invisible
-                    // garbage, and the guard restores the taken blocks so a
-                    // later flush retries (with another fresh blob).
+                    self.cleanup_unpublished_blob(blob_guid, unpublished_identities, &trace_id)
+                        .await;
                     return Err(e);
                 }
 
-                let layout = build_final_layout(blob_guid, 1, None);
-                let publish_bytes = wrap_for_publish(promoted_record.as_ref(), &layout)?;
+                // A create-time fallocate claim is part of the publish
+                // precondition. Reserve every untouched block before the
+                // inode CAS so ENOSPC or a reserve quorum failure reaches the
+                // caller and no metadata can advertise unallocated space.
+                let mut reservation_map = BlockMap::new();
+                let reservation_version = 2;
+                let reservation_blocks: Vec<u32> = snap
+                    .pending_reservations
+                    .iter()
+                    .copied()
+                    .filter(|block| !snap.blocks.contains_key(block))
+                    .collect();
+                unpublished_identities.extend(
+                    reservation_blocks
+                        .iter()
+                        .map(|block| (*block, reservation_version)),
+                );
+                let reserve_results = stream::iter(reservation_blocks.iter().copied())
+                    .map(|block| async move {
+                        self.backend()
+                            .reserve_block(
+                                blob_guid,
+                                block,
+                                block_size as u32,
+                                reservation_version,
+                                &trace_id,
+                            )
+                            .await
+                    })
+                    .buffer_unordered(RESERVATION_CONCURRENCY)
+                    .collect::<Vec<_>>()
+                    .await;
+                if let Some(error) = reserve_results.into_iter().find_map(Result::err) {
+                    self.cleanup_unpublished_blob(blob_guid, unpublished_identities, &trace_id)
+                        .await;
+                    return Err(error);
+                }
+                for block in reservation_blocks {
+                    reservation_map.overlay(
+                        block,
+                        block,
+                        RangeState::Reserved(reservation_version),
+                    );
+                }
+
+                let map_ref = if reservation_map.is_empty() {
+                    None
+                } else {
+                    match self
+                        .publish_block_map(&blob_guid, &reservation_map, &trace_id)
+                        .await
+                    {
+                        Ok(map_ref) => Some(map_ref),
+                        Err(error) => {
+                            self.cleanup_unpublished_blob(
+                                blob_guid,
+                                unpublished_identities,
+                                &trace_id,
+                            )
+                            .await;
+                            return Err(error);
+                        }
+                    }
+                };
+                let layout_version = if reservation_map.is_empty() {
+                    1
+                } else {
+                    reservation_version
+                };
+                let layout = build_final_layout(blob_guid, layout_version, map_ref);
+                let publish_bytes = match wrap_for_publish(promoted_record.as_ref(), &layout) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.cleanup_unpublished_blob(blob_guid, unpublished_identities, &trace_id)
+                            .await;
+                        return Err(error);
+                    }
+                };
                 match self
                     .backend()
                     .put_inode_cas(&publish_key, publish_bytes.clone(), Bytes::new(), &trace_id)
                     .await
                 {
                     Ok(_prev) => {
-                        // Reserve fallocate-claimed blocks not superseded by
-                        // a Rewrite this flush (single-op; EC is a no-op).
-                        for b in snap.pending_reservations.iter() {
-                            if snap.blocks.contains_key(b) {
-                                continue;
+                        for (block, state) in snap.blocks.iter() {
+                            if matches!(state, BlockState::Rewrite(_)) {
+                                committed_write_versions.insert(*block, 1);
                             }
-                            let _ = self
-                                .backend()
-                                .reserve_block(blob_guid, *b, block_size as u32, 1, &trace_id)
-                                .await;
                         }
                         snap.armed = false;
+                        create_reader_lease = attempt_reader_lease;
                         break (layout, 0);
                     }
                     Err(FsError::CasConflict) => {
@@ -1969,233 +2868,308 @@ impl VfsCore {
                                 let cur_bytes: Bytes =
                                     match to_bytes_in::<_, rkyv::rancor::Error>(&cur, Vec::new()) {
                                         Ok(b) => b.into(),
-                                        Err(e) => return Err(FsError::from(e)),
+                                        Err(e) => {
+                                            self.cleanup_unpublished_blob(
+                                                blob_guid,
+                                                unpublished_identities,
+                                                &trace_id,
+                                            )
+                                            .await;
+                                            return Err(FsError::from(e));
+                                        }
                                     };
                                 if cur_bytes == publish_bytes {
+                                    for (block, state) in snap.blocks.iter() {
+                                        if matches!(state, BlockState::Rewrite(_)) {
+                                            committed_write_versions.insert(*block, 1);
+                                        }
+                                    }
                                     snap.armed = false;
+                                    create_reader_lease = attempt_reader_lease;
                                     break (layout, 0);
                                 }
+                                self.cleanup_unpublished_blob(
+                                    blob_guid,
+                                    unpublished_identities,
+                                    &trace_id,
+                                )
+                                .await;
                                 return Err(FsError::CasConflict);
                             }
-                            Err(FsError::NotFound) => return Err(FsError::CasConflict),
-                            Err(e) => return Err(e),
+                            Err(FsError::NotFound) => {
+                                self.cleanup_unpublished_blob(
+                                    blob_guid,
+                                    unpublished_identities,
+                                    &trace_id,
+                                )
+                                .await;
+                                return Err(FsError::CasConflict);
+                            }
+                            Err(e) => {
+                                self.cleanup_unpublished_blob(
+                                    blob_guid,
+                                    unpublished_identities,
+                                    &trace_id,
+                                )
+                                .await;
+                                return Err(e);
+                            }
                         }
                     }
                     Err(e) => return Err(e),
                 }
             };
 
-            // ---- Overwrite/append path against a committed base. ----
+            // Overwrite/append path against a committed base.
             let committed_size = base.size().unwrap_or(0);
             let committed_bc = committed_size.div_ceil(bsz_u64) as u32;
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
 
-            // Step 0: resolve an existing pending record. Our own leftover
-            // (a failed attempt whose abort CAS never landed, or a commit
-            // conflict) and an expired foreign one are aborted here: poison
-            // the recorded v1 append span so those keys are never rewritten
-            // with different bytes, then clear the slot, all in one CAS. A
-            // live foreign lease is polled bounded: a healthy concurrent
-            // writer commits (clearing the slot) within seconds, and a
-            // crashed one expires within one short lease; only sustained
-            // contention past the bound fails Busy (the snapshot guard
-            // re-arms the buffer so a later fsync retries).
-            if let Some(p) = base.pending_write.as_deref().copied() {
-                if p.owner != self.writer_id && p.expires_at_ms > now_ms {
-                    let waited = foreign_wait_started
-                        .get_or_insert_with(Instant::now)
-                        .elapsed();
-                    if waited > Duration::from_millis(FOREIGN_PENDING_WAIT_MS) {
-                        tracing::warn!(
-                            key = %s3_key,
-                            pending_version = p.version,
-                            "flush: foreign pending lease still live after wait; returning Busy"
-                        );
-                        return Err(FsError::Busy);
-                    }
-                    rpc_client_common::rpc_sleep(Duration::from_millis(500)).await;
-                    attempt -= 1;
-                    refetch_base_and_continue!();
-                }
-                let mut cleared = base.clone();
-                cleared.pending_write = None;
-                if let Some((s, e)) = p.append_range {
-                    let mut poisoned = match self.layout_block_map(&base).await? {
-                        Some(m) => (*m).clone(),
-                        None => BlockMap::new(),
+            // An installed record means the single supported writer stopped
+            // before commit. Make every exact key it could have touched
+            // unreachable, clear the recovery record, and start this flush
+            // from that valid state. This is crash recovery, not writer
+            // ownership or conflict coordination.
+            if let Some(recovery) = base.prepared_write.as_deref().copied() {
+                let mut recovered = base.clone();
+                recovered.prepared_write = None;
+                recovered.blob_version = recovered.blob_version.max(recovery.version);
+                if recovery.reservation_abort_map.is_some() || recovery.append_range.is_some() {
+                    let mut recovery_map = match recovery.reservation_abort_map {
+                        Some(map_ref) => {
+                            (*self.load_block_map_ref(blob_guid, map_ref).await?).clone()
+                        }
+                        None => match self.layout_block_map(&base).await? {
+                            Some(map) => (*map).clone(),
+                            None => BlockMap::new(),
+                        },
                     };
-                    poisoned.overlay(s, e, RangeState::Hole);
-                    cleared.block_map = Some(
-                        self.publish_block_map(&blob_guid, &poisoned, &trace_id)
-                            .await?,
-                    );
+                    apply_append_recovery(&mut recovery_map, recovery.append_range);
+                    recovered.block_map = if recovery.append_range.is_none() {
+                        recovery.reservation_abort_map
+                    } else {
+                        Some(
+                            self.publish_block_map(&blob_guid, &recovery_map, &trace_id)
+                                .await?,
+                        )
+                    };
                 }
                 let old_bytes = wrap_for_publish(promoted_record.as_ref(), &base)?;
-                let new_bytes = wrap_for_publish(promoted_record.as_ref(), &cleared)?;
-                match self
+                let new_bytes = wrap_for_publish(promoted_record.as_ref(), &recovered)?;
+                if let Err(error) = self
                     .backend()
-                    .put_inode_cas(&publish_key, new_bytes, old_bytes, &trace_id)
+                    .put_inode_cas(&publish_key, new_bytes.clone(), old_bytes, &trace_id)
                     .await
                 {
-                    Ok(_) => {
-                        if let Some(rec) = promoted_record.as_mut() {
-                            rec.layout = cleared.clone();
-                        }
-                        base_layout = Some(cleared);
-                        // Restart the attempt against the cleaned base; do
-                        // not charge this against the retry budget.
-                        attempt -= 1;
-                        continue;
+                    let landed = match promoted_inode_id {
+                        Some(id) => self
+                            .backend()
+                            .get_inode_record(id, &trace_id)
+                            .await
+                            .ok()
+                            .and_then(|record| wrap_for_publish(Some(&record), &record.layout).ok())
+                            .is_some_and(|current| current == new_bytes),
+                        None => self
+                            .backend()
+                            .get_inode(&publish_key, &trace_id)
+                            .await
+                            .ok()
+                            .and_then(|layout| wrap_for_publish(None, &layout).ok())
+                            .is_some_and(|current| current == new_bytes),
+                    };
+                    if !landed {
+                        return Err(error);
                     }
-                    Err(FsError::CasConflict) => refetch_base_and_continue!(),
-                    Err(e) => return Err(e),
                 }
+                if recovered.block_map != base.block_map {
+                    self.enqueue_superseded_sweep(
+                        blob_guid,
+                        recovered.blob_version,
+                        Vec::new(),
+                        base.block_map,
+                    );
+                }
+                if recovery.append_range.is_some()
+                    && let Some(map_ref) = recovery.reservation_abort_map
+                {
+                    self.enqueue_unreferenced_map_delete(blob_guid, map_ref);
+                }
+                if let Some(record) = promoted_record.as_mut() {
+                    record.layout = recovered.clone();
+                }
+                if let Some(mut handle) = self.file_handles.get_mut(&fh_id) {
+                    handle.layout = Some(recovered.clone());
+                    handle.layout_refreshed_at = Instant::now();
+                }
+                if let Some(mut entry) = self.inodes.get_mut(ino) {
+                    entry.layout = Some(recovered.clone());
+                }
+                base_layout = Some(recovered);
+                continue;
             }
 
             let base_map_arc = self.layout_block_map(&base).await?;
             let base_map: Option<&BlockMap> = base_map_arc.as_deref();
 
-            // Step 1: classify the dirty blocks. First writes strictly
-            // beyond the committed EOF that no map range covers go to
-            // version 1 (map-free appends); everything else is a rewrite at
-            // the burned version. Map coverage includes poison/hole entries
-            // from aborted appends, punches, and shrink trims, which is
-            // exactly what forbids v1 reuse.
+            // Rewrites use the newly burned generation. First writes beyond
+            // the committed EOF remain map-free at version 1; the recovery
+            // record protects that exact-key territory until commit. A
+            // disjoint append span containing committed map state cannot use
+            // range recovery because recovery would overwrite that state.
             let version = base.blob_version + 1;
-            let is_append = |b: u32| -> bool {
-                b >= committed_bc && base_map.is_none_or(|m| m.lookup(b).is_none())
+            let map_free_append_blocks = snap
+                .blocks
+                .iter()
+                .filter_map(|(block, state)| {
+                    (matches!(state, BlockState::Rewrite(_))
+                        && !existing_write_identity(base_map, *block, committed_bc, version).1)
+                        .then_some(*block)
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            let append_range =
+                map_free_append_range(base_map, map_free_append_blocks.iter().copied());
+            let write_identity = |block| {
+                if append_range.is_none() && map_free_append_blocks.contains(&block) {
+                    (version, true)
+                } else {
+                    existing_write_identity(base_map, block, committed_bc, version)
+                }
             };
-            let mut append_range: Option<(u32, u32)> = None;
-            for (b, st) in snap.blocks.iter() {
-                if matches!(st, BlockState::Rewrite(_)) && is_append(*b) {
-                    append_range = Some(match append_range {
-                        None => (*b, *b),
-                        Some((lo, hi)) => (lo.min(*b), hi.max(*b)),
-                    });
+            let is_append =
+                |block| append_range.is_some() && map_free_append_blocks.contains(&block);
+
+            // Classify fallocate claims against the committed state. Map
+            // entries are authoritative; an unmapped block below EOF needs
+            // one version-1 listing probe because it may be either data or a
+            // sparse hole. Existing data/reservations are no-ops, while
+            // holes and beyond-EOF blocks receive a new burned reservation.
+            let mut reservation_blocks = std::collections::BTreeSet::new();
+            let mut unresolved_v1 = Vec::new();
+            for b in snap.pending_reservations.iter().copied() {
+                if snap.blocks.contains_key(&b) {
+                    continue;
+                }
+                match base_map.and_then(|m| m.lookup(b)) {
+                    Some(RangeState::Written(_)) | Some(RangeState::Reserved(_)) => {}
+                    Some(RangeState::Hole) => {
+                        reservation_blocks.insert(b);
+                    }
+                    None if b >= committed_bc => {
+                        reservation_blocks.insert(b);
+                    }
+                    None => unresolved_v1.push(b),
                 }
             }
+            if !unresolved_v1.is_empty() {
+                let mut spans: Vec<(u32, u32)> = Vec::new();
+                for b in unresolved_v1.iter().copied() {
+                    match spans.last_mut() {
+                        Some((_, end)) if end.checked_add(1) == Some(b) => *end = b,
+                        _ => spans.push((b, b)),
+                    }
+                }
+                let mut present_v1 = std::collections::BTreeSet::new();
+                for (first, last) in spans {
+                    let count = last
+                        .checked_sub(first)
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or_else(|| {
+                            FsError::Internal("fallocate probe range overflow".to_string())
+                        })?;
+                    let entries = self
+                        .backend()
+                        .list_blob_blocks(blob_guid, first, count, &trace_id)
+                        .await?;
+                    present_v1.extend(
+                        entries
+                            .into_iter()
+                            .filter(|entry| entry.version == 1)
+                            .map(|entry| entry.block_number),
+                    );
+                }
+                for b in unresolved_v1 {
+                    if !present_v1.contains(&b) {
+                        reservation_blocks.insert(b);
+                    }
+                }
+            }
+            // Reserved identities are mutable exactly once: Reserved to
+            // Data. Pre-publish the map recovery installs if conversion is
+            // interrupted, so the same exact key is never consumed twice.
+            let abort_map = reservation_abort_map(
+                base_map,
+                snap.blocks.iter().filter_map(|(block, state)| {
+                    matches!(state, BlockState::Rewrite(_)).then_some(*block)
+                }),
+            );
+            let reservation_abort_map_ref = if let Some(reservation_abort_map) = abort_map {
+                Some(
+                    self.publish_block_map(&blob_guid, &reservation_abort_map, &trace_id)
+                        .await?,
+                )
+            } else {
+                None
+            };
 
-            // Step 2: prepare CAS. Burns `version` durably (an aborted
-            // attempt's version is never reused, so two attempts can never
-            // disagree on one key's bytes) and declares the v1 territory
-            // this attempt may touch.
+            // Step 2: prepare CAS. This durably burns `version` and records
+            // the version-1 append range and reservation cleanup map before
+            // any data I/O. `blob_version` stays at the reader-visible
+            // generation until commit. The record deliberately has no owner,
+            // lease, or expiry.
             let mut prepare = base.clone();
-            prepare.blob_version = version;
-            prepare.pending_write = Some(Box::new(PendingWrite {
+            prepare.prepared_write = Some(Box::new(PreparedWrite {
                 version,
-                owner: self.writer_id,
                 append_range,
-                expires_at_ms: now_ms + PENDING_LEASE_MS,
+                reservation_abort_map: reservation_abort_map_ref,
             }));
             {
                 let old_bytes = wrap_for_publish(promoted_record.as_ref(), &base)?;
                 let new_bytes = wrap_for_publish(promoted_record.as_ref(), &prepare)?;
-                match self
+                if let Err(error) = self
                     .backend()
-                    .put_inode_cas(&publish_key, new_bytes, old_bytes, &trace_id)
+                    .put_inode_cas(&publish_key, new_bytes.clone(), old_bytes, &trace_id)
                     .await
                 {
-                    Ok(_) => {}
-                    Err(FsError::CasConflict) => refetch_base_and_continue!(),
-                    Err(e) => return Err(e),
+                    let landed = match promoted_inode_id {
+                        Some(id) => self
+                            .backend()
+                            .get_inode_record(id, &trace_id)
+                            .await
+                            .ok()
+                            .and_then(|record| wrap_for_publish(Some(&record), &record.layout).ok())
+                            .is_some_and(|current| current == new_bytes),
+                        None => self
+                            .backend()
+                            .get_inode(&publish_key, &trace_id)
+                            .await
+                            .ok()
+                            .and_then(|layout| wrap_for_publish(None, &layout).ok())
+                            .is_some_and(|current| current == new_bytes),
+                    };
+                    if !landed {
+                        return Err(error);
+                    }
                 }
             }
             if let Some(rec) = promoted_record.as_mut() {
                 rec.layout = prepare.clone();
             }
-
-            // Best-effort abort of this prepared attempt: poison the append
-            // span and clear the slot in one CAS. If the CAS conflicts the
-            // pending simply survives; the next flush's step 0 (or a
-            // takeover after expiry) resumes the obligation, so it is never
-            // lost.
-            macro_rules! abort_prepared_and_return {
-                ($err:expr) => {{
-                    let mut aborted = prepare.clone();
-                    aborted.pending_write = None;
-                    if let Some((s, e)) = append_range {
-                        let mut poisoned = match base_map_arc.as_deref() {
-                            Some(m) => m.clone(),
-                            None => BlockMap::new(),
-                        };
-                        poisoned.overlay(s, e, RangeState::Hole);
-                        match self.publish_block_map(&blob_guid, &poisoned, &trace_id).await {
-                            Ok(r) => aborted.block_map = Some(r),
-                            Err(e2) => {
-                                tracing::warn!(error = %e2, "abort: poison map publish failed; pending survives for takeover");
-                                return Err($err);
-                            }
-                        }
-                    }
-                    let old_bytes = wrap_for_publish(promoted_record.as_ref(), &prepare)?;
-                    let new_bytes = wrap_for_publish(promoted_record.as_ref(), &aborted)?;
-                    if let Err(e2) = self
-                        .backend()
-                        .put_inode_cas(&publish_key, new_bytes, old_bytes, &trace_id)
-                        .await
-                    {
-                        tracing::warn!(error = %e2, "abort CAS failed; pending survives for takeover");
-                    }
-                    return Err($err);
-                }};
+            if let Some(mut handle) = self.file_handles.get_mut(&fh_id) {
+                handle.layout = Some(prepare.clone());
+                handle.layout_refreshed_at = Instant::now();
+            }
+            if let Some(mut entry) = self.inodes.get_mut(ino) {
+                entry.layout = Some(prepare.clone());
             }
 
-            // Step 3: write the dirty blocks. Rewrites go to the burned
-            // version zero-padded to block_size (constant EC shard size);
-            // v1 appends are stored at their exact length, like the create
-            // path (the read side derives the request length from the
-            // version for the same reason). A flush whose write phase
-            // outlasts half the (short) lease renews it in place, so a
-            // slow flush is never taken over mid-flight.
+            // Step 3: write every dirty block at its exact identity. Rewrite
+            // generations are padded to block_size for constant EC shards;
+            // version-1 appends keep their natural length.
             let mut flush_err: Option<FsError> = None;
             for (b, st) in snap.blocks.iter() {
                 let BlockState::Rewrite(bytes) = st else {
                     continue;
                 };
-                let lease_now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                let expires = prepare
-                    .pending_write
-                    .as_deref()
-                    .map(|p| p.expires_at_ms)
-                    .unwrap_or(0);
-                if lease_now_ms + PENDING_LEASE_MS / 2 > expires {
-                    let mut renewed = prepare.clone();
-                    if let Some(p) = renewed.pending_write.as_deref_mut() {
-                        p.expires_at_ms = lease_now_ms + PENDING_LEASE_MS;
-                    }
-                    let old_bytes = wrap_for_publish(promoted_record.as_ref(), &prepare)?;
-                    let new_bytes = wrap_for_publish(promoted_record.as_ref(), &renewed)?;
-                    match self
-                        .backend()
-                        .put_inode_cas(&publish_key, new_bytes, old_bytes, &trace_id)
-                        .await
-                    {
-                        Ok(_) => {
-                            if let Some(rec) = promoted_record.as_mut() {
-                                rec.layout = renewed.clone();
-                            }
-                            prepare = renewed;
-                        }
-                        Err(e) => {
-                            // A concurrent metadata CAS moved the record;
-                            // the commit CAS will conflict and the attempt
-                            // restarts through step 0. Keep writing (the
-                            // burned version stays uniquely ours).
-                            tracing::debug!(error = %e, "lease renewal CAS lost; continuing");
-                        }
-                    }
-                }
-                let (write_version, pad) = if is_append(*b) {
-                    (1, false)
-                } else {
-                    (version, true)
-                };
+                let (write_version, pad) = write_identity(*b);
                 let body = if pad && bytes.len() < block_size {
                     let mut buf = BytesMut::with_capacity(block_size);
                     buf.extend_from_slice(bytes);
@@ -2204,56 +3178,109 @@ impl VfsCore {
                 } else {
                     bytes.clone()
                 };
-                if let Err(e) = self
-                    .backend()
-                    .write_block(blob_guid, *b, body, write_version, &trace_id)
-                    .await
-                {
+                let consumes_reservation = matches!(
+                    base_map.and_then(|map| map.lookup(*b)),
+                    Some(RangeState::Reserved(_))
+                );
+                let write_result = if consumes_reservation {
+                    self.backend()
+                        .write_reserved_block(blob_guid, *b, body, write_version, &trace_id)
+                        .await
+                } else {
+                    self.backend()
+                        .write_block(blob_guid, *b, body, write_version, &trace_id)
+                        .await
+                };
+                if let Err(e) = write_result {
                     flush_err = Some(e);
                     break;
                 }
             }
             if let Some(e) = flush_err {
-                abort_prepared_and_return!(e);
+                return Err(e);
             }
 
-            // Step 4: build the new map. Order matters: shrink/trim poison
+            // Reservation quorum is a precondition of the metadata commit.
+            // Publishing first would let fallocate report success after
+            // ENOSPC and leave a Reserved map entry with no physical claim.
+            let reservation_blocks_vec: Vec<u32> = reservation_blocks.iter().copied().collect();
+            for batch in reservation_blocks_vec.chunks(RESERVATION_CONCURRENCY) {
+                let batch = batch.to_vec();
+                let reserve_result = stream::iter(batch)
+                    .map(|block| {
+                        self.backend().reserve_block(
+                            blob_guid,
+                            block,
+                            block_size as u32,
+                            version,
+                            &trace_id,
+                        )
+                    })
+                    .buffer_unordered(RESERVATION_CONCURRENCY)
+                    .try_collect::<Vec<_>>()
+                    .await;
+                reserve_result?;
+            }
+
+            // Step 4: build the new map. Order matters: shrink and trim
             // first, then this flush's rewrites/punches/reservations on top
             // (main's trim skipped rewritten blocks; overlay order encodes
             // the same rule). Trimmed ranges become Hole entries rather
-            // than map gaps: a later regrow must classify those blocks as
-            // rewrites, never as fresh v1 appends, because their old keys
-            // may survive until the sweep.
+            // than map gaps so a later regrow cannot expose old data.
             let mut new_map = match base_map {
                 Some(m) => m.clone(),
                 None => BlockMap::new(),
             };
             let trim_lo =
                 std::cmp::min(new_num_blocks, eof_low_watermark.unwrap_or(new_num_blocks));
-            let trim_hi = std::cmp::max(committed_bc, trim_upper.unwrap_or(0));
+            let trim_hi = committed_bc.max(trim_upper.unwrap_or(0));
+            let mapped_trims = if eof_low_watermark.is_some() {
+                mapped_trim_ranges(base_map, trim_lo, trim_hi)
+            } else {
+                Vec::new()
+            };
+            let trim_spans = trim_victim_spans(trim_lo, trim_hi, &mapped_trims);
+            let listed_trim_entries =
+                if trim_span_block_count(&trim_spans) > DIRECT_TRIM_VICTIM_LIMIT {
+                    let (first, last) = (
+                        trim_spans.first().expect("large trim has a first span").0,
+                        trim_spans.last().expect("large trim has a last span").1,
+                    );
+                    let count = last
+                        .checked_sub(first)
+                        .and_then(|width| width.checked_add(1))
+                        .unwrap_or(0);
+                    match self
+                        .backend()
+                        .list_blob_blocks(blob_guid, first, count, &trace_id)
+                        .await
+                    {
+                        Ok(entries) => Some(entries),
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    None
+                };
             if trim_lo < trim_hi {
                 new_map.overlay(trim_lo, trim_hi - 1, RangeState::Hole);
+            }
+            for range in &mapped_trims {
+                new_map.overlay(range.start, range.end, RangeState::Hole);
             }
             for (b, st) in snap.blocks.iter() {
                 match st {
                     BlockState::Rewrite(_) if !is_append(*b) => {
-                        new_map.overlay(*b, *b, RangeState::Written(version));
+                        let (write_version, _) = write_identity(*b);
+                        new_map.overlay(*b, *b, RangeState::Written(write_version));
                     }
-                    BlockState::Rewrite(_) => {
-                        // v1 append: absence from the map IS its identity,
-                        // but an inherited hole/trim entry over this block
-                        // cannot happen (is_append excludes covered blocks).
-                    }
+                    BlockState::Rewrite(_) => {}
                     BlockState::Delete => {
                         new_map.overlay(*b, *b, RangeState::Hole);
                     }
                 }
             }
-            let reservation_eligible = |b: u32| is_append(b) && !snap.blocks.contains_key(&b);
-            for b in snap.pending_reservations.iter() {
-                if reservation_eligible(*b) {
-                    new_map.overlay(*b, *b, RangeState::Reserved(version));
-                }
+            for b in reservation_blocks.iter().copied() {
+                new_map.overlay(b, b, RangeState::Reserved(version));
             }
 
             // Superseded identities this commit replaces or drops: the
@@ -2276,14 +3303,42 @@ impl VfsCore {
             };
             for (b, st) in snap.blocks.iter() {
                 match st {
-                    BlockState::Rewrite(_) if !is_append(*b) => consider_victim(*b),
+                    BlockState::Rewrite(_)
+                        if !is_append(*b)
+                            && !matches!(
+                                base_map.and_then(|map| map.lookup(*b)),
+                                Some(RangeState::Reserved(_))
+                            ) =>
+                    {
+                        consider_victim(*b)
+                    }
                     BlockState::Delete => consider_victim(*b),
                     _ => {}
                 }
             }
-            for b in trim_lo..trim_hi {
-                if !snap.blocks.contains_key(&b) {
-                    consider_victim(b);
+            if let Some(entries) = listed_trim_entries {
+                victims.extend(entries.into_iter().filter_map(|entry| {
+                    (block_in_trim_spans(entry.block_number, &trim_spans)
+                        && !snap.blocks.contains_key(&entry.block_number)
+                        && !reservation_blocks.contains(&entry.block_number))
+                    .then_some((entry.block_number, entry.version))
+                }));
+            } else {
+                for b in trim_lo..trim_hi {
+                    if !snap.blocks.contains_key(&b) {
+                        consider_victim(b);
+                    }
+                }
+                for range in mapped_trims {
+                    let version = match range.state {
+                        RangeState::Written(version) | RangeState::Reserved(version) => version,
+                        RangeState::Hole => continue,
+                    };
+                    for block in range.start..=range.end {
+                        if !snap.blocks.contains_key(&block) {
+                            victims.push((block, version));
+                        }
+                    }
                 }
             }
 
@@ -2298,67 +3353,90 @@ impl VfsCore {
             } else if new_map.is_empty() {
                 None
             } else {
-                match self
-                    .publish_block_map(&blob_guid, &new_map, &trace_id)
-                    .await
-                {
-                    Ok(r) => Some(r),
-                    Err(e) => abort_prepared_and_return!(e),
-                }
+                Some(
+                    self.publish_block_map(&blob_guid, &new_map, &trace_id)
+                        .await?,
+                )
             };
 
-            // Step 6: commit CAS (prepare -> final). The single visibility
-            // boundary: after it, every dirty block's exact identity is in
-            // the map (or is a v1 append inside the new size).
+            // Step 6: commit CAS from the prepared layout to the final map.
+            // After it, every dirty block's exact identity is visible.
             let layout = build_final_layout(blob_guid, version, new_map_ref);
             let old_bytes = wrap_for_publish(promoted_record.as_ref(), &prepare)?;
             let new_bytes = wrap_for_publish(promoted_record.as_ref(), &layout)?;
-            match self
+            let commit_result = self
                 .backend()
-                .put_inode_cas(&publish_key, new_bytes, old_bytes, &trace_id)
+                .put_inode_cas(&publish_key, new_bytes.clone(), old_bytes, &trace_id)
+                .await;
+            if let Err(error) = commit_result {
+                let landed = match promoted_inode_id {
+                    Some(id) => self
+                        .backend()
+                        .get_inode_record(id, &trace_id)
+                        .await
+                        .ok()
+                        .and_then(|record| wrap_for_publish(Some(&record), &record.layout).ok())
+                        .is_some_and(|current| current == new_bytes),
+                    None => self
+                        .backend()
+                        .get_inode(&publish_key, &trace_id)
+                        .await
+                        .ok()
+                        .and_then(|layout| wrap_for_publish(None, &layout).ok())
+                        .is_some_and(|current| current == new_bytes),
+                };
+                if !landed {
+                    return Err(error);
+                }
+            }
+            sweep_victims = victims;
+            if map_changed {
+                sweep_old_map = base.block_map;
+            }
+            unused_prepare_map = reservation_abort_map_ref;
+            for (b, st) in snap.blocks.iter() {
+                if matches!(st, BlockState::Rewrite(_)) {
+                    let (write_version, _) = write_identity(*b);
+                    committed_write_versions.insert(*b, write_version);
+                    if is_append(*b) {
+                        append_blocks.insert(*b);
+                    }
+                }
+            }
+            snap.armed = false;
+            break (layout, committed_size);
+        };
+
+        if create_reader_lease.is_none()
+            && let Ok(blob_guid) = final_layout.blob_guid()
+        {
+            match self
+                .acquire_reader_leases(vec![BlobReaderIdentity {
+                    blob_guid,
+                    blob_version: final_layout.blob_version,
+                }])
                 .await
             {
-                Ok(_prev) => {
-                    // Reserve fallocate-claimed blocks not superseded by a
-                    // Rewrite/Delete this flush (single-op; EC is a no-op).
-                    for b in snap.pending_reservations.iter() {
-                        if reservation_eligible(*b) {
-                            let _ = self
-                                .backend()
-                                .reserve_block(blob_guid, *b, block_size as u32, version, &trace_id)
-                                .await;
-                        }
-                    }
-                    sweep_victims = victims;
-                    if map_changed {
-                        sweep_old_map = base.block_map;
-                    }
-                    for (b, st) in snap.blocks.iter() {
-                        if matches!(st, BlockState::Rewrite(_)) && is_append(*b) {
-                            append_blocks.insert(*b);
-                        }
-                    }
-                    snap.armed = false;
-                    break (layout, committed_size);
+                Ok(reader_lease) => create_reader_lease = reader_lease,
+                Err(error) => {
+                    tracing::warn!(
+                        %blob_guid,
+                        %error,
+                        "failed to rotate writer reader lease; retaining older lease"
+                    );
                 }
-                Err(FsError::CasConflict) => {
-                    // A metadata CAS (chmod/utimensat/link) landed between
-                    // prepare and commit, or our lease was taken over. The
-                    // refetched base either still carries our pending (step
-                    // 0 aborts it and the attempt restarts with a fresh
-                    // burned version; blocks rewritten idempotently or at
-                    // the new version) or someone else owns the file now.
-                    refetch_base_and_continue!()
-                }
-                Err(e) => return Err(e),
             }
-        };
+        }
 
         // Update file handle: install the new layout (next CAS guard),
         // clear dirty/size_changed, reset shrink state, and point the buffer
         // at the published blob_guid for subsequent lazy loads.
         if let Some(mut handle) = self.file_handles.get_mut(&fh_id) {
             handle.layout = Some(final_layout.clone());
+            handle.layout_refreshed_at = Instant::now();
+            if let Some(reader_lease) = create_reader_lease.take() {
+                handle.reader_lease = Some(reader_lease);
+            }
             if let Some(ref mut wb) = handle.write_buf {
                 wb.dirty = false;
                 wb.size_changed = false;
@@ -2366,6 +3444,16 @@ impl VfsCore {
                 wb.trim_upper = None;
                 wb.existing_blob_guid = final_layout.blob_guid().ok();
             }
+        }
+        for mut other in self.file_handles.iter_mut() {
+            if *other.key() == fh_id || other.value().ino != ino {
+                continue;
+            }
+            if other.value().write_buf.as_ref().is_some_and(|wb| wb.dirty) {
+                continue;
+            }
+            other.value_mut().layout = Some(final_layout.clone());
+            other.value_mut().layout_refreshed_at = Instant::now();
         }
 
         // Mirror the just-published layout onto the inode entry so a
@@ -2381,12 +3469,8 @@ impl VfsCore {
             e.layout = Some(final_layout.clone());
         }
 
-        // If this inode is a promoted hardlink (including one discovered
-        // mid-flush when a CAS conflict revealed an Indirect redirect),
-        // persist the record identity + resolved layout/posix onto the
-        // inode entry. Otherwise a later setattr would see inode_id == None,
-        // take the non-hardlink path, and overwrite the name's Indirect
-        // redirect with a normal layout.
+        // If this inode is a promoted hardlink, persist the record identity
+        // and resolved layout/posix onto the inode entry.
         if let Some(id) = promoted_inode_id
             && let Some(mut e) = self.inodes.get_mut(ino)
         {
@@ -2463,21 +3547,35 @@ impl VfsCore {
                 // our metadata), or a concurrent reader on a stale handle.
                 // An async write would leave those bytes stale until (or
                 // unless) the mirror lands, so the rewritten bytes must be
-                // correct at flush time. sync_after_flush also advances the
-                // version floor, which fences any still-queued OLDER create
-                // job for this blob. fdatasync is still dropped, so this is
-                // page-cache-cheap; overrides are not the create-storm path.
-                if !appends.is_empty()
-                    && let Err(e) = dc.sync_after_flush(final_blob_guid, 1, &appends, &[]).await
-                {
-                    tracing::warn!(
-                        %final_blob_guid,
-                        error = %e,
-                        "disk cache append mirror failed (best-effort)"
-                    );
-                }
+                // correct at flush time. The file commit epoch fences any
+                // older queued mirror job, while each rewritten block keeps
+                // its exact generation. fdatasync is still dropped, so this
+                // remains page-cache-cheap.
+                let exact_rewrites: Vec<(u32, u64, Bytes)> = rewrites
+                    .iter()
+                    .map(|(block, bytes)| {
+                        (
+                            *block,
+                            committed_write_versions
+                                .get(block)
+                                .copied()
+                                .unwrap_or(blob_version),
+                            bytes.clone(),
+                        )
+                    })
+                    .chain(
+                        appends
+                            .iter()
+                            .map(|(block, bytes)| (*block, 1, bytes.clone())),
+                    )
+                    .collect();
                 if let Err(e) = dc
-                    .sync_after_flush(final_blob_guid, blob_version, &rewrites, &deletes)
+                    .sync_after_flush_exact(
+                        final_blob_guid,
+                        blob_version,
+                        &exact_rewrites,
+                        &deletes,
+                    )
                     .await
                 {
                     // An override mirror cannot be best-effort: a partial
@@ -2545,9 +3643,13 @@ impl VfsCore {
         if let Ok(final_blob_guid) = final_layout.blob_guid() {
             self.enqueue_superseded_sweep(
                 final_blob_guid,
+                final_layout.blob_version,
                 std::mem::take(&mut sweep_victims),
                 sweep_old_map.take(),
             );
+            if let Some(map_ref) = unused_prepare_map.take() {
+                self.enqueue_unreferenced_map_delete(final_blob_guid, map_ref);
+            }
         }
 
         // Update inode table layout
@@ -2569,6 +3671,7 @@ impl VfsCore {
                     final_layout = posix_layout;
                     if let Some(mut handle) = self.file_handles.get_mut(&fh_id) {
                         handle.layout = Some(final_layout.clone());
+                        handle.layout_refreshed_at = Instant::now();
                     }
                     if let Some(mut entry) = self.inodes.get_mut(ino) {
                         entry.layout = Some(final_layout.clone());
@@ -2747,7 +3850,35 @@ impl VfsCore {
         // dead drainer. `ensure_writeback_worker_started` is idempotent, so
         // the lazy calls on the metadata paths become no-ops.
         self.ensure_writeback_worker_started();
+        self.ensure_sweep_worker_started();
         tracing::info!("Filesystem initialized");
+    }
+
+    /// Start the reclamation supervisor on the lifecycle runtime. This
+    /// runtime survives every request ring and is the only runtime that
+    /// owns sweep claims.
+    fn ensure_sweep_worker_started(&self) {
+        if self
+            .sweep_coordinator
+            .worker_started
+            .load(Ordering::Relaxed)
+        {
+            return;
+        }
+        if self
+            .sweep_coordinator
+            .worker_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        compio_runtime::spawn(run_sweep_worker(
+            self.backend_config.clone(),
+            self.sweep_coordinator.clone(),
+        ))
+        .detach();
+        tracing::info!("blob reclamation supervisor started");
     }
 
     /// Spawn the writeback worker the first time it's needed. Cheap
@@ -2787,6 +3918,100 @@ impl VfsCore {
             );
         }
         tracing::info!("Filesystem destroyed");
+    }
+
+    /// Release mount-local reader state and enqueue cleanup that was waiting
+    /// for the final open handle. This runs after dirty handles and metadata
+    /// have drained, when no request worker can create another handle.
+    pub async fn prepare_sweep_shutdown(&self) {
+        let handle_ids = self
+            .file_handles
+            .iter()
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        let mut lease_keys = Vec::new();
+        for fh in handle_ids {
+            let Some((_, mut handle)) = self.file_handles.remove(&fh) else {
+                continue;
+            };
+            if handle.write_buf.is_some() {
+                self.release_write_lock(handle.ino, fh);
+            }
+            if let Some(reader_lease) = handle.reader_lease.take() {
+                lease_keys.extend(reader_lease.shutdown());
+            }
+        }
+        self.inode_write_owner.clear();
+
+        let backend = self.backend();
+        let trace_id = TraceId::new();
+        let trace_id_ref = &trace_id;
+        stream::iter(lease_keys)
+            .for_each_concurrent(VFS_READER_LEASE_CONCURRENCY, move |key| async move {
+                retire_owned_vfs_reader_lease(backend, &key, trace_id_ref).await;
+            })
+            .await;
+
+        let deferred_inodes = self
+            .deferred_blob_cleanup
+            .iter()
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        for ino in deferred_inodes {
+            if let Some((_, old_bytes)) = self.deferred_blob_cleanup.remove(&ino) {
+                self.cleanup_orphaned_value("", Some(ino), old_bytes, &trace_id)
+                    .await;
+            }
+        }
+    }
+
+    /// Wait until every queued or claimed reclamation item finishes. The
+    /// caller supplies the shutdown deadline so cancellation drops active
+    /// claims back into the pending queue without losing exact identities.
+    pub async fn drain_sweep_work(&self) {
+        {
+            let now = Instant::now();
+            let mut queue = self.sweep_coordinator.queue.lock();
+            for work in queue.pending.values_mut() {
+                work.ready_at = now;
+            }
+        }
+        loop {
+            let empty = {
+                let queue = self.sweep_coordinator.queue.lock();
+                queue.pending.is_empty() && queue.active.is_empty()
+            };
+            if empty {
+                return;
+            }
+            compio_runtime::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Report reclamation left behind when the bounded shutdown drain
+    /// expires. Namespace visibility is already gone, but physical blocks
+    /// or block-map rows can remain until a later garbage-collection pass.
+    pub fn log_incomplete_sweep_work(&self) {
+        let queue = self.sweep_coordinator.queue.lock();
+        let pending_victims = queue
+            .pending
+            .values()
+            .map(|work| work.victims.len())
+            .sum::<usize>();
+        let pending_maps = queue
+            .pending
+            .values()
+            .map(|work| work.map_rows.len())
+            .sum::<usize>();
+        tracing::error!(
+            pending_blobs = queue.pending.len(),
+            active_blobs = queue.active.len(),
+            pending_victims,
+            pending_maps,
+            open_handles = self.file_handles.len(),
+            deferred_blobs = self.deferred_blob_cleanup.len(),
+            "destroy: reclamation drain timed out; invisible physical garbage may remain"
+        );
     }
 
     /// POSIX `NAME_MAX = 255`. Linux's general VFS enforces this at
@@ -3014,7 +4239,7 @@ impl VfsCore {
                 block_size: DEFAULT_BLOCK_SIZE,
                 blob_version: 0,
                 block_map: None,
-                pending_write: None,
+                prepared_write: None,
                 state: ObjectState::Indirect(IndirectEntry { inode_id: id }),
             };
             let b: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&l, Vec::new())
@@ -3749,6 +4974,16 @@ impl VfsCore {
         if new_size > MAX_INMEM_FILE_SIZE {
             return Err(FsError::InvalidArg);
         }
+        let operation_lock = self
+            .file_handles
+            .get(&fh)
+            .ok_or(FsError::BadFd)?
+            .operation_lock
+            .clone();
+        let _operation_guard = operation_lock.lock().await;
+        self.ensure_reader_lease_valid(fh)?;
+        self.refresh_handle_layout(fh, false).await?;
+
         // Phase 1: snapshot, drop intents past the new EOF, lower the
         // shrink-destroys watermark, and decide whether the surviving last
         // block of a non-block-aligned shrink needs a synthesized
@@ -3836,6 +5071,7 @@ impl VfsCore {
                         committed_map.as_deref(),
                         last,
                         committed_content_len,
+                        bsz_usize,
                         bsz_usize,
                         &trace_id,
                     )
@@ -4379,7 +5615,7 @@ impl VfsCore {
             timestamp: now_ns() / 1_000_000,
             blob_version: 0,
             block_map: None,
-            pending_write: None,
+            prepared_write: None,
             state: ObjectState::Special(SpecialData {
                 kind,
                 rdev,
@@ -4538,6 +5774,70 @@ impl VfsCore {
                 return Err(e);
             }
         };
+        let trace_id = TraceId::new();
+        let blob_identities = match &layout {
+            Some(layout) => match self
+                .data_blob_identities_for_layout(&s3_key, layout, &trace_id)
+                .await
+            {
+                Ok(blob_identities)
+                    if blob_identities.iter().all(|identity| {
+                        identity.blob_guid.volume_id != DataBlobGuid::S3_VOLUME
+                    }) =>
+                {
+                    blob_identities
+                }
+                Ok(_) => {
+                    if is_write {
+                        self.release_write_lock(inode, fh);
+                    }
+                    return Err(FsError::InvalidState);
+                }
+                Err(error) => {
+                    if is_write {
+                        self.release_write_lock(inode, fh);
+                    }
+                    return Err(error);
+                }
+            },
+            None => Vec::new(),
+        };
+        let reader_lease = match self.acquire_reader_leases(blob_identities).await {
+            Ok(reader_lease) => reader_lease,
+            Err(error) => {
+                if is_write {
+                    self.release_write_lock(inode, fh);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(expected_layout) = &layout {
+            let fresh_layout = match self.inodes.get(inode).and_then(|entry| entry.inode_id) {
+                Some(inode_id) => self
+                    .backend()
+                    .get_inode_record(inode_id, &trace_id)
+                    .await
+                    .map(|record| record.layout),
+                None => self.backend().get_inode(&s3_key, &trace_id).await,
+            };
+            match fresh_layout {
+                Ok(fresh_layout) if fresh_layout.version_id == expected_layout.version_id => {}
+                Ok(_) => {
+                    drop(reader_lease);
+                    if is_write {
+                        self.release_write_lock(inode, fh);
+                    }
+                    return Err(FsError::InvalidState);
+                }
+                Err(error) => {
+                    drop(reader_lease);
+                    if is_write {
+                        self.release_write_lock(inode, fh);
+                    }
+                    return Err(error);
+                }
+            }
+        }
 
         // Cross-instance staleness reconciliation: if the cache file's
         // authoritative_blob_v lags the inode's blob_version, another
@@ -4628,8 +5928,9 @@ impl VfsCore {
                 let dc_arc = Arc::clone(dc);
                 let backend_cfg = Arc::clone(&self.backend_config);
                 let layout_clone = l.clone();
+                let block_map = self.layout_block_map(l).await?;
                 compio_runtime::spawn(async move {
-                    spawn_prefetch_task(backend_cfg, dc_arc, layout_clone).await;
+                    spawn_prefetch_task(backend_cfg, dc_arc, layout_clone, block_map).await;
                 })
                 .detach();
             }
@@ -4641,8 +5942,11 @@ impl VfsCore {
                 ino: inode,
                 s3_key,
                 layout,
+                layout_refreshed_at: Instant::now(),
+                operation_lock: Arc::new(futures::lock::Mutex::new(())),
                 write_buf,
                 backing_id: None,
+                reader_lease,
             },
         );
 
@@ -4660,7 +5964,18 @@ impl VfsCore {
         if data.is_empty() {
             return Ok(0);
         }
-        let end = offset + data.len() as u64;
+        let operation_lock = self
+            .file_handles
+            .get(&fh)
+            .ok_or(FsError::BadFd)?
+            .operation_lock
+            .clone();
+        let _operation_guard = operation_lock.lock().await;
+        self.ensure_reader_lease_valid(fh)?;
+        self.refresh_handle_layout(fh, false).await?;
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(FsError::InvalidArg)?;
 
         // Phase 1: snapshot block_size, committed geometry, and which
         // partially-touched blocks need a lazy read-modify-write load.
@@ -4683,6 +5998,9 @@ impl VfsCore {
                 .write_buf
                 .get_or_insert_with(|| WriteBuffer::new(layout_blob_guid, committed_size, bsize));
             let bsz_u64 = wb.block_size as u64;
+            if end.div_ceil(bsz_u64) > u32::MAX as u64 {
+                return Err(FsError::InvalidArg);
+            }
             let first_block = (offset / bsz_u64) as u32;
             let last_block = ((end - 1) / bsz_u64) as u32;
             // Blocks needing lazy load: partially-touched, not already
@@ -4734,6 +6052,7 @@ impl VfsCore {
                     committed_map.as_deref(),
                     b,
                     committed_content_len,
+                    block_size as usize,
                     block_size as usize,
                     &trace_id,
                 )
@@ -4820,7 +6139,17 @@ impl VfsCore {
             return Err(FsError::InvalidArg);
         }
 
-        let end = offset + length;
+        let operation_lock = self
+            .file_handles
+            .get(&fh)
+            .ok_or(FsError::BadFd)?
+            .operation_lock
+            .clone();
+        let operation_guard = operation_lock.lock().await;
+        self.ensure_reader_lease_valid(fh)?;
+        self.refresh_handle_layout(fh, false).await?;
+
+        let end = offset.checked_add(length).ok_or(FsError::InvalidArg)?;
 
         // Phase 1: snapshot enough state to compute the touched range
         // and decide which blocks need a lazy load for edge zeroing.
@@ -4842,6 +6171,9 @@ impl VfsCore {
                 WriteBuffer::new(layout_blob_guid, committed_size, block_size)
             });
             let bsz_u64 = wb.block_size as u64;
+            if end.div_ceil(bsz_u64) > u32::MAX as u64 {
+                return Err(FsError::InvalidArg);
+            }
             let mut edge_loads: Vec<u32> = Vec::new();
 
             if punch_hole {
@@ -4920,6 +6252,7 @@ impl VfsCore {
                         b,
                         committed_content_len,
                         block_size as usize,
+                        block_size as usize,
                         &trace_id,
                     )
                     .await?;
@@ -4996,13 +6329,14 @@ impl VfsCore {
                 }
             }
             wb.dirty = true;
-            return Ok(());
+            drop(handle);
+            drop(operation_guard);
+            return self.flush_write_buffer(fh).await;
         }
 
-        // mode == 0 or KEEP_SIZE: reservation-only path. Record the
-        // touched range so flush has something to publish if the user
-        // did nothing else, and so SEEK_DATA / dirty-handle reads count
-        // the range as data per Linux convention.
+        // mode == 0 or KEEP_SIZE: reservation-only path. Publish before the
+        // syscall returns so allocation failure is reported by fallocate and
+        // the claim survives a process crash.
         let first_block = (offset / bsz_u64) as u32;
         let last_block_excl = end.div_ceil(bsz_u64) as u32;
         for b in first_block..last_block_excl {
@@ -5020,7 +6354,9 @@ impl VfsCore {
             wb.size_changed = true;
         }
         wb.dirty = true;
-        Ok(())
+        drop(handle);
+        drop(operation_guard);
+        self.flush_write_buffer(fh).await
     }
 
     /// lseek(SEEK_DATA / SEEK_HOLE). Classifies each block in
@@ -5042,6 +6378,16 @@ impl VfsCore {
         if !seek_data && !seek_hole {
             return Err(FsError::InvalidArg);
         }
+
+        let operation_lock = self
+            .file_handles
+            .get(&fh)
+            .ok_or(FsError::BadFd)?
+            .operation_lock
+            .clone();
+        let _operation_guard = operation_lock.lock().await;
+        self.ensure_reader_lease_valid(fh)?;
+        self.refresh_handle_layout(fh, false).await?;
 
         // Snapshot the bits we need without holding the guard across awaits.
         let committed_layout = self
@@ -5709,6 +7055,8 @@ impl VfsCore {
                 ino,
                 s3_key: key,
                 layout: None,
+                layout_refreshed_at: Instant::now(),
+                operation_lock: Arc::new(futures::lock::Mutex::new(())),
                 write_buf: Some({
                     // Fresh empty file; dirty so the close-time flush
                     // publishes the 0-byte inode.
@@ -5718,6 +7066,7 @@ impl VfsCore {
                     wb
                 }),
                 backing_id: None,
+                reader_lease: None,
             },
         );
 
@@ -5783,7 +7132,7 @@ impl VfsCore {
             timestamp,
             blob_version: 0,
             block_map: None,
-            pending_write: None,
+            prepared_write: None,
             state: ObjectState::Symlink(SymlinkData {
                 target: target.to_vec(),
                 core_meta_data: ObjectCoreMetaData {
@@ -6017,6 +7366,15 @@ impl VfsCore {
             }
         }
 
+        match self.backend().get_inode(&key, &trace_id).await {
+            Ok(layout) => {
+                self.ensure_data_layout_supported(&key, &layout, &trace_id)
+                    .await?;
+            }
+            Err(FsError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+
         // Delete the inode from NSS
         let old_bytes = self.backend().delete_inode(&key, &trace_id).await?;
 
@@ -6096,7 +7454,7 @@ impl VfsCore {
             timestamp: now / 1_000_000,
             blob_version: 1,
             block_map: None,
-            pending_write: None,
+            prepared_write: None,
             state: ObjectState::Directory(DirectoryData { posix }),
         };
         let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())
@@ -6282,6 +7640,15 @@ impl VfsCore {
             .find_ino_by_key(&dst_dir_probe, EntryType::Directory);
         for ino in self.writeback_drain_targets(&dst_dir_probe, dst_dir_ino) {
             self.drain_inode_to_barrier(ino).await?;
+        }
+
+        match self.backend().get_inode(&dst_key, &trace_id).await {
+            Ok(layout) => {
+                self.ensure_data_layout_supported(&dst_key, &layout, &trace_id)
+                    .await?;
+            }
+            Err(FsError::NotFound) => {}
+            Err(error) => return Err(error),
         }
 
         // Determine type by probing NSS backend directly (no inode side effects)
@@ -6590,6 +7957,7 @@ async fn spawn_prefetch_task(
     backend_cfg: Arc<BackendConfig>,
     disk_cache: Arc<DiskCache>,
     layout: ObjectLayout,
+    block_map: Option<Arc<BlockMap>>,
 ) {
     let Ok(file_size) = layout.size() else {
         return;
@@ -6637,44 +8005,46 @@ async fn spawn_prefetch_task(
         let block_start = block_num as u64 * block_size;
         let block_content_len = std::cmp::min(block_size, file_size - block_start) as usize;
 
+        let Some((version, mapped)) =
+            VfsCore::resolve_block_source(block_map.as_deref(), block_num)
+        else {
+            let _ = disk_cache.invalidate_block(blob_guid, block_num).await;
+            continue;
+        };
+
         // If another path has already populated this block (e.g. a
-        // racing read), the cache hit short-circuits the BSS round
-        // trip.
+        // racing read), only the exact committed identity short-circuits
+        // the BSS round trip.
         if disk_cache
-            .get_block(blob_guid, block_num, block_content_len)
+            .get_block_exact(blob_guid, block_num, version, block_content_len)
             .await
             .is_some()
         {
             continue;
         }
 
-        // Override (blob_version > 1) blocks are padded to block_size on
-        // disk; request the full block so the EC shard size matches, then
-        // truncate to the logical content length (mirrors read_block_cached).
-        let read_len = if layout.blob_version > 1 {
-            (DEFAULT_BLOCK_SIZE as usize).max(block_content_len)
+        // Rewrite generations are padded to block_size on disk. The burned
+        // file watermark is not a visibility field; the map-selected block
+        // version alone determines the request identity and length.
+        let read_len = if version > 1 {
+            (layout.block_size as usize).max(block_content_len)
         } else {
             block_content_len
         };
         let (mut data, _checksum) = match backend
-            .read_block(
-                blob_guid,
-                layout.blob_version,
-                block_num,
-                read_len,
-                &trace_id,
-            )
+            .read_block(blob_guid, version, block_num, read_len, &trace_id)
             .await
         {
             Ok(r) => r,
-            Err(FsError::Rpc(rpc_client_common::RpcError::NotFound)) => {
-                // Sparse hole; intentionally not cached. The
-                // block-on-demand path treats missing blocks as zeros.
+            Err(FsError::DataVg(volume_group_proxy::DataVgError::BlockNotFound))
+            | Err(FsError::Rpc(rpc_client_common::RpcError::NotFound))
+                if !mapped =>
+            {
                 continue;
             }
             Err(e) => {
                 tracing::debug!(
-                    %blob_guid, block_num, error = %e,
+                    %blob_guid, block_num, version, error = %e,
                     "prefetch block fetch failed; abandoning prefetch"
                 );
                 return;
@@ -6685,8 +8055,537 @@ async fn spawn_prefetch_task(
         }
 
         let _ = disk_cache
-            .insert_block(blob_guid, block_num, layout.blob_version, &data)
+            .insert_block(blob_guid, block_num, version, &data)
             .await;
+    }
+}
+
+async fn retire_vfs_reader_lease(
+    backend: &StorageBackend,
+    record: &VfsReaderLeaseRecord,
+    trace_id: &TraceId,
+) {
+    let tombstone = encode_reader_lease(0, record.blob_version);
+    if backend
+        .put_inode_cas(&record.key, tombstone, record.value.clone(), trace_id)
+        .await
+        .is_ok()
+    {
+        let _ = backend.delete_inode(&record.key, trace_id).await;
+    }
+}
+
+async fn cleanup_vfs_reader_leases(backend: &StorageBackend, records: &[VfsReaderLeaseRecord]) {
+    let trace_id = TraceId::new();
+    stream::iter(records)
+        .for_each_concurrent(VFS_READER_LEASE_CONCURRENCY, |record| async {
+            retire_vfs_reader_lease(backend, record, &trace_id).await;
+        })
+        .await;
+}
+
+/// Retire a lease owned by this mount using its current value. The renewal
+/// task may have advanced that value before shutdown, so retry CAS conflicts
+/// instead of relying on the acquisition-time bytes retained by the guard.
+async fn retire_owned_vfs_reader_lease(backend: &StorageBackend, key: &str, trace_id: &TraceId) {
+    for _ in 0..3 {
+        let current = match backend.get_inode_raw(key, trace_id).await {
+            Ok(current) => current,
+            Err(FsError::NotFound) => return,
+            Err(error) => {
+                tracing::warn!(%key, %error, "owned reader lease read failed during shutdown");
+                return;
+            }
+        };
+        let blob_version = decode_reader_lease(&current)
+            .map(|(_, blob_version)| blob_version)
+            .unwrap_or(0);
+        match backend
+            .put_inode_cas(key, encode_reader_lease(0, blob_version), current, trace_id)
+            .await
+        {
+            Ok(_) => {
+                if let Err(error) = backend.delete_inode(key, trace_id).await {
+                    tracing::warn!(%key, %error, "retired reader lease deletion failed");
+                }
+                return;
+            }
+            Err(FsError::CasConflict) => {}
+            Err(error) => {
+                tracing::warn!(%key, %error, "owned reader lease retirement failed");
+                return;
+            }
+        }
+    }
+    tracing::warn!(%key, "owned reader lease retirement remained conflicted");
+}
+
+async fn renew_vfs_reader_leases(
+    backend: &StorageBackend,
+    records: &mut [VfsReaderLeaseRecord],
+    ttl: Duration,
+) -> Result<u64, FsError> {
+    let expires_at_ms = wall_clock_ms().saturating_add(ttl.as_millis() as u64);
+    let trace_id = TraceId::new();
+    stream::iter(records.iter())
+        .map(|record| async {
+            let value = encode_reader_lease(expires_at_ms, record.blob_version);
+            backend
+                .put_inode_cas(&record.key, value, record.value.clone(), &trace_id)
+                .await
+        })
+        .buffer_unordered(VFS_READER_LEASE_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+    for record in records {
+        record.value = encode_reader_lease(expires_at_ms, record.blob_version);
+    }
+    Ok(expires_at_ms)
+}
+
+async fn maintain_vfs_reader_leases(
+    backend: &'static StorageBackend,
+    mut records: Vec<VfsReaderLeaseRecord>,
+    ttl: Duration,
+    confirmed_until_ms: Arc<AtomicU64>,
+    lost: Arc<AtomicBool>,
+    shutdown_rx: oneshot::Receiver<bool>,
+) {
+    let mut shutdown_rx = shutdown_rx.fuse();
+    loop {
+        let renewal_delay = rpc_client_common::rpc_sleep(VFS_READER_LEASE_RENEW_INTERVAL).fuse();
+        futures::pin_mut!(renewal_delay);
+        futures::select_biased! {
+            cleanup = shutdown_rx => {
+                if cleanup.unwrap_or(false) {
+                    cleanup_vfs_reader_leases(backend, &records).await;
+                }
+                return;
+            }
+            _ = renewal_delay => {
+                match renew_vfs_reader_leases(backend, &mut records, ttl).await {
+                    Ok(expires_at_ms) => {
+                        confirmed_until_ms.store(expires_at_ms, Ordering::Release);
+                    }
+                    Err(error) => {
+                        lost.store(true, Ordering::Release);
+                        tracing::warn!(%error, "VFS reader lease renewal failed");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+const SWEEP_CONCURRENCY: usize = 8;
+const SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const READER_LEASE_RECHECK: Duration = Duration::from_secs(1);
+const READER_LEASE_CLOCK_SKEW: Duration = Duration::from_secs(30);
+const MAX_READER_LEASES: u32 = 10_000;
+const RECLAMATION_WRITE_SLACK: Duration = Duration::from_secs(10);
+
+fn reclamation_grace(rpc_timeout: Duration) -> Duration {
+    rpc_timeout.saturating_add(RECLAMATION_WRITE_SLACK)
+}
+
+async fn run_sweep_worker(backend_config: Arc<BackendConfig>, coordinator: Arc<SweepCoordinator>) {
+    let mut active = stream::FuturesUnordered::new();
+    loop {
+        while active.len() < SWEEP_CONCURRENCY {
+            let Some(mut claim) = SweepClaim::take_ready(&coordinator) else {
+                break;
+            };
+            let backend_config = backend_config.clone();
+            active.push(async move {
+                let attempt =
+                    process_sweep_work(&backend_config, claim.blob_guid, &mut claim.work).await;
+                claim.schedule_retry(attempt);
+            });
+        }
+
+        if active.is_empty() {
+            rpc_client_common::rpc_sleep(SWEEP_POLL_INTERVAL).await;
+            continue;
+        }
+
+        let completed = active.next().fuse();
+        let poll = rpc_client_common::rpc_sleep(SWEEP_POLL_INTERVAL).fuse();
+        futures::pin_mut!(completed, poll);
+        futures::select_biased! {
+            _ = completed => {}
+            _ = poll => {}
+        }
+    }
+}
+
+async fn process_sweep_work(
+    backend_config: &BackendConfig,
+    blob_guid: DataBlobGuid,
+    work: &mut SweepWork,
+) -> SweepAttempt {
+    let backend = match StorageBackend::new(backend_config) {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::warn!(%blob_guid, %error, "blob reclamation backend initialization failed");
+            return SweepAttempt::Failed;
+        }
+    };
+    let trace_id = TraceId::new();
+    if let Some(reader_wait) = work.reader_wait {
+        let before_version = match reader_wait {
+            SweepReaderWait::Before(version) => Some(version),
+            SweepReaderWait::All => None,
+        };
+        match scan_blob_readers_once(&backend, blob_guid, before_version, &trace_id).await {
+            Ok(ReaderLeaseScan::Blocked) => return SweepAttempt::ReaderBlocked,
+            Err(error) => {
+                tracing::warn!(%blob_guid, %error, "reader lease scan failed; delaying sweep");
+                return SweepAttempt::Failed;
+            }
+            Ok(ReaderLeaseScan::Clear) => {
+                let now = Instant::now();
+                let grace_until = now
+                    .checked_add(reclamation_grace(
+                        backend_config.config.rpc_request_timeout(),
+                    ))
+                    .unwrap_or(now);
+                work.reader_wait = None;
+                work.grace_until = Some(
+                    work.grace_until
+                        .map_or(grace_until, |current| current.max(grace_until)),
+                );
+                return SweepAttempt::GracePending;
+            }
+        }
+    }
+    if let Some(grace_until) = work.grace_until {
+        if Instant::now() < grace_until {
+            return SweepAttempt::GracePending;
+        }
+        work.grace_until = None;
+    }
+
+    let mut failed = false;
+    if work.delete_all_blocks {
+        if backend
+            .delete_blob_blocks(blob_guid, &trace_id)
+            .await
+            .is_ok()
+        {
+            work.delete_all_blocks = false;
+            work.victims.clear();
+        } else {
+            failed = true;
+        }
+    }
+    if work.delete_all_maps {
+        if delete_all_bmap_rows(&backend, blob_guid, &trace_id)
+            .await
+            .is_ok()
+        {
+            work.delete_all_maps = false;
+            work.map_rows.clear();
+        } else {
+            failed = true;
+        }
+    }
+
+    let victims = work.victims.iter().copied().collect::<Vec<_>>();
+    let backend_ref = &backend;
+    let trace_id_ref = &trace_id;
+    let victim_results = stream::iter(victims)
+        .map(move |identity @ (block, version)| async move {
+            (
+                identity,
+                backend_ref
+                    .delete_block(blob_guid, block, version, trace_id_ref)
+                    .await,
+            )
+        })
+        .buffer_unordered(32)
+        .collect::<Vec<_>>()
+        .await;
+    for (identity, result) in victim_results {
+        if result.is_ok() {
+            work.victims.remove(&identity);
+        } else {
+            failed = true;
+        }
+    }
+
+    let map_rows = work
+        .map_rows
+        .iter()
+        .map(|(&map_id, &chunk_count)| (map_id, chunk_count))
+        .collect::<Vec<_>>();
+    for (map_id, chunk_count) in map_rows {
+        let backend_ref = &backend;
+        let trace_id_ref = &trace_id;
+        let results = stream::iter(0..chunk_count)
+            .map(move |chunk_no| async move {
+                let key = bmap_chunk_key(&blob_guid, map_id, chunk_no);
+                backend_ref.delete_inode(&key, trace_id_ref).await
+            })
+            .buffer_unordered(32)
+            .collect::<Vec<_>>()
+            .await;
+        if results.into_iter().all(|result| result.is_ok()) {
+            work.map_rows.remove(&map_id);
+        } else {
+            failed = true;
+        }
+    }
+    if work.is_empty() {
+        SweepAttempt::Complete
+    } else {
+        debug_assert!(failed);
+        SweepAttempt::Failed
+    }
+}
+
+async fn delete_all_bmap_rows(
+    backend: &StorageBackend,
+    blob_guid: DataBlobGuid,
+    trace_id: &TraceId,
+) -> Result<(), FsError> {
+    const PAGE_SIZE: u32 = 10_000;
+    let prefix = bmap_prefix(&blob_guid);
+    let mut start_after = String::new();
+    loop {
+        let keys = match backend
+            .list_inode_keys_after(&prefix, &start_after, PAGE_SIZE, trace_id)
+            .await
+        {
+            Ok(keys) => keys,
+            Err(FsError::NotFound) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let page_full = keys.len() == PAGE_SIZE as usize;
+        let Some(next_marker) = keys.last().cloned() else {
+            return Ok(());
+        };
+        let results = stream::iter(keys)
+            .map(|key| async move { backend.delete_inode(&key, trace_id).await })
+            .buffer_unordered(32)
+            .collect::<Vec<_>>()
+            .await;
+        if let Some(error) = results.into_iter().find_map(Result::err) {
+            return Err(error);
+        }
+        if !page_full {
+            return Ok(());
+        }
+        start_after = next_marker;
+    }
+}
+
+fn encode_reader_lease(expires_at_ms: u64, blob_version: u64) -> Bytes {
+    let mut value = [0_u8; 16];
+    value[..8].copy_from_slice(&expires_at_ms.to_le_bytes());
+    value[8..].copy_from_slice(&blob_version.to_le_bytes());
+    Bytes::copy_from_slice(&value)
+}
+
+fn decode_reader_lease(value: &[u8]) -> Option<(u64, u64)> {
+    if value.len() != 16 {
+        return None;
+    }
+    let expires_at_ms = u64::from_le_bytes(value[..8].try_into().ok()?);
+    let blob_version = u64::from_le_bytes(value[8..].try_into().ok()?);
+    Some((expires_at_ms, blob_version))
+}
+
+fn reader_lease_blocks_version(blob_version: u64, before_version: Option<u64>) -> bool {
+    before_version.is_none_or(|cutoff| blob_version < cutoff)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderLeaseScan {
+    Clear,
+    Blocked,
+}
+
+/// Inspect at most one bounded reader page. A malformed, unreadable, or
+/// saturated page conservatively delays reclamation.
+async fn scan_blob_readers_once(
+    backend: &StorageBackend,
+    blob_guid: data_types::DataBlobGuid,
+    before_version: Option<u64>,
+    trace_id: &TraceId,
+) -> Result<ReaderLeaseScan, FsError> {
+    let prefix = block_reader_prefix(&blob_guid);
+    let keys = match backend
+        .list_inode_keys(&prefix, MAX_READER_LEASES, trace_id)
+        .await
+    {
+        Ok(keys) => keys,
+        Err(FsError::NotFound) => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let saturated = keys.len() == MAX_READER_LEASES as usize;
+    let now_ms = wall_clock_ms();
+    let backend_ref = backend;
+    let trace_id_ref = trace_id;
+    let blocked = stream::iter(keys)
+        .map(move |key| async move {
+            match backend_ref.get_inode_raw(&key, trace_id_ref).await {
+                Ok(bytes) => {
+                    let Some((expires_at_ms, blob_version)) = decode_reader_lease(&bytes) else {
+                        tracing::warn!(%blob_guid, %key, "malformed reader lease; delaying sweep");
+                        return true;
+                    };
+                    if expires_at_ms
+                        > now_ms.saturating_sub(READER_LEASE_CLOCK_SKEW.as_millis() as u64)
+                    {
+                        return reader_lease_blocks_version(blob_version, before_version);
+                    }
+
+                    let tombstone = encode_reader_lease(0, blob_version);
+                    match backend_ref
+                        .put_inode_cas(&key, tombstone, bytes, trace_id_ref)
+                        .await
+                    {
+                        Ok(_) => {
+                            if let Err(error) = backend_ref.delete_inode(&key, trace_id_ref).await {
+                                tracing::warn!(
+                                    %blob_guid,
+                                    %key,
+                                    %error,
+                                    "retired reader lease deletion failed"
+                                );
+                            }
+                            false
+                        }
+                        Err(FsError::CasConflict) => true,
+                        Err(error) => {
+                            tracing::warn!(
+                                %blob_guid,
+                                %key,
+                                %error,
+                                "reader lease retirement failed"
+                            );
+                            true
+                        }
+                    }
+                }
+                Err(FsError::NotFound) => false,
+                Err(error) => {
+                    tracing::warn!(%blob_guid, %key, %error, "reader lease read failed");
+                    true
+                }
+            }
+        })
+        .buffer_unordered(VFS_READER_LEASE_CONCURRENCY)
+        .fold(false, |blocked, key_blocked| async move {
+            blocked || key_blocked
+        })
+        .await;
+    if saturated || blocked {
+        Ok(ReaderLeaseScan::Blocked)
+    } else {
+        Ok(ReaderLeaseScan::Clear)
+    }
+}
+
+#[cfg(test)]
+mod reader_lease_tests {
+    use super::*;
+
+    #[test]
+    fn reader_lease_value_round_trips_version() {
+        let value = encode_reader_lease(1234, 56);
+
+        assert_eq!(value.len(), 16);
+        assert_eq!(decode_reader_lease(&value), Some((1234, 56)));
+    }
+
+    #[test]
+    fn reader_lease_rejects_non_fresh_widths() {
+        assert_eq!(decode_reader_lease(&1234_u64.to_le_bytes()), None);
+        assert_eq!(decode_reader_lease(&[0_u8; 17]), None);
+    }
+
+    #[test]
+    fn superseded_sweep_waits_only_for_older_versions() {
+        assert!(reader_lease_blocks_version(4, Some(5)));
+        assert!(!reader_lease_blocks_version(5, Some(5)));
+        assert!(!reader_lease_blocks_version(6, Some(5)));
+        assert!(reader_lease_blocks_version(6, None));
+    }
+
+    #[test]
+    fn pending_sweeps_coalesce_by_blob() {
+        let mut pending = SweepWork::new();
+        pending.victims.insert((3, 1));
+        pending.reader_wait = Some(SweepReaderWait::Before(2));
+        let mut newer = SweepWork::new();
+        newer.victims.extend([(3, 1), (4, 2)]);
+        newer.reader_wait = Some(SweepReaderWait::Before(3));
+        newer.delete_all_maps = true;
+
+        pending.merge(newer);
+
+        assert_eq!(pending.victims, HashSet::from([(3, 1), (4, 2)]));
+        assert_eq!(pending.reader_wait, Some(SweepReaderWait::Before(3)));
+        assert!(pending.delete_all_maps);
+    }
+
+    #[test]
+    fn cancelled_sweep_claim_requeues_exact_work() {
+        let blob_guid = DataBlobGuid {
+            blob_id: Uuid::nil(),
+            volume_id: 1,
+        };
+        let coordinator = Arc::new(SweepCoordinator::default());
+        let mut work = SweepWork::new();
+        work.victims.insert((7, 3));
+        coordinator.queue.lock().pending.insert(blob_guid, work);
+
+        let claim = SweepClaim::take_ready(&coordinator).expect("sweep claim should be ready");
+        assert!(coordinator.queue.lock().active.contains(&blob_guid));
+        drop(claim);
+
+        let queue = coordinator.queue.lock();
+        assert!(queue.active.is_empty());
+        assert_eq!(
+            queue
+                .pending
+                .get(&blob_guid)
+                .expect("cancelled claim should be pending")
+                .victims,
+            HashSet::from([(7, 3)])
+        );
+    }
+
+    #[test]
+    fn cancelled_sweep_claim_merges_new_pending_work() {
+        let blob_guid = DataBlobGuid {
+            blob_id: Uuid::nil(),
+            volume_id: 2,
+        };
+        let coordinator = Arc::new(SweepCoordinator::default());
+        let mut claimed_work = SweepWork::new();
+        claimed_work.victims.insert((7, 3));
+        coordinator
+            .queue
+            .lock()
+            .pending
+            .insert(blob_guid, claimed_work);
+        let claim = SweepClaim::take_ready(&coordinator).expect("sweep claim should be ready");
+
+        let mut new_work = SweepWork::new();
+        new_work.map_rows.insert(Uuid::nil(), 4);
+        coordinator.queue.lock().pending.insert(blob_guid, new_work);
+        drop(claim);
+
+        let queue = coordinator.queue.lock();
+        let pending = queue
+            .pending
+            .get(&blob_guid)
+            .expect("merged sweep should be pending");
+        assert_eq!(pending.victims, HashSet::from([(7, 3)]));
+        assert_eq!(pending.map_rows, HashMap::from([(Uuid::nil(), 4)]));
     }
 }
 
@@ -7053,6 +8952,13 @@ fn now_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn file_mode(perm: u16) -> u32 {

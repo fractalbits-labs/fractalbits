@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use data_types::object_layout::{ObjectLayout, ObjectState, PosixAttrs};
+use data_types::object_layout::{MpuState, ObjectLayout, ObjectState, PosixAttrs};
 use fractal_fuse::InodeId;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -25,8 +25,8 @@ pub fn layout_posix(layout: &ObjectLayout) -> PosixAttrs {
             .as_deref()
             .copied()
             .unwrap_or_default(),
-        ObjectState::Mpu(data_types::object_layout::MpuState::Completed(core)) => {
-            core.posix.as_deref().copied().unwrap_or_default()
+        ObjectState::Mpu(MpuState::Completed(data)) => {
+            data.posix.as_deref().copied().unwrap_or_default()
         }
         ObjectState::Symlink(data) => data
             .core_meta_data
@@ -52,10 +52,9 @@ pub fn layout_posix(layout: &ObjectLayout) -> PosixAttrs {
 /// against a file with no pending flush still survives a
 /// forget+relookup.
 pub fn layout_with_posix(mut layout: ObjectLayout, new_posix: PosixAttrs) -> ObjectLayout {
-    use data_types::object_layout::MpuState;
     match &mut layout.state {
         ObjectState::Normal(data) => data.core_meta_data.posix = Some(Box::new(new_posix)),
-        ObjectState::Mpu(MpuState::Completed(core)) => core.posix = Some(Box::new(new_posix)),
+        ObjectState::Mpu(MpuState::Completed(data)) => data.posix = Some(Box::new(new_posix)),
         ObjectState::Symlink(data) => data.core_meta_data.posix = Some(Box::new(new_posix)),
         ObjectState::Special(data) => data.core_meta_data.posix = Some(Box::new(new_posix)),
         ObjectState::Directory(data) => data.posix = new_posix,
@@ -417,7 +416,7 @@ mod tests {
             block_size: 4096,
             blob_version: 1,
             block_map: None,
-            pending_write: None,
+            prepared_write: None,
             state: ObjectState::Directory(DirectoryData {
                 posix: PosixAttrs {
                     mode,
