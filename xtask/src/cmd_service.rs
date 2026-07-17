@@ -738,6 +738,36 @@ pub fn wait_for_port_ready(port: u16, timeout_secs: u32) -> CmdResult {
     cmd_die!("Timeout waiting for port ${port} to be ready after ${timeout_secs}s")
 }
 
+/// Stop one systemd user unit, tolerating the "Job ... canceled" race: a
+/// unit still transitioning when the stop lands (a role-agent restart, a
+/// previous slow stop draining sweep work) cancels the stop job and
+/// systemctl exits nonzero even though the unit goes down moments later.
+/// Wait out the transition and retry instead of dying on the first loss.
+fn stop_unit_with_retry(service_name: &str) -> CmdResult {
+    const STOP_ATTEMPTS: u32 = 5;
+    if run_cmd!(systemctl --user is-active --quiet $service_name.service).is_err() {
+        return Ok(());
+    }
+    info!("Stopping service: {service_name}");
+    for attempt in 1..=STOP_ATTEMPTS {
+        if run_cmd!(systemctl --user stop $service_name.service).is_ok()
+            && run_cmd!(systemctl --user is-active --quiet $service_name.service).is_err()
+        {
+            return Ok(());
+        }
+        // Canceled stop job or a slow deactivation: give the in-flight
+        // transition up to 10s to finish before issuing the next stop.
+        for _ in 0..20 {
+            if run_cmd!(systemctl --user is-active --quiet $service_name.service).is_err() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        warn!("service {service_name} still active after stop attempt {attempt}, retrying");
+    }
+    cmd_die!("Failed to stop $service_name: service is still running");
+}
+
 pub fn stop_service(service: ServiceName) -> CmdResult {
     let services: Vec<ServiceName> = match service {
         ServiceName::All => all_services(
@@ -757,54 +787,14 @@ pub fn stop_service(service: ServiceName) -> CmdResult {
             );
         } else if service == ServiceName::NssRoleAgent {
             // Handle nss_role_agent template instances
-            for_each_nss_role_agent_service(|service_name| {
-                if run_cmd!(systemctl --user is-active --quiet $service_name.service).is_err() {
-                    return Ok(());
-                }
-                run_cmd! {
-                    info "Stopping service: $service_name";
-                    systemctl --user stop $service_name.service
-                }?;
-
-                if run_cmd!(systemctl --user is-active --quiet $service_name.service).is_ok() {
-                    cmd_die!("Failed to stop $service_name: service is still running");
-                }
-                Ok(())
-            })?;
+            for_each_nss_role_agent_service(stop_unit_with_retry)?;
         } else if service == ServiceName::Bss {
             // Handle BSS template instances using helper function
-            for_each_bss_service(|service_name| {
-                if run_cmd!(systemctl --user is-active --quiet $service_name.service).is_err() {
-                    return Ok(());
-                }
-                run_cmd! {
-                    info "Stopping service: $service_name";
-                    systemctl --user stop $service_name.service
-                }?;
-
-                // make sure the process is really killed
-                if run_cmd!(systemctl --user is-active --quiet $service_name.service).is_ok() {
-                    cmd_die!("Failed to stop $service_name: service is still running");
-                }
-                Ok(())
-            })?;
+            for_each_bss_service(stop_unit_with_retry)?;
             // In case someone removes the whole data directory before issuing stop command
             run_cmd!(ignore killall bss_server &>/dev/null)?;
         } else {
-            let service_name = service.as_ref();
-            if run_cmd!(systemctl --user is-active --quiet $service_name.service).is_err() {
-                continue;
-            }
-
-            run_cmd! {
-                info "Stopping service: $service_name";
-                systemctl --user stop $service_name.service
-            }?;
-
-            // make sure the process is really killed
-            if run_cmd!(systemctl --user is-active --quiet $service_name.service).is_ok() {
-                cmd_die!("Failed to stop $service_name: service is still running");
-            }
+            stop_unit_with_retry(service.as_ref())?;
         }
     }
 
