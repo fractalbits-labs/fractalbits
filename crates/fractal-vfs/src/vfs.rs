@@ -3976,12 +3976,21 @@ impl VfsCore {
                 work.ready_at = now;
             }
         }
+        // Drain only work that is runnable now. A pending item whose
+        // ready_at moved back into the future was re-armed after the
+        // force-ready pass above (the reclamation grace, a reader-lease
+        // recheck, or a failure backoff); waiting those out would hold
+        // shutdown for up to reclamation_grace (rpc timeout + slack)
+        // per commit. Abandon them instead: the end state is the same
+        // tolerated invisible garbage as the bounded-timeout path, and
+        // `log_incomplete_sweep_work` reports it.
         loop {
-            let empty = {
+            let idle = {
+                let now = Instant::now();
                 let queue = self.sweep_coordinator.queue.lock();
-                queue.pending.is_empty() && queue.active.is_empty()
+                queue.active.is_empty() && queue.pending.values().all(|work| work.ready_at > now)
             };
-            if empty {
+            if idle {
                 return;
             }
             compio_runtime::time::sleep(Duration::from_millis(25)).await;
@@ -3993,6 +4002,9 @@ impl VfsCore {
     /// or block-map rows can remain until a later garbage-collection pass.
     pub fn log_incomplete_sweep_work(&self) {
         let queue = self.sweep_coordinator.queue.lock();
+        if queue.pending.is_empty() && queue.active.is_empty() {
+            return;
+        }
         let pending_victims = queue
             .pending
             .values()
@@ -4010,7 +4022,7 @@ impl VfsCore {
             pending_maps,
             open_handles = self.file_handles.len(),
             deferred_blobs = self.deferred_blob_cleanup.len(),
-            "destroy: reclamation drain timed out; invisible physical garbage may remain"
+            "destroy: reclamation incomplete; invisible physical garbage may remain"
         );
     }
 
