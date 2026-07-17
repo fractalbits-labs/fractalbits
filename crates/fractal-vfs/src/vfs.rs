@@ -1721,9 +1721,7 @@ impl VfsCore {
         map: &BlockMap,
         trace_id: &TraceId,
     ) -> Result<BlockMapRef, FsError> {
-        let chunks = map
-            .to_chunks()
-            .map_err(|e| FsError::Internal(format!("block map encode: {e}")))?;
+        let chunks = map.to_chunks();
         let map_id = Uuid::new_v4();
         stream::iter(chunks.iter().enumerate())
             .map(|(chunk_no, chunk)| async move {

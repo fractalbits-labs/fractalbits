@@ -64,7 +64,7 @@ fn main() {
         m.overlay(block, block + 3, RangeState::Written(2 + (i as u64 % 7)));
         block += 6;
     }
-    let chunks = m.to_chunks().unwrap();
+    let chunks = m.to_chunks();
     println!(
         "chunk of 300 ranges:         {} bytes ({} / range)",
         chunks[0].len(),
