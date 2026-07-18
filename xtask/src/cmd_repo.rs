@@ -57,7 +57,10 @@ pub fn run_cmd_repo(repo_cmd: RepoCommand) -> CmdResult {
             with_commit_message,
         } => show_repos_status(with_commit_message)?,
         RepoCommand::Init { all } => init_repos(all)?,
-        RepoCommand::Foreach { command } => run_foreach_repo(&command)?,
+        RepoCommand::Foreach {
+            keep_going,
+            command,
+        } => run_foreach_repo(&command, keep_going)?,
         RepoCommand::Manifest => show_manifest()?,
     }
     Ok(())
@@ -243,18 +246,33 @@ fn init_repos(all: bool) -> CmdResult {
     Ok(())
 }
 
-fn run_foreach_repo(command: &[String]) -> CmdResult {
+fn run_foreach_repo(command: &[String], keep_going: bool) -> CmdResult {
     info!("Running command in each repo: {command:?} ...");
 
+    let mut failed: Vec<&str> = Vec::new();
     for repo in all_repos() {
         let path = repo.path;
-        run_cmd! {
+        let result = run_cmd! {
             info "Running in repo: $path";
             cd $path;
             $[command] 2>&1;
-        }?;
+        };
+        match result {
+            Ok(()) => {}
+            Err(err) if keep_going => {
+                warn!("Command failed in repo {path}: {err}");
+                failed.push(path);
+            }
+            Err(err) => return Err(err),
+        }
     }
 
+    if !failed.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "command failed in repos: {}",
+            failed.join(", ")
+        )));
+    }
     Ok(())
 }
 
