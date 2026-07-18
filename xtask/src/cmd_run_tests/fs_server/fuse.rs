@@ -11,6 +11,37 @@ use super::{MOUNT_POINT, cleanup_objects, generate_test_data, setup_test_bucket}
 
 const MOUNT_POINT_B: &str = "/tmp/fs_server_test_b";
 
+/// Restarts bss@0 + bss@3 on drop unless disarmed: keeps a failed
+/// EC-write-hole test from leaving the cluster degraded for the rest of
+/// the suite.
+struct BssZeroThreeRestartGuard {
+    armed: bool,
+}
+
+impl BssZeroThreeRestartGuard {
+    fn new() -> Self {
+        Self { armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BssZeroThreeRestartGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = run_cmd! {
+            ignore systemctl --user start bss@0.service;
+            ignore systemctl --user start bss@3.service;
+        } {
+            eprintln!("failed to restart BSS nodes after test failure: {error}");
+        }
+    }
+}
+
 fn disk_cache_path() -> String {
     let base = std::env::current_dir().expect("Failed to get cwd");
     base.join("data/fuse_test_disk_cache")
@@ -437,6 +468,10 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         run_test!(
             "Override Survives BSS Partition-Rejoin",
             test_override_survives_bss_partition_rejoin
+        );
+        run_test!(
+            "Failed EC Overwrite Keeps Committed V1",
+            test_failed_ec_overwrite_keeps_committed_v1
         );
     }
 
@@ -3738,6 +3773,110 @@ async fn test_qemu_style_fio_workload(disk_cache: bool) -> CmdResult {
     println!(
         "{}",
         "SUCCESS: qemu-style fio workload + stable-path cache invariant".green()
+    );
+    Ok(())
+}
+
+async fn test_failed_ec_overwrite_keeps_committed_v1(disk_cache: bool) -> CmdResult {
+    use std::io::Write;
+    assert!(
+        !disk_cache,
+        "this EC failure regression requires no disk cache"
+    );
+    let (ctx, bucket) = setup_test_bucket().await;
+    let key = "failed-ec-overwrite.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let file_len = 2 * BLOCK_SIZE as usize;
+    let v1 = generate_test_data("failed-ec-overwrite-v1", file_len);
+    let v2 = generate_test_data("failed-ec-overwrite-v2", file_len);
+    assert_ne!(v1, v2, "test generations must differ");
+
+    println!("  Step 1: Commit a two-block V1 file");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&fuse_path)
+            .expect("open V1 file");
+        file.write_all(&v1).expect("write V1 file");
+        file.sync_all().expect("commit V1 file");
+    }
+    unmount_fuse()?;
+
+    println!("  Step 2: Stop two BSS nodes so EC write quorum is unavailable");
+    let mut restart_guard = BssZeroThreeRestartGuard::new();
+    // Keep two replicas available in each three-node NSS journal volume.
+    run_cmd! {
+        systemctl --user stop bss@0.service;
+        systemctl --user stop bss@3.service;
+    }?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    println!("  Step 3: Attempt a full V2 overwrite with only four shards available");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let sync_result = {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fuse_path)
+            .expect("open V2 file");
+        file.write_all(&v2).expect("write V2 file");
+        file.sync_all()
+    };
+    let unmount_result = unmount_fuse();
+
+    println!("  Step 4: Restart both BSS nodes");
+    let restart_result = run_cmd! {
+        systemctl --user start bss@0.service;
+        systemctl --user start bss@3.service;
+    };
+    if restart_result.is_ok() {
+        restart_guard.disarm();
+    }
+    restart_result?;
+    cmd_service::wait_for_port_ready(8088, 120)?;
+    cmd_service::wait_for_port_ready(8091, 120)?;
+    unmount_result?;
+
+    let sync_error = sync_result.expect_err("V2 sync must fail below EC write quorum");
+    assert_eq!(
+        sync_error.raw_os_error(),
+        Some(libc::EIO),
+        "failed EC overwrite must surface EIO"
+    );
+
+    println!("  Step 5: Remount read-only and verify committed V1 remains visible");
+    mount_fuse_ro(&bucket, disk_cache)?;
+    let actual = std::fs::read(&fuse_path).expect("read after failed V2 overwrite");
+    assert_eq!(
+        actual, v1,
+        "prepared V2 fragments became visible after failed commit"
+    );
+    unmount_fuse()?;
+
+    println!("  Step 6: Retry V2 after every placement node is available");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fuse_path)
+            .expect("open V2 retry");
+        file.write_all(&v2).expect("write V2 retry");
+        file.sync_all().expect("commit V2 retry");
+    }
+    unmount_fuse()?;
+
+    println!("  Step 7: Verify the retried generation is committed");
+    mount_fuse_ro(&bucket, disk_cache)?;
+    let actual = std::fs::read(&fuse_path).expect("read committed V2 retry");
+    assert_eq!(actual, v2, "retried V2 generation was not committed");
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: Failed EC overwrite kept committed V1 bytes".green()
     );
     Ok(())
 }
