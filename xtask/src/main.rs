@@ -666,6 +666,15 @@ pub enum RepoCommand {
 
     #[clap(about = "Run a command in each git repo")]
     Foreach {
+        #[clap(
+            short = 'k',
+            long,
+            long_help = "Keep going when the command fails in some repos; \
+                         failed repos are reported at the end (non-zero exit). \
+                         Must precede the command tokens."
+        )]
+        keep_going: bool,
+
         #[clap(required = true, num_args = 1.., value_name = "COMMAND", allow_hyphen_values = true)]
         command: Vec<String>,
     },

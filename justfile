@@ -35,7 +35,7 @@ repo *args:
   cargo xtask repo {{args}}
 
 git *args:
-  cargo xtask repo foreach git {{args}}
+  cargo xtask repo foreach --keep-going git {{args}}
 
 docker *args:
   cargo xtask docker {{args}}
