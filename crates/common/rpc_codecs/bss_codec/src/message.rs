@@ -82,6 +82,9 @@ pub enum Command {
     // POSIX fs related commands
     ReserveBlocks = 32,
     ListBlobBlocks = 33,
+    // Newest generation of one block at or below a ceiling version,
+    // skipping an excluded-version list (MVCC v2 at-or-before read).
+    GetBlobAtOrBefore = 34,
 }
 
 #[allow(clippy::derivable_impls)]

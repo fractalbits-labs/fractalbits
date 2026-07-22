@@ -1,11 +1,13 @@
 mod fuse_server;
 
 use clap::Parser;
-use fractal_fuse::MountOptions;
-use fractal_fuse::Session;
+use fractal_fuse::{MountOptions, Session, SessionShutdownHandle};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread;
+use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use fractal_vfs::backend;
@@ -20,6 +22,61 @@ use crate::fuse_server::FuseServer;
 struct Opt {
     #[clap(short = 'c', long = "config", help = "Config file path")]
     config_file: Option<PathBuf>,
+}
+
+fn install_shutdown_signal_handler(
+    shutdown: SessionShutdownHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("fs-signal".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                    return;
+                }
+            };
+
+            runtime.block_on(async move {
+                let mut sigterm = match signal(SignalKind::terminate()) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                let mut sigint = match signal(SignalKind::interrupt()) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                if ready_tx.send(Ok(())).is_err() {
+                    return;
+                }
+
+                let signal_name = tokio::select! {
+                    _ = sigterm.recv() => "SIGTERM",
+                    _ = sigint.recv() => "SIGINT",
+                };
+                tracing::info!(
+                    signal = signal_name,
+                    "received signal, shutting down gracefully"
+                );
+                shutdown.shutdown();
+            });
+        })?;
+
+    match ready_rx.recv()? {
+        Ok(()) => Ok(()),
+        Err(error) => Err(Box::new(error)),
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -94,6 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let session =
         Session::new(mount_point.into(), mount_options)?.with_worker_count(cfg.worker_threads);
+    install_shutdown_signal_handler(session.shutdown_handle())?;
     let vfs_core = Arc::new(vfs_core.with_fuse_fd(session.fuse_fd()));
     session.run(FuseServer::new(vfs_core))?;
     tracing::info!("FUSE server exited");

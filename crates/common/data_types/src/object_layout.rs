@@ -24,11 +24,44 @@ pub struct ObjectLayout {
     pub timestamp: u64,
     pub version_id: Uuid, // v4
     pub block_size: u32,
-    /// Monotonic version for in-place block override (V1 sparse + override).
-    /// Incremented by `PutInodeCas` on every flush that has pending work.
-    /// `0` is reserved for legacy / pre-V1 layouts; new flushes start at `1`.
+    /// The committed visibility ceiling: readers select, per block, the
+    /// newest generation with version <= this. Advanced only by a
+    /// commit CAS (version allocation is `next_version`'s job).
     pub blob_version: u64,
+    /// Filesystem-only state, out of line: a pure S3 object (the common
+    /// row on an S3-only deployment) stores only the `None` niche here.
+    /// Must stay normalized (`None` when every member is `None`, via the
+    /// accessors below) so logically equal layouts serialize to identical
+    /// bytes; the flush CAS guard and its posix-only rebase rely on it.
+    /// Prefer the accessors over touching the field directly.
+    pub fs_ext: Option<Box<FsExt>>,
     pub state: ObjectState,
+}
+
+/// POSIX-filesystem members of an `ObjectLayout`, grouped behind one
+/// relative pointer. An rkyv inline `Option<T>` reserves the full `T`
+/// even when `None`, so keeping these inline taxed every pure S3 row
+/// for fields only fs_server populates.
+#[derive(Debug, Archive, Deserialize, Serialize, PartialEq, Clone, Default)]
+pub struct FsExt {
+    /// POSIX attrs the FUSE / NFS layer reads back via `stat(2)` for
+    /// `Normal`, `Mpu(Completed)`, `Symlink`, and `Special` layouts
+    /// (`Directory` embeds its own). `None` means "uninitialised":
+    /// the runtime falls back to the mount-default mode/uid/gid and
+    /// synthesises mtime/ctime from the layout `timestamp`.
+    pub posix: Option<PosixAttrs>,
+    /// Monotonic generation allocator, durably advanced by the prepare
+    /// CAS before any data I/O: the next flush burns
+    /// `max(next_version, blob_version + 1)`. Never decreases and a
+    /// burned version is never reallocated, so every BSS data key is
+    /// written by at most one flush attempt, ever. An interrupted
+    /// attempt needs no record beyond the burn itself: its fragments
+    /// are invisible above the ceiling, and once a later commit passes
+    /// them they read as ordinary content (the POSIX
+    /// unspecified-state-after-failed-write outcome). 0 means "never
+    /// overwritten" and stays the normalized default for plain
+    /// created/appended files.
+    pub next_version: u64,
 }
 
 impl ObjectLayout {
@@ -195,6 +228,48 @@ impl ObjectLayout {
             _ => Err(ObjectLayoutError::InvalidState),
         }
     }
+
+    /// POSIX attrs for `Normal` / `Mpu(Completed)` / `Symlink` /
+    /// `Special` layouts (`Directory` embeds its own; see
+    /// `DirectoryData`).
+    #[inline]
+    pub fn fs_posix(&self) -> Option<PosixAttrs> {
+        self.fs_ext.as_ref().and_then(|e| e.posix)
+    }
+
+    /// The version the next write attempt must burn.
+    #[inline]
+    pub fn next_burn_version(&self) -> u64 {
+        let next = self.fs_ext.as_ref().map_or(0, |e| e.next_version);
+        next.max(self.blob_version + 1)
+    }
+
+    pub fn set_fs_posix(&mut self, posix: Option<PosixAttrs>) {
+        self.update_fs_ext(|e| e.posix = posix);
+    }
+
+    pub fn set_next_version(&mut self, next_version: u64) {
+        self.update_fs_ext(|e| e.next_version = e.next_version.max(next_version));
+    }
+
+    /// Normalized constructor for layout literals: `None` when every
+    /// member is default.
+    pub fn fs_ext_from(posix: Option<PosixAttrs>) -> Option<Box<FsExt>> {
+        let ext = FsExt {
+            posix,
+            next_version: 0,
+        };
+        (ext != FsExt::default()).then(|| Box::new(ext))
+    }
+
+    /// Normalizing mutator: keeps `fs_ext == None` when all members are
+    /// `None`, so logically equal layouts stay byte-equal under the
+    /// flush's CAS guard.
+    fn update_fs_ext(&mut self, f: impl FnOnce(&mut FsExt)) {
+        let mut ext = self.fs_ext.take().map(|b| *b).unwrap_or_default();
+        f(&mut ext);
+        self.fs_ext = (ext != FsExt::default()).then(|| Box::new(ext));
+    }
 }
 
 #[derive(Debug, Archive, Deserialize, Serialize, PartialEq, Clone)]
@@ -245,18 +320,6 @@ pub struct ObjectCoreMetaData {
     pub etag: String,
     pub headers: HeaderList,
     pub checksum: Option<ChecksumValue>,
-    /// POSIX attrs the FUSE / NFS layer reads back via `stat(2)`, stored
-    /// behind a relative pointer so a pure-S3 object (which never sets
-    /// them) costs only the `None` niche (~5 archived bytes) instead of
-    /// the full inline `PosixAttrs` (28 bytes). rkyv is a zero-copy
-    /// format: an inline `Option<PosixAttrs>` would still reserve the
-    /// 28 bytes, so the `Box` is what moves the payload out-of-line and
-    /// makes the absent case cheap. `None` means "uninitialised": the
-    /// runtime falls back to the mount-default mode/uid/gid and
-    /// synthesises mtime/ctime from the layout `timestamp`. Only an
-    /// explicit chmod/chown/utimensat (or an FS-created inode) stores
-    /// `Some`.
-    pub posix: Option<Box<PosixAttrs>>,
 }
 
 /// Persisted POSIX attrs for a regular file, directory, or symlink
@@ -428,7 +491,6 @@ mod tests {
             etag: "etag".to_string(),
             headers: vec![],
             checksum: None,
-            ..Default::default()
         }
     }
 
@@ -438,6 +500,7 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 1,
+            fs_ext: None,
             state: ObjectState::Normal(ObjectMetaData {
                 blob_guid: DataBlobGuid {
                     blob_id: Uuid::nil(),
@@ -449,45 +512,42 @@ mod tests {
     }
 
     #[test]
-    fn absent_posix_serializes_smaller_than_present() {
-        // Pure-S3 object: posix is None (the common case). An FS inode or
-        // a chmod'd object carries Some(Box). The None case must be the
-        // cheaper one; that is the whole point of the Box indirection
-        // (an inline Option<PosixAttrs> would not save anything in rkyv).
-        let mut s3 = core_meta(123);
-        s3.posix = None;
-        let mut fs = core_meta(123);
-        fs.posix = Some(Box::new(PosixAttrs {
+    fn absent_fs_ext_serializes_smaller_than_present() {
+        // Pure-S3 object: fs_ext is None (the common case). An FS inode
+        // carries posix (and possibly a map) behind the ext pointer. The
+        // None case must be the cheaper one; that is the whole point of
+        // the out-of-line box (inline rkyv Options reserve their payload
+        // even when None).
+        let s3 = normal_layout(core_meta(123));
+        let mut fs = normal_layout(core_meta(123));
+        fs.set_fs_posix(Some(PosixAttrs {
             mode: 0o100644,
             uid: 1000,
             gid: 1000,
             mtime_ns: 42,
             ctime_ns: 42,
         }));
-        let s3_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&normal_layout(s3)).expect("ser none");
-        let fs_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&normal_layout(fs)).expect("ser some");
+        let s3_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&s3).expect("ser none");
+        let fs_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&fs).expect("ser some");
         assert!(
             s3_bytes.len() < fs_bytes.len(),
-            "None-posix layout ({} bytes) must be smaller than Some-posix ({} bytes)",
+            "None-ext layout ({} bytes) must be smaller than posix-carrying ({} bytes)",
             s3_bytes.len(),
             fs_bytes.len()
         );
     }
 
     #[test]
-    fn posix_option_box_round_trips() {
+    fn fs_ext_round_trips_and_normalizes() {
         // None.
-        let mut none = core_meta(7);
-        none.posix = None;
-        let l = normal_layout(none);
+        let l = normal_layout(core_meta(7));
         let b = rkyv::to_bytes::<rkyv::rancor::Error>(&l).expect("ser");
         let back: ObjectLayout =
             rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&b).expect("de");
-        match back.state {
-            ObjectState::Normal(d) => assert!(d.core_meta_data.posix.is_none()),
-            _ => unreachable!(),
-        }
-        // Some.
+        assert!(back.fs_ext.is_none());
+        assert!(back.fs_posix().is_none());
+
+        // Some posix round-trips.
         let p = PosixAttrs {
             mode: 0o100600,
             uid: 5,
@@ -495,18 +555,50 @@ mod tests {
             mtime_ns: 9,
             ctime_ns: 10,
         };
-        let mut some = core_meta(7);
-        some.posix = Some(Box::new(p));
-        let l = normal_layout(some);
-        let b = rkyv::to_bytes::<rkyv::rancor::Error>(&l).expect("ser");
+        let plain = normal_layout(core_meta(7));
+        let mut some = plain.clone();
+        some.set_fs_posix(Some(p));
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(&some).expect("ser");
         let back: ObjectLayout =
             rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&b).expect("de");
-        match back.state {
-            ObjectState::Normal(d) => {
-                assert_eq!(d.core_meta_data.posix.as_deref().copied(), Some(p))
-            }
-            _ => unreachable!(),
-        }
+        assert_eq!(back.fs_posix(), Some(p));
+
+        // Clearing the last member drops the box entirely, so equal
+        // layouts stay byte-equal (the flush CAS guard relies on it).
+        let mut cleared = some.clone();
+        cleared.set_fs_posix(None);
+        assert!(cleared.fs_ext.is_none());
+        let plain_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&plain).expect("ser plain");
+        let cleared_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cleared).expect("ser cleared");
+        assert_eq!(
+            plain_bytes.as_slice(),
+            cleared_bytes.as_slice(),
+            "normalization must keep cleared ext byte-equal to never-set"
+        );
+
+        // Setters compose without clobbering each other.
+        let mut multi = normal_layout(core_meta(7));
+        multi.set_next_version(4);
+        multi.set_fs_posix(Some(p));
+        assert_eq!(multi.next_burn_version(), 4);
+        assert_eq!(multi.fs_posix(), Some(p));
+    }
+
+    #[test]
+    fn next_burn_version_tracks_ceiling_and_allocator() {
+        let mut l = normal_layout(core_meta(7));
+        l.blob_version = 5;
+        assert_eq!(l.next_burn_version(), 6, "ceiling + 1 when never burned");
+        l.set_next_version(9);
+        assert_eq!(l.next_burn_version(), 9);
+        l.set_next_version(3);
+        assert_eq!(l.next_burn_version(), 9, "allocator never decreases");
+        l.blob_version = 20;
+        assert_eq!(
+            l.next_burn_version(),
+            21,
+            "ceiling can outrun the allocator"
+        );
     }
 
     fn special_layout(kind: SpecialKind, rdev: u32) -> ObjectLayout {
@@ -515,6 +607,7 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 0,
+            fs_ext: None,
             state: ObjectState::Special(SpecialData {
                 kind,
                 rdev,
@@ -529,6 +622,7 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 0,
+            fs_ext: None,
             state: ObjectState::Directory(DirectoryData {
                 posix: PosixAttrs {
                     mode,
@@ -544,6 +638,7 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 0,
+            fs_ext: None,
             state: ObjectState::Symlink(SymlinkData {
                 target: target.to_vec(),
                 core_meta_data: core_meta(target.len() as u64),
@@ -557,6 +652,7 @@ mod tests {
             version_id: ObjectLayout::gen_version_id(),
             block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
             blob_version: 0,
+            fs_ext: None,
             state: ObjectState::Indirect(IndirectEntry {
                 inode_id: Uuid::new_v4(),
             }),

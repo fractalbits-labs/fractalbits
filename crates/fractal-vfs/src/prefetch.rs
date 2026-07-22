@@ -91,6 +91,9 @@ pub fn cache_pressure_high(usage_bytes: u64, capacity_bytes: u64, policy: &Prefe
 /// Errors are logged and ignored: a prefetch is best-effort, and a
 /// transient failure is acceptable; the kernel's block-on-demand
 /// path still serves the read.
+// Superseded on this branch by `spawn_prefetch_task` in vfs/open.rs,
+// which walks blocks through the at-or-before ceiling read.
+#[allow(dead_code)]
 pub(crate) async fn prefetch_blob(
     backend_cfg: Arc<BackendConfig>,
     disk_cache: Arc<DiskCache>,

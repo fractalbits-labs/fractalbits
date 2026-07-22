@@ -6,12 +6,16 @@ use fractal_fuse::{FileHandleId, InodeId};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::backend::{BackendConfig, StorageBackend};
 use crate::config::WritebackMode;
+use crate::disk_cache::DiskCache;
 use crate::error::FsError;
 use crate::inode::EntryType;
-use crate::prefetch::{cache_pressure_high, prefetch_blob, should_prefetch};
+use crate::prefetch::{cache_pressure_high, should_prefetch};
 use crate::vfs::write_buffer::WriteBuffer;
 use crate::vfs::{DEFAULT_BLOCK_SIZE, FileHandle, VfsCore};
+use data_types::object_layout::ObjectLayout;
+use volume_group_proxy::AtOrBeforeRead;
 
 impl VfsCore {
     /// Acquire the inode-scoped write lock for `fh`. Returns `Busy` if another
@@ -207,6 +211,17 @@ impl VfsCore {
                 return Err(e);
             }
         };
+        let trace_id = TraceId::new();
+        if let Some(layout) = &layout
+            && let Err(error) = self
+                .ensure_data_layout_supported(&s3_key, layout, &trace_id)
+                .await
+        {
+            if is_write {
+                self.release_write_lock(inode, fh);
+            }
+            return Err(error);
+        }
 
         // Cross-instance staleness reconciliation: if the cache file's
         // authoritative_blob_v lags the inode's blob_version, another
@@ -294,7 +309,7 @@ impl VfsCore {
                 let backend_cfg = Arc::clone(&self.backend_config);
                 let layout_clone = l.clone();
                 compio_runtime::spawn(async move {
-                    prefetch_blob(backend_cfg, dc_arc, layout_clone).await;
+                    spawn_prefetch_task(backend_cfg, dc_arc, layout_clone).await;
                 })
                 .detach();
             }
@@ -306,11 +321,116 @@ impl VfsCore {
                 ino: inode,
                 s3_key,
                 layout,
+                layout_refreshed_at: Instant::now(),
+                operation_lock: Arc::new(futures::lock::Mutex::new(())),
                 write_buf,
                 backing_id: None,
             },
         );
 
         Ok(fh)
+    }
+}
+
+/// Background whole-blob prefetch. Walks every block of `layout`,
+/// fetches it from BSS, and inserts it into the disk cache. Each
+/// per-block fetch goes through the same path as a read miss
+/// (`backend.read_block` + `dc.insert`) so block_id, version, and
+/// checksum semantics stay identical between prefetch-warmed entries
+/// and lazy-warmed ones.
+///
+/// Errors are logged and ignored: a prefetch is best-effort, and a
+/// transient failure is acceptable; the kernel's block-on-demand
+/// path still serves the read.
+async fn spawn_prefetch_task(
+    backend_cfg: Arc<BackendConfig>,
+    disk_cache: Arc<DiskCache>,
+    layout: ObjectLayout,
+) {
+    let Ok(file_size) = layout.size() else {
+        return;
+    };
+    if file_size == 0 {
+        return;
+    }
+    let Ok(blob_guid) = layout.blob_guid() else {
+        return;
+    };
+    let block_size = layout.block_size as u64;
+    if block_size == 0 {
+        return;
+    }
+    // Re-check pressure: an unrelated workload may have filled the
+    // cache between the open-time decision and the task starting.
+    let policy = crate::prefetch::PrefetchPolicy {
+        full_threshold_bytes: u64::MAX,
+        partial_threshold_bytes: u64::MAX,
+        workload_bulk_read: false,
+        // Reuse the cache's high-watermark fraction for the in-task
+        // pressure decline.
+        pressure_decline: 0.95,
+    };
+    if crate::prefetch::cache_pressure_high(
+        disk_cache.current_usage(),
+        disk_cache.capacity_bytes(),
+        &policy,
+    ) {
+        return;
+    }
+
+    let backend = match StorageBackend::new(&backend_cfg) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "prefetch: failed to construct backend");
+            return;
+        }
+    };
+
+    let last_block = ((file_size - 1) / block_size) as u32;
+    let trace_id = TraceId::new();
+    let ceiling = layout.blob_version;
+
+    for block_num in 0..=last_block {
+        let block_start = block_num as u64 * block_size;
+        let block_content_len = std::cmp::min(block_size, file_size - block_start) as usize;
+
+        // If another path has already populated this block (e.g. a
+        // racing read), only the ceiling identity can short-circuit the
+        // BSS round trip without a resolution walk.
+        if disk_cache
+            .get_block_exact(blob_guid, block_num, ceiling, block_content_len)
+            .await
+            .is_some()
+        {
+            continue;
+        }
+
+        let read_len = (layout.block_size as usize).max(block_content_len);
+        let (version, mut data) = match backend
+            .read_block_at_or_before(blob_guid, ceiling, block_num, read_len, &trace_id)
+            .await
+        {
+            Ok(AtOrBeforeRead::Data { version, body }) => (version, body),
+            Ok(AtOrBeforeRead::Zeros { .. })
+            | Ok(AtOrBeforeRead::Hole { .. })
+            | Ok(AtOrBeforeRead::SparseHole) => {
+                let _ = disk_cache.invalidate_block(blob_guid, block_num).await;
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    %blob_guid, block_num, error = %e,
+                    "prefetch block fetch failed; abandoning prefetch"
+                );
+                return;
+            }
+        };
+        if data.len() > block_content_len {
+            data = data.slice(0..block_content_len);
+        }
+
+        let _ = disk_cache
+            .insert_block(blob_guid, block_num, version, &data)
+            .await;
     }
 }

@@ -9,6 +9,7 @@ use data_types::object_layout::{
 use fractal_fuse::{FileHandleId, InodeId};
 use rkyv::api::high::to_bytes_in;
 use std::sync::Arc;
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cache::DirEntryKind;
@@ -245,6 +246,7 @@ impl VfsCore {
                 version_id: ObjectLayout::gen_version_id(),
                 block_size: DEFAULT_BLOCK_SIZE,
                 blob_version: 0,
+                fs_ext: None,
                 state: ObjectState::Indirect(IndirectEntry { inode_id: id }),
             };
             let b: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&l, Vec::new())
@@ -767,6 +769,7 @@ impl VfsCore {
             block_size: DEFAULT_BLOCK_SIZE,
             timestamp: now_ns() / 1_000_000,
             blob_version: 0,
+            fs_ext: ObjectLayout::fs_ext_from(Some(posix)),
             state: ObjectState::Special(SpecialData {
                 kind,
                 rdev,
@@ -775,7 +778,6 @@ impl VfsCore {
                     etag: String::new(),
                     headers: vec![],
                     checksum: None,
-                    posix: Some(Box::new(posix)),
                 },
             }),
         };
@@ -849,6 +851,8 @@ impl VfsCore {
                 ino,
                 s3_key: key,
                 layout: None,
+                layout_refreshed_at: Instant::now(),
+                operation_lock: Arc::new(futures::lock::Mutex::new(())),
                 write_buf: Some({
                     // Fresh empty file; dirty so the close-time flush
                     // publishes the 0-byte inode.
@@ -922,6 +926,7 @@ impl VfsCore {
             block_size: DEFAULT_BLOCK_SIZE,
             timestamp,
             blob_version: 0,
+            fs_ext: ObjectLayout::fs_ext_from(Some(posix)),
             state: ObjectState::Symlink(SymlinkData {
                 target: target.to_vec(),
                 core_meta_data: ObjectCoreMetaData {
@@ -929,7 +934,6 @@ impl VfsCore {
                     etag: String::new(),
                     headers: vec![],
                     checksum: None,
-                    posix: Some(Box::new(posix)),
                 },
             }),
         };
@@ -1049,16 +1053,12 @@ impl VfsCore {
         };
         match &old_layout.state {
             ObjectState::Normal(_) => {
-                self.backend()
-                    .delete_blob_blocks(&old_layout, trace_id)
-                    .await;
+                self.teardown_blob(&old_layout, trace_id).await;
             }
             ObjectState::Mpu(MpuState::Completed(_)) => {
                 if let Ok(parts) = self.backend().list_mpu_parts(key, trace_id).await {
                     for (part_key, part_layout) in &parts {
-                        self.backend()
-                            .delete_blob_blocks(part_layout, trace_id)
-                            .await;
+                        self.teardown_blob(part_layout, trace_id).await;
                         let _ = self.backend().delete_inode(part_key, trace_id).await;
                     }
                 }
@@ -1099,9 +1099,7 @@ impl VfsCore {
                         if let Ok(fresh) = self.backend().get_inode_record(inode_id, trace_id).await
                             && fresh.nlink == 0
                         {
-                            self.backend()
-                                .delete_blob_blocks(&fresh.layout, trace_id)
-                                .await;
+                            self.teardown_blob(&fresh.layout, trace_id).await;
                             let _ = self.backend().delete_inode_record(inode_id, trace_id).await;
                         }
                     }
@@ -1159,6 +1157,15 @@ impl VfsCore {
                 }
                 tainted_delete |= self.drain_inode_for_delete(target).await?;
             }
+        }
+
+        match self.backend().get_inode(&key, &trace_id).await {
+            Ok(layout) => {
+                self.ensure_data_layout_supported(&key, &layout, &trace_id)
+                    .await?;
+            }
+            Err(FsError::NotFound) => {}
+            Err(error) => return Err(error),
         }
 
         // Delete the inode from NSS
@@ -1239,6 +1246,7 @@ impl VfsCore {
             block_size: DEFAULT_BLOCK_SIZE,
             timestamp: now / 1_000_000,
             blob_version: 1,
+            fs_ext: None,
             state: ObjectState::Directory(DirectoryData { posix }),
         };
         let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())
@@ -1424,6 +1432,15 @@ impl VfsCore {
             .find_ino_by_key(&dst_dir_probe, EntryType::Directory);
         for ino in self.writeback_drain_targets(&dst_dir_probe, dst_dir_ino) {
             self.drain_inode_to_barrier(ino).await?;
+        }
+
+        match self.backend().get_inode(&dst_key, &trace_id).await {
+            Ok(layout) => {
+                self.ensure_data_layout_supported(&dst_key, &layout, &trace_id)
+                    .await?;
+            }
+            Err(FsError::NotFound) => {}
+            Err(error) => return Err(error),
         }
 
         // Determine type by probing NSS backend directly (no inode side effects)

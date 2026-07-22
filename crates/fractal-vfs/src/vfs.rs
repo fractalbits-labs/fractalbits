@@ -1,22 +1,28 @@
 mod attr;
+mod data_layout;
 mod dir;
 mod drain;
 mod namespace;
 mod open;
 mod publish;
 mod read;
+mod sweep;
 mod write;
 mod write_buffer;
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use data_types::object_layout::{ObjectLayout, ObjectState, SpecialKind};
+use data_types::{DataBlobGuid, TraceId};
 use fractal_fuse::{FileHandleId, InodeId};
+use futures::{FutureExt, StreamExt, stream};
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::backend::{BackendConfig, StorageBackend};
@@ -124,9 +130,160 @@ struct FileHandle {
     ino: InodeId,
     s3_key: String,
     layout: Option<ObjectLayout>,
+    layout_refreshed_at: Instant,
+    operation_lock: Arc<futures::lock::Mutex<()>>,
     write_buf: Option<WriteBuffer>,
     backing_id: Option<i32>,
 }
+
+#[derive(Debug)]
+pub(crate) struct SweepWork {
+    /// Exact identities to delete (failed unpublished creates).
+    victims: HashSet<(u32, u64)>,
+    /// Touched-block reclamation: for each block, delete every listed
+    /// generation strictly below its committed identity, on every
+    /// placement node. Covers superseded generations and any orphan
+    /// fragments interrupted attempts left on these blocks alike.
+    below: HashMap<u32, u64>,
+    grace_until: Option<Instant>,
+    delete_all_blocks: bool,
+    retry_count: u32,
+    ready_at: Instant,
+}
+
+impl SweepWork {
+    fn new() -> Self {
+        Self {
+            victims: HashSet::new(),
+            below: HashMap::new(),
+            grace_until: None,
+            delete_all_blocks: false,
+            retry_count: 0,
+            ready_at: Instant::now(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.victims.is_empty()
+            && self.below.is_empty()
+            && self.grace_until.is_none()
+            && !self.delete_all_blocks
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        self.victims.extend(other.victims.drain());
+        for (block, keep_from) in other.below.drain() {
+            let slot = self.below.entry(block).or_insert(keep_from);
+            *slot = (*slot).max(keep_from);
+        }
+        self.delete_all_blocks |= other.delete_all_blocks;
+        self.grace_until = match (self.grace_until, other.grace_until) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (deadline @ Some(_), None) | (None, deadline @ Some(_)) => deadline,
+            (None, None) => None,
+        };
+        self.retry_count = self.retry_count.max(other.retry_count);
+        self.ready_at = self.ready_at.min(other.ready_at);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepAttempt {
+    Complete,
+    GracePending,
+    Failed,
+}
+
+#[derive(Default)]
+struct SweepQueue {
+    pending: HashMap<DataBlobGuid, SweepWork>,
+    active: HashSet<DataBlobGuid>,
+}
+
+#[derive(Default)]
+struct SweepCoordinator {
+    queue: parking_lot::Mutex<SweepQueue>,
+    worker_started: AtomicBool,
+}
+
+struct SweepClaim {
+    blob_guid: DataBlobGuid,
+    work: SweepWork,
+    coordinator: Arc<SweepCoordinator>,
+}
+
+impl SweepClaim {
+    fn take_ready(coordinator: &Arc<SweepCoordinator>) -> Option<Self> {
+        let mut queue = coordinator.queue.lock();
+        if queue.active.len() >= SWEEP_CONCURRENCY {
+            return None;
+        }
+        let now = Instant::now();
+        let blob_guid = queue
+            .pending
+            .iter()
+            .find(|(blob_guid, work)| !queue.active.contains(blob_guid) && work.ready_at <= now)
+            .map(|(blob_guid, _)| *blob_guid)?;
+        let work = queue
+            .pending
+            .remove(&blob_guid)
+            .expect("ready sweep selected above");
+        queue.active.insert(blob_guid);
+        drop(queue);
+        Some(Self {
+            blob_guid,
+            work,
+            coordinator: coordinator.clone(),
+        })
+    }
+
+    fn schedule_retry(&mut self, attempt: SweepAttempt) {
+        let now = Instant::now();
+        match attempt {
+            SweepAttempt::Complete => {}
+            SweepAttempt::GracePending => {
+                self.work.retry_count = 0;
+                self.work.ready_at = self.work.grace_until.unwrap_or(now);
+            }
+            SweepAttempt::Failed => {
+                self.work.retry_count = self.work.retry_count.saturating_add(1);
+                let shift = self.work.retry_count.min(6);
+                self.work.ready_at = now
+                    .checked_add(Duration::from_secs(1_u64 << shift))
+                    .unwrap_or(now);
+                tracing::warn!(
+                    blob_guid = %self.blob_guid,
+                    victims = self.work.victims.len(),
+                    below = self.work.below.len(),
+                    delete_all_blocks = self.work.delete_all_blocks,
+                    retry = self.work.retry_count,
+                    "blob reclamation incomplete; queued retry"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for SweepClaim {
+    fn drop(&mut self) {
+        let mut queue = self.coordinator.queue.lock();
+        queue.active.remove(&self.blob_guid);
+        if self.work.is_empty() {
+            return;
+        }
+        let work = std::mem::replace(&mut self.work, SweepWork::new());
+        match queue.pending.entry(self.blob_guid) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().merge(work);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(work);
+            }
+        }
+    }
+}
+
+pub(crate) const RESERVATION_CONCURRENCY: usize = 16;
 
 pub struct VfsCore {
     backend_config: Arc<BackendConfig>,
@@ -166,6 +323,9 @@ pub struct VfsCore {
     // the best-effort local-cache write off the FUSE worker threads so it
     // does not steal foreground cycles on a create-heavy workload.
     mirror: Option<MirrorHandle>,
+    /// Coalesces per-blob reclamation and bounds the number of cleanup tasks
+    /// that may wait on long-lived readers at once.
+    sweep_coordinator: Arc<SweepCoordinator>,
 }
 
 impl VfsCore {
@@ -206,7 +366,14 @@ impl VfsCore {
             .as_ref()
             .and_then(|dc| spawn_mirror_worker(dc.clone()));
 
-        let passthrough_enabled = config.passthrough_enabled;
+        // A passthrough backing fd cannot be revoked when another instance
+        // commits a new block map and the cache mirror changes the stable
+        // file in place. Keep the raw-fd path disabled until cache files are
+        // generation-specific or FUSE can revoke active backing mappings.
+        let passthrough_enabled = false;
+        if config.passthrough_enabled {
+            tracing::warn!("FUSE passthrough disabled for mutable versioned blobs");
+        }
         let passthrough_max_object_size =
             config.passthrough_max_object_size_gb * 1024 * 1024 * 1024;
         let prefetch_policy = crate::prefetch::PrefetchPolicy::from_config(config);
@@ -248,6 +415,7 @@ impl VfsCore {
             deferred_blob_cleanup: DashMap::new(),
             inode_write_owner: DashMap::new(),
             mirror,
+            sweep_coordinator: Arc::new(SweepCoordinator::default()),
         }
     }
 
@@ -266,7 +434,7 @@ impl VfsCore {
     /// The backend is leaked into 'static storage because each compio thread
     /// runs for the lifetime of the process and we need references that can
     /// be held across await points.
-    fn backend(&self) -> &StorageBackend {
+    fn backend(&self) -> &'static StorageBackend {
         THREAD_BACKEND.with(|cell| match cell.get() {
             Some(b) => b,
             None => {
@@ -398,6 +566,13 @@ impl VfsCore {
             Err(_) => return (0, 0),
         };
 
+        // Passthrough bypasses the per-read exact-version check. Only arm
+        // it for never-overwritten layouts, where every block is at its
+        // create-time identity.
+        if layout.blob_version > 1 || layout.next_burn_version() > layout.blob_version + 1 {
+            return (0, 0);
+        }
+
         // Check if fully cached
         if !dc.is_complete(blob_guid, file_size) {
             return (0, 0);
@@ -470,6 +645,7 @@ impl VfsCore {
         // dead drainer. `ensure_writeback_worker_started` is idempotent, so
         // the lazy calls on the metadata paths become no-ops.
         self.ensure_writeback_worker_started();
+        self.ensure_sweep_worker_started();
         tracing::info!("Filesystem initialized");
     }
 
@@ -543,4 +719,219 @@ fn dir_mode(perm: u16) -> u32 {
 
 fn symlink_mode(perm: u16) -> u32 {
     libc::S_IFLNK | perm as u32
+}
+
+const SWEEP_CONCURRENCY: usize = 8;
+const SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const RECLAMATION_WRITE_SLACK: Duration = Duration::from_secs(10);
+
+fn reclamation_grace(rpc_timeout: Duration) -> Duration {
+    rpc_timeout.saturating_add(RECLAMATION_WRITE_SLACK)
+}
+
+async fn run_sweep_worker(backend_config: Arc<BackendConfig>, coordinator: Arc<SweepCoordinator>) {
+    let mut active = stream::FuturesUnordered::new();
+    loop {
+        while active.len() < SWEEP_CONCURRENCY {
+            let Some(mut claim) = SweepClaim::take_ready(&coordinator) else {
+                break;
+            };
+            let backend_config = backend_config.clone();
+            active.push(async move {
+                let attempt =
+                    process_sweep_work(&backend_config, claim.blob_guid, &mut claim.work).await;
+                claim.schedule_retry(attempt);
+            });
+        }
+
+        if active.is_empty() {
+            rpc_client_common::rpc_sleep(SWEEP_POLL_INTERVAL).await;
+            continue;
+        }
+
+        let completed = active.next().fuse();
+        let poll = rpc_client_common::rpc_sleep(SWEEP_POLL_INTERVAL).fuse();
+        futures::pin_mut!(completed, poll);
+        futures::select_biased! {
+            _ = completed => {}
+            _ = poll => {}
+        }
+    }
+}
+
+async fn process_sweep_work(
+    backend_config: &BackendConfig,
+    blob_guid: DataBlobGuid,
+    work: &mut SweepWork,
+) -> SweepAttempt {
+    let backend = match StorageBackend::new(backend_config) {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::warn!(%blob_guid, %error, "blob reclamation backend initialization failed");
+            return SweepAttempt::Failed;
+        }
+    };
+    let trace_id = TraceId::new();
+    if let Some(grace_until) = work.grace_until {
+        if Instant::now() < grace_until {
+            return SweepAttempt::GracePending;
+        }
+        work.grace_until = None;
+    }
+
+    let mut failed = false;
+    if work.delete_all_blocks {
+        if backend
+            .delete_blob_blocks(blob_guid, &trace_id)
+            .await
+            .is_ok()
+        {
+            work.delete_all_blocks = false;
+            work.victims.clear();
+            work.below.clear();
+        } else {
+            failed = true;
+        }
+    }
+
+    // Touched-block reclamation: one all-node listing resolves the
+    // `below` work into exact identities (every listed generation
+    // strictly below the block's committed identity), then exact deletes
+    // run against every placement node. Orphan fragments interrupted
+    // attempts left on these blocks are indistinguishable from
+    // superseded generations here and are reclaimed the same way.
+    if !work.below.is_empty() {
+        match backend.list_all_blob_blocks(blob_guid, &trace_id).await {
+            Ok(entries) => {
+                let resolved: Vec<(u32, u64)> = entries
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let superseded = work
+                            .below
+                            .get(&entry.block_number)
+                            .is_some_and(|keep_from| entry.version < *keep_from);
+                        superseded.then_some((entry.block_number, entry.version))
+                    })
+                    .collect();
+                work.victims.extend(resolved);
+                work.below.clear();
+            }
+            Err(error) => {
+                tracing::warn!(%blob_guid, %error, "touched-block sweep listing failed");
+                failed = true;
+            }
+        }
+    }
+
+    let victims = work.victims.iter().copied().collect::<Vec<_>>();
+    let backend_ref = &backend;
+    let trace_id_ref = &trace_id;
+    let victim_results = stream::iter(victims)
+        .map(move |identity @ (block, version)| async move {
+            (
+                identity,
+                backend_ref
+                    .delete_block(blob_guid, block, version, trace_id_ref)
+                    .await,
+            )
+        })
+        .buffer_unordered(32)
+        .collect::<Vec<_>>()
+        .await;
+    for (identity, result) in victim_results {
+        if result.is_ok() {
+            work.victims.remove(&identity);
+        } else {
+            failed = true;
+        }
+    }
+
+    if work.is_empty() {
+        SweepAttempt::Complete
+    } else {
+        debug_assert!(failed);
+        SweepAttempt::Failed
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn pending_sweeps_coalesce_by_blob() {
+        let mut pending = SweepWork::new();
+        pending.victims.insert((3, 1));
+        let mut newer = SweepWork::new();
+        newer.victims.extend([(3, 1), (4, 2)]);
+        newer.below.insert(9, 4);
+        pending.below.insert(9, 6);
+
+        pending.merge(newer);
+
+        assert_eq!(pending.victims, HashSet::from([(3, 1), (4, 2)]));
+        assert_eq!(
+            pending.below,
+            HashMap::from([(9, 6)]),
+            "below merges by max keep-from"
+        );
+    }
+
+    #[test]
+    fn cancelled_sweep_claim_requeues_exact_work() {
+        let blob_guid = DataBlobGuid {
+            blob_id: Uuid::nil(),
+            volume_id: 1,
+        };
+        let coordinator = Arc::new(SweepCoordinator::default());
+        let mut work = SweepWork::new();
+        work.victims.insert((7, 3));
+        coordinator.queue.lock().pending.insert(blob_guid, work);
+
+        let claim = SweepClaim::take_ready(&coordinator).expect("sweep claim should be ready");
+        assert!(coordinator.queue.lock().active.contains(&blob_guid));
+        drop(claim);
+
+        let queue = coordinator.queue.lock();
+        assert!(queue.active.is_empty());
+        assert_eq!(
+            queue
+                .pending
+                .get(&blob_guid)
+                .expect("cancelled claim should be pending")
+                .victims,
+            HashSet::from([(7, 3)])
+        );
+    }
+
+    #[test]
+    fn cancelled_sweep_claim_merges_new_pending_work() {
+        let blob_guid = DataBlobGuid {
+            blob_id: Uuid::nil(),
+            volume_id: 2,
+        };
+        let coordinator = Arc::new(SweepCoordinator::default());
+        let mut claimed_work = SweepWork::new();
+        claimed_work.victims.insert((7, 3));
+        coordinator
+            .queue
+            .lock()
+            .pending
+            .insert(blob_guid, claimed_work);
+        let claim = SweepClaim::take_ready(&coordinator).expect("sweep claim should be ready");
+
+        let mut new_work = SweepWork::new();
+        new_work.below.insert(2, 4);
+        coordinator.queue.lock().pending.insert(blob_guid, new_work);
+        drop(claim);
+
+        let queue = coordinator.queue.lock();
+        let pending = queue
+            .pending
+            .get(&blob_guid)
+            .expect("merged sweep should be pending");
+        assert_eq!(pending.victims, HashSet::from([(7, 3)]));
+        assert_eq!(pending.below, HashMap::from([(2, 4)]));
+    }
 }

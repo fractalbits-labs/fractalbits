@@ -37,6 +37,36 @@ impl AllInBssSingleAzStorage {
 }
 
 impl AllInBssSingleAzStorage {
+    /// At-or-before read against the committed ceiling; the selected
+    /// generation's classification comes back with the bytes.
+    pub async fn get_blob_at_or_before(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        ceiling: u64,
+        content_len: usize,
+        trace_id: &TraceId,
+    ) -> Result<volume_group_proxy::AtOrBeforeRead, BlobStorageError> {
+        Ok(self
+            .data_vg_proxy
+            .get_blob_at_or_before(blob_guid, block_number, ceiling, content_len, trace_id)
+            .await?)
+    }
+
+    pub async fn list_blob_blocks(
+        &self,
+        blob_guid: DataBlobGuid,
+        trace_id: &TraceId,
+    ) -> Result<Vec<(u32, u64)>, BlobStorageError> {
+        Ok(self
+            .data_vg_proxy
+            .list_all_blob_blocks(blob_guid, trace_id)
+            .await?
+            .into_iter()
+            .map(|entry| (entry.block_number, entry.version))
+            .collect())
+    }
+
     pub async fn put_blob(
         &self,
         blob_id: uuid::Uuid,
@@ -78,12 +108,20 @@ impl AllInBssSingleAzStorage {
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         content_len: usize,
         body: &mut Bytes,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         self.data_vg_proxy
-            .get_blob(blob_guid, block_number, content_len, body, trace_id)
+            .get_blob(
+                blob_guid,
+                block_number,
+                version,
+                content_len,
+                body,
+                trace_id,
+            )
             .await?;
 
         histogram!("blob_size", "operation" => "get").record(body.len() as f64);
@@ -94,10 +132,11 @@ impl AllInBssSingleAzStorage {
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         self.data_vg_proxy
-            .delete_blob(blob_guid, block_number, 1, trace_id)
+            .delete_blob(blob_guid, block_number, version, trace_id)
             .await?;
 
         Ok(())

@@ -3,53 +3,31 @@
 use bytes::Bytes;
 use data_types::{Bucket, DataBlobGuid, DataVgInfo, RoutingKey, TraceId};
 use file_ops::{
-    ListEntry, blob_blocks_to_delete, create_dir_marker_layout, mpu_get_part_prefix,
-    parse_delete_inode, parse_get_inode, parse_list_inodes, parse_mpu_parts, parse_put_inode,
-    parse_put_inode_cas,
+    ListEntry, create_dir_marker_layout, mpu_get_part_prefix, parse_delete_inode, parse_get_inode,
+    parse_list_inodes, parse_mpu_parts, parse_put_inode, parse_put_inode_cas,
 };
+use futures::{StreamExt, stream};
 use rpc_client_common::RpcError;
 use rpc_client_common::nss_rpc_retry;
 use rpc_client_nss::RpcClientNss;
 use rpc_client_rss::RpcClientRss;
 use std::cell::RefCell;
-use volume_group_proxy::DataVgProxy;
+use std::collections::BTreeSet;
+use volume_group_proxy::{AtOrBeforeRead, DataVgProxy};
 
 use crate::config::Config;
 use crate::error::FsError;
 use data_types::object_layout::{InodeRecord, ObjectLayout};
 
-/// Per-blob geometry sentinel block index. u32::MAX is reserved and never a
-/// real data block (data blocks are [0, block_count)); list_blob_blocks only
-/// ever queries bounded [first, first+count) ranges so it never returns this.
-pub const GEOMETRY_SENTINEL_BLOCK: u32 = u32::MAX;
+fn exact_blob_identities(
+    entries: Vec<bss_codec::list_blob_blocks_response::BlobBlockEntry>,
+) -> BTreeSet<(u32, u64)> {
+    entries
+        .into_iter()
+        .map(|entry| (entry.block_number, entry.version))
+        .collect()
+}
 
-/// Authoritative blob geometry, stored in the sentinel block via the normal
-/// KV/block path (no batch RPC). Fixed 20-byte little-endian layout.
-#[derive(Debug, Clone, Copy)]
-pub struct BlobInfo {
-    pub total_size: u64,
-    pub block_count: u32,
-    pub blob_version: u64,
-}
-impl BlobInfo {
-    pub fn encode(&self) -> [u8; 20] {
-        let mut out = [0u8; 20];
-        out[0..8].copy_from_slice(&self.total_size.to_le_bytes());
-        out[8..12].copy_from_slice(&self.block_count.to_le_bytes());
-        out[12..20].copy_from_slice(&self.blob_version.to_le_bytes());
-        out
-    }
-    pub fn decode(buf: &[u8]) -> Option<BlobInfo> {
-        if buf.len() < 20 {
-            return None;
-        }
-        Some(BlobInfo {
-            total_size: u64::from_le_bytes(buf[0..8].try_into().ok()?),
-            block_count: u32::from_le_bytes(buf[8..12].try_into().ok()?),
-            blob_version: u64::from_le_bytes(buf[12..20].try_into().ok()?),
-        })
-    }
-}
 /// Discovered configuration from RSS (shared across threads).
 pub struct BackendConfig {
     pub nss_address: String,
@@ -273,43 +251,62 @@ impl StorageBackend {
         Ok(parse_mpu_parts(parse_list_inodes(resp)?)?)
     }
 
-    /// Read a single block from a data blob via DataVgProxy.
+    /// Read one exact generation `(blob_guid, block_number, version)` via
+    /// DataVgProxy. The version comes from the committed block map (or 1
+    /// for unmapped blocks), so there is no version selection: any replica
+    /// holding the key answers authoritatively.
     /// Returns `(data, xxh3_64_checksum)`.
+    /// At-or-before block read: the newest generation at or below the
+    /// layout's committed ceiling. The selected identity/classification
+    /// comes back with the bytes.
+    pub async fn read_block_at_or_before(
+        &self,
+        blob_guid: DataBlobGuid,
+        ceiling: u64,
+        block_number: u32,
+        content_len: usize,
+        trace_id: &TraceId,
+    ) -> Result<AtOrBeforeRead, FsError> {
+        Ok(self
+            .data_vg_proxy
+            .get_blob_at_or_before(blob_guid, block_number, ceiling, content_len, trace_id)
+            .await?)
+    }
+
+    /// Write a punch/trim tombstone generation at `version`: an
+    /// authoritative hole for at-or-before reads.
+    pub async fn write_tombstone_block(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        version: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        self.data_vg_proxy
+            .put_blob_tombstone(blob_guid, block_number, version, trace_id)
+            .await?;
+        Ok(())
+    }
+
     pub async fn read_block(
         &self,
         blob_guid: DataBlobGuid,
-        blob_version: u64,
+        version: u64,
         block_number: u32,
         content_len: usize,
         trace_id: &TraceId,
     ) -> Result<(Bytes, u64), FsError> {
         let mut body = Bytes::new();
-        // Do NOT enforce strict block-version == file-version equality: under
-        // the sparse override model an unrewritten block legitimately sits at
-        // an older blob_version than the file's current version (a flush bumps
-        // the file version but only rewrites dirty blocks).
-        //
-        // For an overridden file (blob_version > 1) use the max-version
-        // (quorum-check) read so a lagging replica / EC shard can't serve a
-        // pre-override block: it picks the highest version available across
-        // replicas (replicated) or reconstructs from the max-version shard
-        // cohort (EC). The initial-create version (<= 1) has no override
-        // history, so the plain first-success read is correct and faster.
-        if blob_version > 1 {
-            self.data_vg_proxy
-                .get_blob_with_quorum_check(
-                    blob_guid,
-                    block_number,
-                    content_len,
-                    &mut body,
-                    trace_id,
-                )
-                .await?;
-        } else {
-            self.data_vg_proxy
-                .get_blob(blob_guid, block_number, content_len, &mut body, trace_id)
-                .await?;
-        }
+        self.data_vg_proxy
+            .get_blob(
+                blob_guid,
+                block_number,
+                version,
+                content_len,
+                &mut body,
+                trace_id,
+            )
+            .await?;
         let checksum = xxhash_rust::xxh3::xxh3_64(&body);
         Ok((body, checksum))
     }
@@ -336,51 +333,8 @@ impl StorageBackend {
         Ok(())
     }
 
-    /// Write the geometry sentinel for `guid` at `version` (single block put).
-    pub async fn write_blob_info(
-        &self,
-        guid: DataBlobGuid,
-        info: BlobInfo,
-        version: u64,
-        trace_id: &TraceId,
-    ) -> Result<(), FsError> {
-        self.write_block(
-            guid,
-            GEOMETRY_SENTINEL_BLOCK,
-            Bytes::copy_from_slice(&info.encode()),
-            version,
-            trace_id,
-        )
-        .await
-    }
-
-    /// Read the LATEST geometry sentinel via a max-version quorum read, so a
-    /// caller holding a stale layout version still observes the most recent
-    /// cross-instance override. Returns Ok(None) if no sentinel exists yet.
-    pub async fn get_blob_info(
-        &self,
-        guid: DataBlobGuid,
-        trace_id: &TraceId,
-    ) -> Result<Option<BlobInfo>, FsError> {
-        let mut body = Bytes::new();
-        match self
-            .data_vg_proxy
-            .get_blob_with_quorum_check(guid, GEOMETRY_SENTINEL_BLOCK, 20, &mut body, trace_id)
-            .await
-        {
-            Ok(()) => Ok(BlobInfo::decode(&body)),
-            // No sentinel published yet. The quorum-check read path normalizes
-            // an all-replicas/all-shards not-found into BlockNotFound (it never
-            // surfaces a raw BssRpc(NotFound) here), so this single arm covers
-            // "no geometry override exists", mirroring read_block_cached's
-            // hole mapping. Report None and let the caller keep its cached size.
-            Err(volume_group_proxy::DataVgError::BlockNotFound) => Ok(None),
-            Err(e) => Err(FsError::DataVg(e)),
-        }
-    }
-
     /// Reserve a single block (single-op, no batch) at `version`. Used by
-    /// fallocate; EC volumes treat it as a no-op.
+    /// fallocate for replicated and EC volumes.
     pub async fn reserve_block(
         &self,
         blob_guid: DataBlobGuid,
@@ -408,6 +362,20 @@ impl StorageBackend {
         Ok(self
             .data_vg_proxy
             .list_blob_blocks(blob_guid, first_block, block_count, trace_id)
+            .await?)
+    }
+
+    /// Enumerate every physical entry for a blob from every placement node.
+    /// Whole-blob reclamation uses this stronger listing so abandoned keys
+    /// that never reached a write quorum are not missed.
+    pub async fn list_all_blob_blocks(
+        &self,
+        blob_guid: DataBlobGuid,
+        trace_id: &TraceId,
+    ) -> Result<Vec<bss_codec::list_blob_blocks_response::BlobBlockEntry>, FsError> {
+        Ok(self
+            .data_vg_proxy
+            .list_all_blob_blocks(blob_guid, trace_id)
             .await?)
     }
 
@@ -439,9 +407,7 @@ impl StorageBackend {
     /// Compare-and-swap publish: installs `value` at `key` only if the bytes
     /// currently stored match `expected_old_value` byte-for-byte (pass an
     /// empty `Bytes` to require absence). Returns the previous value bytes on
-    /// success, or `FsError::CasConflict` when the guard fails: the
-    /// override-flush path uses that typed error to forward-retry against the
-    /// winning snapshot instead of clobbering it.
+    /// success, or `FsError::CasConflict` when the guard fails.
     pub async fn put_inode_cas(
         &self,
         key: &str,
@@ -625,63 +591,43 @@ impl StorageBackend {
         }
     }
 
-    /// Delete a single data block at a specific version. Used by the
-    /// override flush to trim blocks past a shrunk EOF: the block lives on
-    /// the file's stable blob_guid, and deleting it at the bumped
-    /// `blob_version` lets BSS's version-guarded delete drop the older
-    /// block. Best-effort; logs and swallows errors like
-    /// `delete_blob_blocks`.
+    /// Delete a single data block at its exact version. Used by background
+    /// cleanup after the inode CAS makes that generation unreachable.
     pub async fn delete_block(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
         version: u64,
         trace_id: &TraceId,
-    ) {
-        if let Err(e) = self
-            .data_vg_proxy
+    ) -> Result<(), FsError> {
+        self.data_vg_proxy
             .delete_blob(blob_guid, block_number, version, trace_id)
-            .await
-        {
-            tracing::warn!(
-                %blob_guid,
-                block_number,
-                version,
-                error = %e,
-                "Failed to delete trimmed blob block"
-            );
-        }
+            .await?;
+        Ok(())
     }
 
-    /// Delete blob blocks for a given ObjectLayout. Fire-and-forget: logs
-    /// warnings on failure but does not return errors.
-    pub async fn delete_blob_blocks(&self, layout: &ObjectLayout, trace_id: &TraceId) {
-        let version = layout.blob_version;
-        // NOTE: the per-blob geometry sentinel (block GEOMETRY_SENTINEL_BLOCK)
-        // is intentionally NOT deleted here. It is a tiny (20-byte) record and
-        // an unconditional delete of it almost always misses, most blobs
-        // never publish a sentinel, and even when one exists it sits at a
-        // single version. DataVgProxy::delete_blob feeds every NotFound into
-        // the per-node circuit breaker (failure_threshold=3), so issuing a
-        // guaranteed-miss delete on every blob teardown primes the breaker and,
-        // on a single-node BSS, trips it, after which all reads/writes fail
-        // QuorumFailure and unrelated files start reporting ENOENT/EIO
-        // (observed as open/25.t flakiness). Leaking the sentinel is harmless;
-        // a later overwrite of the same blob_guid republishes it in place.
-        for (blob_guid, block_number) in blob_blocks_to_delete(layout) {
-            if let Err(e) = self
-                .data_vg_proxy
-                .delete_blob(blob_guid, block_number, version, trace_id)
-                .await
-            {
-                tracing::warn!(
-                    %blob_guid,
-                    block_number,
-                    error = %e,
-                    "Failed to delete blob block"
-                );
-            }
+    /// Enumerate and delete every exact data or reservation key for a blob.
+    /// This is proportional to allocated keys, not logical file size, and
+    /// includes orphaned generations that no block map references.
+    pub async fn delete_blob_blocks(
+        &self,
+        blob_guid: DataBlobGuid,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        let entries = self.list_all_blob_blocks(blob_guid, trace_id).await?;
+        let identities = exact_blob_identities(entries);
+        let results = stream::iter(identities)
+            .map(|(block_number, version)| async move {
+                self.delete_block(blob_guid, block_number, version, trace_id)
+                    .await
+            })
+            .buffer_unordered(32)
+            .collect::<Vec<_>>()
+            .await;
+        if let Some(error) = results.into_iter().find_map(Result::err) {
+            return Err(error);
         }
+        Ok(())
     }
 
     /// Create a directory marker in NSS.
@@ -692,5 +638,32 @@ impl StorageBackend {
             rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())?;
         self.put_inode(key, Bytes::from(value), trace_id).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_delete_keeps_sparse_and_orphaned_generations() {
+        let entry = |block_number, version, entry_type| {
+            bss_codec::list_blob_blocks_response::BlobBlockEntry {
+                block_number,
+                version,
+                entry_type,
+                is_tombstone: false,
+            }
+        };
+
+        assert_eq!(
+            exact_blob_identities(vec![
+                entry(7, 1, 0),
+                entry(7, 4, 0),
+                entry(u32::MAX - 1, 9, 1),
+                entry(7, 4, 1),
+            ]),
+            BTreeSet::from([(7, 1), (7, 4), (u32::MAX - 1, 9)])
+        );
     }
 }

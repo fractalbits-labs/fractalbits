@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use crate::{AppState, blob_storage::BlobLocation};
+use crate::{
+    AppState,
+    blob_storage::{BlobLocation, BlobStorageError},
+};
 use crate::{
     BlobClient,
     handler::{
@@ -17,13 +20,13 @@ use actix_web::{
     web::Query,
 };
 use bytes::Bytes;
-use data_types::DataBlobGuid;
 use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
-use data_types::{Bucket, TraceId};
+use data_types::{Bucket, DataBlobGuid, TraceId};
 use futures::{StreamExt, TryStreamExt, stream};
 use metrics_wrapper::histogram;
 use serde::Deserialize;
 use tracing::{Instrument, Span};
+use volume_group_proxy::AtOrBeforeRead;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -85,6 +88,7 @@ pub async fn get_object_handler(ctx: ObjectRequestContext) -> Result<HttpRespons
     let bucket = ctx.resolve_bucket().await?;
     let query_opts = Query::<QueryOpts>::from_query(ctx.request.query_string())
         .map_err(|_| S3Error::UnsupportedArgument)?;
+    validate_get_part_number(query_opts.part_number)?;
 
     // Extract header options from headers
     let header_opts = HeaderOpts::from_headers(ctx.request.headers())?;
@@ -199,6 +203,74 @@ pub fn override_headers(
     Ok(())
 }
 
+fn validate_get_part_number(part_number: Option<u32>) -> Result<(), S3Error> {
+    if part_number.is_some_and(|part_number| !(1..=10_000).contains(&part_number)) {
+        return Err(S3Error::InvalidArgument1);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_block(
+    blob_client: &BlobClient,
+    blob_guid: DataBlobGuid,
+    block_number: u32,
+    content_len: usize,
+    block_size: usize,
+    blob_location: BlobLocation,
+    ceiling: u64,
+    trace_id: &TraceId,
+) -> Result<Bytes, S3Error> {
+    // S3-backed blobs are unversioned single-generation objects; read
+    // the exact version-1 key, treating an absence quorum as sparse.
+    if blob_location == BlobLocation::S3 {
+        let mut body = Bytes::new();
+        return match blob_client
+            .get_blob(
+                blob_guid,
+                block_number,
+                1,
+                content_len,
+                blob_location,
+                &mut body,
+                trace_id,
+            )
+            .await
+        {
+            Ok(()) => {
+                if body.len() > content_len {
+                    body = body.slice(..content_len);
+                }
+                Ok(body)
+            }
+            Err(BlobStorageError::DataVg(volume_group_proxy::DataVgError::BlockNotFound)) => {
+                Ok(Bytes::from(vec![0; content_len]))
+            }
+            Err(error) => Err(error.into()),
+        };
+    }
+
+    // DataVg: at-or-before selection at the committed ceiling. Tombstones
+    // and Reserved claims read as zeros; a sparse absence quorum is a
+    // legal hole.
+    let read_len = block_size.max(content_len);
+    match blob_client
+        .get_blob_at_or_before(blob_guid, block_number, ceiling, read_len, trace_id)
+        .await
+        .map_err(S3Error::from)?
+    {
+        AtOrBeforeRead::Data { mut body, .. } => {
+            if body.len() > content_len {
+                body = body.slice(..content_len);
+            }
+            Ok(body)
+        }
+        AtOrBeforeRead::Zeros { .. } | AtOrBeforeRead::Hole { .. } | AtOrBeforeRead::SparseHole => {
+            Ok(Bytes::from(vec![0; content_len]))
+        }
+    }
+}
+
 pub async fn get_object_content(
     app: Arc<AppState>,
     bucket: &Bucket,
@@ -224,6 +296,7 @@ pub async fn get_object_content(
             let size = object.size()?;
             let block_size = object.block_size as usize;
             let blob_location = object.get_blob_location()?;
+            let ceiling = object.blob_version;
             let body_stream = get_full_blob_stream(
                 blob_client,
                 blob_guid,
@@ -231,6 +304,7 @@ pub async fn get_object_content(
                 size,
                 block_size,
                 blob_location,
+                ceiling,
                 *trace_id,
             )
             .await?;
@@ -288,6 +362,7 @@ pub async fn get_object_content(
                             let mpu_size = mpu_obj.size()?;
                             let block_size = mpu_obj.block_size as usize;
                             let blob_location = mpu_obj.get_blob_location()?;
+                            let part_ceiling = mpu_obj.blob_version;
                             get_full_blob_stream(
                                 blob_client,
                                 blob_guid,
@@ -295,6 +370,7 @@ pub async fn get_object_content(
                                 mpu_size,
                                 block_size,
                                 blob_location,
+                                part_ceiling,
                                 trace_id,
                             )
                             .await
@@ -327,6 +403,7 @@ async fn get_object_range_content(
             let blob_location = object.get_blob_location()?;
             let object_size = object.size()?;
             let num_blocks = object.num_blocks()?;
+            let ceiling = object.blob_version;
             let body_stream = get_range_blob_stream(
                 blob_client,
                 blob_guid,
@@ -336,6 +413,7 @@ async fn get_object_range_content(
                 range.start,
                 range.end,
                 blob_location,
+                ceiling,
                 *trace_id,
             );
             Ok(Box::pin(body_stream))
@@ -414,6 +492,7 @@ async fn get_object_range_content(
                                     blob_start,
                                     blob_end,
                                     BlobLocation::S3,
+                                    1,
                                     trace_id,
                                 ))
                             }
@@ -426,6 +505,7 @@ async fn get_object_range_content(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn get_full_blob_stream(
     blob_client: Arc<BlobClient>,
     blob_guid: DataBlobGuid,
@@ -433,6 +513,7 @@ async fn get_full_blob_stream(
     object_size: u64,
     block_size: usize,
     blob_location: BlobLocation,
+    ceiling: u64,
     trace_id: TraceId,
 ) -> Result<impl stream::Stream<Item = Result<Bytes, S3Error>>, S3Error> {
     if num_blocks == 0 {
@@ -445,29 +526,25 @@ async fn get_full_blob_stream(
         block_size
     };
 
-    // Get the first block
-    let mut first_block = Bytes::new();
-    blob_client
-        .get_blob(
-            blob_guid,
-            0,
-            first_block_len,
-            blob_location,
-            &mut first_block,
-            &trace_id,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(%blob_guid, block_number=0, error=?e, "failed to get blob");
-            S3Error::from(e)
-        })?;
+    let first_block = read_block(
+        &blob_client,
+        blob_guid,
+        0,
+        first_block_len,
+        block_size,
+        blob_location,
+        ceiling,
+        &trace_id,
+    )
+    .await
+    .inspect_err(|error| {
+        tracing::error!(%blob_guid, block_number = 0, %error, "failed to get blob");
+    })?;
 
     if num_blocks == 1 {
-        // Single block optimization - return immediately without streaming overhead
         return Ok(stream::once(async { Ok(first_block) }).boxed());
     }
 
-    // Multi-block case: stream first block + remaining blocks
     let remaining_stream = stream::iter(1..num_blocks).then(move |i| {
         let blob_client = blob_client.clone();
         async move {
@@ -477,24 +554,20 @@ async fn get_full_blob_stream(
             } else {
                 block_size
             };
-            let mut block = Bytes::new();
-            match blob_client
-                .get_blob(
-                    blob_guid,
-                    i as u32,
-                    content_len,
-                    blob_location,
-                    &mut block,
-                    &trace_id,
-                )
-                .await
-            {
-                Err(e) => {
-                    tracing::error!(%blob_guid, block_number=i, error=?e, "failed to get blob");
-                    Err(S3Error::from(e))
-                }
-                Ok(_) => Ok(block),
-            }
+            read_block(
+                &blob_client,
+                blob_guid,
+                i as u32,
+                content_len,
+                block_size,
+                blob_location,
+                ceiling,
+                &trace_id,
+            )
+            .await
+            .inspect_err(|error| {
+                tracing::error!(%blob_guid, block_number = i, %error, "failed to get blob");
+            })
         }
     });
 
@@ -512,6 +585,7 @@ fn get_range_blob_stream(
     start: usize,
     end: usize,
     blob_location: BlobLocation,
+    ceiling: u64,
     trace_id: TraceId,
 ) -> impl stream::Stream<Item = Result<Bytes, S3Error>> {
     let start_block_i = start / block_size;
@@ -523,32 +597,26 @@ fn get_range_blob_stream(
         .then(move |i| {
             let blob_client = blob_client.clone();
             async move {
-                let mut block = Bytes::new();
-                // For range reads, we always read full blocks and trim in the scan below
-                // except for the last block which might be partial
                 let is_last_block = i == num_blocks - 1;
                 let content_len = if is_last_block {
                     (object_size as usize) - (block_size * i)
                 } else {
                     block_size
                 };
-                match blob_client
-                    .get_blob(
-                        blob_guid,
-                        i as u32,
-                        content_len,
-                        blob_location,
-                        &mut block,
-                        &trace_id,
-                    )
-                    .await
-                {
-                    Err(e) => {
-                        tracing::error!(%blob_guid, block_number=i, error=?e, "failed to get blob");
-                        Err(S3Error::from(e))
-                    }
-                    Ok(_) => Ok(block),
-                }
+                read_block(
+                    &blob_client,
+                    blob_guid,
+                    i as u32,
+                    content_len,
+                    block_size,
+                    blob_location,
+                    ceiling,
+                    &trace_id,
+                )
+                .await
+                .inspect_err(|error| {
+                    tracing::error!(%blob_guid, block_number = i, %error, "failed to get blob");
+                })
             }
             .instrument(span.clone())
         })

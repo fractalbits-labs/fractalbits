@@ -482,9 +482,7 @@ impl VfsCore {
                 if let Ok(old_layout) =
                     rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
                 {
-                    self.backend()
-                        .delete_blob_blocks(&old_layout, &trace_id)
-                        .await;
+                    self.teardown_blob(&old_layout, &trace_id).await;
                 }
             } else {
                 // Still more handles open, re-insert

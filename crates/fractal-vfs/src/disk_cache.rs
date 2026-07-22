@@ -55,29 +55,30 @@ const BLOCK_META_SIZE: u64 = 16;
 const CACHE_MAGIC: u32 = 0x4642_4443; // "FBDC"
 const CACHE_FORMAT_VERSION: u32 = 1;
 
-/// File-level cache header. Tracks the BSS-side `blob_version` that
-/// the cache file was last reconciled against (`authoritative_blob_v`).
-/// A different instance bumping past this value is the cue to
-/// invalidate the file on next open.
+/// File-level cache header. `commit_epoch` is the newest file commit or
+/// mirror job reconciled with this cache file. It orders whole-file mirror
+/// jobs and is independent of the exact generation stored for each block.
+/// A different instance bumping past this value is the cue to invalidate the
+/// file on next open.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 struct CacheHeader {
     magic: u32,
     format_version: u32,
     block_size: u32,
     block_count: u32,
-    authoritative_blob_v: u64,
+    commit_epoch: u64,
     flags: u32,
     _reserved: u32,
 }
 
 impl CacheHeader {
-    fn new(block_size: u32, authoritative_blob_v: u64) -> Self {
+    fn new(block_size: u32, commit_epoch: u64) -> Self {
         Self {
             magic: CACHE_MAGIC,
             format_version: CACHE_FORMAT_VERSION,
             block_size,
             block_count: 0,
-            authoritative_blob_v,
+            commit_epoch,
             flags: 0,
             _reserved: 0,
         }
@@ -89,7 +90,7 @@ impl CacheHeader {
         out[4..8].copy_from_slice(&self.format_version.to_le_bytes());
         out[8..12].copy_from_slice(&self.block_size.to_le_bytes());
         out[12..16].copy_from_slice(&self.block_count.to_le_bytes());
-        out[16..24].copy_from_slice(&self.authoritative_blob_v.to_le_bytes());
+        out[16..24].copy_from_slice(&self.commit_epoch.to_le_bytes());
         out[24..28].copy_from_slice(&self.flags.to_le_bytes());
         out[28..32].copy_from_slice(&self._reserved.to_le_bytes());
         out
@@ -112,7 +113,7 @@ impl CacheHeader {
             format_version,
             block_size: u32::from_le_bytes(buf[8..12].try_into().ok()?),
             block_count: u32::from_le_bytes(buf[12..16].try_into().ok()?),
-            authoritative_blob_v: u64::from_le_bytes(buf[16..24].try_into().ok()?),
+            commit_epoch: u64::from_le_bytes(buf[16..24].try_into().ok()?),
             flags: u32::from_le_bytes(buf[24..28].try_into().ok()?),
             _reserved: u32::from_le_bytes(buf[28..32].try_into().ok()?),
         })
@@ -251,15 +252,6 @@ impl CacheTracker {
 
 // DiskCache
 
-/// Number of stripe locks serializing per-blob cache-file mutations.
-/// Fixed (not per-blob) to bound memory; distinct blobs that collide on a
-/// stripe only see rare, brief contention.
-const MIRROR_LOCK_STRIPES: usize = 256;
-/// Process-local floors only protect stale handles after their cache file has
-/// been dropped. Bound the map so a long-lived process that overrides many
-/// distinct blobs cannot grow it forever.
-const VERSION_FLOOR_CAP: usize = 65_536;
-
 /// Local NVMe disk cache for block data.
 ///
 /// Each blob maps to a sparse cache file at
@@ -277,10 +269,19 @@ const VERSION_FLOOR_CAP: usize = 65_536;
 /// treats it as a miss and refetches.
 ///
 /// Cross-instance staleness is detected at open time via
-/// `reconcile_on_open`: if the cache file's `authoritative_blob_v`
-/// lags the inode's `layout.blob_version` (another instance has
-/// bumped the version), the whole cache file is unlinked so the next
-/// read cold-fetches from BSS.
+/// `reconcile_on_open`: if the cache file's commit epoch lags the inode's
+/// `layout.blob_version` (another instance has committed a newer layout), the
+/// whole cache file is unlinked so the next read cold-fetches from BSS.
+#[allow(dead_code)]
+/// Number of stripe locks serializing per-blob cache-file mutations.
+/// Fixed (not per-blob) to bound memory; distinct blobs that collide on a
+/// stripe only see rare, brief contention.
+const MIRROR_LOCK_STRIPES: usize = 256;
+/// Process-local commit epochs fence delayed mirror jobs after their cache file
+/// has been dropped. Bound the map so a long-lived process that overrides many
+/// distinct blobs cannot grow it forever.
+const COMMIT_EPOCH_CAP: usize = 65_536;
+
 pub struct DiskCache {
     cache_dir: PathBuf,
     max_size_bytes: u64,
@@ -288,12 +289,12 @@ pub struct DiskCache {
     high_bytes: u64,
     low_bytes: u64,
     tracker: Arc<CacheTracker>,
-    /// Highest override blob_version this process has observed for each
-    /// cache file. Kept outside the cache file so dropping/evicting the file
-    /// does not let stale open handles fall back to old-version BSS reads.
-    version_floors: Arc<Mutex<LruCache<(Uuid, u16), u64>>>,
+    /// Highest file commit epoch this process has observed for each cache
+    /// file. Kept outside the cache file so dropping the file does not let a
+    /// delayed older mirror job recreate stale cache contents.
+    commit_epochs: Arc<Mutex<LruCache<(Uuid, u16), u64>>>,
     /// Serializes cache writers for the same blob so they cannot race on the
-    /// cache file or its version floor. Striped to bound memory. With the
+    /// cache file or its commit epoch. Striped to bound memory. With the
     /// inline mirror this was guaranteed by the single-writer-per-inode
     /// lock; the async create mirror runs on its own thread, so the
     /// serialization is reestablished here.
@@ -309,19 +310,19 @@ impl DiskCache {
         max_size_gb: u64,
         block_size: u64,
     ) -> io::Result<Self> {
-        Self::new_with_version_floor_cap(
+        Self::new_with_commit_epoch_cap(
             cache_dir,
             max_size_gb,
             block_size,
-            NonZeroUsize::new(VERSION_FLOOR_CAP).expect("version floor cap is nonzero"),
+            NonZeroUsize::new(COMMIT_EPOCH_CAP).expect("commit epoch cap is nonzero"),
         )
     }
 
-    fn new_with_version_floor_cap(
+    fn new_with_commit_epoch_cap(
         cache_dir: impl Into<PathBuf>,
         max_size_gb: u64,
         block_size: u64,
-        version_floor_cap: NonZeroUsize,
+        commit_epoch_cap: NonZeroUsize,
     ) -> io::Result<Self> {
         let cache_dir = cache_dir.into();
         std::fs::create_dir_all(&cache_dir)?;
@@ -331,7 +332,7 @@ impl DiskCache {
 
         let max_size_bytes = max_size_gb * 1024 * 1024 * 1024;
         let tracker = Arc::new(CacheTracker::new());
-        let version_floors = Arc::new(Mutex::new(LruCache::new(version_floor_cap)));
+        let commit_epochs = Arc::new(Mutex::new(LruCache::new(commit_epoch_cap)));
 
         // Cold-start: populate tracker from existing cache files
         cold_start_scan(&cache_dir, &tracker);
@@ -347,7 +348,7 @@ impl DiskCache {
             high_bytes: (max_size_bytes as f64 * HIGH_WATERMARK) as u64,
             low_bytes: (max_size_bytes as f64 * LOW_WATERMARK) as u64,
             tracker,
-            version_floors,
+            commit_epochs,
             mirror_locks,
         })
     }
@@ -358,25 +359,25 @@ impl DiskCache {
         &self.mirror_locks[idx]
     }
 
-    fn memory_floor(&self, blob_id: Uuid, vol: u16) -> u64 {
-        self.version_floors
+    fn memory_commit_epoch(&self, blob_id: Uuid, vol: u16) -> u64 {
+        self.commit_epochs
             .lock()
             .get(&(blob_id, vol))
             .copied()
             .unwrap_or(0)
     }
 
-    fn record_floor(&self, blob_id: Uuid, vol: u16, version: u64) {
-        if version <= 1 {
+    fn record_commit_epoch(&self, blob_id: Uuid, vol: u16, commit_epoch: u64) {
+        if commit_epoch <= 1 {
             return;
         }
-        let mut floors = self.version_floors.lock();
-        if let Some(entry) = floors.get_mut(&(blob_id, vol)) {
-            if version > *entry {
-                *entry = version;
+        let mut epochs = self.commit_epochs.lock();
+        if let Some(entry) = epochs.get_mut(&(blob_id, vol)) {
+            if commit_epoch > *entry {
+                *entry = commit_epoch;
             }
         } else {
-            floors.push((blob_id, vol), version);
+            epochs.push((blob_id, vol), commit_epoch);
         }
     }
 
@@ -423,8 +424,9 @@ impl DiskCache {
             .join(format!("{}_{}", blob_id.as_simple(), vol))
     }
 
-    /// Read a cached block. Returns None on miss (block never cached,
-    /// or checksum mismatch, both treated identically by callers).
+    /// Read a cached block without checking its generation. Committed-layout
+    /// callers should use `get_block_exact`. Returns None on miss (block never
+    /// cached or checksum mismatch, both treated identically by callers).
     ///
     /// The cache always stores blocks at `self.block_size` bytes
     /// (zero-padded by writers; BSS pads identically on the
@@ -440,6 +442,31 @@ impl DiskCache {
         block: u32,
         block_content_len: usize,
     ) -> Option<Bytes> {
+        self.get_block_with_version(blob_guid, block, None, block_content_len)
+            .await
+    }
+
+    /// Read a cached block only when its metadata carries `expected_version`.
+    /// The version and checksum are validated from the same metadata record,
+    /// so a caller never needs a separate version probe before reading bytes.
+    pub async fn get_block_exact(
+        &self,
+        blob_guid: DataBlobGuid,
+        block: u32,
+        expected_version: u64,
+        block_content_len: usize,
+    ) -> Option<Bytes> {
+        self.get_block_with_version(blob_guid, block, Some(expected_version), block_content_len)
+            .await
+    }
+
+    async fn get_block_with_version(
+        &self,
+        blob_guid: DataBlobGuid,
+        block: u32,
+        expected_version: Option<u64>,
+        block_content_len: usize,
+    ) -> Option<Bytes> {
         let blob_id = blob_guid.blob_id;
         let vol = blob_guid.volume_id;
         let path = self.cache_file_path(blob_id, vol);
@@ -452,7 +479,9 @@ impl DiskCache {
         }
 
         let meta = read_block_meta(&file, block).await?;
-        if !meta.is_cached() {
+        if !meta.is_cached()
+            || expected_version.is_some_and(|version| meta.block_version != version)
+        {
             return None;
         }
 
@@ -485,8 +514,9 @@ impl DiskCache {
         Some(Bytes::from(data).slice(..take))
     }
 
-    /// Read a cached block into a caller-provided buffer (zero-copy
-    /// path). Returns Some(bytes_read) on hit, None on miss.
+    /// Read a cached block into a caller-provided buffer without checking its
+    /// generation. Committed-layout callers should use `get_block_into_exact`.
+    /// Returns Some(bytes_read) on hit, None on miss.
     ///
     /// The on-disk block is `self.block_size` bytes long and the
     /// checksum is over the full block, so for a partial last block
@@ -503,6 +533,39 @@ impl DiskCache {
         block_content_len: usize,
         buf: &mut [u8],
     ) -> Option<usize> {
+        self.get_block_into_with_version(blob_guid, block, None, block_content_len, buf)
+            .await
+    }
+
+    /// Read a cached block into `buf` only when its metadata carries
+    /// `expected_version`. The version and checksum are validated from the
+    /// same metadata record before the buffer is accepted as a cache hit.
+    pub async fn get_block_into_exact(
+        &self,
+        blob_guid: DataBlobGuid,
+        block: u32,
+        expected_version: u64,
+        block_content_len: usize,
+        buf: &mut [u8],
+    ) -> Option<usize> {
+        self.get_block_into_with_version(
+            blob_guid,
+            block,
+            Some(expected_version),
+            block_content_len,
+            buf,
+        )
+        .await
+    }
+
+    async fn get_block_into_with_version(
+        &self,
+        blob_guid: DataBlobGuid,
+        block: u32,
+        expected_version: Option<u64>,
+        block_content_len: usize,
+        buf: &mut [u8],
+    ) -> Option<usize> {
         let blob_id = blob_guid.blob_id;
         let vol = blob_guid.volume_id;
         let path = self.cache_file_path(blob_id, vol);
@@ -514,7 +577,9 @@ impl DiskCache {
         }
 
         let meta = read_block_meta(&file, block).await?;
-        if !meta.is_cached() {
+        if !meta.is_cached()
+            || expected_version.is_some_and(|version| meta.block_version != version)
+        {
             return None;
         }
 
@@ -597,13 +662,10 @@ impl DiskCache {
         let vol = blob_guid.volume_id;
         let path = self.cache_file_path(blob_id, vol);
 
-        // Serialize against drop_blob / sync_after_flush for
-        // this blob so the floor check below and the block write are atomic.
+        // Serialize against drop_blob and sync_after_flush for this blob so a
+        // mirror job cannot race the block write or header initialization.
         let _guard = self.mirror_lock(blob_guid).lock().await;
-        let memory_floor = self.memory_floor(blob_id, vol);
-        if block_version < memory_floor {
-            return Ok(());
-        }
+        let memory_commit_epoch = self.memory_commit_epoch(blob_id, vol);
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -616,31 +678,26 @@ impl DiskCache {
                 tracing::warn!(%blob_id, vol, block, error = %e, "failed to open cache file");
             })?;
 
-        // Header + version floor. A read handle whose layout still carries
-        // an old blob_version can cold-fetch superseded bytes from BSS's
-        // non-quorum path; caching them below the floor that a newer
-        // override flush established (via sync_after_flush) would
-        // poison later reads, which only check populated+checksum, not
-        // version. So refuse to cache a block older than the floor. A brand
-        // new (or malformed) header reads as None -> initialize it; the
-        // per-block xxhash gate keeps any leftover bytes from being trusted.
+        // The header epoch orders whole-file mirror jobs only. Exact block
+        // generations are independent: a committed layout at epoch 2 can
+        // still reference an unchanged version-1 block, so an exact v1 cold
+        // fill must be admitted without lowering the epoch. A new or malformed
+        // header inherits the process-local epoch when available; otherwise it
+        // starts at the initial commit epoch.
         match read_header(&file).await {
             Some(mut hdr) => {
-                let floor = memory_floor.max(hdr.authoritative_blob_v);
-                if block_version < floor {
-                    return Ok(());
-                }
-                if floor > hdr.authoritative_blob_v {
-                    hdr.authoritative_blob_v = floor;
+                let commit_epoch = memory_commit_epoch.max(hdr.commit_epoch);
+                if commit_epoch > hdr.commit_epoch {
+                    hdr.commit_epoch = commit_epoch;
                     write_header(&mut file, &hdr).await?;
                 }
-                self.record_floor(blob_id, vol, floor);
+                self.record_commit_epoch(blob_id, vol, commit_epoch);
             }
             None => {
-                let floor = memory_floor.max(block_version);
-                let header = CacheHeader::new(self.block_size as u32, floor);
+                let commit_epoch = memory_commit_epoch.max(1);
+                let header = CacheHeader::new(self.block_size as u32, commit_epoch);
                 write_header(&mut file, &header).await?;
-                self.record_floor(blob_id, vol, floor);
+                self.record_commit_epoch(blob_id, vol, commit_epoch);
             }
         }
 
@@ -713,22 +770,20 @@ impl DiskCache {
         clear_block_meta(&file, block).await
     }
 
-    /// The recorded version floor (`authoritative_blob_v` on disk, plus the
-    /// in-process floor kept when a cache file is removed), or `None` if no
-    /// floor exists. A read that missed cache uses this to lower-bound the
-    /// BSS fetch version, so a reader on a stale handle doesn't refetch a
-    /// superseded version when this instance has already seen newer.
-    pub async fn floor_version(&self, blob_guid: DataBlobGuid) -> Option<u64> {
-        let memory_floor = self.memory_floor(blob_guid.blob_id, blob_guid.volume_id);
+    /// The newest file commit epoch recorded on disk or in this process.
+    /// This value orders mirror jobs and does not constrain which exact block
+    /// generations may be cached.
+    pub async fn commit_epoch(&self, blob_guid: DataBlobGuid) -> Option<u64> {
+        let memory_epoch = self.memory_commit_epoch(blob_guid.blob_id, blob_guid.volume_id);
         let path = self.cache_file_path(blob_guid.blob_id, blob_guid.volume_id);
-        let file_floor = match File::open(&path).await {
-            Ok(file) => read_header(&file).await.map(|h| h.authoritative_blob_v),
+        let file_epoch = match File::open(&path).await {
+            Ok(file) => read_header(&file).await.map(|h| h.commit_epoch),
             Err(_) => None,
         };
-        match (memory_floor, file_floor) {
+        match (memory_epoch, file_epoch) {
             (0, None) => None,
-            (floor, None) => Some(floor),
-            (floor, Some(file_floor)) => Some(floor.max(file_floor)),
+            (epoch, None) => Some(epoch),
+            (epoch, Some(file_epoch)) => Some(epoch.max(file_epoch)),
         }
     }
 
@@ -739,31 +794,56 @@ impl DiskCache {
     /// populated+checksum hit, so an override flush must not report success
     /// with that file still active. Holds the stripe lock so it cannot race a
     /// concurrent write for the same blob.
-    pub async fn drop_blob(&self, blob_guid: DataBlobGuid, floor_version: u64) {
+    pub async fn drop_blob(&self, blob_guid: DataBlobGuid, commit_epoch: u64) {
         let _guard = self.mirror_lock(blob_guid).lock().await;
         let blob_id = blob_guid.blob_id;
         let vol = blob_guid.volume_id;
         let path = self.cache_file_path(blob_id, vol);
-        self.record_floor(blob_id, vol, floor_version);
+        self.record_commit_epoch(blob_id, vol, commit_epoch);
         self.tracker.remove(blob_id, vol);
         let _ = compio_fs::remove_file(&path).await;
     }
 
-    /// Post-flush hook. Updates the cache to reflect the writer's
-    /// just-published version: rewrites land at their natural offsets,
-    /// deletes punch holes, the per-block metadata is bumped to the
-    /// new version, and the header's `authoritative_blob_v` advances.
+    /// Post-flush wrapper for commits whose rewritten blocks all use the
+    /// commit epoch as their exact generation.
     pub async fn sync_after_flush(
         &self,
         blob_guid: DataBlobGuid,
-        new_blob_version: u64,
+        commit_epoch: u64,
         rewrites: &[(u32, Bytes)],
         deletes: &[u32],
     ) -> io::Result<()> {
-        if new_blob_version == 0 {
+        let exact_rewrites: Vec<(u32, u64, Bytes)> = rewrites
+            .iter()
+            .map(|(block, bytes)| (*block, commit_epoch, bytes.clone()))
+            .collect();
+        self.sync_after_flush_exact(blob_guid, commit_epoch, &exact_rewrites, deletes)
+            .await
+    }
+
+    /// Post-flush hook for exact per-block generations. `commit_epoch` orders
+    /// whole-file mirror jobs, while each rewrite carries the generation that
+    /// must be stamped into that block's metadata.
+    pub async fn sync_after_flush_exact(
+        &self,
+        blob_guid: DataBlobGuid,
+        commit_epoch: u64,
+        rewrites: &[(u32, u64, Bytes)],
+        deletes: &[u32],
+    ) -> io::Result<()> {
+        if commit_epoch == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "new_blob_version=0 is reserved",
+                "commit_epoch=0 is reserved",
+            ));
+        }
+        if rewrites
+            .iter()
+            .any(|(_, block_version, _)| *block_version == 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "block_version=0 is reserved as the not-cached sentinel",
             ));
         }
         let blob_id = blob_guid.blob_id;
@@ -771,10 +851,10 @@ impl DiskCache {
         let path = self.cache_file_path(blob_id, vol);
 
         // Serialize against concurrent cache writers for the same blob, and
-        // read the version floor they may have set.
+        // read the commit epoch they may have set.
         let _guard = self.mirror_lock(blob_guid).lock().await;
-        let memory_floor = self.memory_floor(blob_id, vol);
-        if new_blob_version < memory_floor {
+        let memory_commit_epoch = self.memory_commit_epoch(blob_id, vol);
+        if commit_epoch < memory_commit_epoch {
             return Ok(());
         }
 
@@ -786,30 +866,28 @@ impl DiskCache {
             .open(&path)
             .await?;
 
-        // Version floor + header advance. If a newer flush already raised
-        // `authoritative_blob_v` past this job's version (via
-        // `sync_after_flush`/`drop_blob` or a later mirror write), this job is a
-        // stale straggler: writing its blocks would revive data the newer
-        // flush superseded, so skip it entirely. The blocks it would have
-        // written stay missing and cold-fetch the current bytes from BSS.
+        // If a newer commit already advanced the file epoch, this mirror is a
+        // stale straggler and must be skipped in full. Per-block generations
+        // do not participate in this ordering because one committed layout can
+        // legitimately reference blocks from several generations.
         match read_header(&file).await {
             Some(mut hdr) => {
-                let floor = memory_floor.max(hdr.authoritative_blob_v);
-                if new_blob_version < floor {
+                let current_epoch = memory_commit_epoch.max(hdr.commit_epoch);
+                if commit_epoch < current_epoch {
                     return Ok(());
                 }
-                let new_floor = floor.max(new_blob_version);
-                if new_floor > hdr.authoritative_blob_v {
-                    hdr.authoritative_blob_v = new_floor;
+                let new_epoch = current_epoch.max(commit_epoch);
+                if new_epoch > hdr.commit_epoch {
+                    hdr.commit_epoch = new_epoch;
                     write_header(&mut file, &hdr).await?;
                 }
-                self.record_floor(blob_id, vol, new_floor);
+                self.record_commit_epoch(blob_id, vol, new_epoch);
             }
             None => {
-                let floor = memory_floor.max(new_blob_version);
-                let hdr = CacheHeader::new(self.block_size as u32, floor);
+                let new_epoch = memory_commit_epoch.max(commit_epoch);
+                let hdr = CacheHeader::new(self.block_size as u32, new_epoch);
                 write_header(&mut file, &hdr).await?;
-                self.record_floor(blob_id, vol, floor);
+                self.record_commit_epoch(blob_id, vol, new_epoch);
             }
         }
 
@@ -817,12 +895,10 @@ impl DiskCache {
         let bsz = self.block_size as usize;
         let mut added_bytes: u64 = 0;
 
-        // Rewrites: write block_size-padded bytes + bump metadata to
-        // new_blob_version. Padding (and checksumming over the full
-        // block) is what keeps the cache consistent across file_size
-        // changes: an extend followed by a read at the formerly-last
-        // block sees `block_size` bytes laid out the way BSS would.
-        for (block_num, bytes) in rewrites {
+        // Rewrites: write block_size-padded bytes and stamp each block's exact
+        // generation. Padding and checksumming over the full block keep the
+        // cache consistent across file_size changes.
+        for (block_num, block_version, bytes) in rewrites {
             let was_populated = is_block_populated(fd, *block_num, self.block_size);
             let block_offset = (*block_num as u64) * self.block_size;
             let padded = pad_to_block_size_owned(bytes, bsz);
@@ -835,7 +911,7 @@ impl DiskCache {
                 return Err(e);
             }
             let meta = BlockMeta {
-                block_version: new_blob_version,
+                block_version: *block_version,
                 checksum,
             };
             write_block_meta(&mut file, *block_num, &meta).await?;
@@ -859,8 +935,8 @@ impl DiskCache {
         // The data stays in the page cache and the OS writes it back
         // lazily; on a crash a torn block fails its per-block checksum
         // on read and cold-fetches from BSS, and reconcile_on_open
-        // drops a cache file whose header lags the authoritative
-        // blob_version. Eviction/teardown can force a single bulk sync
+        // drops a cache file whose commit epoch lags the layout.
+        // Eviction/teardown can force a single bulk sync
         // if cache persistence across reboot is ever required.
 
         if added_bytes > 0 {
@@ -881,10 +957,10 @@ impl DiskCache {
     pub async fn reconcile_on_open(
         &self,
         blob_guid: DataBlobGuid,
-        layout_blob_version: u64,
+        layout_commit_epoch: u64,
     ) -> io::Result<()> {
-        if layout_blob_version > 1 {
-            self.record_floor(blob_guid.blob_id, blob_guid.volume_id, layout_blob_version);
+        if layout_commit_epoch > 1 {
+            self.record_commit_epoch(blob_guid.blob_id, blob_guid.volume_id, layout_commit_epoch);
         }
         let blob_id = blob_guid.blob_id;
         let vol = blob_guid.volume_id;
@@ -906,11 +982,11 @@ impl DiskCache {
                 return Ok(());
             }
         };
-        if header.authoritative_blob_v < layout_blob_version {
+        if header.commit_epoch < layout_commit_epoch {
             tracing::info!(
                 %blob_id, vol,
-                cache_v = header.authoritative_blob_v,
-                layout_v = layout_blob_version,
+                cache_epoch = header.commit_epoch,
+                layout_epoch = layout_commit_epoch,
                 "disk cache stale (cross-instance bump), unlinking",
             );
             drop(file);
@@ -1327,6 +1403,41 @@ mod tests {
     }
 
     #[compio_macros::test]
+    async fn test_get_block_exact_rejects_other_generation() {
+        let dir = test_cache_dir();
+        let cache = DiskCache::new(&dir, 1, 1024).unwrap();
+
+        let guid = guid_with(Uuid::new_v4(), 1);
+        let version_7 = vec![0x77u8; 1024];
+        cache.insert_block(guid, 0, 7, &version_7).await.unwrap();
+
+        assert_eq!(cache.get_block_exact(guid, 0, 6, 1024).await, None);
+        assert_eq!(
+            cache
+                .get_block_exact(guid, 0, 7, 1024)
+                .await
+                .expect("exact generation should hit")
+                .as_ref(),
+            &version_7[..]
+        );
+
+        let version_8 = vec![0x88u8; 1024];
+        cache.insert_block(guid, 0, 8, &version_8).await.unwrap();
+
+        assert_eq!(cache.get_block_exact(guid, 0, 7, 1024).await, None);
+        assert_eq!(
+            cache
+                .get_block_exact(guid, 0, 8, 1024)
+                .await
+                .expect("replacement generation should hit")
+                .as_ref(),
+            &version_8[..]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio_macros::test]
     async fn test_get_block_into() {
         let dir = test_cache_dir();
         let cache = DiskCache::new(&dir, 1, 1024).unwrap();
@@ -1344,6 +1455,39 @@ mod tests {
         let mut buf2 = vec![0u8; 1024];
         let result = cache.get_block_into(guid, 1, 1024, &mut buf2).await;
         assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio_macros::test]
+    async fn test_get_block_into_exact_rejects_other_generation() {
+        let dir = test_cache_dir();
+        let cache = DiskCache::new(&dir, 1, 1024).unwrap();
+
+        let guid = guid_with(Uuid::new_v4(), 1);
+        let data = vec![0x55u8; 1024];
+        cache.insert_block(guid, 0, 4, &data).await.unwrap();
+
+        let mut rejected = vec![0xAAu8; 1024];
+        assert_eq!(
+            cache
+                .get_block_into_exact(guid, 0, 3, 1024, &mut rejected)
+                .await,
+            None
+        );
+        assert!(
+            rejected.iter().all(|byte| *byte == 0xAA),
+            "rejected generation must not alter the destination buffer"
+        );
+
+        let mut accepted = vec![0u8; 1024];
+        assert_eq!(
+            cache
+                .get_block_into_exact(guid, 0, 4, 1024, &mut accepted)
+                .await,
+            Some(1024)
+        );
+        assert_eq!(accepted, data);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1411,9 +1555,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `sync_after_flush` updates the in-place file: same path, new
-    /// bytes at the rewritten offsets, new per-block version,
-    /// header's authoritative_blob_v advanced.
+    /// `sync_after_flush_exact` updates the in-place file: same path, new
+    /// bytes and exact generations at rewritten offsets, and an advanced
+    /// commit epoch in the header.
     #[compio_macros::test]
     async fn test_sync_after_flush_in_place() {
         let dir = test_cache_dir();
@@ -1431,10 +1575,20 @@ mod tests {
         let path_before = cache.cache_file_path(guid.blob_id, guid.volume_id);
         assert!(path_before.exists());
 
-        // Override flush: rewrite block 1 only -> V=2.
+        // Commit epoch 2 rewrites block 1 at generation 2 and mirrors a
+        // version-1 append independently.
         let new_block_1 = vec![22u8; block_size as usize];
+        let appended_block_3 = vec![33u8; block_size as usize];
         cache
-            .sync_after_flush(guid, 2, &[(1, Bytes::from(new_block_1.clone()))], &[])
+            .sync_after_flush_exact(
+                guid,
+                2,
+                &[
+                    (1, 2, Bytes::from(new_block_1.clone())),
+                    (3, 1, Bytes::from(appended_block_3.clone())),
+                ],
+                &[],
+            )
             .await
             .unwrap();
 
@@ -1448,10 +1602,12 @@ mod tests {
             .collect();
         assert_eq!(files.len(), 1, "exactly one cache file post-override");
 
-        // Per-block versions: blocks 0 and 2 still at v1; block 1 at v2.
+        // The commit epoch and exact per-block generations remain independent.
         assert_eq!(cache.get_block_version(guid, 0).await, Some(1));
         assert_eq!(cache.get_block_version(guid, 1).await, Some(2));
         assert_eq!(cache.get_block_version(guid, 2).await, Some(1));
+        assert_eq!(cache.get_block_version(guid, 3).await, Some(1));
+        assert_eq!(cache.commit_epoch(guid).await, Some(2));
 
         // Reading returns the new bytes for block 1 and the old bytes
         // for blocks 0 and 2.
@@ -1478,6 +1634,14 @@ mod tests {
                 .unwrap()
                 .as_ref(),
             &v1_data_2[..]
+        );
+        assert_eq!(
+            cache
+                .get_block(guid, 3, block_size as usize)
+                .await
+                .unwrap()
+                .as_ref(),
+            &appended_block_3[..]
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1515,7 +1679,10 @@ mod tests {
 
         let guid = guid_with(Uuid::new_v4(), 1);
         let data = vec![9u8; block_size as usize];
-        cache.insert_block(guid, 0, 5, &data).await.unwrap();
+        cache
+            .sync_after_flush_exact(guid, 5, &[(0, 5, Bytes::from(data))], &[])
+            .await
+            .unwrap();
         let path = cache.cache_file_path(guid.blob_id, guid.volume_id);
         assert!(path.exists());
 
@@ -1523,7 +1690,7 @@ mod tests {
         cache.reconcile_on_open(guid, 6).await.unwrap();
         assert!(!path.exists(), "stale cache file unlinked");
         assert_eq!(cache.tracked_file_count(), 0);
-        assert_eq!(cache.floor_version(guid).await, Some(6));
+        assert_eq!(cache.commit_epoch(guid).await, Some(6));
 
         // No-op when cache file is missing.
         cache.reconcile_on_open(guid, 6).await.unwrap();
@@ -1531,8 +1698,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Reconcile leaves the cache alone when its authoritative_blob_v
-    /// is >= the layout's blob_version.
+    /// Reconcile leaves the cache alone when its commit epoch is at least the
+    /// layout's commit epoch.
     #[compio_macros::test]
     async fn test_reconcile_keeps_fresh_cache() {
         let dir = test_cache_dir();
@@ -1541,8 +1708,10 @@ mod tests {
 
         let guid = guid_with(Uuid::new_v4(), 1);
         let data = vec![9u8; block_size as usize];
-        cache.insert_block(guid, 0, 10, &data).await.unwrap();
+        cache.reconcile_on_open(guid, 10).await.unwrap();
+        cache.insert_block(guid, 0, 1, &data).await.unwrap();
         let path = cache.cache_file_path(guid.blob_id, guid.volume_id);
+        assert_eq!(cache.commit_epoch(guid).await, Some(10));
 
         cache.reconcile_on_open(guid, 10).await.unwrap();
         assert!(path.exists(), "cache file kept when up to date");
@@ -1552,12 +1721,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An override (sync_after_flush at a higher version) overwrites the
-    /// block bytes in place and raises the version floor; a stale older
-    /// sync_after_flush below the floor is then refused, instead of
+    /// A newer mirror commit overwrites the block bytes in place and raises
+    /// the commit epoch. A delayed older mirror commit is fenced without
     /// reviving the superseded bytes.
     #[compio_macros::test]
-    async fn test_sync_after_flush_overrides_and_floors() {
+    async fn test_sync_after_flush_exact_fences_stale_commit() {
         let dir = test_cache_dir();
         let block_size = 8192u64;
         let cache = DiskCache::new(&dir, 1, block_size).unwrap();
@@ -1572,10 +1740,10 @@ mod tests {
             Some(&v1[..])
         );
 
-        // Override to v2 rewrites block 0 in place and raises the floor.
+        // Commit epoch 2 rewrites block 0 at exact generation 2.
         let v2 = vec![0xBBu8; bsz];
         cache
-            .sync_after_flush(guid, 2, &[(0, Bytes::from(v2.clone()))], &[])
+            .sync_after_flush_exact(guid, 2, &[(0, 2, Bytes::from(v2.clone()))], &[])
             .await
             .unwrap();
         assert_eq!(
@@ -1583,29 +1751,27 @@ mod tests {
             Some(&v2[..]),
             "override bytes visible immediately"
         );
-        assert_eq!(cache.floor_version(guid).await, Some(2));
+        assert_eq!(cache.commit_epoch(guid).await, Some(2));
 
-        // A stale older mirror job (e.g. a delayed create-job at v1) must
-        // NOT revive the superseded bytes: it is below the floor.
+        // A delayed commit-epoch-1 mirror must not revive its old bytes.
         cache
-            .sync_after_flush(guid, 1, &[(0, Bytes::from(vec![0xDDu8; bsz]))], &[])
+            .sync_after_flush_exact(guid, 1, &[(0, 1, Bytes::from(vec![0xDDu8; bsz]))], &[])
             .await
             .unwrap();
         assert_eq!(
             cache.get_block(guid, 0, bsz).await.as_deref(),
             Some(&v2[..]),
-            "stale v1 mirror job refused by version floor"
+            "stale mirror commit must be fenced"
         );
+        assert_eq!(cache.commit_epoch(guid).await, Some(2));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A read-miss cold-fill (`insert_block`) must honor the version floor
-    /// too: a read on a lagging handle can fetch superseded bytes from
-    /// BSS's non-quorum path, and caching them below the floor would
-    /// poison later reads. The stale insert is refused; a matching lands.
+    /// Exact block generations do not inherit the file commit epoch. A layout
+    /// committed at epoch 2 can still reference an unchanged version-1 block.
     #[compio_macros::test]
-    async fn test_insert_block_honors_version_floor() {
+    async fn test_insert_block_accepts_generation_below_commit_epoch() {
         let dir = test_cache_dir();
         let block_size = 8192u64;
         let cache = DiskCache::new(&dir, 1, block_size).unwrap();
@@ -1613,38 +1779,34 @@ mod tests {
         let guid = guid_with(Uuid::new_v4(), 1);
         let bsz = block_size as usize;
 
-        // An override to v2 (writes block 0) establishes a floor of 2.
+        // Establish commit epoch 2 with a generation-2 rewrite.
         cache
-            .sync_after_flush(guid, 2, &[(0, Bytes::from(vec![0xBBu8; bsz]))], &[])
+            .sync_after_flush_exact(guid, 2, &[(0, 2, Bytes::from(vec![0xBBu8; bsz]))], &[])
             .await
             .unwrap();
-        assert_eq!(cache.floor_version(guid).await, Some(2));
+        assert_eq!(cache.commit_epoch(guid).await, Some(2));
 
-        // A stale v1 cold-fill of block 1 must NOT populate.
-        cache
-            .insert_block(guid, 1, 1, &vec![0xDDu8; bsz])
-            .await
-            .unwrap();
-        assert!(
-            cache.get_block(guid, 1, bsz).await.is_none(),
-            "stale v1 cold-fill refused by version floor"
-        );
-
-        // A floor-matching v2 cold-fill lands.
-        let fresh = vec![0xEEu8; bsz];
-        cache.insert_block(guid, 1, 2, &fresh).await.unwrap();
+        // The committed layout still references block 1 at exact generation 1.
+        let v1 = vec![0xDDu8; bsz];
+        cache.insert_block(guid, 1, 1, &v1).await.unwrap();
         assert_eq!(
             cache.get_block(guid, 1, bsz).await.as_deref(),
-            Some(&fresh[..]),
-            "version-2 cold-fill lands"
+            Some(&v1[..]),
+            "exact generation-1 cold-fill must land"
+        );
+        assert_eq!(cache.get_block_version(guid, 1).await, Some(1));
+        assert_eq!(
+            cache.commit_epoch(guid).await,
+            Some(2),
+            "cold-fill must not lower the commit epoch"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `drop_blob` (the override-mirror-failure fallback) removes the whole
-    /// cache file so every block misses, while preserving the version floor
-    /// so stale handles cannot repopulate below it.
+    /// `drop_blob` removes the whole cache file while preserving the commit
+    /// epoch. Delayed older mirrors stay fenced, but exact older block
+    /// generations may cold-fill again when a committed layout references them.
     #[compio_macros::test]
     async fn test_drop_blob_removes_cache_file() {
         let dir = test_cache_dir();
@@ -1672,16 +1834,22 @@ mod tests {
             "every block misses after drop"
         );
         assert!(cache.get_block(guid, 1, bsz).await.is_none());
-        assert_eq!(cache.floor_version(guid).await, Some(2));
+        assert_eq!(cache.commit_epoch(guid).await, Some(2));
 
         cache
-            .insert_block(guid, 0, 1, &vec![0xDDu8; bsz])
+            .sync_after_flush_exact(guid, 1, &[(0, 1, Bytes::from(vec![0xCCu8; bsz]))], &[])
             .await
             .unwrap();
-        assert!(
-            cache.get_block(guid, 0, bsz).await.is_none(),
-            "stale cold-fill refused after drop"
+        assert!(!path.exists(), "stale mirror must not recreate the file");
+
+        let exact_v1 = vec![0xDDu8; bsz];
+        cache.insert_block(guid, 0, 1, &exact_v1).await.unwrap();
+        assert_eq!(
+            cache.get_block(guid, 0, bsz).await.as_deref(),
+            Some(&exact_v1[..]),
+            "exact generation-1 cold-fill must be admitted"
         );
+        assert_eq!(cache.commit_epoch(guid).await, Some(2));
 
         // Drop on an absent blob is a no-op.
         cache.drop_blob(guid_with(Uuid::new_v4(), 1), 2).await;
@@ -1689,13 +1857,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The in-process floor map is bounded. Evicting an old floor is allowed:
-    /// it only drops protection for a very old stale handle after the cache
-    /// file was removed.
+    /// The in-process commit-epoch map is bounded. Evicting an old entry is
+    /// allowed because it only drops protection against a very old delayed
+    /// mirror after the cache file was removed.
     #[compio_macros::test]
-    async fn test_version_floor_map_is_lru_capped() {
+    async fn test_commit_epoch_map_is_lru_capped() {
         let dir = test_cache_dir();
-        let cache = DiskCache::new_with_version_floor_cap(
+        let cache = DiskCache::new_with_commit_epoch_cap(
             &dir,
             1,
             8192,
@@ -1709,21 +1877,21 @@ mod tests {
 
         cache.drop_blob(guid1, 2).await;
         cache.drop_blob(guid2, 3).await;
-        assert_eq!(cache.floor_version(guid1).await, Some(2));
+        assert_eq!(cache.commit_epoch(guid1).await, Some(2));
 
         cache.drop_blob(guid3, 4).await;
 
         assert_eq!(
-            cache.floor_version(guid1).await,
+            cache.commit_epoch(guid1).await,
             Some(2),
-            "recently touched floor retained"
+            "recently touched epoch retained"
         );
         assert_eq!(
-            cache.floor_version(guid2).await,
+            cache.commit_epoch(guid2).await,
             None,
-            "least recently used floor evicted"
+            "least recently used epoch evicted"
         );
-        assert_eq!(cache.floor_version(guid3).await, Some(4));
+        assert_eq!(cache.commit_epoch(guid3).await, Some(4));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1860,7 +2028,7 @@ mod tests {
             format_version: CACHE_FORMAT_VERSION,
             block_size: 65536,
             block_count: 1024,
-            authoritative_blob_v: 12345,
+            commit_epoch: 12345,
             flags: 0,
             _reserved: 0,
         };

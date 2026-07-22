@@ -22,6 +22,8 @@ message ListBlobsResponse {
     uint64 checksum_body = 3;
     uint64 version = 4;
     bool is_deleted = 5;
+    // 0 = Data, 1 = Reserved.
+    uint32 entry_type = 6;
   }
 
   message Blobs {
@@ -56,6 +58,14 @@ message ReserveBlocksResponse {
 message ListBlobBlocksRequest {
   uint32 first_block = 1;
   uint32 block_count = 2;
+  string marker = 3;
+}
+
+// GetBlobAtOrBefore: select the newest generation of a single block with
+// version <= header.version (the committed ceiling). The response body
+// is the raw block payload; the selected version, entry type, and punch
+// flag ride the response header.
+message GetBlobAtOrBeforeRequest {
 }
 
 message ListBlobBlocksResponse {
@@ -69,9 +79,14 @@ message ListBlobBlocksResponse {
     // 0 = Data, 1 = Reserved.
     uint32 entry_type = 2;
     uint64 version = 3;
+    // A live punch/trim tombstone generation (empty body, authoritative
+    // hole). Distinct from ART-deleted entries, which are filtered out.
+    bool is_tombstone = 4;
   }
 
   message Blocks {
     repeated BlobBlockEntry blocks = 1;
+    bool has_more = 2;
+    string next_marker = 3;
   }
 }

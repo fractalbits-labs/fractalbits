@@ -63,6 +63,12 @@ pub(crate) struct WriteBuffer {
     /// `Rewrite`/`Delete`. Reads and `lseek(SEEK_DATA)` treat reserved
     /// blocks as logical-data per Linux convention even before flush.
     pub(crate) pending_reservations: std::collections::BTreeSet<u32>,
+    /// Committed fallocate claims this handle published: block ->
+    /// reserved version. Lets a later fallocate skip re-claiming a block
+    /// this handle already holds a claim for. A write of the block takes
+    /// a fresh burned identity; the superseded claim is reclaimed by the
+    /// touched-block sweep.
+    pub(crate) committed_reservations: std::collections::BTreeMap<u32, u64>,
 }
 
 impl WriteBuffer {
@@ -81,6 +87,7 @@ impl WriteBuffer {
             eof_low_watermark: None,
             trim_upper: None,
             pending_reservations: std::collections::BTreeSet::new(),
+            committed_reservations: std::collections::BTreeMap::new(),
         }
     }
 
