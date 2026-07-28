@@ -137,7 +137,7 @@ impl VfsCore {
     /// Create a hardlink `new_parent/new_name` to the file at `inode`.
     ///
     /// The first link promotes the file: its real layout is moved into a
-    /// `#hardlink/<uuid>` `InodeRecord` (nlink=2) and both the original
+    /// `@hardlink/<uuid>` `InodeRecord` (nlink=2) and both the original
     /// name and the new name become `Indirect(uuid)` redirects to it.
     /// A subsequent link to an already-promoted inode just bumps nlink
     /// and writes another redirect. Hardlinks to directories are EPERM

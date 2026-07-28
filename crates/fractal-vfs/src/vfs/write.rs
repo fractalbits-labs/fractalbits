@@ -188,7 +188,7 @@ impl VfsCore {
 
         // A name unlinked while its fd stayed open must not be resurrected
         // in NSS, unless the inode was promoted to a hardlink, in which
-        // case its data lives in the shared `#hardlink/<id>` InodeRecord
+        // case its data lives in the shared `@hardlink/<id>` InodeRecord
         // blob and the other names still reference it, so the write must
         // still flush (routed to the record below, not this s3_key, whose
         // NSS row holds only an Indirect redirect).
@@ -224,7 +224,7 @@ impl VfsCore {
         let new_num_blocks = file_size.div_ceil(bsz_u64) as u32;
 
         // Promoted (hardlink) inodes flush into the shared InodeRecord at
-        // `#hardlink/<id>` via CAS, not at this name's s3_key. Fetch the
+        // `@hardlink/<id>` via CAS, not at this name's s3_key. Fetch the
         // record up front: its layout seeds the override-flush base (the
         // shared blob_guid + blob_version) and its nlink/orphan_since are
         // preserved on republish.
@@ -353,7 +353,7 @@ impl VfsCore {
                 }),
             };
             // Choose the publish target. A promoted inode republishes its
-            // layout inside the shared InodeRecord at the `#hardlink/<id>`
+            // layout inside the shared InodeRecord at the `@hardlink/<id>`
             // key, CAS'd on the current record bytes so a concurrent writer
             // on another hardlink name (a different FUSE inode with its own
             // write lock) loses the race and retries instead of clobbering.

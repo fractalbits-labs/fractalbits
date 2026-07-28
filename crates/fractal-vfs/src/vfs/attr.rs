@@ -756,7 +756,7 @@ impl VfsCore {
 
         if let Some(layout) = updated_layout {
             // Hardlink: the shared metadata (mode/uid/gid/times) lives in
-            // the `#hardlink/<inode_id>` InodeRecord, not at this name's
+            // the `@hardlink/<inode_id>` InodeRecord, not at this name's
             // redirect. Fold the new posix into the record's layout so
             // every name observes the chmod/chown/utimes; nlink and
             // orphan_since are preserved.

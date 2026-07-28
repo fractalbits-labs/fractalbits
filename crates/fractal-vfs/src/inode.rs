@@ -101,7 +101,7 @@ pub struct InodeEntry {
     /// stat-immediately-after contract.
     pub atime_ns: u64,
     /// `Some(uuid)` once this inode has been promoted to a hardlink:
-    /// its real layout lives in the `#hardlink/<uuid>` `InodeRecord`,
+    /// its real layout lives in the `@hardlink/<uuid>` `InodeRecord`,
     /// and `layout` caches the resolved real layout (never an
     /// `Indirect` redirect). `None` for an ordinary single-named file.
     pub inode_id: Option<Uuid>,
