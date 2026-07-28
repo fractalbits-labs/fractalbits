@@ -50,13 +50,10 @@ pub struct Config {
     pub rss_rpc_timeout_seconds: u64,
     pub worker_threads: usize,
     pub allow_other: bool,
-    #[allow(dead_code)]
     pub auto_unmount: bool,
 
     pub dir_cache_ttl_seconds: u64,
-    #[allow(dead_code)]
     pub attr_cache_ttl_seconds: u64,
-    #[allow(dead_code)]
     pub block_cache_size_mb: u64,
     pub read_write: bool,
 
@@ -110,7 +107,6 @@ impl Config {
         Duration::from_secs(self.dir_cache_ttl_seconds)
     }
 
-    #[allow(dead_code)]
     pub fn attr_cache_ttl(&self) -> Duration {
         Duration::from_secs(self.attr_cache_ttl_seconds)
     }

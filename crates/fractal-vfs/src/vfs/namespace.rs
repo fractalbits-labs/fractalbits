@@ -1,7 +1,24 @@
 //! Namei operations: lookup, link, create, unlink, rename, directories as names.
 
-#[allow(unused_imports)]
-use super::*;
+use bytes::Bytes;
+use data_types::TraceId;
+use data_types::object_layout::{
+    DirectoryData, IndirectEntry, InodeRecord, MpuState, ObjectCoreMetaData, ObjectLayout,
+    ObjectState, PosixAttrs, SpecialData, SpecialKind, SymlinkData,
+};
+use fractal_fuse::{FileHandleId, InodeId};
+use rkyv::api::high::to_bytes_in;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::cache::DirEntryKind;
+use crate::config::WritebackMode;
+use crate::error::FsError;
+use crate::inode::{EntryType, ForgetOutcome, ROOT_INODE};
+use crate::vfs::FileHandle;
+use crate::vfs::write_buffer::WriteBuffer;
+use crate::vfs::{DEFAULT_BLOCK_SIZE, VfsAttr, VfsCore, now_ns, symlink_mode};
+use crate::writeback::WritebackQueue;
 
 impl VfsCore {
     /// POSIX `NAME_MAX = 255`. Linux's general VFS enforces this at
@@ -137,7 +154,7 @@ impl VfsCore {
     /// Create a hardlink `new_parent/new_name` to the file at `inode`.
     ///
     /// The first link promotes the file: its real layout is moved into a
-    /// `#hardlink/<uuid>` `InodeRecord` (nlink=2) and both the original
+    /// `@hardlink/<uuid>` `InodeRecord` (nlink=2) and both the original
     /// name and the new name become `Indirect(uuid)` redirects to it.
     /// A subsequent link to an already-promoted inode just bumps nlink
     /// and writes another redirect. Hardlinks to directories are EPERM
@@ -1519,5 +1536,20 @@ impl VfsCore {
         }
 
         Ok(())
+    }
+}
+
+/// Releases a `block_prefix` hold when a directory rename returns or
+/// unwinds, so a blocked prefix never outlives the rename that set it
+/// (e.g. an early `?` on a drain or `rename_folder` error, or future
+/// cancellation at unmount).
+struct PrefixBlockGuard {
+    writeback: Arc<WritebackQueue>,
+    prefix: String,
+}
+
+impl Drop for PrefixBlockGuard {
+    fn drop(&mut self) {
+        self.writeback.unblock_prefix(&self.prefix);
     }
 }

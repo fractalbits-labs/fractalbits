@@ -468,7 +468,7 @@ impl StorageBackend {
     }
 
     /// Fetch the `InodeRecord` backing a hardlink-promoted inode from its
-    /// `#hardlink/<inode_id>` NSS key. Uses the raw `get_inode` RPC and
+    /// `@hardlink/<inode_id>` NSS key. Uses the raw `get_inode` RPC and
     /// decodes the bytes as an `InodeRecord` (rather than `ObjectLayout`).
     ///
     /// Callers that CAS-update a record re-serialize the value returned here
@@ -510,7 +510,7 @@ impl StorageBackend {
     }
 
     /// Persist the `InodeRecord` for a hardlink-promoted inode at its
-    /// `#hardlink/<inode_id>` NSS key.
+    /// `@hardlink/<inode_id>` NSS key.
     pub async fn put_inode_record(
         &self,
         inode_id: uuid::Uuid,
