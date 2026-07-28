@@ -1,7 +1,18 @@
 //! Attribute reads and posix publication.
 
-#[allow(unused_imports)]
-use super::*;
+use bytes::Bytes;
+use data_types::TraceId;
+use data_types::object_layout::{ObjectLayout, ObjectState, PosixAttrs, SpecialKind};
+use fractal_fuse::{FileHandleId, InodeId};
+use rkyv::api::high::to_bytes_in;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::config::WritebackMode;
+use crate::error::FsError;
+use crate::inode::{EntryType, ROOT_INODE};
+use crate::vfs::publish::{publish_set_posix, put_inode_create_idempotent};
+use crate::vfs::{DEFAULT_BLOCK_SIZE, VfsAttr, VfsCore, dir_mode, file_mode, now_ns, symlink_mode};
+use crate::writeback::{CoalesceOutcome, InodeOp as WbInodeOp};
 
 impl VfsCore {
     pub(crate) fn file_perm(&self) -> u16 {

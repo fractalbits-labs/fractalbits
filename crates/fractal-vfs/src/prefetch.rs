@@ -7,13 +7,19 @@
 //! FUSE crossing.
 //!
 //! The decision is intentionally cheap: a few comparisons against the
-//! file size and the kernel's `FOPEN_KEEP_CACHE` hint. Heavy lifting
-//! (block fetches, parallel scheduling, cache-pressure decline) lives
-//! in the prefetch task itself.
+//! file size and the kernel's `FOPEN_KEEP_CACHE` hint. The heavy lifting
+//! (block fetches, cache-pressure decline) is `prefetch_blob` at the
+//! bottom of this file, which `vfs_open` spawns as a detached task.
 
-#![allow(dead_code)] // Wired into `vfs_open` opt-in by config.
+use data_types::TraceId;
+use data_types::object_layout::ObjectLayout;
+use std::sync::Arc;
 
+use crate::backend::{BackendConfig, StorageBackend};
 use crate::config::Config;
+use crate::disk_cache::DiskCache;
+use crate::error::FsError;
+use crate::vfs::DEFAULT_BLOCK_SIZE;
 
 /// Tunable thresholds and opt-ins for `should_prefetch`. Built once
 /// from `Config` at startup so the hot decision path doesn't reparse
@@ -73,6 +79,120 @@ pub fn cache_pressure_high(usage_bytes: u64, capacity_bytes: u64, policy: &Prefe
     }
     let frac = usage_bytes as f64 / capacity_bytes as f64;
     frac >= policy.pressure_decline
+}
+
+/// Background whole-blob prefetch. Walks every block of `layout`,
+/// fetches it from BSS, and inserts it into the disk cache. Each
+/// per-block fetch goes through the same path as a read miss
+/// (`backend.read_block` + `dc.insert`) so block_id, version, and
+/// checksum semantics stay identical between prefetch-warmed entries
+/// and lazy-warmed ones.
+///
+/// Errors are logged and ignored: a prefetch is best-effort, and a
+/// transient failure is acceptable; the kernel's block-on-demand
+/// path still serves the read.
+pub(crate) async fn prefetch_blob(
+    backend_cfg: Arc<BackendConfig>,
+    disk_cache: Arc<DiskCache>,
+    layout: ObjectLayout,
+) {
+    let Ok(file_size) = layout.size() else {
+        return;
+    };
+    if file_size == 0 {
+        return;
+    }
+    let Ok(blob_guid) = layout.blob_guid() else {
+        return;
+    };
+    let block_size = layout.block_size as u64;
+    if block_size == 0 {
+        return;
+    }
+    // Re-check pressure: an unrelated workload may have filled the
+    // cache between the open-time decision and the task starting.
+    let policy = PrefetchPolicy {
+        full_threshold_bytes: u64::MAX,
+        partial_threshold_bytes: u64::MAX,
+        workload_bulk_read: false,
+        // Reuse the cache's high-watermark fraction for the in-task
+        // pressure decline.
+        pressure_decline: 0.95,
+    };
+    if cache_pressure_high(
+        disk_cache.current_usage(),
+        disk_cache.capacity_bytes(),
+        &policy,
+    ) {
+        return;
+    }
+
+    let backend = match StorageBackend::new(&backend_cfg) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "prefetch: failed to construct backend");
+            return;
+        }
+    };
+
+    let last_block = ((file_size - 1) / block_size) as u32;
+    let trace_id = TraceId::new();
+
+    for block_num in 0..=last_block {
+        let block_start = block_num as u64 * block_size;
+        let block_content_len = std::cmp::min(block_size, file_size - block_start) as usize;
+
+        // If another path has already populated this block (e.g. a
+        // racing read), the cache hit short-circuits the BSS round
+        // trip.
+        if disk_cache
+            .get_block(blob_guid, block_num, block_content_len)
+            .await
+            .is_some()
+        {
+            continue;
+        }
+
+        // Override (blob_version > 1) blocks are padded to block_size on
+        // disk; request the full block so the EC shard size matches, then
+        // truncate to the logical content length (mirrors read_block_cached).
+        let read_len = if layout.blob_version > 1 {
+            (DEFAULT_BLOCK_SIZE as usize).max(block_content_len)
+        } else {
+            block_content_len
+        };
+        let (mut data, _checksum) = match backend
+            .read_block(
+                blob_guid,
+                layout.blob_version,
+                block_num,
+                read_len,
+                &trace_id,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(FsError::Rpc(rpc_client_common::RpcError::NotFound)) => {
+                // Sparse hole; intentionally not cached. The
+                // block-on-demand path treats missing blocks as zeros.
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    %blob_guid, block_num, error = %e,
+                    "prefetch block fetch failed; abandoning prefetch"
+                );
+                return;
+            }
+        };
+        if data.len() > block_content_len {
+            data = data.slice(0..block_content_len);
+        }
+
+        let _ = disk_cache
+            .insert_block(blob_guid, block_num, layout.blob_version, &data)
+            .await;
+    }
 }
 
 #[cfg(test)]

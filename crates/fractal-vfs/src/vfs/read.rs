@@ -1,7 +1,12 @@
 //! Data read paths: cached block reads, MPU stitching, vfs_read.
 
-#[allow(unused_imports)]
-use super::*;
+use bytes::{Bytes, BytesMut};
+use data_types::TraceId;
+use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
+use fractal_fuse::FileHandleId;
+
+use crate::error::FsError;
+use crate::vfs::{DEFAULT_BLOCK_SIZE, VfsCore};
 
 impl VfsCore {
     /// Read a block, checking disk cache first. On miss, fetches from backend

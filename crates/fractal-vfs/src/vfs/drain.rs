@@ -1,7 +1,16 @@
 //! Flush orchestration: fsync/close flushes, writeback draining, release.
 
-#[allow(unused_imports)]
-use super::*;
+use data_types::TraceId;
+use data_types::object_layout::ObjectLayout;
+use fractal_fuse::{FileHandleId, InodeId};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::config::WritebackMode;
+use crate::error::FsError;
+use crate::inode::EntryType;
+use crate::vfs::VfsCore;
+use crate::writeback::{Generation, WritebackQueue};
 
 impl VfsCore {
     pub async fn vfs_flush(&self, fh: FileHandleId) -> Result<(), FsError> {
@@ -581,5 +590,27 @@ impl VfsCore {
             self.reap_forgotten_inode(ino);
         })
         .detach();
+    }
+}
+
+/// Collapses a release-flush cycle to `Done` when the flush task is dropped
+/// before it can advance the cycle itself (the ring runtime hosting the
+/// detached task is torn down at unmount). An orphaned non-`Done` cycle
+/// would otherwise wedge `destroy`'s drain barrier until it times out. The
+/// paired `FlushSnapshotGuard` has by then restored the buffer dirty, so
+/// `destroy`'s `flush_open_dirty_handles` still republishes the data.
+/// Disarmed on the normal paths, which advance the cycle explicitly.
+struct ReleaseCycleGuard {
+    writeback: Arc<WritebackQueue>,
+    ino: InodeId,
+    generation: Generation,
+    armed: bool,
+}
+
+impl Drop for ReleaseCycleGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.writeback.advance_to_done(self.ino, self.generation);
+        }
     }
 }

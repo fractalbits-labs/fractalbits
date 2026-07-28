@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -250,6 +251,15 @@ impl CacheTracker {
 
 // DiskCache
 
+/// Number of stripe locks serializing per-blob cache-file mutations.
+/// Fixed (not per-blob) to bound memory; distinct blobs that collide on a
+/// stripe only see rare, brief contention.
+const MIRROR_LOCK_STRIPES: usize = 256;
+/// Process-local floors only protect stale handles after their cache file has
+/// been dropped. Bound the map so a long-lived process that overrides many
+/// distinct blobs cannot grow it forever.
+const VERSION_FLOOR_CAP: usize = 65_536;
+
 /// Local NVMe disk cache for block data.
 ///
 /// Each blob maps to a sparse cache file at
@@ -271,16 +281,6 @@ impl CacheTracker {
 /// lags the inode's `layout.blob_version` (another instance has
 /// bumped the version), the whole cache file is unlinked so the next
 /// read cold-fetches from BSS.
-#[allow(dead_code)]
-/// Number of stripe locks serializing per-blob cache-file mutations.
-/// Fixed (not per-blob) to bound memory; distinct blobs that collide on a
-/// stripe only see rare, brief contention.
-const MIRROR_LOCK_STRIPES: usize = 256;
-/// Process-local floors only protect stale handles after their cache file has
-/// been dropped. Bound the map so a long-lived process that overrides many
-/// distinct blobs cannot grow it forever.
-const VERSION_FLOOR_CAP: usize = 65_536;
-
 pub struct DiskCache {
     cache_dir: PathBuf,
     max_size_bytes: u64,
@@ -300,7 +300,6 @@ pub struct DiskCache {
     mirror_locks: Vec<futures::lock::Mutex<()>>,
 }
 
-#[allow(dead_code)]
 impl DiskCache {
     /// Create a new DiskCache. Creates the cache directory if needed,
     /// verifies the filesystem supports SEEK_DATA (ext4/xfs), and
@@ -1194,6 +1193,91 @@ fn run_eviction(cache_dir: &Path, tracker: &CacheTracker, target_bytes: u64) {
         remaining_bytes = tracker.current_usage(),
         "disk cache eviction complete"
     );
+}
+
+/// A best-effort disk-cache mirror write, handed to the dedicated mirror
+/// thread so the local-cache I/O + checksum never run on a FUSE worker.
+pub(crate) struct MirrorJob {
+    pub(crate) blob_guid: data_types::DataBlobGuid,
+    pub(crate) blob_version: u64,
+    pub(crate) rewrites: Vec<(u32, Bytes)>,
+    pub(crate) deletes: Vec<u32>,
+    /// Retained `rewrites` payload size, used to keep `mirror_queued_bytes`
+    /// balanced (added on enqueue, subtracted once the job is processed).
+    pub(crate) byte_len: usize,
+}
+
+/// Sender + the shared queued-byte counter for the mirror channel.
+pub(crate) struct MirrorHandle {
+    pub(crate) tx: futures::channel::mpsc::Sender<MirrorJob>,
+    pub(crate) queued_bytes: Arc<AtomicUsize>,
+}
+
+/// Bound on queued mirror jobs by count. The dedicated thread drains local
+/// page-cache writes far faster than the network publish feeds it, so this
+/// rarely fills; when it does, `try_send` drops the job (best-effort; the
+/// block cold-fills from BSS on the next read) instead of blocking a FUSE
+/// worker.
+const MIRROR_QUEUE_CAP: usize = 4096;
+
+/// Byte bound on the mirror queue. A job retains its rewritten `Bytes`
+/// until the mirror thread writes them, so a slow cache device could
+/// otherwise pin unbounded flushed write buffers (one large-file override
+/// flush is a single job but many MiB). When the in-flight payload exceeds
+/// this, new jobs are dropped (best-effort) before their `Bytes` are
+/// retained. 256 MiB caps memory while staying far above the steady-state
+/// backlog of an 83k-file untar.
+pub(crate) const MIRROR_BYTE_BUDGET: usize = 256 * 1024 * 1024;
+
+/// Spawn the dedicated disk-cache mirror thread. It owns its own compio
+/// runtime (separate io_uring) and drains the job channel, so a
+/// create-heavy workload's cache writes never steal cycles from the FUSE
+/// worker threads. Returns the handle, or `None` if the runtime could not
+/// be built (mirror then silently disabled; the cache still serves
+/// reads via cold-fill, just not write-populated).
+pub(crate) fn spawn_mirror_worker(dc: Arc<DiskCache>) -> Option<MirrorHandle> {
+    let (tx, mut rx) = futures::channel::mpsc::channel::<MirrorJob>(MIRROR_QUEUE_CAP);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let worker_bytes = queued_bytes.clone();
+    let spawned = std::thread::Builder::new()
+        .name("fb-disk-mirror".to_string())
+        .spawn(move || {
+            let rt = match compio_runtime::Runtime::builder().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::warn!(error = %e, "disk-cache mirror thread: runtime build failed");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                use futures::StreamExt;
+                while let Some(job) = rx.next().await {
+                    if let Err(e) = dc
+                        .sync_after_flush(
+                            job.blob_guid,
+                            job.blob_version,
+                            &job.rewrites,
+                            &job.deletes,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            blob_version = job.blob_version,
+                            error = %e,
+                            "disk cache mirror write failed (best-effort)"
+                        );
+                    }
+                    worker_bytes.fetch_sub(job.byte_len, Ordering::Relaxed);
+                }
+            });
+        });
+    match spawned {
+        Ok(_) => Some(MirrorHandle { tx, queued_bytes }),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to spawn disk-cache mirror thread");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

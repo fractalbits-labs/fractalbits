@@ -1,7 +1,22 @@
 //! Write buffering and the flush/commit path, truncate, fallocate, lseek.
 
-#[allow(unused_imports)]
-use super::*;
+use bytes::{Bytes, BytesMut};
+use data_types::TraceId;
+use data_types::object_layout::{InodeRecord, ObjectLayout, ObjectState};
+use data_types::object_layout::{ObjectCoreMetaData, ObjectMetaData};
+use fractal_fuse::{FileHandleId, InodeId};
+use rkyv::api::high::to_bytes_in;
+use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::backend::BlobInfo;
+use crate::cache::DirEntryKind;
+use crate::config::WritebackMode;
+use crate::disk_cache::{MIRROR_BYTE_BUDGET, MirrorJob};
+use crate::error::FsError;
+use crate::vfs::write_buffer::BlockState;
+use crate::vfs::write_buffer::WriteBuffer;
+use crate::vfs::{DEFAULT_BLOCK_SIZE, MAX_INMEM_FILE_SIZE, VfsAttr, VfsCore, parent_prefix_of};
 
 impl VfsCore {
     /// Load one block's committed bytes from BSS for an RMW / dirty read /
@@ -1407,5 +1422,33 @@ impl VfsCore {
             .map(|wb| wb.file_size)
             .unwrap_or(new_size);
         Ok(self.make_new_file_attr(inode, new_attr_size))
+    }
+}
+
+/// Restores a flush's taken block snapshot back into the file handle if the
+/// flush does not complete: on an error return OR on future cancellation
+/// (e.g. a release-flush task dropped when its ring runtime is torn down at
+/// unmount). `flush_write_buffer` moves the blocks out and clears `dirty`
+/// up front; without this guard a cancelled flush would leave the handle
+/// looking clean, so `destroy`'s `flush_open_dirty_handles` would skip it
+/// and the buffered data would be silently lost. Disarmed once the publish
+/// succeeds, after which the snapshot is discarded normally.
+struct FlushSnapshotGuard<'a> {
+    vfs: &'a VfsCore,
+    fh_id: FileHandleId,
+    blocks: std::collections::BTreeMap<u32, BlockState>,
+    pending_reservations: std::collections::BTreeSet<u32>,
+    armed: bool,
+}
+
+impl Drop for FlushSnapshotGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.vfs.restore_flush_snapshot(
+                self.fh_id,
+                std::mem::take(&mut self.blocks),
+                std::mem::take(&mut self.pending_reservations),
+            );
+        }
     }
 }

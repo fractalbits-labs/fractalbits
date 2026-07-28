@@ -1,7 +1,15 @@
 //! Directory listing and statfs.
 
-#[allow(unused_imports)]
-use super::*;
+use data_types::TraceId;
+use data_types::object_layout::{InodeRecord, ObjectState};
+use fractal_fuse::{FileHandleId, InodeId};
+use std::sync::Arc;
+
+use crate::cache::{DirEntry, DirEntryKind};
+use crate::config::WritebackMode;
+use crate::error::FsError;
+use crate::inode::{EntryType, ROOT_INODE};
+use crate::vfs::{DEFAULT_BLOCK_SIZE, VfsCore, VfsDirEntry, VfsDirEntryPlus, VfsStatfs};
 
 impl VfsCore {
     pub(crate) async fn fetch_dir_entries(
