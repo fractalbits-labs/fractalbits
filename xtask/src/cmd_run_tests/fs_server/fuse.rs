@@ -1013,7 +1013,7 @@ async fn test_writeback_default_mode_symlink(disk_cache: bool) -> CmdResult {
 /// Regression for the P0 where a write after creating a hardlink was
 /// silently discarded: hardlink promotion sets `inode_id`, and the flush
 /// then skipped publish entirely, never touching the shared blob or the
-/// `#hardlink/<id>` InodeRecord. Writes must instead flush to the record
+/// `@hardlink/<id>` InodeRecord. Writes must instead flush to the record
 /// (record-aware CAS path) so both names observe the new bytes, before
 /// and after a remount.
 async fn test_hardlink_write_visible(disk_cache: bool) -> CmdResult {
