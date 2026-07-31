@@ -481,10 +481,13 @@ impl VfsCore {
                 let trace_id = TraceId::new();
                 if let Ok(old_layout) =
                     rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
+                    && let Ok(blob_guid) = old_layout.blob_guid()
+                    && let Err(e) = self
+                        .backend()
+                        .delete_blob_blocks(blob_guid, &trace_id)
+                        .await
                 {
-                    self.backend()
-                        .delete_blob_blocks(&old_layout, &trace_id)
-                        .await;
+                    tracing::warn!(%blob_guid, error = %e, "orphaned blob cleanup incomplete");
                 }
             } else {
                 // Still more handles open, re-insert

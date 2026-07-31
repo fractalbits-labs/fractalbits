@@ -61,6 +61,20 @@ impl S3HybridSingleAzStorage {
 }
 
 impl S3HybridSingleAzStorage {
+    pub async fn list_blob_blocks(
+        &self,
+        blob_guid: DataBlobGuid,
+        trace_id: &TraceId,
+    ) -> Result<Vec<(u32, u64)>, BlobStorageError> {
+        Ok(self
+            .data_vg_proxy
+            .list_all_blob_blocks(blob_guid, trace_id)
+            .await?
+            .into_iter()
+            .map(|entry| (entry.block_number, entry.version))
+            .collect())
+    }
+
     pub async fn put_blob(
         &self,
         blob_id: Uuid,
@@ -145,10 +159,12 @@ impl S3HybridSingleAzStorage {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_blob(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         content_len: usize,
         location: BlobLocation,
         body: &mut Bytes,
@@ -158,7 +174,14 @@ impl S3HybridSingleAzStorage {
             BlobLocation::DataVgProxy => {
                 // Small blob - get from DataVgProxy
                 self.data_vg_proxy
-                    .get_blob(blob_guid, block_number, content_len, body, trace_id)
+                    .get_blob(
+                        blob_guid,
+                        block_number,
+                        version,
+                        content_len,
+                        body,
+                        trace_id,
+                    )
                     .await?;
             }
             BlobLocation::S3 => {
@@ -200,6 +223,7 @@ impl S3HybridSingleAzStorage {
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         location: BlobLocation,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
@@ -207,11 +231,11 @@ impl S3HybridSingleAzStorage {
             BlobLocation::DataVgProxy => {
                 // Small blob - delete from DataVgProxy
                 self.data_vg_proxy
-                    .delete_blob(blob_guid, block_number, 1, trace_id)
+                    .delete_blob(blob_guid, block_number, version, trace_id)
                     .await?;
             }
             BlobLocation::S3 => {
-                // Large blob - delete from S3
+                // S3 keys are not generation-specific, so version is ignored here.
                 let s3_key = blob_key(blob_guid.blob_id, block_number);
                 self.client_s3
                     .delete_object()

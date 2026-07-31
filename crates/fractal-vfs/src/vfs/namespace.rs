@@ -1050,16 +1050,16 @@ impl VfsCore {
         };
         match &old_layout.state {
             ObjectState::Normal(_) => {
-                self.backend()
-                    .delete_blob_blocks(&old_layout, trace_id)
-                    .await;
+                if let Ok(blob_guid) = old_layout.blob_guid() {
+                    let _ = self.backend().delete_blob_blocks(blob_guid, trace_id).await;
+                }
             }
             ObjectState::Mpu(MpuState::Completed(_)) => {
                 if let Ok(parts) = self.backend().list_mpu_parts(key, trace_id).await {
                     for (part_key, part_layout) in &parts {
-                        self.backend()
-                            .delete_blob_blocks(part_layout, trace_id)
-                            .await;
+                        if let Ok(blob_guid) = part_layout.blob_guid() {
+                            let _ = self.backend().delete_blob_blocks(blob_guid, trace_id).await;
+                        }
                         let _ = self.backend().delete_inode(part_key, trace_id).await;
                     }
                 }
@@ -1100,9 +1100,10 @@ impl VfsCore {
                         if let Ok(fresh) = self.backend().get_inode_record(inode_id, trace_id).await
                             && fresh.nlink == 0
                         {
-                            self.backend()
-                                .delete_blob_blocks(&fresh.layout, trace_id)
-                                .await;
+                            if let Ok(blob_guid) = fresh.layout.blob_guid() {
+                                let _ =
+                                    self.backend().delete_blob_blocks(blob_guid, trace_id).await;
+                            }
                             let _ = self.backend().delete_inode_record(inode_id, trace_id).await;
                         }
                     }

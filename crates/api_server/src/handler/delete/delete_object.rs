@@ -175,6 +175,7 @@ pub async fn delete_blob(
         let request = BlobDeletionRequest {
             blob_guid,
             block_number: block_number as u32,
+            version: 1,
             location: blob_location,
         };
 

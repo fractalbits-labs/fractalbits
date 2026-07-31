@@ -78,31 +78,15 @@ impl VfsCore {
         Ok(data)
     }
 
-    /// Authoritative logical file size for data reads. The geometry
-    /// sentinel (our BSS-parent-size authority) reflects the latest
-    /// committed override regardless of our cached layout version, so a
-    /// read on a handle whose cached layout lags a peer's overwrite (or
-    /// this instance's own just-committed flush) still sees the right EOF.
-    /// The cached/NSS layout size is a lazy copy. Falls back to the cached
-    /// size when no sentinel exists or it is older than the cached layout
-    /// (so a stale sentinel never shrinks a fresher local size).
+    /// Authoritative logical file size for data reads: the NSS layout is
+    /// the sole size authority (the BSS geometry sentinel is gone with the
+    /// versioned-key design). Cross-instance freshness comes from the
+    /// attr-TTL-bounded layout refresh, same as every other attribute.
     pub(crate) async fn authoritative_file_size(
         &self,
         layout: &ObjectLayout,
     ) -> Result<u64, FsError> {
-        let cached = layout.size()?;
-        if layout.is_symlink() || layout.special().is_some() {
-            return Ok(cached);
-        }
-        if let Ok(guid) = layout.blob_guid() {
-            let trace_id = TraceId::new();
-            if let Ok(Some(info)) = self.backend().get_blob_info(guid, &trace_id).await
-                && info.blob_version >= layout.blob_version
-            {
-                return Ok(info.total_size);
-            }
-        }
-        Ok(cached)
+        layout.size().map_err(FsError::from)
     }
 
     pub(crate) async fn read_mpu(

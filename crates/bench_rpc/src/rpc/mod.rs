@@ -314,6 +314,7 @@ async fn benchmark_bss_read(
                     .get_data_blob(
                         blob_guid,
                         0,
+                        1,
                         &mut content,
                         BLOB_SIZE - 256,
                         None,
@@ -362,6 +363,7 @@ async fn benchmark_bss_read(
                     .get_data_blob(
                         blob_guid,
                         0,
+                        1,
                         &mut content,
                         BLOB_SIZE - 256,
                         None,

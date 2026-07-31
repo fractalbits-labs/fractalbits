@@ -15,6 +15,9 @@ use tokio::{sync::mpsc::Receiver, task::JoinHandle};
 pub struct BlobDeletionRequest {
     pub blob_guid: DataBlobGuid,
     pub block_number: u32,
+    /// Exact generation to delete: data keys are versioned and
+    /// write-once, so a delete names one identity.
+    pub version: u64,
     pub location: BlobLocation,
 }
 
@@ -111,6 +114,7 @@ impl BlobClient {
                 .delete_blob(
                     request.blob_guid,
                     request.block_number,
+                    request.version,
                     request.location,
                     &TraceId::new(),
                 )
@@ -185,10 +189,12 @@ impl BlobClient {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_blob(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         content_len: usize,
         location: BlobLocation,
         body: &mut Bytes,
@@ -198,6 +204,7 @@ impl BlobClient {
             .get_blob(
                 blob_guid,
                 block_number,
+                version,
                 content_len,
                 location,
                 body,
@@ -210,11 +217,12 @@ impl BlobClient {
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         location: BlobLocation,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         self.storage
-            .delete_blob(blob_guid, block_number, location, trace_id)
+            .delete_blob(blob_guid, block_number, version, location, trace_id)
             .await
     }
 }

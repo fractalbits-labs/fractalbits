@@ -9,7 +9,6 @@ use rkyv::api::high::to_bytes_in;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::backend::BlobInfo;
 use crate::cache::DirEntryKind;
 use crate::config::WritebackMode;
 use crate::disk_cache::{MIRROR_BYTE_BUDGET, MirrorJob};
@@ -441,28 +440,19 @@ impl VfsCore {
                         if matches!(snap.blocks.get(&b), Some(BlockState::Rewrite(_))) {
                             continue;
                         }
-                        self.backend()
+                        let _ = self
+                            .backend()
                             .delete_block(blob_guid, b, new_version, &trace_id)
                             .await;
                     }
                     // Replay PUNCH_HOLE intents.
                     for (b, st) in snap.blocks.iter() {
                         if matches!(st, BlockState::Delete) {
-                            self.backend()
+                            let _ = self
+                                .backend()
                                 .delete_block(blob_guid, *b, new_version, &trace_id)
                                 .await;
                         }
-                    }
-                    // Reserve fallocate-claimed blocks not superseded by a
-                    // Rewrite/Delete this flush (single-op; EC is a no-op).
-                    for b in snap.pending_reservations.iter() {
-                        if snap.blocks.contains_key(b) {
-                            continue;
-                        }
-                        let _ = self
-                            .backend()
-                            .reserve_block(blob_guid, *b, block_size as u32, new_version, &trace_id)
-                            .await;
                     }
                     // Publish landed: disarm the restore guard so the taken
                     // snapshot is discarded instead of re-marking the handle
@@ -706,35 +696,6 @@ impl VfsCore {
                         }
                     }
                 }
-            }
-        }
-
-        // Publish the authoritative blob-geometry sentinel so a peer instance
-        // serving vfs_getattr from a stale cached layout still observes the
-        // latest cross-instance size override (the inode size+blob_version it
-        // cached may lag this flush). Initial creates use a fresh blob_guid
-        // and publish exact size in NSS, so only override versions need this
-        // extra BSS write.
-        if final_layout.blob_version > 1
-            && let Ok(geom_guid) = final_layout.blob_guid()
-        {
-            let new_bc = file_size.div_ceil(block_size as u64) as u32;
-            let info = BlobInfo {
-                total_size: file_size,
-                block_count: new_bc,
-                blob_version: final_layout.blob_version,
-            };
-            if let Err(e) = self
-                .backend()
-                .write_blob_info(geom_guid, info, final_layout.blob_version, &trace_id)
-                .await
-            {
-                tracing::warn!(
-                    %geom_guid,
-                    blob_version = final_layout.blob_version,
-                    error = %e,
-                    "write_blob_info (geometry sentinel) failed; cross-instance size may lag until next flush"
-                );
             }
         }
 
