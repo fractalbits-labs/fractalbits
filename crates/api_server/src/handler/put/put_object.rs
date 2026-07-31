@@ -1,7 +1,9 @@
-use data_types::{DataBlobGuid, Volume};
+use bytes::Bytes;
+use data_types::{DataBlobGuid, RoutingKey, Volume};
 use metrics_wrapper::histogram;
 use rpc_client_common::nss_rpc_retry;
 use std::hash::Hasher;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use actix_web::{HttpResponse, http::header};
@@ -18,8 +20,8 @@ use tracing::{Instrument, Span};
 use super::block_data_stream::BlockDataStream;
 use super::s3_streaming::S3StreamingPayload;
 use crate::{
-    BlobStorageBackend,
-    blob_client::BlobDeletionRequest,
+    AppState, BlobStorageBackend,
+    blob_client::enqueue_blob_deletion,
     handler::{
         ObjectRequestContext,
         common::{
@@ -33,6 +35,48 @@ use crate::{
     },
 };
 use data_types::object_layout::*;
+
+/// Overwrite cleanup, shared by both PUT bodies (a fix applied to one
+/// copy and not the other silently leaks): the replaced object's blob is
+/// torn down in the background, including its `@ovr/` rows (an S3 PUT
+/// over a FUSE-overwritten file installs a fresh blob_guid non-CAS and
+/// orphans the entire previous row set). Skipped for multipart part keys
+/// ('#') to avoid part-replacement races.
+async fn enqueue_replaced_object_cleanup(
+    app: Arc<AppState>,
+    routing_key: RoutingKey,
+    root_blob_name: &str,
+    key: &str,
+    old_object_bytes: Bytes,
+    replacement_blob_guid: DataBlobGuid,
+) -> Result<(), S3Error> {
+    if old_object_bytes.is_empty() || key.contains('#') {
+        return Ok(());
+    }
+    let old_object =
+        rkyv::from_bytes::<ObjectLayout, Error>(&old_object_bytes).map_err(|error| {
+            tracing::error!(%error, "failed to deserialize replaced object layout");
+            S3Error::InternalError
+        })?;
+    if let Ok(size) = old_object.size() {
+        histogram!("object_size", "operation" => "delete_old_blob").record(size as f64);
+    }
+    let old_blob_guid = old_object.blob_guid().map_err(|error| {
+        tracing::error!(%error, "failed to get replaced object blob id");
+        S3Error::InternalError
+    })?;
+    if old_blob_guid != replacement_blob_guid {
+        enqueue_blob_deletion(app, routing_key, root_blob_name, &old_object)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "failed to enqueue replaced object cleanup");
+                S3Error::InternalError
+            })?;
+    } else {
+        tracing::warn!(%old_blob_guid, "skipping cleanup of replacement with the same blob id");
+    }
+    Ok(())
+}
 
 fn split_chunks_into_blocks(
     chunks: Vec<actix_web::web::Bytes>,
@@ -484,61 +528,16 @@ async fn put_object_streaming_internal(
         S3Error::from(e)
     })?;
 
-    // Delete old object if it is an overwrite request
-    // But skip deletion for multipart parts (keys containing '#') to avoid race conditions
     let old_object_bytes = parse_put_inode(resp)?;
-
-    let is_multipart_part = ctx.key.contains('#');
-    if !old_object_bytes.is_empty() && !is_multipart_part {
-        let old_object =
-            rkyv::from_bytes::<ObjectLayout, Error>(&old_object_bytes).map_err(|e| {
-                tracing::error!("Failed to deserialize old object layout: {e}");
-                S3Error::InternalError
-            })?;
-
-        if let Ok(size) = old_object.size() {
-            histogram!("object_size", "operation" => "delete_old_blob").record(size as f64);
-        }
-        let old_blob_guid = old_object.blob_guid().map_err(|e| {
-            tracing::error!("Failed to get blob_id from old object: {e}");
-            S3Error::InternalError
-        })?;
-
-        // Only delete old blob if it's different from the new one
-        if old_blob_guid != blob_guid {
-            let num_blocks = old_object.num_blocks().map_err(|e| {
-                tracing::error!("Failed to get num_blocks from old object: {e}");
-                S3Error::InternalError
-            })?;
-
-            let blob_deletion = ctx.app.get_blob_deletion();
-
-            // Send deletion request for each block
-            let blob_location = old_object.get_blob_location().map_err(|e| {
-                tracing::error!("Failed to get blob_location from old object: {e}");
-                S3Error::InternalError
-            })?;
-            for block_number in 0..num_blocks {
-                let request = BlobDeletionRequest {
-                    blob_guid: old_blob_guid,
-                    block_number: block_number as u32,
-                    version: 1,
-                    location: blob_location,
-                };
-
-                if let Err(e) = blob_deletion.send(request).await {
-                    tracing::warn!(
-                        "Failed to send blob {old_blob_guid} block={block_number} for background deletion: {e}"
-                    );
-                }
-            }
-        } else {
-            tracing::warn!(
-                "Skipping deletion of old blob as it matches new blob GUID: {}",
-                blob_guid.blob_id
-            );
-        }
-    }
+    enqueue_replaced_object_cleanup(
+        ctx.app.clone(),
+        routing_key,
+        &bucket_obj.root_blob_name,
+        &ctx.key,
+        old_object_bytes,
+        blob_guid,
+    )
+    .await?;
 
     histogram!("put_object_handler", "stage" => "done").record(start.elapsed().as_nanos() as f64);
 
@@ -695,60 +694,16 @@ async fn put_object_with_no_trailer(
         S3Error::from(e)
     })?;
 
-    // Delete old object if it is an overwrite request
-    // But skip deletion for multipart parts (keys containing '#') to avoid race conditions
     let old_object_bytes = parse_put_inode(resp)?;
-    let is_multipart_part = ctx.key.contains('#');
-    if !old_object_bytes.is_empty() && !is_multipart_part {
-        let old_object =
-            rkyv::from_bytes::<ObjectLayout, Error>(&old_object_bytes).map_err(|e| {
-                tracing::error!("Failed to deserialize old object layout: {e}");
-                S3Error::InternalError
-            })?;
-
-        if let Ok(size) = old_object.size() {
-            histogram!("object_size", "operation" => "delete_old_blob").record(size as f64);
-        }
-        let old_blob_guid = old_object.blob_guid().map_err(|e| {
-            tracing::error!("Failed to get blob_guid from old object: {e}");
-            S3Error::InternalError
-        })?;
-
-        // Only delete old blob if it's different from the new one
-        if old_blob_guid != blob_guid {
-            let num_blocks = old_object.num_blocks().map_err(|e| {
-                tracing::error!("Failed to get num_blocks from old object: {e}");
-                S3Error::InternalError
-            })?;
-
-            let blob_deletion = ctx.app.get_blob_deletion();
-
-            // Send deletion request for each block
-            let blob_location = old_object.get_blob_location().map_err(|e| {
-                tracing::error!("Failed to get blob_location from old object: {e}");
-                S3Error::InternalError
-            })?;
-            for block_number in 0..num_blocks {
-                let request = BlobDeletionRequest {
-                    blob_guid: old_blob_guid,
-                    block_number: block_number as u32,
-                    version: 1,
-                    location: blob_location,
-                };
-
-                if let Err(e) = blob_deletion.send(request).await {
-                    tracing::warn!(
-                        "Failed to send blob {old_blob_guid} block={block_number} for background deletion: {e}"
-                    );
-                }
-            }
-        } else {
-            tracing::warn!(
-                "Skipping deletion of old blob as it matches new blob GUID: {}",
-                blob_guid.blob_id
-            );
-        }
-    }
+    enqueue_replaced_object_cleanup(
+        ctx.app.clone(),
+        routing_key,
+        &bucket.root_blob_name,
+        &ctx.key,
+        old_object_bytes,
+        blob_guid,
+    )
+    .await?;
 
     tracing::debug!(
         "Successfully stored object {}/{} with size {}",
