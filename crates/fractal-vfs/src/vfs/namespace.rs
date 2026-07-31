@@ -1057,7 +1057,6 @@ impl VfsCore {
             ObjectState::Mpu(MpuState::Completed(_)) => {
                 if let Ok(parts) = self.backend().list_mpu_parts(key, trace_id).await {
                     for (part_key, part_layout) in &parts {
-                        self.write_teardown_marker(part_layout, trace_id).await;
                         self.teardown_blob(part_layout).await;
                         let _ = self.backend().delete_inode(part_key, trace_id).await;
                     }
@@ -1099,7 +1098,6 @@ impl VfsCore {
                         if let Ok(fresh) = self.backend().get_inode_record(inode_id, trace_id).await
                             && fresh.nlink == 0
                         {
-                            self.write_teardown_marker(&fresh.layout, trace_id).await;
                             self.teardown_blob(&fresh.layout).await;
                             let _ = self.backend().delete_inode_record(inode_id, trace_id).await;
                         }
@@ -1169,7 +1167,8 @@ impl VfsCore {
             Ok(doomed) => {
                 self.ensure_data_layout_supported(&doomed, &trace_id)
                     .await?;
-                self.write_teardown_marker(&doomed, &trace_id).await;
+                self.write_teardown_marker(&doomed, Some(&key), &trace_id)
+                    .await?;
             }
             Err(FsError::NotFound) => {}
             Err(error) => return Err(error),
@@ -1449,7 +1448,8 @@ impl VfsCore {
             Ok(dst_layout) => {
                 self.ensure_data_layout_supported(&dst_layout, &trace_id)
                     .await?;
-                self.write_teardown_marker(&dst_layout, &trace_id).await;
+                self.write_teardown_marker(&dst_layout, Some(&dst_key), &trace_id)
+                    .await?;
             }
             Err(FsError::NotFound) => {}
             Err(error) => return Err(error),

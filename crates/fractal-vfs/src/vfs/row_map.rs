@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use data_types::ovr_map::{
-    OvrRow, OvrRowMap, RowState, merge_row_for_write, ovr_row_key, ovr_row_prefix,
-    parse_ovr_row_block,
+    OVR_ABORT_VALUE, OvrRow, OvrRowMap, PrevSlot, RowState, merge_row_for_write_in_map,
+    ovr_abort_key, ovr_row_key, ovr_row_prefix, parse_ovr_abort_range, parse_ovr_row_block,
 };
 use data_types::{DataBlobGuid, TraceId};
 use futures::{StreamExt, stream};
@@ -38,9 +38,9 @@ pub(crate) struct RowWrite {
 /// What the row CAS displaced, handed to the sweep as exact victims.
 #[derive(Debug, Default)]
 pub(crate) struct RowWriteOutcome {
-    /// Superseded `Written` identities: the committed generation this
+    /// Superseded `Written` identities: the committed fallback this
     /// flush replaces, plus any orphan fragment an abandoned attempt
-    /// left in the `cur` slot.
+    /// left in `cur`.
     pub(crate) victims: Vec<(u32, u64)>,
     /// The rows as stored after this flush's CAS, for the write-through
     /// into the cached snapshot on commit.
@@ -80,8 +80,9 @@ impl VfsCore {
 
     /// Load (or serve cached) the row snapshot for `blob_guid` at
     /// `map_epoch`. Validity rule: a snapshot at epoch M serves any read
-    /// whose layout carries the same M, regardless of ceiling movement,
-    /// including the negative knowledge that a row was absent.
+    /// whose layout carries the same M. A delayed aborted row can land
+    /// at that epoch, but resolves identically through its committed
+    /// fallback.
     pub(crate) async fn load_row_map(
         &self,
         blob_guid: DataBlobGuid,
@@ -126,14 +127,13 @@ impl VfsCore {
         let backend = self.backend();
         let results = stream::iter(writes.iter().copied())
             .map(|write| async move {
-                let hint = base_map.and_then(|map| map.get(write.block)).copied();
                 write_one_row(
                     backend,
                     blob_guid.blob_id,
                     write,
                     version,
                     base_ceiling,
-                    hint,
+                    base_map,
                     trace_id,
                 )
                 .await
@@ -144,40 +144,82 @@ impl VfsCore {
 
         let mut outcome = RowWriteOutcome::default();
         for result in results {
-            let (block, stored, victim) = result?;
+            let (block, stored, victims) = result?;
             outcome.rows.push((block, stored));
-            if let Some(identity) = victim {
-                outcome.victims.push(identity);
-            }
+            outcome.victims.extend(victims);
         }
         Ok(outcome)
+    }
+
+    /// Persist proof that every generation in `[lo, hi]` was doomed by
+    /// this flush's successful prepare CAS. The immutable record lands
+    /// before any commit can advance the ceiling across the range, so a
+    /// delayed row CAS from an older attempt remains permanently
+    /// non-readable. A lost successful reply is recovered by comparing
+    /// the deterministic value.
+    pub(crate) async fn record_aborted_versions(
+        &self,
+        blob_guid: DataBlobGuid,
+        lo: u64,
+        hi: u64,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        if lo == 0 || lo > hi {
+            return Err(FsError::Internal(format!(
+                "invalid aborted generation range {lo}..={hi}"
+            )));
+        }
+        let key = ovr_abort_key(&blob_guid.blob_id, lo, hi);
+        let value = Bytes::from_static(&OVR_ABORT_VALUE);
+        match self
+            .backend()
+            .put_inode_cas(&key, value.clone(), Bytes::new(), trace_id)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => match self.backend().get_inode_raw(&key, trace_id).await {
+                Ok(stored) if stored.as_ref() == OVR_ABORT_VALUE => Ok(()),
+                Ok(_) => Err(FsError::Internal(format!(
+                    "malformed aborted generation record at {key}"
+                ))),
+                Err(FsError::NotFound) => Err(error),
+                Err(probe_error) => {
+                    tracing::warn!(%key, %probe_error, "abort record write outcome is ambiguous");
+                    Err(error)
+                }
+            },
+        }
     }
 }
 
 /// CAS-install one row. `hint` seeds the expected-old bytes from the
 /// flush's base snapshot; a conflict refetches and recomputes, bounded
 /// by `ROW_CAS_RETRIES`. Returns the stored row and the displaced
-/// `Written` identity (if any).
+/// `Written` identities.
 async fn write_one_row(
     backend: &crate::backend::StorageBackend,
     blob_id: Uuid,
     write: RowWrite,
     version: u64,
     base_ceiling: u64,
-    hint: Option<OvrRow>,
+    base_map: Option<&OvrRowMap>,
     trace_id: &TraceId,
-) -> Result<(u32, OvrRow, Option<(u32, u64)>), FsError> {
+) -> Result<(u32, OvrRow, Vec<(u32, u64)>), FsError> {
     let key = ovr_row_key(&blob_id, write.block);
-    let mut current: Option<OvrRow> = hint;
+    let mut current = base_map.and_then(|map| map.get(write.block)).copied();
     for _ in 0..ROW_CAS_RETRIES {
-        let Some(merged) =
-            merge_row_for_write(current.as_ref(), write.state, version, base_ceiling)
-        else {
+        let Some(merged) = merge_row_for_write_in_map(
+            current.as_ref(),
+            write.state,
+            version,
+            base_ceiling,
+            base_map,
+        ) else {
             // The stored cur is already at or above our version: an
             // idempotent replay of this flush's own row. Nothing is
             // displaced that this attempt did not already report.
             let stored = current.expect("skip implies a stored row");
-            return Ok((write.block, stored, None));
+            return Ok((write.block, stored, Vec::new()));
         };
         let expected_old = match current {
             Some(row) => Bytes::copy_from_slice(&row.encode()),
@@ -193,15 +235,23 @@ async fn write_one_row(
                 // committed generation this flush supersedes (promoted
                 // into prev until the commit lands), or an abandoned
                 // attempt's orphan fragment (cur above the base ceiling).
-                let victim = match current {
+                let mut victims = Vec::new();
+                if let Some(identity) = match current {
                     Some(OvrRow {
                         cur_state: RowState::Written,
                         cur_version,
                         ..
                     }) if cur_version != version => Some((write.block, cur_version)),
                     _ => None,
-                };
-                return Ok((write.block, merged, victim));
+                } {
+                    victims.push(identity);
+                }
+                if let PrevSlot::Slot(RowState::Written, prev_version) = merged.prev {
+                    victims.push((write.block, prev_version));
+                }
+                victims.sort_unstable();
+                victims.dedup();
+                return Ok((write.block, merged, victims));
             }
             Err(FsError::CasConflict) => {
                 // Self-heal from the stored bytes and retry. A conflict
@@ -240,23 +290,31 @@ async fn load_row_snapshot(
             .await
         {
             Ok(page) => page,
-            // No rows at all: legal for a freshly mapped blob whose
-            // first row-writing commit only produced Hole rows that a
-            // later teardown already removed, and for lagging caches.
-            Err(FsError::NotFound) => return Ok(map),
+            // `NotFound` here means the NSS root is gone, not that this
+            // prefix is empty. Do not turn bucket deletion into a valid
+            // empty map for a stale layout.
+            Err(FsError::NotFound) => return Err(FsError::NotFound),
             Err(error) => return Err(error),
         };
         let Some(last_key) = page.last().map(|(key, _)| key.clone()) else {
             return Ok(map);
         };
         for (key, value) in page {
-            let Some(block) = parse_ovr_row_block(&key) else {
-                return Err(FsError::Internal(format!("malformed @ovr row key {key}")));
-            };
-            let Some(row) = OvrRow::decode(&value) else {
-                return Err(FsError::Internal(format!("malformed @ovr row at {key}")));
-            };
-            map.insert(block, row);
+            if let Some(block) = parse_ovr_row_block(&key) {
+                let Some(row) = OvrRow::decode(&value) else {
+                    return Err(FsError::Internal(format!("malformed @ovr row at {key}")));
+                };
+                map.insert(block, row);
+            } else if let Some((lo, hi)) = parse_ovr_abort_range(&key) {
+                if value.as_ref() != OVR_ABORT_VALUE {
+                    return Err(FsError::Internal(format!(
+                        "malformed aborted generation record at {key}"
+                    )));
+                }
+                map.add_aborted_range(lo, hi);
+            } else {
+                return Err(FsError::Internal(format!("malformed @ovr key {key}")));
+            }
         }
         if !has_more {
             return Ok(map);

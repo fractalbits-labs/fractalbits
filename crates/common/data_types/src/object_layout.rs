@@ -55,10 +55,8 @@ pub struct FsExt {
     /// `max(next_version, blob_version + 1)`. Never decreases and a
     /// burned version is never reallocated, so every BSS data key is
     /// written by at most one flush attempt, ever. An interrupted
-    /// attempt needs no record beyond the burn itself: its fragments
-    /// are invisible above the ceiling, and once a later commit passes
-    /// them they read as ordinary content (the POSIX
-    /// unspecified-state-after-failed-write outcome). 0 means "never
+    /// attempt's bodies need no record beyond the burn itself: they are
+    /// invisible until a committed row names them. 0 means "never
     /// overwritten" and stays the normalized default for plain
     /// created/appended files.
     pub next_version: u64,
@@ -73,11 +71,11 @@ pub struct FsExt {
     /// before any version-1 body I/O, cleared by the commit CAS that
     /// resolves the whole range.
     pub pending_append: Option<(u32, u32)>,
-    /// Ceiling value of the last commit that wrote any `@ovr/` row; 0
-    /// means the blob has never been mapped. A row snapshot taken at
-    /// epoch M serves any read whose layout still carries M, however
-    /// far the ceiling advanced: every row change is published by a
-    /// commit CAS that bumps this in the same CAS.
+    /// Ceiling value of the last commit that changed the `@ovr/` map or
+    /// its interpretation; 0 means the blob has never been mapped. A
+    /// row snapshot taken at epoch M serves any read whose layout still
+    /// carries M. Row writes and commits that cross an aborted
+    /// generation both bump this in the publishing CAS.
     pub map_epoch: u64,
 }
 
@@ -279,17 +277,31 @@ impl ObjectLayout {
         self.update_fs_ext(|e| e.pending_append = range);
     }
 
-    /// Ceiling of the last row-writing commit; 0 = never mapped.
+    /// Ceiling of the last row-interpretation change; 0 = never mapped.
     #[inline]
     pub fn map_epoch(&self) -> u64 {
         self.fs_ext.as_ref().map_or(0, |e| e.map_epoch)
     }
 
-    /// Whether any committed `@ovr/` row can exist for this blob. False
-    /// means every block resolves to the base version with no NSS read.
+    /// Whether any committed `@ovr/` row or abort record can affect this
+    /// blob. False means every block resolves to the base version with
+    /// no NSS read.
     #[inline]
     pub fn is_mapped(&self) -> bool {
         self.map_epoch() != 0
+    }
+
+    /// Whether this layout can have any physical `@ovr/` key. A
+    /// prepared first overwrite can stage rows before its map epoch is
+    /// committed; the allocator advanced more than one step past the
+    /// ceiling is the durable signal for that case.
+    #[inline]
+    pub fn may_have_ovr_records(&self) -> bool {
+        self.is_mapped()
+            || self
+                .fs_ext
+                .as_ref()
+                .is_some_and(|ext| ext.next_version > self.blob_version.saturating_add(1))
     }
 
     pub fn set_map_epoch(&mut self, map_epoch: u64) {
@@ -648,6 +660,23 @@ mod tests {
             21,
             "ceiling can outrun the allocator"
         );
+    }
+
+    #[test]
+    fn potential_ovr_records_include_prepared_first_overwrite() {
+        let mut normal = normal_layout(core_meta(7));
+        normal.blob_version = 5;
+        assert!(!normal.may_have_ovr_records());
+        normal.set_next_version(6);
+        assert!(!normal.may_have_ovr_records());
+
+        let mut prepared = normal.clone();
+        prepared.set_next_version(7);
+        assert!(prepared.may_have_ovr_records());
+
+        let mut mapped = normal;
+        mapped.set_map_epoch(5);
+        assert!(mapped.may_have_ovr_records());
     }
 
     fn special_layout(kind: SpecialKind, rdev: u32) -> ObjectLayout {

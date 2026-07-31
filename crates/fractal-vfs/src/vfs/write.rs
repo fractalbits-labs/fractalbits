@@ -10,18 +10,16 @@
 //!    block inside an interrupted append's `pending_append` range) lands
 //!    at one freshly burned generation with a row.
 //! 2. Prepare CAS: durably burn the generation and record the
-//!    version-1 append range before any data I/O. Version 1 is the one
-//!    generation two attempts can contest, so an interrupted attempt
-//!    must be recorded; a burned generation needs no record beyond the
-//!    burn (write-once keys make its fragments invisible and
-//!    uncontendable).
+//!    version-1 append range before any data I/O. Once it wins, every
+//!    skipped generation between the committed ceiling and this attempt
+//!    is permanently rejected by an immutable abort-range record.
 //! 3. Bodies, then rows, then reservations. A block's row CAS is issued
 //!    only after that block's own body write is acknowledged, or a crash
 //!    could leave a row naming a version with no data. Rows carry
 //!    `cur_version` above the ceiling: invisible until commit.
 //! 4. Commit CAS: the ceiling advances to the burned generation, every
 //!    staged row becomes visible atomically, `pending_append` clears,
-//!    and `map_epoch` bumps iff any row was written.
+//!    and `map_epoch` bumps when rows or their interpretation changed.
 //! 5. The superseded exact identities (handed over by the row CASes)
 //!    go to the background sweep, after a reader grace.
 
@@ -43,6 +41,7 @@ use crate::cache::DirEntryKind;
 use crate::config::WritebackMode;
 use crate::disk_cache::{MIRROR_BYTE_BUDGET, MirrorJob};
 use crate::error::FsError;
+use crate::inode::{layout_posix, layout_with_posix};
 use crate::vfs::row_map::RowWrite;
 use crate::vfs::write_buffer::BlockState;
 use crate::vfs::write_buffer::WriteBuffer;
@@ -70,6 +69,67 @@ fn union_ranges(a: Option<(u32, u32)>, b: Option<(u32, u32)>) -> Option<(u32, u3
 
 fn in_range(range: Option<(u32, u32)>, block: u32) -> bool {
     range.is_some_and(|(lo, hi)| lo <= block && block <= hi)
+}
+
+fn aborted_generation_range(
+    base_ceiling: u64,
+    version: u64,
+) -> Result<Option<(u64, u64)>, FsError> {
+    let first_skipped = base_ceiling
+        .checked_add(1)
+        .ok_or_else(|| FsError::Internal("block version exhausted".into()))?;
+    Ok((version > first_skipped).then_some((first_skipped, version - 1)))
+}
+
+fn committed_map_epoch(
+    base_epoch: u64,
+    version: u64,
+    rows_written: bool,
+    aborted_range: Option<(u64, u64)>,
+) -> u64 {
+    if rows_written || aborted_range.is_some() {
+        version
+    } else {
+        base_epoch
+    }
+}
+
+/// Carry the POSIX fields from the exact CAS guard into a data-layout
+/// candidate. Data publication owns the structural and size fields, but a
+/// concurrent metadata publication owns these attributes.
+fn rebase_layout_posix(layout: &ObjectLayout, guard: &ObjectLayout) -> ObjectLayout {
+    layout_with_posix(layout.clone(), layout_posix(guard))
+}
+
+/// Verdict on a create publish whose CAS did not return success,
+/// derived from a probe of the published key. Deletion of the fresh
+/// blob requires PROOF of non-publication: if the CAS landed (lost
+/// reply), the inode references the blob and a queued whole-blob
+/// deletion would destroy acknowledged data after the grace window.
+#[derive(Debug, PartialEq, Eq)]
+enum CreatePublish {
+    /// The key references this attempt's blob: idempotently landed.
+    Landed,
+    /// No proof either way: leak, never delete. Even absence or another
+    /// blob at the original path is insufficient because a successful
+    /// create may already have been renamed or hardlinked elsewhere.
+    Ambiguous,
+}
+
+fn classify_create_publish(
+    probe: &Result<ObjectLayout, FsError>,
+    ours: data_types::DataBlobGuid,
+) -> CreatePublish {
+    if probe
+        .as_ref()
+        .ok()
+        .and_then(|current| current.blob_guid().ok())
+        == Some(ours)
+    {
+        CreatePublish::Landed
+    } else {
+        CreatePublish::Ambiguous
+    }
 }
 
 impl VfsCore {
@@ -405,6 +465,12 @@ impl VfsCore {
         // Rows as stored after this flush's CASes, for the write-through
         // into the cached row snapshot.
         let mut committed_rows: Vec<(u32, data_types::ovr_map::OvrRow)> = Vec::new();
+        // Newly durable rejected-generation range, if this commit
+        // crossed one or more abandoned attempts.
+        let mut committed_aborted_range: Option<(u64, u64)> = None;
+        // Hold the exact base snapshot through commit so LRU eviction by
+        // another reader cannot make write-through construct a partial map.
+        let mut committed_base_rows: Option<std::sync::Arc<OvrRowMap>> = None;
         let (mut final_layout, final_committed_size) = loop {
             let publish_key = promoted_record_key
                 .clone()
@@ -414,19 +480,14 @@ impl VfsCore {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64;
-            // On the promoted (hardlink) path, carry the freshly-fetched
-            // record's posix forward, NOT the local snapshot taken before
-            // this flush: another alias may have chmod/chown'd the shared
-            // record between the snapshot and this CAS attempt, and a data
-            // write changes only size/data fields (never posix).
-            let effective_posix = if promoted_record.is_some() {
-                base_layout
-                    .as_ref()
-                    .map(crate::inode::layout_posix)
-                    .unwrap_or_else(|| self.inodes.get(ino).map(|e| e.posix).unwrap_or_default())
-            } else {
-                self.inodes.get(ino).map(|e| e.posix).unwrap_or_default()
-            };
+            // Carry the exact CAS base's posix forward. The inode cache can
+            // lag a chmod or utimensat published by another mount, including
+            // on the ordinary (non-hardlink) path. A create has no base yet,
+            // so only that path seeds the layout from the local inode.
+            let effective_posix = base_layout
+                .as_ref()
+                .map(layout_posix)
+                .unwrap_or_else(|| self.inodes.get(ino).map(|e| e.posix).unwrap_or_default());
             let build_layout = |blob_guid: data_types::DataBlobGuid,
                                 blob_version: u64,
                                 next_version: u64,
@@ -505,56 +566,37 @@ impl VfsCore {
                         return Err(error);
                     }
                 };
-                match self
+                let cas_result = self
                     .backend()
                     .put_inode_cas(&publish_key, publish_bytes.clone(), Bytes::new(), &trace_id)
-                    .await
-                {
-                    Ok(_prev) => {
-                        for (block, state) in snap.blocks.iter() {
-                            if matches!(state, BlockState::Rewrite(_)) {
-                                committed_write_versions.insert(*block, 1);
-                            }
-                        }
-                        snap.armed = false;
-                        break (layout, 0);
-                    }
-                    Err(FsError::CasConflict) => {
-                        // A first publish is a create, not an overwrite. If
-                        // the CAS reply was lost and an internal retry saw
-                        // the row present, the stored bytes match exactly
-                        // and the publish is idempotently complete.
-                        // Otherwise another creator won the name.
-                        match self.backend().get_inode(&publish_key, &trace_id).await {
-                            Ok(cur) => {
-                                let cur_bytes = wrap_for_publish(None, &cur);
-                                if cur_bytes.is_ok_and(|current| current == publish_bytes) {
-                                    for (block, state) in snap.blocks.iter() {
-                                        if matches!(state, BlockState::Rewrite(_)) {
-                                            committed_write_versions.insert(*block, 1);
-                                        }
-                                    }
-                                    snap.armed = false;
-                                    break (layout, 0);
-                                }
-                            }
-                            Err(FsError::NotFound) => {}
-                            Err(e) => {
-                                self.cleanup_unpublished_blob(blob_guid, unpublished_identities)
-                                    .await;
-                                return Err(e);
-                            }
-                        }
-                        self.cleanup_unpublished_blob(blob_guid, unpublished_identities)
-                            .await;
-                        return Err(FsError::CasConflict);
-                    }
-                    Err(e) => {
-                        self.cleanup_unpublished_blob(blob_guid, unpublished_identities)
-                            .await;
-                        return Err(e);
+                    .await;
+                if let Err(error) = cas_result {
+                    // The CAS may have landed with a lost reply (an
+                    // internal retry then sees our own row and reports
+                    // CasConflict), and a transport error may or may
+                    // not have been applied. Probe by blob IDENTITY,
+                    // not bytes: a concurrent posix republish (create
+                    // then immediate chmod) already changes the bytes
+                    // of a landed publish.
+                    let probe = self.backend().get_inode(&publish_key, &trace_id).await;
+                    match classify_create_publish(&probe, blob_guid) {
+                        // Idempotently complete: fall through.
+                        CreatePublish::Landed => {}
+                        // Never delete on ambiguity: if the CAS landed,
+                        // the inode references this blob and deletion
+                        // would destroy published data after the grace.
+                        // A truly-unpublished blob leaks instead, which
+                        // scrub reconciles.
+                        CreatePublish::Ambiguous => return Err(error),
                     }
                 }
+                for (block, state) in snap.blocks.iter() {
+                    if matches!(state, BlockState::Rewrite(_)) {
+                        committed_write_versions.insert(*block, 1);
+                    }
+                }
+                snap.armed = false;
+                break (layout, 0);
             };
 
             // Overwrite/append path against a committed base.
@@ -566,8 +608,20 @@ impl VfsCore {
             let base_rows_ref = base_rows.as_deref();
             let abandoned = base.pending_append();
 
-            let has_row =
-                |b: u32| -> bool { base_rows_ref.is_some_and(|rows| rows.get(b).is_some()) };
+            // Whether a row commits this block to an exact generation
+            // or a hole at the current ceiling. Deliberately NOT "a row
+            // exists": a straggler-staged row that resolves to Base
+            // must keep base-version semantics everywhere (version-1
+            // classification, trim probes, v1 sweep victims), or it
+            // shields the block's real state from this flush.
+            let row_resolves = |b: u32| -> bool {
+                base_rows_ref.is_some_and(|rows| {
+                    !matches!(
+                        rows.resolve(b, base_ceiling),
+                        BlockResolution::Base | BlockResolution::Stale
+                    )
+                })
+            };
 
             // Version-1 append territory: first writes beyond the
             // committed EOF, outside any interrupted append's range. A
@@ -578,7 +632,7 @@ impl VfsCore {
                 .iter()
                 .filter_map(|(b, st)| {
                     (matches!(st, BlockState::Rewrite(_))
-                        && !has_row(*b)
+                        && !row_resolves(*b)
                         && *b >= committed_bc
                         && !in_range(abandoned, *b))
                     .then_some(*b)
@@ -630,13 +684,36 @@ impl VfsCore {
                         if snap.blocks.contains_key(&b) {
                             continue;
                         }
-                        if row.cur_version <= base_ceiling && row.cur_state == RowState::Written {
-                            trim_hole_blocks.insert(b);
+                        // Classify by the committed RESOLUTION, not the
+                        // raw cur: a straggler-staged cur above the
+                        // ceiling would otherwise shield its committed
+                        // prev (and the block's v1 body, via the probe
+                        // skip below) from the Hole conversion, and this
+                        // flush's commit would then publish it where the
+                        // shrink requires zeros.
+                        match rows.resolve(b, base_ceiling) {
+                            BlockResolution::Exact { version } => {
+                                trim_hole_blocks.insert(b);
+                                sweep_victims.push((b, version));
+                            }
+                            // A committed Hole needs no new row.
+                            BlockResolution::Hole => {}
+                            // Base-resolving row: the ROW must still be
+                            // superseded by a Hole (this flush's commit
+                            // passes its staged cur, which would then
+                            // resolve Written); the probe below finds
+                            // any v1 body to reclaim.
+                            BlockResolution::Base | BlockResolution::Stale => {
+                                trim_hole_blocks.insert(b);
+                            }
+                        }
+                        if row.cur_version > base_ceiling && row.cur_state == RowState::Written {
+                            // Straggler orphan body at the staged
+                            // generation. This trim's row CAS supersedes
+                            // its metadata; the abort record keeps any
+                            // still-delayed copy non-readable.
                             sweep_victims.push((b, row.cur_version));
                         }
-                        // A committed Hole needs no new row; a staged cur
-                        // above the ceiling is superseded by the row CAS
-                        // if this block is ever touched again.
                     }
                 }
                 let count = trim_hi - trim_lo;
@@ -646,7 +723,7 @@ impl VfsCore {
                     .await?;
                 for entry in entries {
                     let b = entry.block_number;
-                    if snap.blocks.contains_key(&b) || has_row(b) {
+                    if snap.blocks.contains_key(&b) || row_resolves(b) {
                         continue;
                     }
                     if entry.version == 1 {
@@ -678,12 +755,10 @@ impl VfsCore {
             }
 
             // Step 2: prepare CAS. Durably burns `version` and records
-            // the version-1 territory before any data I/O. `blob_version`
-            // stays at the reader-visible ceiling until commit. The
-            // doomed-preparer property starts here: any older prepared
-            // flush can no longer commit, so the ceiling cannot move
-            // before this flush commits or aborts, which is what makes
-            // the row CASes' conditional promotion sound.
+            // the version-1 territory before any data I/O.
+            // `blob_version` stays at the reader-visible ceiling until
+            // commit. The doomed-preparer property starts here: any
+            // older prepared flush can no longer commit.
             let mut prepare = base.clone();
             prepare.set_next_version(version + 1);
             prepare.set_pending_append(pending_union);
@@ -741,6 +816,16 @@ impl VfsCore {
             }
             if let Some(mut entry) = self.inodes.get_mut(ino) {
                 entry.layout = Some(prepare.clone());
+            }
+
+            // The successful prepare above permanently doomed every
+            // skipped generation. Publish that fact before any commit
+            // can advance the ceiling across the gap. Delayed row CASes
+            // may still land, but every reader rejects their versions.
+            let aborted_range = aborted_generation_range(base_ceiling, version)?;
+            if let Some((lo, hi)) = aborted_range {
+                self.record_aborted_versions(blob_guid, lo, hi, &trace_id)
+                    .await?;
             }
 
             // Step 3: bodies, pipelined (independent write-once keys;
@@ -828,7 +913,7 @@ impl VfsCore {
             // whatever sat at version 1 (data or a claim; a miss is an
             // idempotent no-op for the sweep).
             for b in burned_rewrites.iter().chain(punched.iter()) {
-                if !has_row(*b) && *b < committed_bc {
+                if !row_resolves(*b) && *b < committed_bc {
                     sweep_victims.push((*b, 1));
                 }
                 if in_range(abandoned, *b) {
@@ -843,10 +928,10 @@ impl VfsCore {
             // over a punched block): resolve those via one listing in
             // the sweep.
             for b in burned_rewrites.iter() {
-                if let Some(row) = base_rows_ref.and_then(|rows| rows.get(*b))
-                    && row.cur_version <= base_ceiling
-                    && row.cur_state == RowState::Hole
-                {
+                if matches!(
+                    base_rows_ref.map(|rows| rows.resolve(*b, base_ceiling)),
+                    Some(BlockResolution::Hole)
+                ) {
                     sweep_below.push((*b, version));
                 }
             }
@@ -854,22 +939,26 @@ impl VfsCore {
             // Step 6: commit CAS. The ceiling advances to `version`,
             // every staged row becomes visible together, the version-1
             // territory is resolved (pending_append clears), and
-            // map_epoch bumps iff this commit wrote any row.
-            let map_epoch = if rows_written {
-                version
-            } else {
-                base.map_epoch()
-            };
-            let layout = build_layout(blob_guid, version, version + 1, None, map_epoch);
-            let new_bytes = wrap_for_publish(promoted_record.as_ref(), &layout)?;
+            // map_epoch bumps when this commit wrote a row or changed
+            // row interpretation by crossing an aborted generation.
+            let map_epoch =
+                committed_map_epoch(base.map_epoch(), version, rows_written, aborted_range);
+            let structural_layout = build_layout(blob_guid, version, version + 1, None, map_epoch);
             let mut commit_guard = prepare.clone();
-            loop {
+            let layout = loop {
+                // A chmod or utimensat can win after prepare. Rebuild the
+                // candidate from the current guard on every CAS retry so the
+                // data commit never restores stale POSIX metadata.
+                let candidate = rebase_layout_posix(&structural_layout, &commit_guard);
+                let new_bytes = wrap_for_publish(promoted_record.as_ref(), &candidate)?;
                 let old_bytes = wrap_for_publish(promoted_record.as_ref(), &commit_guard)?;
                 let commit_result = self
                     .backend()
                     .put_inode_cas(&publish_key, new_bytes.clone(), old_bytes, &trace_id)
                     .await;
-                let Err(error) = commit_result else { break };
+                let Err(error) = commit_result else {
+                    break candidate;
+                };
                 if self
                     .publish_landed(
                         &publish_key,
@@ -880,7 +969,7 @@ impl VfsCore {
                     )
                     .await
                 {
-                    break;
+                    break candidate;
                 }
                 if posix_rebase_attempts < MAX_POSIX_REBASE_ATTEMPTS
                     && let Some(current) = self
@@ -898,7 +987,7 @@ impl VfsCore {
                     continue;
                 }
                 return Err(error);
-            }
+            };
 
             for b in snap
                 .blocks
@@ -912,6 +1001,8 @@ impl VfsCore {
                 };
                 committed_write_versions.insert(b, committed_version);
             }
+            committed_aborted_range = aborted_range;
+            committed_base_rows = base_rows;
             snap.armed = false;
             break (layout, committed_size);
         };
@@ -920,17 +1011,24 @@ impl VfsCore {
         // this writer never reloads its own rows: clone the base
         // snapshot, overlay the stored rows, retag at the new epoch.
         if let Ok(final_blob_guid) = final_layout.blob_guid() {
-            if committed_rows.is_empty() {
+            if committed_rows.is_empty() && committed_aborted_range.is_none() {
                 // No rows written: any cached snapshot is still valid at
                 // its (unchanged) epoch.
             } else {
-                let mut fresh = self
-                    .row_maps
-                    .lock()
-                    .get(&final_blob_guid.blob_id)
-                    .map(|cached| (**cached).clone())
+                let mut fresh = committed_base_rows
+                    .as_deref()
+                    .cloned()
+                    .or_else(|| {
+                        self.row_maps
+                            .lock()
+                            .get(&final_blob_guid.blob_id)
+                            .map(|cached| (**cached).clone())
+                    })
                     .unwrap_or_default();
                 fresh.epoch = final_layout.map_epoch();
+                if let Some((lo, hi)) = committed_aborted_range {
+                    fresh.add_aborted_range(lo, hi);
+                }
                 for (block, row) in committed_rows.drain(..) {
                     fresh.insert(block, row);
                 }
@@ -1922,5 +2020,130 @@ mod range_tests {
         assert!(in_range(Some((3, 5)), 5));
         assert!(!in_range(Some((3, 5)), 6));
         assert!(!in_range(None, 0));
+    }
+
+    #[test]
+    fn row_free_recovery_bumps_map_epoch() {
+        // Version 2 was prepared and abandoned. A row-free version-3
+        // commit must publish the abort interpretation through epoch 3.
+        let aborted = aborted_generation_range(1, 3).expect("range");
+        assert_eq!(aborted, Some((2, 2)));
+        assert_eq!(committed_map_epoch(0, 3, false, aborted), 3);
+
+        // The ordinary consecutive row-free commit changes no row
+        // interpretation and retains the existing cache epoch.
+        let consecutive = aborted_generation_range(3, 4).expect("range");
+        assert_eq!(consecutive, None);
+        assert_eq!(committed_map_epoch(3, 4, false, consecutive), 3);
+        assert_eq!(committed_map_epoch(3, 4, true, consecutive), 4);
+    }
+}
+
+#[cfg(test)]
+mod create_publish_tests {
+    use data_types::DataBlobGuid;
+    use data_types::object_layout::{IndirectEntry, ObjectCoreMetaData, PosixAttrs};
+    use uuid::Uuid;
+
+    use super::*;
+
+    fn guid(n: u128) -> DataBlobGuid {
+        DataBlobGuid {
+            blob_id: Uuid::from_u128(n),
+            volume_id: 1,
+        }
+    }
+
+    fn normal_layout(blob_guid: DataBlobGuid) -> ObjectLayout {
+        ObjectLayout {
+            timestamp: 1,
+            version_id: ObjectLayout::gen_version_id(),
+            block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
+            blob_version: 1,
+            fs_ext: None,
+            state: ObjectState::Normal(ObjectMetaData {
+                blob_guid,
+                core_meta_data: ObjectCoreMetaData {
+                    size: 0,
+                    etag: String::new(),
+                    headers: vec![],
+                    checksum: None,
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn only_identity_match_proves_create_landed() {
+        let ours = guid(7);
+
+        // Landed by identity, even when the bytes have since moved
+        // (posix republish): never classified unpublished.
+        let landed = normal_layout(ours);
+        assert_eq!(
+            classify_create_publish(&Ok(landed), ours),
+            CreatePublish::Landed
+        );
+
+        // Another creator may have replaced a create whose reply was
+        // lost after it was renamed or hardlinked elsewhere.
+        assert_eq!(
+            classify_create_publish(&Ok(normal_layout(guid(8))), ours),
+            CreatePublish::Ambiguous
+        );
+
+        // Absence has the same rename race and cannot authorize cleanup.
+        assert_eq!(
+            classify_create_publish(&Err(FsError::NotFound), ours),
+            CreatePublish::Ambiguous
+        );
+
+        // Probe failure: the CAS may have landed. Must never delete.
+        assert_eq!(
+            classify_create_publish(&Err(FsError::CasConflict), ours),
+            CreatePublish::Ambiguous
+        );
+        assert_eq!(
+            classify_create_publish(&Err(FsError::InvalidState), ours),
+            CreatePublish::Ambiguous
+        );
+
+        // A state the blob cannot be ruled out of (no extractable
+        // guid): ambiguous, never delete.
+        let mut indirect = normal_layout(ours);
+        indirect.state = ObjectState::Indirect(IndirectEntry {
+            inode_id: Uuid::from_u128(3),
+        });
+        assert_eq!(
+            classify_create_publish(&Ok(indirect), ours),
+            CreatePublish::Ambiguous
+        );
+    }
+
+    #[test]
+    fn data_candidate_rebases_posix_from_current_guard() {
+        let mut desired = normal_layout(guid(9));
+        desired.blob_version = 4;
+        desired.set_next_version(5);
+        desired.set_pending_append(Some((2, 3)));
+        desired.set_map_epoch(4);
+
+        let mut guard = desired.clone();
+        let current_posix = PosixAttrs {
+            mode: 0o100640,
+            uid: 41,
+            gid: 42,
+            mtime_ns: 43,
+            ctime_ns: 44,
+        };
+        guard.set_fs_posix(Some(current_posix));
+
+        let rebased = rebase_layout_posix(&desired, &guard);
+        assert_eq!(rebased.fs_posix(), Some(current_posix));
+        assert_eq!(rebased.blob_version, 4);
+        assert_eq!(rebased.next_burn_version(), 5);
+        assert_eq!(rebased.pending_append(), Some((2, 3)));
+        assert_eq!(rebased.map_epoch(), 4);
+        assert!(posix_only_moved(&desired, &rebased));
     }
 }

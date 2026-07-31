@@ -119,8 +119,8 @@ fn new_blob_deletion_request(
         blob_guid,
         num_blocks,
         location,
-        mapped: object.is_mapped(),
-        marker_written: !object.is_mapped(),
+        mapped: object.may_have_ovr_records(),
+        marker_written: !object.may_have_ovr_records(),
         grace_until: Some(Instant::now() + grace),
         blocks_deleted: false,
         app,
@@ -508,8 +508,11 @@ async fn write_gc_marker(request: &BlobDeletionRequest, trace_id: &TraceId) -> R
         .await
         .map_err(|error| error.to_string())?;
     let key = ovr_gc_key(&request.blob_guid.blob_id);
-    // Value content is irrelevant (NSS rejects empty values); the
-    // marker's existence is the record.
+    // The "gc" sentinel marks an UNCONDITIONAL teardown: this worker
+    // only runs after the doomed object is already unreachable in NSS,
+    // so the fs_server marker scavenger may replay it. Pre-mutation
+    // (unlink/rename) markers carry the doomed key and are retained as
+    // opaque conditional intents.
     nss_rpc_retry!(
         nss_client,
         put_inode(

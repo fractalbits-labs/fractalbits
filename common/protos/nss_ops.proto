@@ -101,6 +101,15 @@ message ListInodesResponse {
 message DeleteInodeRequest {
   string root_blob_name = 1;
   string key = 2;
+  // Nonzero only for bucket teardown. It permits this erase while the
+  // matching root is fenced against ordinary namespace mutations.
+  uint64 teardown_token = 3;
+  // Per-attempt fencing generation. A newer cleanup attempt for the same
+  // stable teardown token invalidates erases from the older attempt.
+  uint64 teardown_session = 4;
+  // Opaque NSS-issued generation returned by the initial fenced root delete.
+  // A cleanup erase is authorized only by the exact active generation.
+  uint64 teardown_generation = 5;
 }
 
 message DeleteInodeResponse {
@@ -134,13 +143,30 @@ message CreateRootInodeResponse {
 // DeleteRootInode
 message DeleteRootInodeRequest {
   string root_blob_name = 1;
+  // A nonzero token acquires or continues a bucket teardown fence. The
+  // fence survives err_not_empty until its active session completes or aborts.
+  uint64 teardown_token = 2;
+  // Release the matching teardown fence without deleting the root.
+  bool abort_teardown = 3;
+  // Per-attempt fencing generation. This prevents concurrent callers that
+  // share the stable root token from aborting or mutating for each other.
+  uint64 teardown_session = 4;
+  // Zero starts or retries acquisition for teardown_session. A nonzero value
+  // continues or aborts only the exact generation issued by NSS.
+  uint64 teardown_generation = 5;
 }
 
 message DeleteRootInodeResponse {
+  message FencedNotEmpty {
+    // Opaque generation required by cleanup erases and continuation requests.
+    uint64 teardown_generation = 1;
+  }
+
   oneof result {
     string ok = 1;
     google.protobuf.Empty err_not_empty = 2;
     string err_other = 3;
+    FencedNotEmpty fenced_not_empty = 4;
   }
 }
 

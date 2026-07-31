@@ -18,6 +18,15 @@ pub fn ec_padded_len(content_len: usize, data_shards: usize) -> usize {
     }
 }
 
+/// Cohort identity shared by every shard produced by one EC body.
+///
+/// Zero is reserved for non-EC entries. The tag covers the padded body so
+/// repair can validate a reconstructed stripe without the file's logical tail
+/// length.
+pub fn ec_cohort_tag(padded_body: &[u8]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(padded_body).max(1)
+}
+
 /// Compute shard index from node position and rotation.
 /// Given node_idx in the volume's bss_nodes list, returns the logical shard
 /// index (0..k are data shards, k..k+m are parity shards).
@@ -62,6 +71,17 @@ mod tests {
         assert_eq!(ec_padded_len(9, 4), 16);
         assert_eq!(ec_padded_len(0, 4), 0);
         assert_eq!(ec_padded_len(99, 4), 104);
+    }
+
+    #[test]
+    fn cohort_tag_is_stable_nonzero_and_body_specific() {
+        let body = b"one padded EC body";
+        assert_ne!(ec_cohort_tag(body), 0);
+        assert_eq!(ec_cohort_tag(body), ec_cohort_tag(body));
+        assert_ne!(
+            ec_cohort_tag(body),
+            ec_cohort_tag(b"another padded EC body")
+        );
     }
 
     #[test]

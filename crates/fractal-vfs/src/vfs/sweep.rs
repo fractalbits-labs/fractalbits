@@ -5,9 +5,13 @@
 use std::collections::{HashMap, HashSet, hash_map};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use data_types::ovr_map::{OVR_GC_PREFIX, ovr_gc_key, ovr_row_prefix, parse_ovr_gc_blob_id};
+use bytes::Bytes;
+use data_types::ovr_map::{
+    OVR_GC_PREFIX, OvrGcMarker, encode_ovr_gc_data_pending, encode_ovr_gc_rows_ready, ovr_gc_key,
+    ovr_row_prefix, parse_ovr_gc_blob_id, parse_ovr_gc_marker,
+};
 use data_types::{DataBlobGuid, TraceId};
 use futures::{FutureExt, StreamExt, stream};
 use uuid::Uuid;
@@ -30,6 +34,79 @@ const ROW_TEARDOWN_PAGE: u32 = 1000;
 // miss, not stale data).
 use rpc_client_common::reclamation_grace;
 
+const TEARDOWN_MARKER_CAS_RETRIES: u32 = 16;
+
+#[derive(Clone)]
+enum TeardownMarkerWrite {
+    Conditional(Bytes),
+    DataPending {
+        volume_id: u16,
+        not_before_unix_ms: u64,
+    },
+    RowsReady {
+        volume_id: u16,
+    },
+}
+
+impl TeardownMarkerWrite {
+    fn value(&self) -> Bytes {
+        match self {
+            Self::Conditional(value) => value.clone(),
+            Self::DataPending {
+                volume_id,
+                not_before_unix_ms,
+            } => {
+                Bytes::copy_from_slice(&encode_ovr_gc_data_pending(*volume_id, *not_before_unix_ms))
+            }
+            Self::RowsReady { volume_id } => {
+                Bytes::copy_from_slice(&encode_ovr_gc_rows_ready(*volume_id))
+            }
+        }
+    }
+
+    fn satisfied_by(&self, current: Option<&[u8]>) -> bool {
+        let Some(current) = current else {
+            return false;
+        };
+        match self {
+            Self::Conditional(_) => true,
+            Self::DataPending { volume_id, .. } => matches!(
+                parse_ovr_gc_marker(current),
+                OvrGcMarker::DataPending {
+                    volume_id: stored,
+                    ..
+                } | OvrGcMarker::RowsReady { volume_id: stored }
+                    if stored == *volume_id
+            ),
+            Self::RowsReady { volume_id } => matches!(
+                parse_ovr_gc_marker(current),
+                OvrGcMarker::RowsReady { volume_id: stored } if stored == *volume_id
+            ),
+        }
+    }
+}
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn unix_deadline_after(duration: Duration) -> u64 {
+    let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    unix_time_millis().saturating_add(millis)
+}
+
+fn instant_for_unix_deadline(deadline_unix_ms: u64) -> Instant {
+    let remaining = Duration::from_millis(deadline_unix_ms.saturating_sub(unix_time_millis()));
+    Instant::now()
+        .checked_add(remaining)
+        .unwrap_or_else(Instant::now)
+}
+
 #[derive(Debug)]
 pub(crate) struct SweepWork {
     /// Exact identities to delete on every placement node: superseded
@@ -46,6 +123,10 @@ pub(crate) struct SweepWork {
     /// Tear down every `@ovr/` row of the blob, then clear its
     /// `@ovr-gc/` marker.
     delete_rows: bool,
+    /// Retry a failed transition from conditional intent to durable
+    /// data-pending teardown before any physical deletion. The value is
+    /// the wall-clock grace deadline encoded into the marker.
+    marker_data_pending: Option<u64>,
     grace_until: Option<Instant>,
     retry_count: u32,
     ready_at: Instant,
@@ -58,6 +139,7 @@ impl SweepWork {
             below: HashMap::new(),
             delete_all_blocks: false,
             delete_rows: false,
+            marker_data_pending: None,
             grace_until: None,
             retry_count: 0,
             ready_at: Instant::now(),
@@ -69,6 +151,7 @@ impl SweepWork {
             && self.below.is_empty()
             && !self.delete_all_blocks
             && !self.delete_rows
+            && self.marker_data_pending.is_none()
             && self.grace_until.is_none()
     }
 
@@ -80,6 +163,11 @@ impl SweepWork {
         }
         self.delete_all_blocks |= other.delete_all_blocks;
         self.delete_rows |= other.delete_rows;
+        self.marker_data_pending = match (self.marker_data_pending, other.marker_data_pending) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (deadline @ Some(_), None) | (None, deadline @ Some(_)) => deadline,
+            (None, None) => None,
+        };
         self.grace_until = match (self.grace_until, other.grace_until) {
             (Some(left), Some(right)) => Some(left.max(right)),
             (deadline @ Some(_), None) | (None, deadline @ Some(_)) => deadline,
@@ -193,6 +281,46 @@ impl Drop for SweepClaim {
     }
 }
 
+async fn write_teardown_marker_cas(
+    backend: &StorageBackend,
+    blob_guid: DataBlobGuid,
+    target: TeardownMarkerWrite,
+    trace_id: &TraceId,
+) -> Result<(), FsError> {
+    let key = ovr_gc_key(&blob_guid.blob_id);
+    let value = target.value();
+    let mut current: Option<Bytes> = None;
+    for _ in 0..TEARDOWN_MARKER_CAS_RETRIES {
+        if target.satisfied_by(current.as_deref()) {
+            return Ok(());
+        }
+        let expected = current.clone().unwrap_or_default();
+        match backend
+            .put_inode_cas(&key, value.clone(), expected, trace_id)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(FsError::CasConflict) => {
+                current = match backend.get_inode_raw(&key, trace_id).await {
+                    Ok(stored) => Some(stored),
+                    Err(FsError::NotFound) => None,
+                    Err(error) => return Err(error),
+                };
+            }
+            Err(error) => {
+                let probe = backend.get_inode_raw(&key, trace_id).await;
+                if target.satisfied_by(probe.as_ref().ok().map(Bytes::as_ref)) {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        }
+    }
+    Err(FsError::Internal(format!(
+        "teardown marker CAS budget exhausted for {key}"
+    )))
+}
+
 impl VfsCore {
     fn graced_work(&self) -> SweepWork {
         let mut work = SweepWork::new();
@@ -244,43 +372,76 @@ impl VfsCore {
     }
 
     /// Tear down every exact data/reservation key and every `@ovr/` row
-    /// belonging to a blob, after the reclamation grace. The caller must
-    /// have written the `@ovr-gc/` marker (see `write_teardown_marker`)
-    /// before the inode was deleted; the sweep removes it when the rows
-    /// are gone, and the init-time scavenger replays markers a crash
-    /// left behind.
+    /// belonging to a blob, after the reclamation grace. This promotes
+    /// any pre-mutation `@ovr-gc/` intent to a committed marker; the
+    /// sweep removes it when the rows are gone, and the init-time
+    /// scavenger replays committed markers a crash left behind.
     pub(crate) async fn teardown_blob(&self, layout: &ObjectLayout) {
         let Ok(blob_guid) = layout.blob_guid() else {
             return;
         };
+        let marker_required = layout.may_have_ovr_records();
         let mut work = self.graced_work();
         work.delete_all_blocks = true;
-        work.delete_rows = true;
+        work.delete_rows = marker_required;
+        let marker_deadline = unix_deadline_after(reclamation_grace(
+            self.backend_config.config.rpc_request_timeout(),
+        ));
+        // Promote any pre-mutation intent to an unconditional teardown
+        // record only after the caller established that the blob is
+        // unreachable. The durable deadline lets a restarted scavenger
+        // preserve the reader grace before replaying data deletion.
+        if marker_required {
+            let trace_id = TraceId::new();
+            let target = TeardownMarkerWrite::DataPending {
+                volume_id: blob_guid.volume_id,
+                not_before_unix_ms: marker_deadline,
+            };
+            if let Err(error) =
+                write_teardown_marker_cas(self.backend(), blob_guid, target, &trace_id).await
+            {
+                work.marker_data_pending = Some(marker_deadline);
+                tracing::warn!(%blob_guid, %error, "teardown marker promotion failed; queued retry");
+            }
+        }
         self.enqueue_sweep_work(blob_guid, work);
     }
 
-    /// Best-effort `@ovr-gc/{blob_id}` teardown-intent marker. Written
+    /// Durable `@ovr-gc/{blob_id}` teardown marker. Written
     /// before the inode delete so a crash mid-teardown cannot leak the
     /// blob's rows forever (the blob_id is unrecoverable from any
-    /// surviving key once the inode is gone). Only mapped blobs need
-    /// one: an unmapped blob has no rows to leak.
-    pub(crate) async fn write_teardown_marker(&self, layout: &ObjectLayout, trace_id: &TraceId) {
-        if !layout.is_mapped() {
-            return;
+    /// surviving key once the inode is gone). Layouts that cannot have
+    /// overwrite rows need no marker.
+    ///
+    /// `doomed_key` is the NSS key whose deletion this marker
+    /// anticipates. It MUST be passed when the marker is written before
+    /// the namespace mutation (unlink, rename-over): the mutation can
+    /// still fail, leaving a live blob under a standing death warrant,
+    /// so the scavenger must distinguish it from a committed teardown.
+    /// Conditional markers are never replayed. `None` means the blob is
+    /// already unreachable and the marker may be replayed unconditionally.
+    pub(crate) async fn write_teardown_marker(
+        &self,
+        layout: &ObjectLayout,
+        doomed_key: Option<&str>,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        if !layout.may_have_ovr_records() {
+            return Ok(());
         }
         let Ok(blob_guid) = layout.blob_guid() else {
-            return;
+            return Ok(());
         };
-        let key = ovr_gc_key(&blob_guid.blob_id);
-        // Value content is irrelevant (NSS rejects empty values); the
-        // marker's existence is the record.
-        if let Err(error) = self
-            .backend()
-            .put_inode(&key, bytes::Bytes::from_static(b"gc"), trace_id)
-            .await
-        {
-            tracing::warn!(%blob_guid, %error, "teardown marker write failed; rows may leak on crash");
-        }
+        let target = match doomed_key {
+            Some(doomed) => TeardownMarkerWrite::Conditional(Bytes::from(doomed.to_owned())),
+            None => TeardownMarkerWrite::DataPending {
+                volume_id: blob_guid.volume_id,
+                not_before_unix_ms: unix_deadline_after(reclamation_grace(
+                    self.backend_config.config.rpc_request_timeout(),
+                )),
+            },
+        };
+        write_teardown_marker_cas(self.backend(), blob_guid, target, trace_id).await
     }
 
     pub(crate) fn enqueue_sweep_work(&self, blob_guid: DataBlobGuid, work: SweepWork) {
@@ -500,6 +661,19 @@ async fn process_sweep_work(
         }
     };
     let trace_id = TraceId::new();
+    if let Some(not_before_unix_ms) = work.marker_data_pending {
+        let target = TeardownMarkerWrite::DataPending {
+            volume_id: blob_guid.volume_id,
+            not_before_unix_ms,
+        };
+        match write_teardown_marker_cas(&backend, blob_guid, target, &trace_id).await {
+            Ok(()) => work.marker_data_pending = None,
+            Err(error) => {
+                tracing::warn!(%blob_guid, %error, "data-pending teardown marker retry failed");
+                return SweepAttempt::Failed;
+            }
+        }
+    }
     if let Some(grace_until) = work.grace_until {
         if Instant::now() < grace_until {
             return SweepAttempt::GracePending;
@@ -509,19 +683,31 @@ async fn process_sweep_work(
 
     let mut failed = false;
     if work.delete_all_blocks {
-        if backend
-            .delete_blob_blocks(blob_guid, &trace_id)
-            .await
-            .is_ok()
-        {
+        if let Err(error) = backend.delete_blob_blocks(blob_guid, &trace_id).await {
+            tracing::warn!(%blob_guid, %error, "whole-blob data deletion failed");
+            failed = true;
+        } else if work.delete_rows {
+            let target = TeardownMarkerWrite::RowsReady {
+                volume_id: blob_guid.volume_id,
+            };
+            match write_teardown_marker_cas(&backend, blob_guid, target, &trace_id).await {
+                Ok(()) => {
+                    work.delete_all_blocks = false;
+                    work.victims.clear();
+                    work.below.clear();
+                }
+                Err(error) => {
+                    tracing::warn!(%blob_guid, %error, "rows-ready teardown marker write failed");
+                    failed = true;
+                }
+            }
+        } else {
             work.delete_all_blocks = false;
             work.victims.clear();
             work.below.clear();
-        } else {
-            failed = true;
         }
     }
-    if work.delete_rows {
+    if work.delete_rows && !work.delete_all_blocks {
         if delete_all_ovr_rows(&backend, blob_guid.blob_id, &trace_id)
             .await
             .is_ok()
@@ -588,11 +774,51 @@ async fn process_sweep_work(
     }
 }
 
-/// One pass over `@ovr-gc/`: every marker is a teardown a previous
-/// process started but did not finish. Re-enqueue its row teardown.
-/// The data-key side needs no replay: `delete_blob_blocks` ran before
-/// the marker's rows, and a leaked data key without an inode is found
-/// by scrub, not by this scavenger.
+enum ScavengedMarker {
+    Conditional,
+    LegacyDataPending,
+    Work(DataBlobGuid, SweepWork),
+}
+
+fn work_for_teardown_marker(blob_id: Uuid, value: &[u8]) -> ScavengedMarker {
+    match parse_ovr_gc_marker(value) {
+        OvrGcMarker::Conditional => ScavengedMarker::Conditional,
+        OvrGcMarker::LegacyDataPending => ScavengedMarker::LegacyDataPending,
+        OvrGcMarker::DataPending {
+            volume_id,
+            not_before_unix_ms,
+        } => {
+            let blob_guid = DataBlobGuid { blob_id, volume_id };
+            let mut work = SweepWork::new();
+            let grace_until = instant_for_unix_deadline(not_before_unix_ms);
+            work.grace_until = Some(grace_until);
+            work.ready_at = grace_until;
+            work.delete_all_blocks = true;
+            work.delete_rows = true;
+            ScavengedMarker::Work(blob_guid, work)
+        }
+        OvrGcMarker::RowsReady { volume_id } => {
+            let blob_guid = DataBlobGuid { blob_id, volume_id };
+            let mut work = SweepWork::new();
+            work.delete_rows = true;
+            ScavengedMarker::Work(blob_guid, work)
+        }
+    }
+}
+
+/// One pass over `@ovr-gc/`: resume the durable teardown phase a previous
+/// process did not finish. Data-pending markers carry both the volume and
+/// the wall-clock grace deadline, so restart waits the remaining grace,
+/// deletes every physical key, and only then advances the marker to
+/// rows-ready. A rows-ready marker proves data deletion already finished.
+///
+/// A marker is an INTENT, not proof: unlink and rename write it before
+/// the namespace mutation, which can still fail and leave the blob
+/// live. Every unrecognized value is an opaque conditional intent. The
+/// scavenger neither probes its mutable path nor removes it: path state
+/// is not global reachability proof, and removal would race a concurrent
+/// promotion. Legacy `gc` markers lack a volume and grace deadline, so
+/// they are retained fail-closed as well.
 async fn scavenge_teardown_markers(
     backend_config: Arc<BackendConfig>,
     coordinator: Arc<SweepCoordinator>,
@@ -621,20 +847,22 @@ async fn scavenge_teardown_markers(
         let Some(last_key) = page.last().map(|(key, _)| key.clone()) else {
             return;
         };
-        for (key, _) in &page {
+        for (key, value) in &page {
             let Some(blob_id) = parse_ovr_gc_blob_id(key) else {
                 tracing::warn!(%key, "malformed @ovr-gc marker skipped");
                 continue;
             };
-            // volume_id is unknown from the marker; rows are keyed by
-            // blob_id alone and delete_rows never touches BSS, so a
-            // placeholder volume is fine for this work item.
-            let blob_guid = DataBlobGuid {
-                blob_id,
-                volume_id: 0,
+            let (blob_guid, work) = match work_for_teardown_marker(blob_id, value) {
+                ScavengedMarker::Conditional => {
+                    tracing::warn!(%key, "conditional @ovr-gc marker retained without teardown commit");
+                    continue;
+                }
+                ScavengedMarker::LegacyDataPending => {
+                    tracing::warn!(%key, "legacy @ovr-gc marker retained without safe replay metadata");
+                    continue;
+                }
+                ScavengedMarker::Work(blob_guid, work) => (blob_guid, work),
             };
-            let mut work = SweepWork::new();
-            work.delete_rows = true;
             coordinator.queue.lock().enqueue(blob_guid, work);
         }
         if !has_more {
@@ -647,6 +875,66 @@ async fn scavenge_teardown_markers(
 #[cfg(test)]
 mod sweep_tests {
     use super::*;
+
+    #[test]
+    fn marker_writes_are_monotonic() {
+        let conditional = TeardownMarkerWrite::Conditional(Bytes::from_static(b"/doomed"));
+        let data_pending = TeardownMarkerWrite::DataPending {
+            volume_id: 7,
+            not_before_unix_ms: 123,
+        };
+        let rows_ready = TeardownMarkerWrite::RowsReady { volume_id: 7 };
+        let pending_value = encode_ovr_gc_data_pending(7, 123);
+        let ready_value = encode_ovr_gc_rows_ready(7);
+
+        assert!(!conditional.satisfied_by(None));
+        assert!(conditional.satisfied_by(Some(b"/other")));
+        assert!(conditional.satisfied_by(Some(&pending_value)));
+        assert!(conditional.satisfied_by(Some(&ready_value)));
+
+        assert!(!data_pending.satisfied_by(None));
+        assert!(!data_pending.satisfied_by(Some(b"/doomed")));
+        assert!(!data_pending.satisfied_by(Some(data_types::ovr_map::OVR_GC_LEGACY_VALUE)));
+        assert!(data_pending.satisfied_by(Some(&pending_value)));
+        assert!(data_pending.satisfied_by(Some(&ready_value)));
+
+        assert!(!rows_ready.satisfied_by(None));
+        assert!(!rows_ready.satisfied_by(Some(&pending_value)));
+        assert!(rows_ready.satisfied_by(Some(&ready_value)));
+    }
+
+    #[test]
+    fn scavenger_resumes_only_durable_teardown_phases() {
+        let blob_id = Uuid::nil();
+        assert!(matches!(
+            work_for_teardown_marker(blob_id, b"/doomed"),
+            ScavengedMarker::Conditional
+        ));
+        assert!(matches!(
+            work_for_teardown_marker(blob_id, data_types::ovr_map::OVR_GC_LEGACY_VALUE),
+            ScavengedMarker::LegacyDataPending
+        ));
+
+        let pending = encode_ovr_gc_data_pending(9, unix_time_millis().saturating_add(60_000));
+        let ScavengedMarker::Work(guid, pending_work) = work_for_teardown_marker(blob_id, &pending)
+        else {
+            unreachable!("data-pending marker must produce work");
+        };
+        assert_eq!(guid.volume_id, 9);
+        assert!(pending_work.delete_all_blocks);
+        assert!(pending_work.delete_rows);
+        assert!(pending_work.grace_until.is_some());
+
+        let ready = encode_ovr_gc_rows_ready(11);
+        let ScavengedMarker::Work(guid, ready_work) = work_for_teardown_marker(blob_id, &ready)
+        else {
+            unreachable!("rows-ready marker must produce work");
+        };
+        assert_eq!(guid.volume_id, 11);
+        assert!(!ready_work.delete_all_blocks);
+        assert!(ready_work.delete_rows);
+        assert!(ready_work.grace_until.is_none());
+    }
 
     #[test]
     fn pending_sweeps_coalesce_by_blob() {

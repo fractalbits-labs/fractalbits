@@ -218,10 +218,10 @@ pub struct VfsCore {
     mirror: Option<MirrorHandle>,
     /// Per-blob `@ovr/` row snapshots keyed by blob_id, each tagged with
     /// the `map_epoch` it was loaded under. A snapshot at epoch M serves
-    /// any read whose layout still carries M (rows change only under a
-    /// commit CAS that bumps the epoch), so invalidation is a cheap
-    /// epoch compare, never a TTL. LRU-bounded: eviction reloads one
-    /// blob's prefix, one listing page per 1000 rows.
+    /// any read whose layout still carries M (every resolution change is
+    /// published by a commit CAS that bumps the epoch), so invalidation
+    /// is a cheap epoch compare, never a TTL. LRU-bounded: eviction
+    /// reloads one blob's prefix, one listing page per 1000 records.
     row_maps: parking_lot::Mutex<lru::LruCache<Uuid, Arc<OvrRowMap>>>,
     /// Coalesces per-blob reclamation and bounds concurrent cleanup.
     sweep_coordinator: Arc<SweepCoordinator>,
@@ -472,10 +472,7 @@ impl VfsCore {
         // Passthrough bypasses the per-read exact-version check. Only arm
         // it for never-overwritten, unmapped layouts, where every block is
         // at its create-time identity.
-        if layout.blob_version > 1
-            || layout.is_mapped()
-            || layout.next_burn_version() > layout.blob_version + 1
-        {
+        if layout.blob_version > 1 || layout.may_have_ovr_records() {
             return (0, 0);
         }
 

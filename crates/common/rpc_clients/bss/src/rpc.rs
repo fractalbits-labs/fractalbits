@@ -13,6 +13,13 @@ use rpc_client_common::{InflightRpcGuard, RpcError, encode_protobuf};
 use rpc_codec_common::MessageFrame;
 use tracing::error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataBlobMetadata {
+    pub version: u64,
+    /// Zero denotes a non-EC entry.
+    pub cohort_tag: u64,
+}
+
 /// Check the errno field in the response header and return appropriate error
 fn check_response_errno(header: &MessageHeader) -> Result<(), RpcError> {
     // errno codes from core/common/rpc/rpc_error.zig
@@ -257,6 +264,35 @@ impl RpcClient {
             timeout,
             trace_id,
             retry_count,
+            0,
+        )
+        .await
+    }
+
+    /// Store one EC shard with the cohort shared by its stripe.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_data_blob_with_cohort(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        body: Bytes,
+        body_checksum: u64,
+        version: u64,
+        cohort_tag: u64,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<(), RpcError> {
+        self.put_data_blob_inner(
+            blob_guid,
+            block_number,
+            body,
+            body_checksum,
+            version,
+            timeout,
+            trace_id,
+            retry_count,
+            cohort_tag,
         )
         .await
     }
@@ -272,6 +308,7 @@ impl RpcClient {
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
+        cohort_tag: u64,
     ) -> Result<(), RpcError> {
         let _guard = InflightRpcGuard::new("bss", "put_data_blob");
         let mut header = MessageHeader::default();
@@ -287,6 +324,7 @@ impl RpcClient {
         header.trace_id = trace_id.0;
         header.checksum_body = body_checksum;
         header.version = version;
+        header.set_data_cohort_tag(cohort_tag);
 
         let msg_frame = MessageFrame::new(header, body);
         let resp_frame = self
@@ -363,7 +401,7 @@ impl RpcClient {
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
-    ) -> Result<u64, RpcError> {
+    ) -> Result<DataBlobMetadata, RpcError> {
         let _guard = InflightRpcGuard::new("bss", "get_data_blob");
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
@@ -389,7 +427,10 @@ impl RpcClient {
                 e
             })?;
         check_response_errno(&resp_frame.header)?;
-        let version = resp_frame.header.version;
+        let metadata = DataBlobMetadata {
+            version: resp_frame.header.version,
+            cohort_tag: resp_frame.header.data_cohort_tag(),
+        };
         *body = resp_frame.body;
         // Block-size padding (override flush) stores every block at full
         // block_size, so a reader that knows the logical content length
@@ -404,7 +445,7 @@ impl RpcClient {
                 content_len
             )));
         }
-        Ok(version)
+        Ok(metadata)
     }
 
     #[allow(clippy::too_many_arguments)]
