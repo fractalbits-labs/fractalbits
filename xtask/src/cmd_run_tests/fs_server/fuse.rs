@@ -3,6 +3,12 @@ use crate::{CmdResult, FsServerConfig, InitConfig, ServiceName};
 use aws_sdk_s3::primitives::ByteStream;
 use cmd_lib::*;
 use colored::*;
+use data_types::object_layout::ObjectLayout;
+use data_types::{Bucket, TraceId};
+use file_ops::parse_get_inode;
+use rpc_client_nss::RpcClientNss;
+use rpc_client_rss::RpcClientRss;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -10,6 +16,37 @@ use std::time::Duration;
 use super::{MOUNT_POINT, cleanup_objects, generate_test_data, setup_test_bucket};
 
 const MOUNT_POINT_B: &str = "/tmp/fs_server_test_b";
+
+/// Restarts bss@0 + bss@3 on drop unless disarmed: keeps a failed
+/// EC-write-hole test from leaving the cluster degraded for the rest of
+/// the suite.
+struct BssZeroThreeRestartGuard {
+    armed: bool,
+}
+
+impl BssZeroThreeRestartGuard {
+    fn new() -> Self {
+        Self { armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BssZeroThreeRestartGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = run_cmd! {
+            ignore systemctl --user start bss@0.service;
+            ignore systemctl --user start bss@3.service;
+        } {
+            eprintln!("failed to restart BSS nodes after test failure: {error}");
+        }
+    }
+}
 
 fn disk_cache_path() -> String {
     let base = std::env::current_dir().expect("Failed to get cwd");
@@ -437,6 +474,14 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         run_test!(
             "Override Survives BSS Partition-Rejoin",
             test_override_survives_bss_partition_rejoin
+        );
+        run_test!(
+            "Failed EC Overwrite Keeps Committed V1",
+            test_failed_ec_overwrite_keeps_committed_v1
+        );
+        run_test!(
+            "Overwrite Retry After EC Quorum Failure",
+            test_overwrite_retry_after_quorum_failure
         );
     }
 
@@ -3738,6 +3783,266 @@ async fn test_qemu_style_fio_workload(disk_cache: bool) -> CmdResult {
     println!(
         "{}",
         "SUCCESS: qemu-style fio workload + stable-path cache invariant".green()
+    );
+    Ok(())
+}
+
+async fn test_failed_ec_overwrite_keeps_committed_v1(disk_cache: bool) -> CmdResult {
+    assert!(
+        !disk_cache,
+        "this EC failure regression requires no disk cache"
+    );
+    let (ctx, bucket) = setup_test_bucket().await;
+    let key = "failed-ec-overwrite.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let file_len = 2 * BLOCK_SIZE as usize;
+    let v1 = generate_test_data("failed-ec-overwrite-v1", file_len);
+    let v2 = generate_test_data("failed-ec-overwrite-v2", file_len);
+    assert_ne!(v1, v2, "test generations must differ");
+
+    println!("  Step 1: Commit a two-block V1 file");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&fuse_path)
+            .expect("open V1 file");
+        file.write_all(&v1).expect("write V1 file");
+        file.sync_all().expect("commit V1 file");
+    }
+    unmount_fuse()?;
+
+    println!("  Step 2: Stop two BSS nodes so EC write quorum is unavailable");
+    let mut restart_guard = BssZeroThreeRestartGuard::new();
+    // Keep two replicas available in each three-node NSS journal volume.
+    run_cmd! {
+        systemctl --user stop bss@0.service;
+        systemctl --user stop bss@3.service;
+    }?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    println!("  Step 3: Attempt a full V2 overwrite with only four shards available");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let sync_result = {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fuse_path)
+            .expect("open V2 file");
+        file.write_all(&v2).expect("write V2 file");
+        file.sync_all()
+    };
+    let unmount_result = unmount_fuse();
+
+    println!("  Step 4: Restart both BSS nodes");
+    let restart_result = run_cmd! {
+        systemctl --user start bss@0.service;
+        systemctl --user start bss@3.service;
+    };
+    if restart_result.is_ok() {
+        restart_guard.disarm();
+    }
+    restart_result?;
+    cmd_service::wait_for_port_ready(8088, 120)?;
+    cmd_service::wait_for_port_ready(8091, 120)?;
+    unmount_result?;
+
+    let sync_error = sync_result.expect_err("V2 sync must fail below EC write quorum");
+    assert_eq!(
+        sync_error.raw_os_error(),
+        Some(libc::EIO),
+        "failed EC overwrite must surface EIO"
+    );
+
+    println!("  Step 5: Remount read-only and verify committed V1 remains visible");
+    mount_fuse_ro(&bucket, disk_cache)?;
+    let actual = std::fs::read(&fuse_path).expect("read after failed V2 overwrite");
+    assert_eq!(
+        actual, v1,
+        "prepared V2 fragments became visible after failed commit"
+    );
+    unmount_fuse()?;
+
+    println!("  Step 6: Retry V2 after every placement node is available");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fuse_path)
+            .expect("open V2 retry");
+        file.write_all(&v2).expect("write V2 retry");
+        file.sync_all().expect("commit V2 retry");
+    }
+    unmount_fuse()?;
+
+    println!("  Step 7: Verify the retried generation is committed");
+    mount_fuse_ro(&bucket, disk_cache)?;
+    let actual = std::fs::read(&fuse_path).expect("read committed V2 retry");
+    assert_eq!(actual, v2, "retried V2 generation was not committed");
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: Failed EC overwrite kept committed V1 bytes".green()
+    );
+    Ok(())
+}
+
+/// Fetch the committed NSS layout for `key`: the bare ObjectLayout stored
+/// at the s3_key (not valid for hardlink-promoted inodes).
+async fn fetch_object_layout(bucket: &str, key: &str) -> std::io::Result<ObjectLayout> {
+    let timeout = Duration::from_secs(5);
+    let trace_id = TraceId::new();
+    let rss = RpcClientRss::new_from_addresses(vec!["127.0.0.1:8086".to_string()], timeout);
+    let (_version, bucket_json) = rss
+        .get(&format!("bucket:{bucket}"), Some(timeout), &trace_id, 0)
+        .await
+        .map_err(|e| std::io::Error::other(format!("rss get bucket: {e:?}")))?;
+    let bucket_info: Bucket = serde_json::from_str(&bucket_json)
+        .map_err(|e| std::io::Error::other(format!("parse bucket json: {e}")))?;
+    let nss = RpcClientNss::new_from_address("127.0.0.1:8087".to_string(), timeout);
+    // NSS stores every key with a leading "/" (see InodeTable::new).
+    let nss_key = format!("/{key}");
+    let resp = nss
+        .get_inode(
+            &bucket_info.root_blob_name,
+            &nss_key,
+            Some(timeout),
+            &trace_id,
+            0,
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("nss get_inode: {e:?}")))?;
+    parse_get_inode(resp).map_err(|e| std::io::Error::other(format!("parse layout: {e:?}")))
+}
+
+/// Interrupted overwrite then same-mount retry: the failed attempt burns
+/// a version (the allocator advances durably before data I/O) while the
+/// ceiling stays put, so committed data keeps serving; the retry burns a
+/// fresh version and commits. Companion to
+/// `test_failed_ec_overwrite_keeps_committed_v1`, which remounts between
+/// the interruption and the retry.
+async fn test_overwrite_retry_after_quorum_failure(disk_cache: bool) -> CmdResult {
+    assert!(
+        !disk_cache,
+        "this EC failure regression requires no disk cache"
+    );
+    let (ctx, bucket) = setup_test_bucket().await;
+    let key = "overwrite-retry.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let file_len = 2 * BLOCK_SIZE as usize;
+    let v1 = generate_test_data("overwrite-retry-v1", file_len);
+    let v2 = generate_test_data("overwrite-retry-v2", file_len);
+
+    println!("  Step 1: Commit a two-block V1 file");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&fuse_path)
+            .expect("open V1 file");
+        file.write_all(&v1).expect("write V1 file");
+        file.sync_all().expect("commit V1 file");
+    }
+    let base = fetch_object_layout(&bucket, key).await?;
+    let base_version = base.blob_version;
+    let base_burn = base.next_burn_version();
+
+    println!("  Step 2: Stop two BSS nodes so EC write quorum is unavailable");
+    let mut restart_guard = BssZeroThreeRestartGuard::new();
+    // Keep two replicas available in each three-node NSS journal volume.
+    run_cmd! {
+        systemctl --user stop bss@0.service;
+        systemctl --user stop bss@3.service;
+    }?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    println!("  Step 3: V2 overwrite fails in-process, handle stays open");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fuse_path)
+        .expect("open V2 file");
+    file.write_all(&v2).expect("write V2");
+    let sync_error = file
+        .sync_all()
+        .expect_err("V2 sync must fail below EC write quorum");
+    assert_eq!(
+        sync_error.raw_os_error(),
+        Some(libc::EIO),
+        "failed EC overwrite must surface EIO"
+    );
+    let interrupted = fetch_object_layout(&bucket, key).await?;
+    assert_eq!(
+        interrupted.blob_version, base_version,
+        "the ceiling must not move on an interrupted overwrite"
+    );
+    assert!(
+        interrupted.next_burn_version() > base_burn,
+        "the failed attempt must have durably burned its version"
+    );
+
+    println!("  Step 4: Restart both BSS nodes");
+    let restart_result = run_cmd! {
+        systemctl --user start bss@0.service;
+        systemctl --user start bss@3.service;
+    };
+    if restart_result.is_ok() {
+        restart_guard.disarm();
+    }
+    restart_result?;
+    cmd_service::wait_for_port_ready(8088, 120)?;
+    cmd_service::wait_for_port_ready(8091, 120)?;
+    // A ready TCP port only means the process is up, not that the node has
+    // rejoined the volume group and can serve EC writes again. Give the
+    // cluster a moment to converge before retrying, then keep retrying on a
+    // generous budget: under full-suite load the rejoin can take well past
+    // ten seconds, and each iteration re-dirties the buffer so the flush is
+    // genuinely re-attempted (not a consumed-fsync-error no-op).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    println!("  Step 5: Retry V2 on the same handle until the flush commits");
+    let mut committed = false;
+    for _ in 0..60 {
+        file.seek(SeekFrom::Start(0)).expect("rewind for retry");
+        file.write_all(&v2).expect("rewrite V2");
+        if file.sync_all().is_ok() {
+            committed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        committed,
+        "V2 retry did not commit after BSS nodes returned"
+    );
+    drop(file);
+
+    println!("  Step 6: Verify the retry committed a newer generation");
+    let final_layout = fetch_object_layout(&bucket, key).await?;
+    assert!(
+        final_layout.blob_version > base_version,
+        "retry must commit a newer generation"
+    );
+    assert!(
+        final_layout.next_burn_version() > final_layout.blob_version,
+        "allocator must stay ahead of the ceiling"
+    );
+    unmount_fuse()?;
+
+    println!("  Step 7: Remount and verify V2 content");
+    mount_fuse_ro(&bucket, disk_cache)?;
+    let actual = std::fs::read(&fuse_path).expect("read committed V2");
+    assert_eq!(actual, v2, "retried V2 generation was not committed");
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: Interrupted overwrite retried and committed cleanly".green()
     );
     Ok(())
 }

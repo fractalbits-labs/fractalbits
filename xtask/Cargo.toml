@@ -15,6 +15,9 @@ colored.workspace = true
 test_common.workspace = true
 data_types.workspace = true
 rpc_client_bss = { workspace = true, features = ["tokio-runtime"] }
+rpc_client_nss = { workspace = true, features = ["tokio-runtime"] }
+rpc_client_rss = { workspace = true, features = ["tokio-runtime"] }
+file_ops.workspace = true
 aws-sdk-s3.workspace = true
 aws-config.workspace = true
 tokio = { workspace = true, features = ["full"] }
