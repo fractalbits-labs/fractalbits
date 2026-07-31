@@ -1,23 +1,29 @@
 mod attr;
+mod data_layout;
 mod dir;
 mod drain;
 mod namespace;
 mod open;
 mod publish;
 mod read;
+mod row_map;
+mod sweep;
 mod write;
 mod write_buffer;
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use data_types::object_layout::{ObjectLayout, ObjectState, SpecialKind};
+use data_types::ovr_map::OvrRowMap;
 use fractal_fuse::{FileHandleId, InodeId};
+use rkyv::api::high::to_bytes_in;
 use std::cell::Cell;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 use crate::backend::{BackendConfig, StorageBackend};
 use crate::cache::{DirCache, DirEntry, DirEntryKind};
@@ -26,9 +32,12 @@ use crate::disk_cache::{DiskCache, MirrorHandle, spawn_mirror_worker};
 use crate::error::FsError;
 use crate::inode::InodeTable;
 use crate::vfs::publish::spawn_writeback_worker;
+use crate::vfs::sweep::SweepCoordinator;
 use crate::vfs::write_buffer::WriteBuffer;
 use crate::writeback::WritebackQueue;
 pub const TTL: Duration = Duration::from_secs(1);
+/// Bound on cached per-blob row snapshots.
+const ROW_MAP_CACHE_CAP: usize = 4096;
 pub const DEFAULT_BLOCK_SIZE: u32 = 128 * 1024;
 /// Upper bound on a single file's in-memory write buffer. The buffer is
 /// a flat `BytesMut`, so a truncate/extend allocates the whole size; a
@@ -124,8 +133,49 @@ struct FileHandle {
     ino: InodeId,
     s3_key: String,
     layout: Option<ObjectLayout>,
+    /// When the committed layout snapshot was last confirmed against
+    /// NSS. Clean handles refresh on the attr TTL so a long-lived open
+    /// fd cannot pin a superseded generation set past the sweep.
+    layout_refreshed_at: Instant,
+    /// Serializes this handle's data operations (read / write / flush /
+    /// truncate / fallocate / lseek) so a mid-operation layout refresh
+    /// cannot interleave with a flush's prepare/commit window.
+    operation_lock: Arc<futures::lock::Mutex<()>>,
     write_buf: Option<WriteBuffer>,
     backing_id: Option<i32>,
+}
+
+/// True when `current` differs from `expected` only in posix attributes:
+/// the async SetPosix worker (or a chmod/utimensat) republished the row
+/// between this flush's base snapshot and its CAS. Metadata updates clone
+/// the fetched layout and carry the versioning fields (blob_version,
+/// next_version, pending_append, map_epoch) forward unchanged, so a data
+/// flush can rebase over them; any other divergence is a foreign writer
+/// and stays a hard conflict. The row-CAS promotion rule depends on
+/// exactly this narrowness: it promotes a stored `cur` into `prev` only
+/// when that `cur` is at or below the ceiling observed at prepare time,
+/// which is sound only because the ceiling cannot move between a flush's
+/// prepare and commit. Widening the rebase to accept a moved
+/// blob_version would silently unsound the rows' prev slots.
+fn posix_only_moved(expected: &ObjectLayout, current: &ObjectLayout) -> bool {
+    if !matches!(expected.state, ObjectState::Normal(_))
+        || !matches!(current.state, ObjectState::Normal(_))
+    {
+        return false;
+    }
+    // `set_fs_posix` re-normalizes the fs_ext box, so a republish that
+    // only touched posix collapses back to the expected shape (including
+    // the ext disappearing entirely when nothing else is in it).
+    let mut normalized = current.clone();
+    normalized.set_fs_posix(expected.fs_posix());
+    // rkyv encoding is deterministic for these types (the CAS guard itself
+    // relies on this), so byte equality is exact structural equality.
+    let expected_bytes = to_bytes_in::<_, rkyv::rancor::Error>(expected, Vec::new());
+    let normalized_bytes = to_bytes_in::<_, rkyv::rancor::Error>(&normalized, Vec::new());
+    match (expected_bytes, normalized_bytes) {
+        (Ok(expected_bytes), Ok(normalized_bytes)) => expected_bytes == normalized_bytes,
+        _ => false,
+    }
 }
 
 pub struct VfsCore {
@@ -166,6 +216,15 @@ pub struct VfsCore {
     // the best-effort local-cache write off the FUSE worker threads so it
     // does not steal foreground cycles on a create-heavy workload.
     mirror: Option<MirrorHandle>,
+    /// Per-blob `@ovr/` row snapshots keyed by blob_id, each tagged with
+    /// the `map_epoch` it was loaded under. A snapshot at epoch M serves
+    /// any read whose layout still carries M (rows change only under a
+    /// commit CAS that bumps the epoch), so invalidation is a cheap
+    /// epoch compare, never a TTL. LRU-bounded: eviction reloads one
+    /// blob's prefix, one listing page per 1000 rows.
+    row_maps: parking_lot::Mutex<lru::LruCache<Uuid, Arc<OvrRowMap>>>,
+    /// Coalesces per-blob reclamation and bounds concurrent cleanup.
+    sweep_coordinator: Arc<SweepCoordinator>,
 }
 
 impl VfsCore {
@@ -206,7 +265,15 @@ impl VfsCore {
             .as_ref()
             .and_then(|dc| spawn_mirror_worker(dc.clone()));
 
-        let passthrough_enabled = config.passthrough_enabled;
+        // A passthrough backing fd cannot be revoked when another instance
+        // commits new row-mapped generations and the cache mirror changes
+        // the stable file in place. Keep the raw-fd path disabled until
+        // cache files are generation-specific or FUSE can revoke active
+        // backing mappings.
+        let passthrough_enabled = false;
+        if config.passthrough_enabled {
+            tracing::warn!("FUSE passthrough disabled for mutable versioned blobs");
+        }
         let passthrough_max_object_size =
             config.passthrough_max_object_size_gb * 1024 * 1024 * 1024;
         let prefetch_policy = crate::prefetch::PrefetchPolicy::from_config(config);
@@ -248,6 +315,10 @@ impl VfsCore {
             deferred_blob_cleanup: DashMap::new(),
             inode_write_owner: DashMap::new(),
             mirror,
+            row_maps: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(ROW_MAP_CACHE_CAP).expect("row map cap is nonzero"),
+            )),
+            sweep_coordinator: Arc::new(SweepCoordinator::default()),
         }
     }
 
@@ -266,7 +337,7 @@ impl VfsCore {
     /// The backend is leaked into 'static storage because each compio thread
     /// runs for the lifetime of the process and we need references that can
     /// be held across await points.
-    fn backend(&self) -> &StorageBackend {
+    fn backend(&self) -> &'static StorageBackend {
         THREAD_BACKEND.with(|cell| match cell.get() {
             Some(b) => b,
             None => {
@@ -398,6 +469,16 @@ impl VfsCore {
             Err(_) => return (0, 0),
         };
 
+        // Passthrough bypasses the per-read exact-version check. Only arm
+        // it for never-overwritten, unmapped layouts, where every block is
+        // at its create-time identity.
+        if layout.blob_version > 1
+            || layout.is_mapped()
+            || layout.next_burn_version() > layout.blob_version + 1
+        {
+            return (0, 0);
+        }
+
         // Check if fully cached
         if !dc.is_complete(blob_guid, file_size) {
             return (0, 0);
@@ -470,6 +551,7 @@ impl VfsCore {
         // dead drainer. `ensure_writeback_worker_started` is idempotent, so
         // the lazy calls on the metadata paths become no-ops.
         self.ensure_writeback_worker_started();
+        self.ensure_sweep_worker_started();
         tracing::info!("Filesystem initialized");
     }
 
@@ -543,4 +625,77 @@ fn dir_mode(perm: u16) -> u32 {
 
 fn symlink_mode(perm: u16) -> u32 {
     libc::S_IFLNK | perm as u32
+}
+
+#[cfg(test)]
+mod posix_only_moved_tests {
+    use super::*;
+    use data_types::DataBlobGuid;
+    use data_types::object_layout::{ObjectCoreMetaData, ObjectMetaData, PosixAttrs};
+
+    fn layout_with(mtime_ns: u64, blob_version: u64) -> ObjectLayout {
+        ObjectLayout {
+            timestamp: 1,
+            version_id: uuid::Uuid::nil(),
+            block_size: DEFAULT_BLOCK_SIZE,
+            blob_version,
+            fs_ext: ObjectLayout::fs_ext_from(Some(PosixAttrs {
+                mode: 0o100644,
+                uid: 1000,
+                gid: 1000,
+                mtime_ns,
+                ctime_ns: mtime_ns,
+            })),
+            state: ObjectState::Normal(ObjectMetaData {
+                blob_guid: DataBlobGuid {
+                    blob_id: uuid::Uuid::nil(),
+                    volume_id: 1,
+                },
+                core_meta_data: ObjectCoreMetaData {
+                    size: 2,
+                    etag: "etag".to_string(),
+                    headers: vec![],
+                    checksum: None,
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn posix_republish_is_benign() {
+        let base = layout_with(100, 1);
+        let moved = layout_with(200, 1);
+        assert!(posix_only_moved(&base, &moved), "mtime-only move rebases");
+        assert!(posix_only_moved(&base, &base), "identical rows rebase");
+    }
+
+    #[test]
+    fn structural_divergence_stays_a_conflict() {
+        let base = layout_with(100, 1);
+        let mut advanced = layout_with(100, 2);
+        assert!(
+            !posix_only_moved(&base, &advanced),
+            "blob_version change is a real writer"
+        );
+        advanced = layout_with(100, 1);
+        if let ObjectState::Normal(meta) = &mut advanced.state {
+            meta.core_meta_data.size = 3;
+        }
+        assert!(
+            !posix_only_moved(&base, &advanced),
+            "size change is a real writer"
+        );
+        let mut mapped = layout_with(100, 1);
+        mapped.set_map_epoch(4);
+        assert!(
+            !posix_only_moved(&base, &mapped),
+            "a row-writing commit is a real writer"
+        );
+        let mut pending = layout_with(100, 1);
+        pending.set_pending_append(Some((3, 5)));
+        assert!(
+            !posix_only_moved(&base, &pending),
+            "an in-flight append record is a real writer"
+        );
+    }
 }

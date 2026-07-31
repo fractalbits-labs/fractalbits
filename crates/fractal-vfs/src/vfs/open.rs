@@ -208,6 +208,17 @@ impl VfsCore {
             }
         };
 
+        // The FUSE data path only speaks the BSS block protocol; an S3
+        // hybrid-volume object cannot be opened for data access.
+        if let Some(ref l) = layout
+            && let Err(error) = self.ensure_data_layout_supported(l, &TraceId::new()).await
+        {
+            if is_write {
+                self.release_write_lock(inode, fh);
+            }
+            return Err(error);
+        }
+
         // Cross-instance staleness reconciliation: if the cache file's
         // authoritative_blob_v lags the inode's blob_version, another
         // instance has bumped the version since we last sync'd. Clear
@@ -293,8 +304,9 @@ impl VfsCore {
                 let dc_arc = Arc::clone(dc);
                 let backend_cfg = Arc::clone(&self.backend_config);
                 let layout_clone = l.clone();
+                let rows = self.row_map_for_prefetch(l).await;
                 compio_runtime::spawn(async move {
-                    prefetch_blob(backend_cfg, dc_arc, layout_clone).await;
+                    prefetch_blob(backend_cfg, dc_arc, layout_clone, rows).await;
                 })
                 .detach();
             }
@@ -306,6 +318,8 @@ impl VfsCore {
                 ino: inode,
                 s3_key,
                 layout,
+                layout_refreshed_at: Instant::now(),
+                operation_lock: Arc::new(futures::lock::Mutex::new(())),
                 write_buf,
                 backing_id: None,
             },

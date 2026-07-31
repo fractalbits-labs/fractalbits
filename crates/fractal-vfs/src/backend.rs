@@ -4,7 +4,8 @@ use bytes::Bytes;
 use data_types::{Bucket, DataBlobGuid, DataVgInfo, RoutingKey, TraceId};
 use file_ops::{
     ListEntry, create_dir_marker_layout, mpu_get_part_prefix, parse_delete_inode, parse_get_inode,
-    parse_list_inodes, parse_mpu_parts, parse_put_inode, parse_put_inode_cas,
+    parse_list_inodes, parse_list_inodes_raw, parse_mpu_parts, parse_put_inode,
+    parse_put_inode_cas,
 };
 use futures::{StreamExt, stream};
 use rpc_client_common::RpcError;
@@ -192,6 +193,68 @@ impl StorageBackend {
         .await?;
 
         Ok(parse_get_inode(resp)?)
+    }
+
+    /// Raw NSS value fetch: the stored bytes without the `ObjectLayout`
+    /// decode. The `@ovr/` row path must bypass `parse_get_inode`, which
+    /// hard-errors on non-layout values.
+    pub async fn get_inode_raw(&self, key: &str, trace_id: &TraceId) -> Result<Bytes, FsError> {
+        let resp = nss_rpc_retry!(
+            self.nss_client.borrow(),
+            get_inode(
+                &self.root_blob_name,
+                key,
+                Some(self.config.rpc_request_timeout()),
+                trace_id
+            ),
+            self,
+            trace_id
+        )
+        .await?;
+        match resp.result {
+            Some(nss_codec::get_inode_response::Result::Ok(bytes)) => Ok(bytes),
+            Some(nss_codec::get_inode_response::Result::ErrNotFound(()))
+            | Some(nss_codec::get_inode_response::Result::ErrNoSuchRootBlob(())) => {
+                Err(FsError::NotFound)
+            }
+            Some(nss_codec::get_inode_response::Result::ErrOther(e)) => Err(FsError::Internal(e)),
+            None => Err(FsError::Internal("empty GetInodeResponse".into())),
+        }
+    }
+
+    /// One raw listing page: `(key, value)` pairs plus the has_more flag.
+    /// Bypasses `parse_list_inodes`, whose `ObjectLayout` decode
+    /// hard-errors on raw `@ovr/` row values. Callers own pagination via
+    /// `start_after`; the NSS page clamp makes ignoring `has_more` a
+    /// silent-truncation bug.
+    pub async fn list_inodes_raw_page(
+        &self,
+        prefix: &str,
+        start_after: &str,
+        max_keys: u32,
+        trace_id: &TraceId,
+    ) -> Result<(Vec<(String, Bytes)>, bool), FsError> {
+        let resp = nss_rpc_retry!(
+            self.nss_client.borrow(),
+            list_inodes(
+                &self.root_blob_name,
+                max_keys,
+                prefix,
+                "",
+                start_after,
+                true,
+                Some(self.config.rpc_request_timeout()),
+                trace_id
+            ),
+            self,
+            trace_id
+        )
+        .await?;
+        match parse_list_inodes_raw(resp) {
+            Ok(page) => Ok(page),
+            Err(file_ops::NssError::NoSuchRootBlob) => Err(FsError::NotFound),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// List inodes from NSS. Returns (key, Option<ObjectLayout>).

@@ -18,8 +18,6 @@ use std::sync::Arc;
 use crate::backend::{BackendConfig, StorageBackend};
 use crate::config::Config;
 use crate::disk_cache::DiskCache;
-use crate::error::FsError;
-use crate::vfs::DEFAULT_BLOCK_SIZE;
 
 /// Tunable thresholds and opt-ins for `should_prefetch`. Built once
 /// from `Config` at startup so the hot decision path doesn't reparse
@@ -95,6 +93,7 @@ pub(crate) async fn prefetch_blob(
     backend_cfg: Arc<BackendConfig>,
     disk_cache: Arc<DiskCache>,
     layout: ObjectLayout,
+    rows: Option<Arc<data_types::ovr_map::OvrRowMap>>,
 ) {
     let Ok(file_size) = layout.size() else {
         return;
@@ -138,48 +137,54 @@ pub(crate) async fn prefetch_blob(
     let last_block = ((file_size - 1) / block_size) as u32;
     let trace_id = TraceId::new();
 
+    let ceiling = layout.blob_version;
     for block_num in 0..=last_block {
         let block_start = block_num as u64 * block_size;
         let block_content_len = std::cmp::min(block_size, file_size - block_start) as usize;
 
+        // Resolve the block's exact committed identity from the rows;
+        // holes need no fetch (and any stale cached entry for them is
+        // superseded by the row).
+        let (version, read_len, miss_is_loss) = match data_types::ovr_map::block_fetch_plan(
+            rows.as_deref(),
+            block_num,
+            ceiling,
+            layout.block_size as usize,
+            block_content_len,
+        ) {
+            data_types::ovr_map::BlockFetchPlan::Fetch {
+                version,
+                read_len,
+                miss_is_loss,
+            } => (version, read_len, miss_is_loss),
+            data_types::ovr_map::BlockFetchPlan::Zeros
+            | data_types::ovr_map::BlockFetchPlan::Stale => continue,
+        };
+
         // If another path has already populated this block (e.g. a
-        // racing read), the cache hit short-circuits the BSS round
-        // trip.
+        // racing read), only the exact committed identity can
+        // short-circuit the BSS round trip.
         if disk_cache
-            .get_block(blob_guid, block_num, block_content_len)
+            .get_block_exact(blob_guid, block_num, version, block_content_len)
             .await
             .is_some()
         {
             continue;
         }
 
-        // Override (blob_version > 1) blocks are padded to block_size on
-        // disk; request the full block so the EC shard size matches, then
-        // truncate to the logical content length (mirrors read_block_cached).
-        let read_len = if layout.blob_version > 1 {
-            (DEFAULT_BLOCK_SIZE as usize).max(block_content_len)
-        } else {
-            block_content_len
-        };
         let (mut data, _checksum) = match backend
-            .read_block(
-                blob_guid,
-                layout.blob_version,
-                block_num,
-                read_len,
-                &trace_id,
-            )
+            .read_block(blob_guid, version, block_num, read_len, &trace_id)
             .await
         {
             Ok(r) => r,
-            Err(FsError::Rpc(rpc_client_common::RpcError::NotFound)) => {
+            Err(e) if e.is_block_missing() && !miss_is_loss => {
                 // Sparse hole; intentionally not cached. The
                 // block-on-demand path treats missing blocks as zeros.
                 continue;
             }
             Err(e) => {
                 tracing::debug!(
-                    %blob_guid, block_num, error = %e,
+                    %blob_guid, block_num, version, error = %e,
                     "prefetch block fetch failed; abandoning prefetch"
                 );
                 return;
@@ -190,7 +195,7 @@ pub(crate) async fn prefetch_blob(
         }
 
         let _ = disk_cache
-            .insert_block(blob_guid, block_num, layout.blob_version, &data)
+            .insert_block(blob_guid, block_num, version, &data)
             .await;
     }
 }

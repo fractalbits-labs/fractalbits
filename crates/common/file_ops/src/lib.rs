@@ -112,6 +112,32 @@ pub fn parse_list_inodes(resp: ListInodesResponse) -> Result<ListInodesResult, N
     Ok(ListInodesResult { entries, has_more })
 }
 
+/// Raw variant of `parse_list_inodes` for internal keyspaces (`@ovr/`
+/// rows and friends) whose values are not `ObjectLayout`s: returns the
+/// NUL-trimmed keys with their raw value bytes plus the has_more flag,
+/// skipping the rkyv decode that hard-errors on non-layout values.
+pub fn parse_list_inodes_raw(
+    resp: ListInodesResponse,
+) -> Result<(Vec<(String, Bytes)>, bool), NssError> {
+    let (inodes, has_more) = match resp.result.unwrap() {
+        list_inodes_response::Result::Ok(res) => (res.inodes, res.has_more),
+        list_inodes_response::Result::ErrNoSuchRootBlob(()) => {
+            return Err(NssError::NoSuchRootBlob);
+        }
+        list_inodes_response::Result::ErrOther(e) => {
+            tracing::error!("NSS list_inodes error: {e}");
+            return Err(NssError::Internal(e));
+        }
+    };
+    Ok((
+        inodes
+            .into_iter()
+            .map(|inode| (inode.key.trim_end_matches('\0').to_string(), inode.inode))
+            .collect(),
+        has_more,
+    ))
+}
+
 pub fn parse_put_inode(resp: PutInodeResponse) -> Result<Bytes, NssError> {
     match resp.result.unwrap() {
         put_inode_response::Result::Ok(res) => Ok(res),

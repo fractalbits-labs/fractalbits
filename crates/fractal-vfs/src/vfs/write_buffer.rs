@@ -58,11 +58,6 @@ pub(crate) struct WriteBuffer {
     /// the smaller new size, so recomputing the upper bound from the layout
     /// on retry would lose the original committed bound. Reset on flush.
     pub(crate) trim_upper: Option<u32>,
-    /// Block indices fallocate has reserved. On flush these become
-    /// `ReserveBlocks` (single-op, no batch) for blocks not superseded by a
-    /// `Rewrite`/`Delete`. Reads and `lseek(SEEK_DATA)` treat reserved
-    /// blocks as logical-data per Linux convention even before flush.
-    pub(crate) pending_reservations: std::collections::BTreeSet<u32>,
 }
 
 impl WriteBuffer {
@@ -80,15 +75,12 @@ impl WriteBuffer {
             dirty: false,
             eof_low_watermark: None,
             trim_upper: None,
-            pending_reservations: std::collections::BTreeSet::new(),
         }
     }
 
-    /// Drop per-block intents and reservations past the new EOF (shrink).
+    /// Drop per-block intents past the new EOF (shrink).
     pub(crate) fn drop_blocks_past(&mut self, new_last_block_excl: u32) {
         self.blocks.retain(|b, _| *b < new_last_block_excl);
-        self.pending_reservations
-            .retain(|b| *b < new_last_block_excl);
     }
 
     /// True when block `b` sits in a range whose committed BSS bytes were

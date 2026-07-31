@@ -54,6 +54,24 @@ pub enum FsError {
 
     #[error("cas conflict: stored value changed under the put_inode_cas guard")]
     CasConflict,
+
+    #[error("layout may have changed while reading sparse block {1} of {0}")]
+    StaleLayout(data_types::DataBlobGuid, u32),
+}
+
+impl FsError {
+    /// The addressed exact generation does not exist on enough nodes.
+    /// Which wrapper delivers it depends on the backend path (direct
+    /// BSS client vs volume-group proxy), so classification lives here
+    /// rather than at each call site.
+    pub(crate) fn is_block_missing(&self) -> bool {
+        matches!(
+            self,
+            FsError::DataVg(volume_group_proxy::DataVgError::BlockNotFound)
+                | FsError::DataVg(volume_group_proxy::DataVgError::BssRpc(RpcError::NotFound))
+                | FsError::Rpc(RpcError::NotFound)
+        )
+    }
 }
 
 impl From<FsError> for io::Error {
@@ -68,6 +86,10 @@ impl From<FsError> for io::Error {
             FsError::ReadOnly => io::Error::from_raw_os_error(libc::EROFS),
             FsError::BadFd => io::Error::from_raw_os_error(libc::EBADF),
             FsError::Busy => io::Error::from_raw_os_error(libc::EBUSY),
+            FsError::Rpc(RpcError::NoSpace) => io::Error::from_raw_os_error(libc::ENOSPC),
+            FsError::DataVg(volume_group_proxy::DataVgError::BssRpc(RpcError::NoSpace)) => {
+                io::Error::from_raw_os_error(libc::ENOSPC)
+            }
             FsError::Rpc(ref e) => {
                 if e.retryable() {
                     io::Error::from_raw_os_error(libc::EAGAIN)
@@ -81,11 +103,10 @@ impl From<FsError> for io::Error {
             FsError::NoData => io::Error::from_raw_os_error(libc::ENXIO),
             FsError::Deserialize(_) => io::Error::from_raw_os_error(libc::EIO),
             FsError::Internal(_) => io::Error::from_raw_os_error(libc::EIO),
-            // A CAS conflict means the inode was rewritten underneath this
-            // publish (another writer / instance won). The override-flush
-            // path catches this typed variant and forward-retries; if it
-            // ever escapes to the kernel, ESTALE is the honest answer.
+            // A CAS conflict means the guarded inode bytes changed before
+            // this publish. ESTALE is the honest kernel result.
             FsError::CasConflict => io::Error::from_raw_os_error(libc::ESTALE),
+            FsError::StaleLayout(_, _) => io::Error::from_raw_os_error(libc::ESTALE),
         }
     }
 }
@@ -119,9 +140,8 @@ impl From<file_ops::NssError> for FsError {
             file_ops::NssError::AlreadyExists => FsError::AlreadyExists,
             file_ops::NssError::Internal(msg) => FsError::Internal(msg),
             file_ops::NssError::Deserialization(msg) => FsError::Deserialize(msg),
-            // The override flush path uses the typed CasConflict variant to
-            // distinguish a lost CAS race (retry) from a hard failure; the
-            // winning value bytes are dropped here and re-read on retry.
+            // Preserve the typed conflict so each operation can apply its
+            // own idempotence or failure policy.
             file_ops::NssError::CasConflict(_) => FsError::CasConflict,
         }
     }
