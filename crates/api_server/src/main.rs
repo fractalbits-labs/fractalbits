@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use actix_files::Files;
 use actix_web::HttpResponse;
 use actix_web::{App, HttpServer, middleware::Logger, rt::System, web};
@@ -230,6 +232,7 @@ fn main() -> std::io::Result<()> {
                         nss_clients,
                         worker_idx as u16,
                     ));
+                    let server_app_state = app_state.clone();
 
                     let mut server = HttpServer::new(move || {
                         if let Some(core_id) = core_id {
@@ -242,7 +245,7 @@ fn main() -> std::io::Result<()> {
                         // behind stuck S3 requests) and also frees up "mgmt"
                         // and "api_keys" as valid S3 bucket names on the main
                         // port.
-                        let app_state = app_state.clone();
+                        let app_state = server_app_state.clone();
                         let mut app = App::new()
                             .app_data(web::Data::new(app_state))
                             .app_data(web::PayloadConfig::default().limit(5_368_709_120))
@@ -316,7 +319,9 @@ fn main() -> std::io::Result<()> {
                     let _ = handle_tx.send(server_handle);
                     drop(handle_tx);
 
-                    server.await
+                    let result = server.await;
+                    app_state.shutdown_blob_deletions().await;
+                    result
                 })
             })?;
 
@@ -340,9 +345,10 @@ fn main() -> std::io::Result<()> {
                         nss_clients,
                         u16::MAX, // mgmt worker id (distinct from S3 workers)
                     ));
+                    let server_app_state = app_state.clone();
 
                     let server = HttpServer::new(move || {
-                        let app_state = app_state.clone();
+                        let app_state = server_app_state.clone();
                         App::new()
                             .app_data(web::Data::new(app_state))
                             .wrap(Logger::default())
@@ -373,7 +379,9 @@ fn main() -> std::io::Result<()> {
                     let server = server.run();
                     let _ = mgmt_tx.send(server.handle());
                     drop(mgmt_tx);
-                    server.await
+                    let result = server.await;
+                    app_state.shutdown_blob_deletions().await;
+                    result
                 })
             })?;
         let handle = mgmt_rx.recv().expect("mgmt HttpServer failed to start");

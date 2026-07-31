@@ -17,13 +17,159 @@ use actix_web::{
     web::Query,
 };
 use bytes::Bytes;
-use data_types::DataBlobGuid;
 use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
-use data_types::{Bucket, TraceId};
+use data_types::ovr_map::{
+    BlockFetchPlan, OvrRow, OvrRowMap, block_fetch_plan, ovr_row_prefix, parse_ovr_row_block, zeros,
+};
+use data_types::{Bucket, DataBlobGuid, RoutingKey, TraceId};
+use file_ops::parse_list_inodes_raw;
 use futures::{StreamExt, TryStreamExt, stream};
 use metrics_wrapper::histogram;
+use rpc_client_common::nss_rpc_retry;
 use serde::Deserialize;
 use tracing::{Instrument, Span};
+
+/// NSS listing page for row loads; the has_more loop, not the page
+/// size, bounds coverage (never trust one clamped page).
+const ROW_LOAD_PAGE: u32 = 1_000;
+
+/// The blob's committed `@ovr/` row snapshot for `layout`, or `None`
+/// for an unmapped blob. Cached per (blob_id, map_epoch): rows change
+/// only under a commit CAS that bumps the epoch.
+async fn load_row_map(
+    app: &Arc<AppState>,
+    routing_key: &RoutingKey,
+    root_blob_name: &str,
+    layout: &ObjectLayout,
+    trace_id: &TraceId,
+) -> Result<Option<Arc<OvrRowMap>>, S3Error> {
+    if !layout.is_mapped() {
+        return Ok(None);
+    }
+    let blob_guid = layout.blob_guid()?;
+    let map_epoch = layout.map_epoch();
+    let cache_key = (blob_guid.blob_id, map_epoch);
+    if let Some(map) = app.row_maps.get(&cache_key).await {
+        return Ok(Some(map));
+    }
+
+    let prefix = ovr_row_prefix(&blob_guid.blob_id);
+    let mut map = OvrRowMap::new(map_epoch);
+    let mut start_after = String::new();
+    loop {
+        let nss_client = app.get_nss_rpc_client(routing_key).await?;
+        let response = nss_rpc_retry!(
+            nss_client,
+            list_inodes(
+                root_blob_name,
+                ROW_LOAD_PAGE,
+                &prefix,
+                "",
+                &start_after,
+                true,
+                Some(app.config.rpc_request_timeout()),
+                trace_id
+            ),
+            app.as_ref(),
+            routing_key,
+            trace_id
+        )
+        .await?;
+        let (page, has_more) = match parse_list_inodes_raw(response) {
+            Ok(page) => page,
+            Err(file_ops::NssError::NoSuchRootBlob) => return Err(S3Error::NoSuchBucket),
+            Err(error) => {
+                tracing::error!(%blob_guid, %error, "@ovr row listing failed");
+                return Err(S3Error::InternalError);
+            }
+        };
+        let last_key = page.last().map(|(key, _)| key.clone());
+        for (key, value) in page {
+            let (Some(block), Some(row)) = (parse_ovr_row_block(&key), OvrRow::decode(&value))
+            else {
+                tracing::error!(%blob_guid, %key, "malformed @ovr row");
+                return Err(S3Error::InternalError);
+            };
+            map.insert(block, row);
+        }
+        let Some(last_key) = last_key else { break };
+        if !has_more {
+            break;
+        }
+        start_after = last_key;
+    }
+
+    let map = Arc::new(map);
+    app.row_maps.insert(cache_key, map.clone()).await;
+    Ok(Some(map))
+}
+
+/// Read one block at its exact committed identity. A `Hole` returns
+/// zeros with no RPC; a row-committed miss is detected data loss (never
+/// a hole); a base-version miss is a sparse hole.
+#[allow(clippy::too_many_arguments)]
+async fn read_block(
+    blob_client: &BlobClient,
+    blob_guid: DataBlobGuid,
+    block_number: u32,
+    content_len: usize,
+    block_size: usize,
+    blob_location: BlobLocation,
+    rows: Option<&OvrRowMap>,
+    ceiling: u64,
+    trace_id: &TraceId,
+) -> Result<Bytes, S3Error> {
+    let (version, read_len, miss_is_loss) =
+        match block_fetch_plan(rows, block_number, ceiling, block_size, content_len) {
+            BlockFetchPlan::Zeros => return Ok(zeros(content_len)),
+            // The layout snapshot predates the row's last write; a fresh
+            // GET re-reads both. Fail this one rather than guess.
+            BlockFetchPlan::Stale => {
+                tracing::warn!(%blob_guid, block_number, "row pair above the GET's ceiling");
+                return Err(S3Error::InternalError);
+            }
+            BlockFetchPlan::Fetch {
+                version,
+                read_len,
+                miss_is_loss,
+            } => (version, read_len, miss_is_loss),
+        };
+    let mut body = Bytes::new();
+    match blob_client
+        .get_blob(
+            blob_guid,
+            block_number,
+            version,
+            read_len,
+            blob_location,
+            &mut body,
+            trace_id,
+        )
+        .await
+    {
+        Ok(()) => {
+            if body.len() > content_len {
+                body = body.slice(..content_len);
+            }
+            Ok(body)
+        }
+        Err(crate::blob_storage::BlobStorageError::DataVg(
+            volume_group_proxy::DataVgError::BlockNotFound,
+        )) => {
+            if miss_is_loss {
+                tracing::error!(
+                    %blob_guid,
+                    block_number,
+                    version,
+                    "DATA LOSS: row-committed generation missing on every replica"
+                );
+                return Err(S3Error::InternalError);
+            }
+            Ok(zeros(content_len))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -224,6 +370,14 @@ pub async fn get_object_content(
             let size = object.size()?;
             let block_size = object.block_size as usize;
             let blob_location = object.get_blob_location()?;
+            let rows = load_row_map(
+                &app,
+                &bucket.routing_key,
+                &bucket.root_blob_name,
+                object,
+                trace_id,
+            )
+            .await?;
             let body_stream = get_full_blob_stream(
                 blob_client,
                 blob_guid,
@@ -231,6 +385,8 @@ pub async fn get_object_content(
                 size,
                 block_size,
                 blob_location,
+                rows,
+                object.blob_version,
                 *trace_id,
             )
             .await?;
@@ -288,6 +444,10 @@ pub async fn get_object_content(
                             let mpu_size = mpu_obj.size()?;
                             let block_size = mpu_obj.block_size as usize;
                             let blob_location = mpu_obj.get_blob_location()?;
+                            // MPU parts are uploaded whole and never
+                            // overwritten in place (a FUSE overwrite
+                            // republishes as a Normal layout with a fresh
+                            // blob), so they carry no rows.
                             get_full_blob_stream(
                                 blob_client,
                                 blob_guid,
@@ -295,6 +455,8 @@ pub async fn get_object_content(
                                 mpu_size,
                                 block_size,
                                 blob_location,
+                                None,
+                                mpu_obj.blob_version,
                                 trace_id,
                             )
                             .await
@@ -327,6 +489,14 @@ async fn get_object_range_content(
             let blob_location = object.get_blob_location()?;
             let object_size = object.size()?;
             let num_blocks = object.num_blocks()?;
+            let rows = load_row_map(
+                &app,
+                &bucket.routing_key,
+                &bucket.root_blob_name,
+                object,
+                trace_id,
+            )
+            .await?;
             let body_stream = get_range_blob_stream(
                 blob_client,
                 blob_guid,
@@ -336,6 +506,8 @@ async fn get_object_range_content(
                 range.start,
                 range.end,
                 blob_location,
+                rows,
+                object.blob_version,
                 *trace_id,
             );
             Ok(Box::pin(body_stream))
@@ -414,6 +586,8 @@ async fn get_object_range_content(
                                     blob_start,
                                     blob_end,
                                     BlobLocation::S3,
+                                    None,
+                                    1,
                                     trace_id,
                                 ))
                             }
@@ -426,6 +600,7 @@ async fn get_object_range_content(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn get_full_blob_stream(
     blob_client: Arc<BlobClient>,
     blob_guid: DataBlobGuid,
@@ -433,6 +608,8 @@ async fn get_full_blob_stream(
     object_size: u64,
     block_size: usize,
     blob_location: BlobLocation,
+    rows: Option<Arc<OvrRowMap>>,
+    ceiling: u64,
     trace_id: TraceId,
 ) -> Result<impl stream::Stream<Item = Result<Bytes, S3Error>>, S3Error> {
     if num_blocks == 0 {
@@ -445,23 +622,21 @@ async fn get_full_blob_stream(
         block_size
     };
 
-    // Get the first block
-    let mut first_block = Bytes::new();
-    blob_client
-        .get_blob(
-            blob_guid,
-            0,
-            1,
-            first_block_len,
-            blob_location,
-            &mut first_block,
-            &trace_id,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(%blob_guid, block_number=0, error=?e, "failed to get blob");
-            S3Error::from(e)
-        })?;
+    let first_block = read_block(
+        &blob_client,
+        blob_guid,
+        0,
+        first_block_len,
+        block_size,
+        blob_location,
+        rows.as_deref(),
+        ceiling,
+        &trace_id,
+    )
+    .await
+    .inspect_err(|error| {
+        tracing::error!(%blob_guid, block_number = 0, %error, "failed to get blob");
+    })?;
 
     if num_blocks == 1 {
         // Single block optimization - return immediately without streaming overhead
@@ -471,6 +646,7 @@ async fn get_full_blob_stream(
     // Multi-block case: stream first block + remaining blocks
     let remaining_stream = stream::iter(1..num_blocks).then(move |i| {
         let blob_client = blob_client.clone();
+        let rows = rows.clone();
         async move {
             let is_last_block = i == num_blocks - 1;
             let content_len = if is_last_block {
@@ -478,25 +654,21 @@ async fn get_full_blob_stream(
             } else {
                 block_size
             };
-            let mut block = Bytes::new();
-            match blob_client
-                .get_blob(
-                    blob_guid,
-                    i as u32,
-                    1,
-                    content_len,
-                    blob_location,
-                    &mut block,
-                    &trace_id,
-                )
-                .await
-            {
-                Err(e) => {
-                    tracing::error!(%blob_guid, block_number=i, error=?e, "failed to get blob");
-                    Err(S3Error::from(e))
-                }
-                Ok(_) => Ok(block),
-            }
+            read_block(
+                &blob_client,
+                blob_guid,
+                i as u32,
+                content_len,
+                block_size,
+                blob_location,
+                rows.as_deref(),
+                ceiling,
+                &trace_id,
+            )
+            .await
+            .inspect_err(|error| {
+                tracing::error!(%blob_guid, block_number = i, %error, "failed to get blob");
+            })
         }
     });
 
@@ -514,6 +686,8 @@ fn get_range_blob_stream(
     start: usize,
     end: usize,
     blob_location: BlobLocation,
+    rows: Option<Arc<OvrRowMap>>,
+    ceiling: u64,
     trace_id: TraceId,
 ) -> impl stream::Stream<Item = Result<Bytes, S3Error>> {
     let start_block_i = start / block_size;
@@ -524,8 +698,8 @@ fn get_range_blob_stream(
     futures::stream::iter(start_block_i..=end_block_i)
         .then(move |i| {
             let blob_client = blob_client.clone();
+            let rows = rows.clone();
             async move {
-                let mut block = Bytes::new();
                 // For range reads, we always read full blocks and trim in the scan below
                 // except for the last block which might be partial
                 let is_last_block = i == num_blocks - 1;
@@ -534,24 +708,21 @@ fn get_range_blob_stream(
                 } else {
                     block_size
                 };
-                match blob_client
-                    .get_blob(
-                        blob_guid,
-                        i as u32,
-                        1,
-                        content_len,
-                        blob_location,
-                        &mut block,
-                        &trace_id,
-                    )
-                    .await
-                {
-                    Err(e) => {
-                        tracing::error!(%blob_guid, block_number=i, error=?e, "failed to get blob");
-                        Err(S3Error::from(e))
-                    }
-                    Ok(_) => Ok(block),
-                }
+                read_block(
+                    &blob_client,
+                    blob_guid,
+                    i as u32,
+                    content_len,
+                    block_size,
+                    blob_location,
+                    rows.as_deref(),
+                    ceiling,
+                    &trace_id,
+                )
+                .await
+                .inspect_err(|error| {
+                    tracing::error!(%blob_guid, block_number = i, %error, "failed to get blob");
+                })
             }
             .instrument(span.clone())
         })

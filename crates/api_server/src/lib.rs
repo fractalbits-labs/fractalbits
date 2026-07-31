@@ -32,6 +32,10 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub cache: Arc<Cache<String, Versioned<String>>>,
     pub worker_id: u16,
+    /// Per-blob `@ovr/` row snapshots keyed by (blob_id, map_epoch).
+    /// Rows change only under a commit CAS that bumps the epoch, so an
+    /// epoch-keyed snapshot never goes stale; superseded epochs age out.
+    pub(crate) row_maps: Cache<(uuid::Uuid, u64), Arc<data_types::ovr_map::OvrRowMap>>,
 
     // Per-routing-key NSS clients, lazily populated as buckets are resolved.
     // A single api_server instance can cache clients for multiple distinct
@@ -51,6 +55,7 @@ pub struct NssEntry {
 
 impl AppState {
     const PER_CORE_CACHE_CAPACITY: u64 = 10_000;
+    const PER_CORE_ROW_MAP_CACHE_CAPACITY: u64 = 4_096;
 
     pub fn new_per_core_sync(
         config: Arc<Config>,
@@ -85,6 +90,9 @@ impl AppState {
             blob_deletion_tx: tx,
             blob_deletion_rx: Mutex::new(Some(rx)),
             cache,
+            row_maps: Cache::builder()
+                .max_capacity(Self::PER_CORE_ROW_MAP_CACHE_CAPACITY)
+                .build(),
             worker_id,
         }
     }
@@ -248,13 +256,6 @@ impl AppState {
             .get_or_try_init(|| async {
                 debug!("Creating per-worker BlobClient on-demand");
 
-                let rx = self
-                    .blob_deletion_rx
-                    .lock()
-                    .await
-                    .take()
-                    .ok_or_else(|| "BlobClient already initialized".to_string())?;
-
                 debug!(
                     "Fetching DataVgInfo from RSS at {:?}",
                     self.config.rss_addrs
@@ -271,9 +272,8 @@ impl AppState {
                     data_vg_info.volumes.len()
                 );
 
-                let blob_client = BlobClient::new_with_data_vg_info(
+                let storage = BlobClient::create_storage_with_data_vg_info(
                     &self.config.blob_storage,
-                    rx,
                     self.config.rss_rpc_timeout(),
                     self.config.rpc_connection_timeout(),
                     data_vg_info,
@@ -281,7 +281,14 @@ impl AppState {
                 .await
                 .map_err(|e| e.to_string())?;
 
-                Ok(Arc::new(blob_client))
+                let rx = self
+                    .blob_deletion_rx
+                    .lock()
+                    .await
+                    .take()
+                    .ok_or_else(|| "BlobClient already initialized".to_string())?;
+
+                Ok(Arc::new(BlobClient::new_with_storage(storage, rx)))
             })
             .await
             .cloned()
@@ -289,6 +296,16 @@ impl AppState {
 
     pub fn get_blob_deletion(&self) -> Sender<BlobDeletionRequest> {
         self.blob_deletion_tx.clone()
+    }
+
+    /// Drain the background deletion worker on shutdown so queued blob
+    /// teardowns (data keys and @ovr rows) are not stranded.
+    pub async fn shutdown_blob_deletions(&self) {
+        if let Some(blob_client) = self.blob_client.get() {
+            debug!(worker_id = self.worker_id, "draining blob deletion worker");
+            blob_client.shutdown().await;
+            debug!(worker_id = self.worker_id, "blob deletion worker stopped");
+        }
     }
 }
 
