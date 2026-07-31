@@ -130,6 +130,7 @@ impl MessageHeader {
     const _SIZE_OK: () = assert!(size_of::<Self>() == 160);
     const _FENCE_TOKEN_OFFSET_OK: () = assert!(std::mem::offset_of!(Self, fence_token) == 96);
     pub const PROTO_VERSION: u8 = 1;
+    const DATA_COHORT_TAG_OFFSET: usize = 8;
 
     /// Calculate and set the body checksum field.
     /// The checksum covers the message body after this header.
@@ -146,6 +147,20 @@ impl MessageHeader {
             hasher.update(chunk);
         }
         self.checksum_body = hasher.digest();
+    }
+
+    /// EC stripe identity carried in checksum-protected spare header bytes.
+    pub fn data_cohort_tag(&self) -> u64 {
+        u64::from_le_bytes(
+            self.reserve1[Self::DATA_COHORT_TAG_OFFSET..Self::DATA_COHORT_TAG_OFFSET + 8]
+                .try_into()
+                .expect("cohort tag header slice"),
+        )
+    }
+
+    pub fn set_data_cohort_tag(&mut self, cohort_tag: u64) {
+        self.reserve1[Self::DATA_COHORT_TAG_OFFSET..Self::DATA_COHORT_TAG_OFFSET + 8]
+            .copy_from_slice(&cohort_tag.to_le_bytes());
     }
 }
 
@@ -181,5 +196,18 @@ impl MessageHeaderTrait for MessageHeader {
     fn verify_body_checksum(&self, body: &[u8]) -> bool {
         let calculated = xxh3_64(body);
         self.checksum_body == calculated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MessageHeader;
+
+    #[test]
+    fn data_cohort_tag_roundtrips_full_width() {
+        let mut header = MessageHeader::default();
+        let cohort_tag = 0xfedc_ba98_7654_3210;
+        header.set_data_cohort_tag(cohort_tag);
+        assert_eq!(header.data_cohort_tag(), cohort_tag);
     }
 }
