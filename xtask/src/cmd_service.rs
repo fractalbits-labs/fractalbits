@@ -1365,6 +1365,10 @@ StartLimitBurst=100
         ServiceName::NssRoleAgent => "nss_role_agent-%i".to_string(),
         _ => service_name.to_string(),
     };
+    let timeout_stop_sec = match service {
+        ServiceName::ApiServer | ServiceName::FsServer => 60,
+        _ => 5,
+    };
 
     let systemd_unit_content = format!(
         r##"[Unit]
@@ -1374,7 +1378,7 @@ Description={service_name} Service
 
 [Service]
 {auto_restart}
-TimeoutStopSec=5
+TimeoutStopSec={timeout_stop_sec}
 LimitNOFILE=1000000
 LimitCORE=infinity
 SyslogIdentifier={syslog_identifier}
