@@ -6,7 +6,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use cmd_lib::*;
 use colored::*;
-use data_types::ec_utils::{ec_padded_len, ec_rotation, node_index};
+use data_types::ec_utils::{ec_cohort_tag, ec_padded_len, ec_rotation, node_index};
 use data_types::{DataBlobGuid, TraceId};
 use data_types::{DataRepairReport, MetaRepairReport};
 use reed_solomon_simd::encode as rs_encode;
@@ -132,11 +132,11 @@ async fn run_bss_repair_tests_inner() -> TestResult {
 
     println!(
         "\n{}",
-        "=== Test: Majority Repair Fixes Outlier Replica ==="
+        "=== Test: Majority Repair Preserves Conflicting Data ==="
             .bold()
             .green()
     );
-    test_majority_repair_fixes_outlier_replica().await?;
+    test_majority_repair_preserves_conflicting_data().await?;
 
     println!(
         "\n{}",
@@ -254,11 +254,11 @@ async fn run_bss_repair_tests_inner() -> TestResult {
 
     println!(
         "\n{}",
-        "=== Test: EC Repair Overwrites Corrupt Shard ==="
+        "=== Test: EC Repair Preserves Conflicting Data Shard ==="
             .bold()
             .green()
     );
-    test_ec_repair_overwrites_corrupt_shard().await?;
+    test_ec_repair_preserves_conflicting_data_shard().await?;
 
     println!(
         "\n{}",
@@ -347,7 +347,7 @@ async fn test_repair_mode_heals_multiple_blobs_and_healthy_followup() -> TestRes
     Ok(())
 }
 
-async fn test_majority_repair_fixes_outlier_replica() -> TestResult {
+async fn test_majority_repair_preserves_conflicting_data() -> TestResult {
     let volumes = *TEST_VOLUMES.get().expect("test volumes initialized");
     let blob_guid = DataBlobGuid {
         blob_id: Uuid::now_v7(),
@@ -357,21 +357,23 @@ async fn test_majority_repair_fixes_outlier_replica() -> TestResult {
     let outlier_body = Bytes::from_static(b"outlier-body");
 
     write_blob_to_two_nodes(blob_guid, 0, canonical_body.clone()).await?;
-    put_blob("127.0.0.1:8090", blob_guid, 0, outlier_body).await?;
+    put_blob("127.0.0.1:8090", blob_guid, 0, outlier_body.clone()).await?;
 
     let volume_id = volumes.majority.to_string();
     let report = run_bss_repair_json(&["repair-data", "--volume-id", &volume_id, "--json"])?;
     assert_eq!(report.scanned_volumes, 1, "expected one scanned volume");
     assert_eq!(report.failed_volumes, 0, "majority repair should succeed");
     assert_eq!(report.repair_candidates, 1, "expected one repair candidate");
-    assert_eq!(report.repaired_blobs, 1, "expected one repaired blob");
+    assert_eq!(report.repaired_blobs, 0, "conflicting Data is immutable");
+    assert_eq!(report.failed_repairs, 1, "conflict should be reported");
+    assert_eq!(report.degraded_volumes, 1, "conflict should degrade repair");
     assert_eq!(
-        read_blob_from_node("127.0.0.1:8090", blob_guid, 0, canonical_body.len()).await?,
-        canonical_body,
-        "outlier replica should be overwritten with canonical body"
+        read_blob_from_node("127.0.0.1:8090", blob_guid, 0, outlier_body.len()).await?,
+        outlier_body,
+        "conflicting Data should remain unchanged"
     );
 
-    println!("  OK: majority replicas repaired the outlier node");
+    println!("  OK: majority repair reported and preserved conflicting Data");
     Ok(())
 }
 
@@ -656,18 +658,29 @@ async fn put_blob(
     block_number: u32,
     body: Bytes,
 ) -> TestResult {
+    put_blob_with_cohort(addr, blob_guid, block_number, body, 0).await
+}
+
+async fn put_blob_with_cohort(
+    addr: &str,
+    blob_guid: DataBlobGuid,
+    block_number: u32,
+    body: Bytes,
+    cohort_tag: u64,
+) -> TestResult {
     let client = Arc::new(RpcClientBss::new_from_address(
         addr.to_string(),
         Duration::from_secs(5),
     ));
     let checksum = xxhash_rust::xxh3::xxh3_64(&body);
     client
-        .put_data_blob(
+        .put_data_blob_with_cohort(
             blob_guid,
             block_number,
             body,
             checksum,
             1,
+            cohort_tag,
             Some(Duration::from_secs(5)),
             &TraceId::new(),
             0,
@@ -1246,6 +1259,7 @@ async fn write_ec_shards_partial(
     let padded_len = ec_padded_len(body.len(), EC_K);
     let mut padded = vec![0u8; padded_len];
     padded[..body.len()].copy_from_slice(body);
+    let cohort_tag = ec_cohort_tag(&padded);
 
     let shard_size = padded_len / EC_K;
     let data_shards: Vec<&[u8]> = padded.chunks(shard_size).collect();
@@ -1272,7 +1286,7 @@ async fn write_ec_shards_partial(
         let ni = node_index(shard_idx, rotation, EC_TOTAL);
         let addr = format!("127.0.0.1:{}", 8088 + ni as u16);
         let shard_data = Bytes::from(shard.clone());
-        put_blob(&addr, blob_guid, block_number, shard_data).await?;
+        put_blob_with_cohort(&addr, blob_guid, block_number, shard_data, cohort_tag).await?;
     }
 
     Ok(shard_size)
@@ -1470,7 +1484,7 @@ async fn test_ec_repair_skips_tombstoned_blob() -> TestResult {
     Ok(())
 }
 
-async fn test_ec_repair_overwrites_corrupt_shard() -> TestResult {
+async fn test_ec_repair_preserves_conflicting_data_shard() -> TestResult {
     let volumes = *EC_TEST_VOLUMES.get().expect("ec test volumes initialized");
     let blob_guid = DataBlobGuid {
         blob_id: Uuid::now_v7(),
@@ -1483,23 +1497,29 @@ async fn test_ec_repair_overwrites_corrupt_shard() -> TestResult {
     let shard_size = write_ec_shards_partial(blob_guid, 0, body, &[0]).await?;
 
     // Put a wrong-size shard to the node for shard index 0 (simulates corruption).
-    // Because shard 0 was never written, this is a fresh write — no BSS overwrite
+    // Because shard 0 was never written, this is a fresh write. No BSS overwrite
     // check applies. The scanner will see this shard's size differs from the
     // majority and classify it as corrupt.
     let rotation = ec_rotation(&blob_guid.blob_id, EC_TOTAL as u32);
     let corrupt_node = node_index(0, rotation, EC_TOTAL);
     let corrupt_addr = format!("127.0.0.1:{}", 8088 + corrupt_node as u16);
     let garbage = Bytes::from(vec![0xFFu8; shard_size + 1]);
-    put_blob(&corrupt_addr, blob_guid, 0, garbage).await?;
+    let corrupt_cohort = ec_cohort_tag(&garbage);
+    put_blob_with_cohort(&corrupt_addr, blob_guid, 0, garbage, corrupt_cohort).await?;
 
     let volume_id = volumes.corrupt.to_string();
     let report = run_bss_repair_json(&["repair-data", "--volume-id", &volume_id, "--json"])?;
-    assert_eq!(report.failed_volumes, 0, "repair should succeed");
-    assert_eq!(report.repaired_blobs, 1, "expected one repaired blob");
-    assert_eq!(report.failed_repairs, 0, "expected no failed repairs");
+    assert_eq!(report.failed_volumes, 0, "repair should complete");
+    assert_eq!(report.repair_candidates, 0, "conflict is not writable");
+    assert_eq!(report.repaired_blobs, 0, "conflicting Data is immutable");
+    assert_eq!(
+        report.failed_repairs, 0,
+        "no repair write should be attempted"
+    );
+    assert_eq!(report.deferred_blobs, 1, "conflict should be reported");
 
-    // Verify the corrupt shard was fixed: read it back and check size
-    let mut repaired_shard = Bytes::new();
+    // Verify repair did not delete or replace the conflicting Data entry.
+    let mut preserved_shard = Bytes::new();
     let client = Arc::new(RpcClientBss::new_from_address(
         corrupt_addr,
         Duration::from_secs(5),
@@ -1509,20 +1529,16 @@ async fn test_ec_repair_overwrites_corrupt_shard() -> TestResult {
             blob_guid,
             0,
             1,
-            &mut repaired_shard,
-            shard_size,
+            &mut preserved_shard,
+            shard_size + 1,
             Some(Duration::from_secs(5)),
             &TraceId::new(),
             0,
         )
         .await
-        .expect("should read repaired shard");
-    assert_eq!(
-        repaired_shard.len(),
-        shard_size,
-        "repaired shard wrong size"
-    );
-    println!("  OK: EC repair overwrote corrupt shard with correct data");
+        .expect("should read preserved shard");
+    assert_eq!(preserved_shard, Bytes::from(vec![0xFFu8; shard_size + 1]));
+    println!("  OK: EC repair preserved conflicting Data without deletion");
     Ok(())
 }
 

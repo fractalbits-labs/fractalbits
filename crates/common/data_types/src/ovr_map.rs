@@ -8,11 +8,11 @@
 //! A row holds two (state, version) slots. The two slots exist for
 //! atomicity, not history: a flush pre-stages its rows with
 //! `cur_version` above the committed ceiling, and the commit CAS that
-//! raises the ceiling switches the whole flush's rows on at once. While
-//! `cur_version > ceiling`, `prev` is exactly the resolution a reader
-//! at the current committed ceiling computes, which holds because at
-//! most one flush is committable at a time (the most recent preparer;
-//! see the flush's prepare CAS).
+//! raises the ceiling switches the whole flush's rows on at once. A
+//! later prepare durably rejects every skipped generation before a
+//! commit can cross it, so delayed rows from doomed attempts always
+//! resolve through `prev`. At most one flush is committable at a time
+//! (the most recent preparer; see the flush's prepare CAS).
 
 use std::collections::BTreeMap;
 
@@ -30,6 +30,72 @@ const PREV_BASE: u8 = 0;
 
 pub const OVR_ROW_PREFIX: &str = "@ovr/";
 pub const OVR_GC_PREFIX: &str = "@ovr-gc/";
+/// Value stored at an immutable abort-range key. The range itself is
+/// encoded in the key so a single paginated row-prefix listing loads
+/// both rows and every permanently rejected generation.
+pub const OVR_ABORT_VALUE: [u8; 1] = [1];
+
+/// Legacy unconditional teardown marker. Older writers stored this before
+/// data deletion, so a new scavenger must retain it rather than assuming the
+/// blob's physical keys are gone.
+pub const OVR_GC_LEGACY_VALUE: &[u8] = b"gc";
+const OVR_GC_DATA_PENDING_TAG: &[u8; 8] = b"gcpend01";
+const OVR_GC_ROWS_READY_TAG: &[u8; 8] = b"gcrows01";
+const OVR_GC_DATA_PENDING_LEN: usize = OVR_GC_DATA_PENDING_TAG.len() + 2 + 8;
+const OVR_GC_ROWS_READY_LEN: usize = OVR_GC_ROWS_READY_TAG.len() + 2;
+
+/// Durable phase of a whole-blob teardown marker. Unrecognized values are
+/// conditional pre-mutation intents and are never replayed by a scavenger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OvrGcMarker {
+    Conditional,
+    LegacyDataPending,
+    DataPending {
+        volume_id: u16,
+        not_before_unix_ms: u64,
+    },
+    RowsReady {
+        volume_id: u16,
+    },
+}
+
+pub fn encode_ovr_gc_data_pending(
+    volume_id: u16,
+    not_before_unix_ms: u64,
+) -> [u8; OVR_GC_DATA_PENDING_LEN] {
+    let mut value = [0u8; OVR_GC_DATA_PENDING_LEN];
+    value[..8].copy_from_slice(OVR_GC_DATA_PENDING_TAG);
+    value[8..10].copy_from_slice(&volume_id.to_le_bytes());
+    value[10..18].copy_from_slice(&not_before_unix_ms.to_le_bytes());
+    value
+}
+
+pub fn encode_ovr_gc_rows_ready(volume_id: u16) -> [u8; OVR_GC_ROWS_READY_LEN] {
+    let mut value = [0u8; OVR_GC_ROWS_READY_LEN];
+    value[..8].copy_from_slice(OVR_GC_ROWS_READY_TAG);
+    value[8..10].copy_from_slice(&volume_id.to_le_bytes());
+    value
+}
+
+pub fn parse_ovr_gc_marker(value: &[u8]) -> OvrGcMarker {
+    if value == OVR_GC_LEGACY_VALUE {
+        return OvrGcMarker::LegacyDataPending;
+    }
+    if value.len() == OVR_GC_DATA_PENDING_LEN && &value[..8] == OVR_GC_DATA_PENDING_TAG {
+        return OvrGcMarker::DataPending {
+            volume_id: u16::from_le_bytes(value[8..10].try_into().expect("fixed marker width")),
+            not_before_unix_ms: u64::from_le_bytes(
+                value[10..18].try_into().expect("fixed marker width"),
+            ),
+        };
+    }
+    if value.len() == OVR_GC_ROWS_READY_LEN && &value[..8] == OVR_GC_ROWS_READY_TAG {
+        return OvrGcMarker::RowsReady {
+            volume_id: u16::from_le_bytes(value[8..10].try_into().expect("fixed marker width")),
+        };
+    }
+    OvrGcMarker::Conditional
+}
 
 /// State of one committed slot of a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,16 +215,22 @@ pub enum BlockResolution {
 /// the layout's committed ceiling. `None` means the row is absent from
 /// a complete row snapshot. An unmapped blob (`map_epoch == 0`) skips
 /// rows entirely and resolves every block to `Base`.
-pub fn resolve_row(row: Option<&OvrRow>, ceiling: u64) -> BlockResolution {
+fn resolve_row_filtered(
+    row: Option<&OvrRow>,
+    ceiling: u64,
+    is_aborted: impl Fn(u64) -> bool,
+) -> BlockResolution {
     let Some(row) = row else {
         return BlockResolution::Base;
     };
-    let slot = if row.cur_version <= ceiling {
+    let slot = if row.cur_version <= ceiling && !is_aborted(row.cur_version) {
         (row.cur_state, row.cur_version)
     } else {
         match row.prev {
             PrevSlot::Base => return BlockResolution::Base,
-            PrevSlot::Slot(state, version) if version <= ceiling => (state, version),
+            PrevSlot::Slot(state, version) if version <= ceiling && !is_aborted(version) => {
+                (state, version)
+            }
             PrevSlot::Slot(_, _) => return BlockResolution::Stale,
         }
     };
@@ -166,6 +238,10 @@ pub fn resolve_row(row: Option<&OvrRow>, ceiling: u64) -> BlockResolution {
         (RowState::Hole, _) => BlockResolution::Hole,
         (RowState::Written, version) => BlockResolution::Exact { version },
     }
+}
+
+pub fn resolve_row(row: Option<&OvrRow>, ceiling: u64) -> BlockResolution {
+    resolve_row_filtered(row, ceiling, |_| false)
 }
 
 /// How to fetch one resolved block from BSS. This owns the fetch-side
@@ -253,13 +329,23 @@ pub fn merge_row_for_write(
     version: u64,
     base_ceiling: u64,
 ) -> Option<OvrRow> {
+    merge_row_for_write_filtered(old, new_state, version, base_ceiling, |_| false)
+}
+
+fn merge_row_for_write_filtered(
+    old: Option<&OvrRow>,
+    new_state: RowState,
+    version: u64,
+    base_ceiling: u64,
+    is_aborted: impl Fn(u64) -> bool,
+) -> Option<OvrRow> {
     let prev = match old {
         None => PrevSlot::Base,
         Some(old) => {
             if version <= old.cur_version {
                 return None;
             }
-            if old.cur_version <= base_ceiling {
+            if old.cur_version <= base_ceiling && !is_aborted(old.cur_version) {
                 // The stored cur is committed: it becomes the reader's
                 // fallback while this flush's version is above the
                 // ceiling, and the exact identity the sweep may reclaim
@@ -283,6 +369,20 @@ pub fn merge_row_for_write(
 /// NSS key of one block's row.
 pub fn ovr_row_key(blob_id: &Uuid, block: u32) -> String {
     format!("{}{}/{:08x}", OVR_ROW_PREFIX, blob_id.as_simple(), block)
+}
+
+/// Immutable record proving that every generation in `[lo, hi]` was
+/// doomed by a later prepare CAS. The leading `x` sorts these records
+/// after fixed-width hexadecimal block keys while retaining the same
+/// per-blob prefix for loading and teardown.
+pub fn ovr_abort_key(blob_id: &Uuid, lo: u64, hi: u64) -> String {
+    format!(
+        "{}{}/x{:016x}-{:016x}",
+        OVR_ROW_PREFIX,
+        blob_id.as_simple(),
+        lo,
+        hi
+    )
 }
 
 /// Prefix of every row of a blob. The block number is fixed-width hex,
@@ -312,6 +412,20 @@ pub fn parse_ovr_row_block(key: &str) -> Option<u32> {
     u32::from_str_radix(block_hex, 16).ok()
 }
 
+/// Inclusive rejected-generation range encoded by `ovr_abort_key`.
+pub fn parse_ovr_abort_range(key: &str) -> Option<(u64, u64)> {
+    let key = key.trim_end_matches('\0');
+    let rest = key.strip_prefix(OVR_ROW_PREFIX)?;
+    let (_, encoded) = rest.split_once('/')?;
+    let (lo_hex, hi_hex) = encoded.strip_prefix('x')?.split_once('-')?;
+    if lo_hex.len() != 16 || hi_hex.len() != 16 {
+        return None;
+    }
+    let lo = u64::from_str_radix(lo_hex, 16).ok()?;
+    let hi = u64::from_str_radix(hi_hex, 16).ok()?;
+    (lo > 0 && lo <= hi).then_some((lo, hi))
+}
+
 /// Blob id of a `@ovr-gc/` marker key.
 pub fn parse_ovr_gc_blob_id(key: &str) -> Option<Uuid> {
     let key = key.trim_end_matches('\0');
@@ -320,12 +434,14 @@ pub fn parse_ovr_gc_blob_id(key: &str) -> Option<Uuid> {
 
 /// A complete row snapshot for one blob, tagged with the `map_epoch`
 /// it was loaded under. Validity rule: a snapshot at epoch M serves any
-/// read whose layout carries the same M, however far the ceiling has
-/// advanced, including the negative knowledge that a row was absent.
+/// read whose layout carries the same M. A delayed aborted row may land
+/// without another epoch change, but it resolves exactly like the
+/// previously cached row or absence.
 #[derive(Debug, Clone, Default)]
 pub struct OvrRowMap {
     pub epoch: u64,
     rows: BTreeMap<u32, OvrRow>,
+    aborted: Vec<(u64, u64)>,
 }
 
 impl OvrRowMap {
@@ -333,6 +449,7 @@ impl OvrRowMap {
         Self {
             epoch,
             rows: BTreeMap::new(),
+            aborted: Vec::new(),
         }
     }
 
@@ -345,7 +462,37 @@ impl OvrRowMap {
     }
 
     pub fn resolve(&self, block: u32, ceiling: u64) -> BlockResolution {
-        resolve_row(self.get(block), ceiling)
+        resolve_row_filtered(self.get(block), ceiling, |version| self.is_aborted(version))
+    }
+
+    /// Add an inclusive rejected-generation range, merging overlaps and
+    /// adjacency. Abort records are rare, and keeping them normalized
+    /// makes each row resolution a logarithmic lookup.
+    pub fn add_aborted_range(&mut self, lo: u64, hi: u64) {
+        if lo == 0 || lo > hi {
+            return;
+        }
+        let start = self
+            .aborted
+            .partition_point(|(_, existing_hi)| existing_hi.saturating_add(1) < lo);
+        let mut merged_lo = lo;
+        let mut merged_hi = hi;
+        let mut end = start;
+        while let Some((existing_lo, existing_hi)) = self.aborted.get(end).copied() {
+            if existing_lo > merged_hi.saturating_add(1) {
+                break;
+            }
+            merged_lo = merged_lo.min(existing_lo);
+            merged_hi = merged_hi.max(existing_hi);
+            end += 1;
+        }
+        self.aborted
+            .splice(start..end, std::iter::once((merged_lo, merged_hi)));
+    }
+
+    pub fn is_aborted(&self, version: u64) -> bool {
+        let index = self.aborted.partition_point(|(lo, _)| *lo <= version);
+        index > 0 && version <= self.aborted[index - 1].1
     }
 
     /// Rows intersecting `[start, end_excl)`, in block order.
@@ -364,9 +511,48 @@ impl OvrRowMap {
     }
 }
 
+/// Merge against the base snapshot's durable abort records. An
+/// abandoned `cur` below the ceiling is never promoted into `prev`;
+/// its last committed fallback remains the reader-visible slot.
+pub fn merge_row_for_write_in_map(
+    old: Option<&OvrRow>,
+    new_state: RowState,
+    version: u64,
+    base_ceiling: u64,
+    base_map: Option<&OvrRowMap>,
+) -> Option<OvrRow> {
+    merge_row_for_write_filtered(old, new_state, version, base_ceiling, |candidate| {
+        base_map.is_some_and(|map| map.is_aborted(candidate))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gc_marker_codec_distinguishes_durable_phases() {
+        let pending = encode_ovr_gc_data_pending(17, 123_456);
+        assert_eq!(
+            parse_ovr_gc_marker(&pending),
+            OvrGcMarker::DataPending {
+                volume_id: 17,
+                not_before_unix_ms: 123_456,
+            }
+        );
+        let ready = encode_ovr_gc_rows_ready(19);
+        assert_eq!(
+            parse_ovr_gc_marker(&ready),
+            OvrGcMarker::RowsReady { volume_id: 19 }
+        );
+        assert_eq!(
+            parse_ovr_gc_marker(OVR_GC_LEGACY_VALUE),
+            OvrGcMarker::LegacyDataPending
+        );
+        for conditional in [b"/doomed".as_slice(), b"", b"gcpend01", &[0xff]] {
+            assert_eq!(parse_ovr_gc_marker(conditional), OvrGcMarker::Conditional);
+        }
+    }
 
     fn row(cur_state: RowState, cur_version: u64, prev: PrevSlot) -> OvrRow {
         OvrRow {
@@ -529,6 +715,53 @@ mod tests {
     }
 
     #[test]
+    fn aborted_cur_never_becomes_readable_or_promoted() {
+        let abandoned = row(RowState::Written, 5, PrevSlot::Slot(RowState::Written, 3));
+        let mut map = OvrRowMap::new(7);
+        map.add_aborted_range(5, 5);
+        map.insert(11, abandoned);
+
+        let mut warm = OvrRowMap::new(7);
+        warm.add_aborted_range(5, 5);
+        warm.insert(11, row(RowState::Written, 3, PrevSlot::Base));
+
+        // A delayed version-5 row may land after version 7 commits, but
+        // the durable abort record keeps the committed version-3 fallback.
+        // A cache loaded before that delayed CAS and a later cold load
+        // therefore resolve to identical bytes.
+        assert_eq!(warm.resolve(11, 7), map.resolve(11, 7));
+        assert_eq!(map.resolve(11, 7), BlockResolution::Exact { version: 3 });
+        let merged = merge_row_for_write_in_map(Some(&abandoned), RowState::Hole, 8, 7, Some(&map))
+            .expect("newer row");
+        assert_eq!(
+            merged,
+            row(RowState::Hole, 8, PrevSlot::Slot(RowState::Written, 3))
+        );
+
+        let mut base_fallback = OvrRowMap::new(7);
+        base_fallback.add_aborted_range(5, 6);
+        base_fallback.insert(12, row(RowState::Written, 6, PrevSlot::Base));
+        assert_eq!(base_fallback.resolve(12, 7), BlockResolution::Base);
+    }
+
+    #[test]
+    fn aborted_ranges_merge_and_resolve_logarithmically() {
+        let mut map = OvrRowMap::new(20);
+        map.add_aborted_range(8, 10);
+        map.add_aborted_range(3, 4);
+        map.add_aborted_range(5, 7);
+        map.add_aborted_range(15, 16);
+
+        for version in 3..=10 {
+            assert!(map.is_aborted(version), "version {version}");
+        }
+        assert!(!map.is_aborted(2));
+        assert!(!map.is_aborted(11));
+        assert!(map.is_aborted(15));
+        assert!(!map.is_aborted(17));
+    }
+
+    #[test]
     fn repeated_failed_attempts_never_move_prev() {
         // V1 < V2 < V3 burn without committing: each CAS advances cur,
         // prev stays at the committed resolution throughout.
@@ -617,6 +850,15 @@ mod tests {
         assert_eq!(parse_ovr_row_block(&key), Some(0x2a));
         assert_eq!(parse_ovr_row_block(&format!("{key}\0")), Some(0x2a));
         assert_eq!(parse_ovr_row_block("@ovr/xyz"), None);
+
+        let abort = ovr_abort_key(&blob_id, 7, 19);
+        assert_eq!(
+            abort,
+            "@ovr/123456789abcdef01122334455667788/x0000000000000007-0000000000000013"
+        );
+        assert_eq!(parse_ovr_abort_range(&abort), Some((7, 19)));
+        assert_eq!(parse_ovr_abort_range(&format!("{abort}\0")), Some((7, 19)));
+        assert_eq!(parse_ovr_row_block(&abort), None);
 
         // Fixed-width hex: lexicographic order equals numeric order.
         assert!(ovr_row_key(&blob_id, 9) < ovr_row_key(&blob_id, 10));
