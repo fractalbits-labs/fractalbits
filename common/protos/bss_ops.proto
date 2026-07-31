@@ -24,6 +24,8 @@ message ListBlobsResponse {
     bool is_deleted = 5;
     // 0 = Data, 1 = Reserved.
     uint32 entry_type = 6;
+    // Nonzero EC write cohort shared by every shard of one stripe.
+    uint64 cohort_tag = 7;
   }
 
   message Blobs {
@@ -82,6 +84,8 @@ message ListBlobBlocksResponse {
     // A live punch/trim tombstone generation (empty body, authoritative
     // hole). Distinct from ART-deleted entries, which are filtered out.
     bool is_tombstone = 4;
+    // Nonzero EC write cohort shared by every shard of one stripe.
+    uint64 cohort_tag = 5;
   }
 
   message Blocks {

@@ -1,6 +1,6 @@
 use crate::DataVgError;
 use bytes::Bytes;
-use data_types::ec_utils::{ec_padded_len, ec_rotation};
+use data_types::ec_utils::{ec_cohort_tag, ec_padded_len, ec_rotation};
 use data_types::{DataBlobGuid, DataVgInfo, TraceId, Volume, VolumeMode};
 use futures::future::Either;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -11,6 +11,7 @@ use reed_solomon_simd::{decode as rs_decode, encode as rs_encode};
 use rpc_client_bss::RpcClientBss;
 use rpc_client_common::RpcError;
 use std::{
+    collections::HashMap,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
@@ -347,6 +348,15 @@ impl DataVgProxy {
                     if *parity_shards == 0 {
                         return Err(DataVgError::InitializationError(format!(
                             "EC volume {} has invalid parity_shards=0",
+                            volume.volume_id
+                        )));
+                    }
+                    // With m < k, two write cohorts can never both reach
+                    // k of the k + m shard positions, so the decodable
+                    // cohort a census selects is unique.
+                    if *parity_shards >= *data_shards {
+                        return Err(DataVgError::InitializationError(format!(
+                            "EC volume {} requires parity_shards < data_shards for unique cohort decoding",
                             volume.volume_id
                         )));
                     }
@@ -748,6 +758,7 @@ impl DataVgProxy {
                 body.clone(),
                 body_checksum,
                 version,
+                0,
                 rpc_timeout,
                 trace_id,
             ));
@@ -1021,6 +1032,7 @@ impl DataVgProxy {
         body: Bytes,
         body_checksum: u64,
         version: u64,
+        cohort_tag: u64,
         rpc_timeout: Duration,
         trace_id: TraceId,
     ) -> (Arc<BssNode>, String, Result<(), RpcError>) {
@@ -1029,12 +1041,13 @@ impl DataVgProxy {
 
         let bss_client = bss_node.get_client();
         let result = bss_client
-            .put_data_blob(
+            .put_data_blob_with_cohort(
                 blob_guid,
                 block_number,
                 body,
                 body_checksum,
                 version,
+                cohort_tag,
                 Some(rpc_timeout),
                 &trace_id,
                 0,
@@ -1115,6 +1128,7 @@ impl DataVgProxy {
                     block_number,
                     version,
                     content_len,
+                    0,
                     body,
                     trace_id,
                 )
@@ -1534,126 +1548,196 @@ impl DataVgProxy {
         let total = k + m;
         // The write quorum is k + 1, so m responders intersect it.
         let responders_needed = total - (k + 1) + 1;
+        let _ = content_len;
 
-        let mut select_futures = FuturesUnordered::new();
-        for bss_node in volume.bss_nodes.iter().filter(|n| n.is_available()) {
-            select_futures.push(async move {
-                let result = self
-                    .at_or_before_from_node(
-                        bss_node,
-                        blob_guid,
-                        block_number,
-                        ceiling,
-                        true,
-                        trace_id,
-                    )
-                    .await;
-                (bss_node, result)
-            });
-        }
+        // Effective-generation selection: walk candidates newest-first,
+        // skipping a candidate only when a COMPLETE census (every
+        // placement node answered) proves no cohort at that version
+        // reaches k shards. Such a generation can serve no one in either
+        // world: an orphan's skip serves the correct committed bytes
+        // below, and a committed generation degraded below k is already
+        // irrecoverable, so the skip is the total-loss semantics this
+        // design accepts, with an alarm instead of silence. An incomplete
+        // census proves nothing and fails retriably. Each skip re-sweeps
+        // with a lowered ceiling because a node's answer only names its
+        // newest eligible entry.
+        const DEAD_GENERATION_SKIP_BUDGET: usize = 4;
+        let mut effective_ceiling = ceiling;
+        for _ in 0..DEAD_GENERATION_SKIP_BUDGET {
+            let mut select_futures = FuturesUnordered::new();
+            for bss_node in volume.bss_nodes.iter().filter(|n| n.is_available()) {
+                let sweep_ceiling = effective_ceiling;
+                select_futures.push(async move {
+                    let result = self
+                        .at_or_before_from_node(
+                            bss_node,
+                            blob_guid,
+                            block_number,
+                            sweep_ceiling,
+                            true,
+                            trace_id,
+                        )
+                        .await;
+                    (bss_node, result)
+                });
+            }
 
-        let mut best: Option<rpc_client_bss::AtOrBeforeBlob> = None;
-        let mut answers = 0usize;
-        let mut not_found = 0usize;
-        while let Some((node, result)) = select_futures.next().await {
-            match result {
-                Ok(ans) => {
-                    node.record_success();
-                    answers += 1;
-                    if best.as_ref().is_none_or(|b| ans.version > b.version) {
-                        best = Some(ans);
+            let mut answers: Vec<rpc_client_bss::AtOrBeforeBlob> = Vec::new();
+            let mut not_found = 0usize;
+            let mut failures = 0usize;
+            while let Some((node, result)) = select_futures.next().await {
+                match result {
+                    Ok(ans) => {
+                        node.record_success();
+                        answers.push(ans);
+                    }
+                    Err(RpcError::NotFound) => {
+                        node.record_success();
+                        not_found += 1;
+                    }
+                    Err(e) => {
+                        node.record_failure();
+                        failures += 1;
+                        warn!(
+                            "EC at-or-before selection failed from {}: {}",
+                            node.address, e
+                        );
                     }
                 }
-                Err(RpcError::NotFound) => {
-                    node.record_success();
-                    not_found += 1;
-                }
-                Err(e) => {
-                    node.record_failure();
-                    warn!(
-                        "EC at-or-before selection failed from {}: {}",
-                        node.address, e
-                    );
-                }
             }
-        }
 
-        if answers + not_found < responders_needed {
-            histogram!("datavg_ab_get_nanos", "result" => "ec_quorum_failure")
-                .record(start.elapsed().as_nanos() as f64);
-            return Err(DataVgError::QuorumFailure(format!(
-                "EC at-or-before selection got {} answers + {} absences, needs {}",
-                answers, not_found, responders_needed
-            )));
-        }
-        let Some(ans) = best else {
-            histogram!("datavg_ab_get_nanos", "result" => "ec_sparse_hole")
-                .record(start.elapsed().as_nanos() as f64);
-            return Ok(AtOrBeforeRead::SparseHole);
-        };
-
-        // Reserved claims and punch tombstones are full (empty) copies on
-        // every placement node; the identity alone answers.
-        match ans.entry {
-            rpc_client_bss::AtOrBeforeEntry::Tombstone => {
-                return Ok(AtOrBeforeRead::Hole {
-                    version: ans.version,
-                });
-            }
-            rpc_client_bss::AtOrBeforeEntry::Reserved => {
-                return Ok(AtOrBeforeRead::Zeros {
-                    version: ans.version,
-                });
-            }
-            rpc_client_bss::AtOrBeforeEntry::Data => {}
-        }
-
-        // Never descend: the selected identity must assemble or the read
-        // fails. A BlockNotFound here means the observed generation fell
-        // below k shards, which is a durability event, not a hole.
-        //
-        // The assembly length comes from the selected generation's stored
-        // shard size (every shard of one generation is equal-length), NOT
-        // the caller's request length: a version-1 create is stored at
-        // its exact logical length while burned generations are padded to
-        // block_size, and only the generation itself knows which.
-        let _ = content_len;
-        let version = ans.version;
-        let assemble_len = (ans.total_bytes as usize).saturating_mul(k);
-        if assemble_len == 0 {
-            return Ok(AtOrBeforeRead::Data {
-                version,
-                body: Bytes::new(),
-            });
-        }
-        let mut body = Bytes::new();
-        match self
-            .get_blob_ec(
-                blob_guid,
-                block_number,
-                version,
-                assemble_len,
-                &mut body,
-                trace_id,
-            )
-            .await
-        {
-            Ok(()) => {
-                histogram!("datavg_ab_get_nanos", "result" => "ec_success")
+            if answers.len() + not_found < responders_needed {
+                histogram!("datavg_ab_get_nanos", "result" => "ec_quorum_failure")
                     .record(start.elapsed().as_nanos() as f64);
-                Ok(AtOrBeforeRead::Data { version, body })
+                return Err(DataVgError::QuorumFailure(format!(
+                    "EC at-or-before selection got {} answers + {} absences, needs {}",
+                    answers.len(),
+                    not_found,
+                    responders_needed
+                )));
             }
-            Err(DataVgError::BlockNotFound) => {
+            let Some(candidate) = answers.iter().map(|a| a.version).max() else {
+                histogram!("datavg_ab_get_nanos", "result" => "ec_sparse_hole")
+                    .record(start.elapsed().as_nanos() as f64);
+                return Ok(AtOrBeforeRead::SparseHole);
+            };
+            let best = answers
+                .iter()
+                .find(|a| a.version == candidate)
+                .expect("candidate came from answers");
+
+            // Reserved claims and punch tombstones are full (empty) copies
+            // on every placement node; the identity alone answers.
+            match best.entry {
+                rpc_client_bss::AtOrBeforeEntry::Tombstone => {
+                    return Ok(AtOrBeforeRead::Hole { version: candidate });
+                }
+                rpc_client_bss::AtOrBeforeEntry::Reserved => {
+                    return Ok(AtOrBeforeRead::Zeros { version: candidate });
+                }
+                rpc_client_bss::AtOrBeforeEntry::Data => {}
+            }
+
+            // Cohort census at the candidate version. One attempt writes
+            // one cohort, so a second tag at this version is an illegal
+            // history (contested write); decoding across tags would
+            // produce garbage that passes every per-shard checksum.
+            let mut cohorts: HashMap<u64, (usize, u32)> = HashMap::new();
+            for ans in answers.iter().filter(|a| {
+                a.version == candidate && a.entry == rpc_client_bss::AtOrBeforeEntry::Data
+            }) {
+                let slot = cohorts
+                    .entry(ans.cohort_tag)
+                    .or_insert((0, ans.total_bytes));
+                slot.0 += 1;
+            }
+            if cohorts.len() > 1 {
                 error!(
-                    "EC at-or-before selected v{} for {}:{} but could not assemble it",
-                    version, blob_guid, block_number
+                    "EC at-or-before found {} write cohorts at {}:{} v{}: contested stripe",
+                    cohorts.len(),
+                    blob_guid,
+                    block_number,
+                    candidate
                 );
-                Err(DataVgError::QuorumFailure(format!(
-                    "selected generation v{version} unreadable"
-                )))
+                counter!("datavg_ec_mixed_cohorts").increment(1);
             }
-            Err(e) => Err(e),
+            let decodable = cohorts
+                .iter()
+                .filter(|(_, (count, _))| *count >= k)
+                .max_by_key(|(_, (count, _))| *count)
+                .map(|(cohort, (_, shard_bytes))| (*cohort, *shard_bytes));
+
+            if let Some((cohort, shard_bytes)) = decodable {
+                // The assembly length comes from the selected generation's
+                // stored shard size (every shard of one generation is
+                // equal-length), NOT the caller's request length: a
+                // version-1 create is stored at its exact logical length
+                // while burned generations are padded to block_size, and
+                // only the generation itself knows which.
+                let assemble_len = (shard_bytes as usize).saturating_mul(k);
+                if assemble_len == 0 {
+                    return Ok(AtOrBeforeRead::Data {
+                        version: candidate,
+                        body: Bytes::new(),
+                    });
+                }
+                let mut body = Bytes::new();
+                return match self
+                    .get_blob_ec(
+                        blob_guid,
+                        block_number,
+                        candidate,
+                        assemble_len,
+                        cohort,
+                        &mut body,
+                        trace_id,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        histogram!("datavg_ab_get_nanos", "result" => "ec_success")
+                            .record(start.elapsed().as_nanos() as f64);
+                        Ok(AtOrBeforeRead::Data {
+                            version: candidate,
+                            body,
+                        })
+                    }
+                    // Shards receded between the census and the fetch
+                    // (a sweep race): retriable, never a descent.
+                    Err(DataVgError::BlockNotFound) => {
+                        error!(
+                            "EC at-or-before selected v{} for {}:{} but could not assemble it",
+                            candidate, blob_guid, block_number
+                        );
+                        Err(DataVgError::QuorumFailure(format!(
+                            "selected generation v{candidate} unreadable"
+                        )))
+                    }
+                    Err(e) => Err(e),
+                };
+            }
+
+            // No cohort reaches k. Only a complete census may classify the
+            // candidate as provably dead; anything less is an availability
+            // failure that repair may still fix.
+            let census_complete = failures == 0 && answers.len() + not_found == total;
+            if !census_complete {
+                histogram!("datavg_ab_get_nanos", "result" => "ec_undecodable")
+                    .record(start.elapsed().as_nanos() as f64);
+                return Err(DataVgError::QuorumFailure(format!(
+                    "candidate generation v{candidate} has no decodable cohort and the census is incomplete"
+                )));
+            }
+            error!(
+                "EC generation {}:{} v{} is provably dead (complete census, no cohort at k={}); skipping to older bytes",
+                blob_guid, block_number, candidate, k
+            );
+            counter!("datavg_ec_dead_generation_skipped").increment(1);
+            effective_ceiling = candidate - 1;
         }
+        Err(DataVgError::QuorumFailure(format!(
+            "dead-generation skip budget exhausted below ceiling {ceiling}"
+        )))
     }
 
     fn convert_at_or_before(ans: rpc_client_bss::AtOrBeforeBlob) -> AtOrBeforeRead {
@@ -2185,6 +2269,10 @@ impl DataVgProxy {
 
         let mut padded = body.to_vec();
         padded.resize(padded_len, 0u8);
+        // One nonzero identity for every shard of this stripe: part of
+        // the write-once identity, and the end-to-end check a decode is
+        // verified against.
+        let cohort_tag = ec_cohort_tag(&padded);
 
         // Split into k data shards
         let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total);
@@ -2241,6 +2329,7 @@ impl DataVgProxy {
                 shard_data,
                 checksum,
                 version,
+                cohort_tag,
                 rpc_timeout,
                 trace_id,
             ));
@@ -2323,12 +2412,19 @@ impl DataVgProxy {
     /// no version selection or cohort filtering exists. Missing shards of
     /// an existing generation are inline-repaired (re-encoded and written
     /// back) best-effort.
+    /// `expected_cohort` is the generation's write-cohort identity when
+    /// the caller knows it (the at-or-before selection does); the
+    /// reconstructed padded body is verified against it, which both
+    /// detects illegal same-version stripe mixing and closes the
+    /// end-to-end EC integrity gap. Zero skips the check.
+    #[allow(clippy::too_many_arguments)]
     async fn get_blob_ec(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
         version: u64,
         content_len: usize,
+        expected_cohort: u64,
         body: &mut Bytes,
         trace_id: &TraceId,
     ) -> Result<(), DataVgError> {
@@ -2591,6 +2687,18 @@ impl DataVgProxy {
             }
         }
         let padded_body = result_data.clone();
+        let computed_cohort = ec_cohort_tag(&padded_body);
+        if expected_cohort != 0 && computed_cohort != expected_cohort {
+            error!(
+                "EC decode of {}:{} v{} does not match its write cohort \
+                 (expected 0x{:x}, computed 0x{:x}): mixed or corrupt stripe",
+                blob_guid, block_number, version, expected_cohort, computed_cohort
+            );
+            counter!("datavg_ec_cohort_mismatch").increment(1);
+            return Err(DataVgError::Internal(format!(
+                "EC stripe v{version} failed cohort verification"
+            )));
+        }
         result_data.truncate(content_len);
         *body = Bytes::from(result_data);
 
@@ -2626,6 +2734,8 @@ impl DataVgProxy {
                 let node = ec_vol.bss_nodes[node_idx].clone();
                 let shard_data = Bytes::from(all_shards[shard_idx].clone());
                 let checksum = xxhash_rust::xxh3::xxh3_64(&shard_data);
+                // The repaired shard must carry the generation's own
+                // cohort, or later censuses would see a mixed stripe.
                 repair_futs.push(Self::put_blob_to_node(
                     node,
                     blob_guid,
@@ -2633,6 +2743,11 @@ impl DataVgProxy {
                     shard_data,
                     checksum,
                     version,
+                    if expected_cohort != 0 {
+                        expected_cohort
+                    } else {
+                        computed_cohort
+                    },
                     self.rpc_timeout,
                     *trace_id,
                 ));

@@ -32,6 +32,8 @@ pub struct AtOrBeforeBlob {
     /// Exact stored payload length (0 for Reserved/Tombstone bodies).
     pub total_bytes: u32,
     pub body_checksum: u64,
+    /// EC write-cohort identity of the selected generation (0 = non-EC).
+    pub cohort_tag: u64,
     pub body: Bytes,
 }
 
@@ -321,12 +323,43 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
+        self.put_data_blob_with_cohort(
+            blob_guid,
+            block_number,
+            body,
+            body_checksum,
+            version,
+            0,
+            timeout,
+            trace_id,
+            retry_count,
+        )
+        .await
+    }
+
+    /// Data put carrying the EC write-cohort identity. Every shard of
+    /// one stripe stores the same nonzero tag; it is part of the
+    /// write-once identity, so a same-key retransmit must repeat it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_data_blob_with_cohort(
+        &self,
+        blob_guid: DataBlobGuid,
+        block_number: u32,
+        body: Bytes,
+        body_checksum: u64,
+        version: u64,
+        cohort_tag: u64,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<(), RpcError> {
         self.put_data_blob_inner(
             blob_guid,
             block_number,
             body,
             body_checksum,
             version,
+            cohort_tag,
             timeout,
             trace_id,
             retry_count,
@@ -342,6 +375,7 @@ impl RpcClient {
         body: Bytes,
         body_checksum: u64,
         version: u64,
+        cohort_tag: u64,
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
@@ -360,6 +394,7 @@ impl RpcClient {
         header.trace_id = trace_id.0;
         header.checksum_body = body_checksum;
         header.version = version;
+        header.set_data_cohort_tag(cohort_tag);
 
         let msg_frame = MessageFrame::new(header, body);
         let resp_frame = self
@@ -566,10 +601,17 @@ impl RpcClient {
             })?;
         check_response_errno(&resp_frame.header)?;
 
+        // Reply overlay (zig `AtOrBeforeResp`): cohort_tag at scratch[0..8],
+        // entry_type at scratch[8].
+        let cohort_tag = u64::from_le_bytes(
+            resp_frame.header.reserve1[0..8]
+                .try_into()
+                .expect("cohort slice"),
+        );
         let entry = if resp_frame.header.is_deleted != 0 {
             AtOrBeforeEntry::Tombstone
         } else {
-            match resp_frame.header.reserve1[0] {
+            match resp_frame.header.reserve1[8] {
                 0 => AtOrBeforeEntry::Data,
                 1 => AtOrBeforeEntry::Reserved,
                 other => {
@@ -584,6 +626,7 @@ impl RpcClient {
             entry,
             total_bytes: resp_frame.header.body_len,
             body_checksum: resp_frame.header.checksum_body,
+            cohort_tag,
             body: resp_frame.body,
         })
     }

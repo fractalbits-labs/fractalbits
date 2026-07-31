@@ -21,6 +21,16 @@ pub fn ec_padded_len(content_len: usize, data_shards: usize) -> usize {
 /// Compute shard index from node position and rotation.
 /// Given node_idx in the volume's bss_nodes list, returns the logical shard
 /// index (0..k are data shards, k..k+m are parity shards).
+/// Cohort identity shared by every shard produced by one EC body.
+///
+/// Zero is reserved for non-EC entries. The tag covers the padded body,
+/// so a reconstructed stripe can be verified without the file's logical
+/// tail length, and shards of two contested write attempts can never be
+/// combined silently.
+pub fn ec_cohort_tag(padded_body: &[u8]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(padded_body).max(1)
+}
+
 pub fn shard_index(node_idx: usize, rotation: usize, total: usize) -> usize {
     (node_idx + total - rotation) % total
 }
@@ -34,6 +44,17 @@ pub fn node_index(shard_idx: usize, rotation: usize, total: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cohort_tag_is_stable_nonzero_and_body_specific() {
+        let body = b"one padded EC body";
+        assert_ne!(ec_cohort_tag(body), 0);
+        assert_eq!(ec_cohort_tag(body), ec_cohort_tag(body));
+        assert_ne!(
+            ec_cohort_tag(body),
+            ec_cohort_tag(b"another padded EC body")
+        );
+    }
 
     #[test]
     fn rotation_deterministic() {

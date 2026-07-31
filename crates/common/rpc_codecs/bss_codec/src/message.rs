@@ -134,6 +134,16 @@ impl MessageHeader {
     const _FENCE_TOKEN_OFFSET_OK: () = assert!(std::mem::offset_of!(Self, fence_token) == 96);
     pub const PROTO_VERSION: u8 = 1;
 
+    /// EC stripe identity of a data put, carried in checksum-protected
+    /// spare header bytes (zig `BssHeader.scratch[16..24]`).
+    pub fn data_cohort_tag(&self) -> u64 {
+        u64::from_le_bytes(self.reserve1[16..24].try_into().expect("cohort slice"))
+    }
+
+    pub fn set_data_cohort_tag(&mut self, cohort_tag: u64) {
+        self.reserve1[16..24].copy_from_slice(&cohort_tag.to_le_bytes());
+    }
+
     /// Calculate and set the body checksum field.
     /// The checksum covers the message body after this header.
     pub fn set_body_checksum(&mut self, body: &[u8]) {

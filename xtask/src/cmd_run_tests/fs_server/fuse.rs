@@ -1,11 +1,15 @@
 use crate::cmd_service;
 use crate::{CmdResult, FsServerConfig, InitConfig, ServiceName};
 use aws_sdk_s3::primitives::ByteStream;
+use bytes::Bytes;
 use cmd_lib::*;
 use colored::*;
+use data_types::ec_utils::{ec_cohort_tag, ec_padded_len};
 use data_types::object_layout::ObjectLayout;
 use data_types::{Bucket, TraceId};
 use file_ops::parse_get_inode;
+use file_ops::parse_put_inode_cas;
+use rpc_client_bss::RpcClientBss;
 use rpc_client_nss::RpcClientNss;
 use rpc_client_rss::RpcClientRss;
 use std::io::{Seek, SeekFrom, Write};
@@ -482,6 +486,10 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         run_test!(
             "Overwrite Retry After EC Quorum Failure",
             test_overwrite_retry_after_quorum_failure
+        );
+        run_test!(
+            "Partial EC Orphan Reads Committed Bytes",
+            test_partial_ec_orphan_reads_committed_bytes
         );
     }
 
@@ -3917,6 +3925,147 @@ async fn fetch_object_layout(bucket: &str, key: &str) -> std::io::Result<ObjectL
         .await
         .map_err(|e| std::io::Error::other(format!("nss get_inode: {e:?}")))?;
     parse_get_inode(resp).map_err(|e| std::io::Error::other(format!("parse layout: {e:?}")))
+}
+
+/// CAS the committed layout at `key` from `base` to `mutated`, exactly
+/// as a flush's prepare CAS would: used to plant the durable footprint
+/// of an interrupted write attempt.
+async fn nss_cas_layout(
+    bucket: &str,
+    key: &str,
+    base: &ObjectLayout,
+    mutated: &ObjectLayout,
+) -> std::io::Result<()> {
+    let timeout = Duration::from_secs(5);
+    let trace_id = TraceId::new();
+    let rss = RpcClientRss::new_from_addresses(vec!["127.0.0.1:8086".to_string()], timeout);
+    let (_version, bucket_json) = rss
+        .get(&format!("bucket:{bucket}"), Some(timeout), &trace_id, 0)
+        .await
+        .map_err(|e| std::io::Error::other(format!("rss get bucket: {e:?}")))?;
+    let bucket_info: Bucket = serde_json::from_str(&bucket_json)
+        .map_err(|e| std::io::Error::other(format!("parse bucket json: {e}")))?;
+    let nss = RpcClientNss::new_from_address("127.0.0.1:8087".to_string(), timeout);
+    let nss_key = format!("/{key}");
+    let old_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(base)
+        .map_err(|e| std::io::Error::other(format!("serialize base: {e}")))?;
+    let new_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(mutated)
+        .map_err(|e| std::io::Error::other(format!("serialize mutated: {e}")))?;
+    let resp = nss
+        .put_inode_cas(
+            &bucket_info.root_blob_name,
+            &nss_key,
+            Bytes::from(new_bytes.to_vec()),
+            Bytes::from(old_bytes.to_vec()),
+            Some(timeout),
+            &trace_id,
+            0,
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("nss put_inode_cas: {e:?}")))?;
+    parse_put_inode_cas(resp)
+        .map_err(|e| std::io::Error::other(format!("layout injection lost a CAS race: {e:?}")))?;
+    Ok(())
+}
+
+/// A partial EC orphan below the ceiling must not wedge its block. An
+/// interrupted overwrite that landed fewer than k shards is planted at
+/// a burned version; an append then commits, raising the ceiling past
+/// it. The read must census the orphan (complete answers, no cohort at
+/// k = 4), skip it with an alarm, and serve the committed bytes below,
+/// instead of the permanent EIO the unconditional never-descend rule
+/// produced.
+async fn test_partial_ec_orphan_reads_committed_bytes(disk_cache: bool) -> CmdResult {
+    assert!(!disk_cache, "this regression requires uncached reads");
+    let (ctx, bucket) = setup_test_bucket().await;
+    let key = "partial-ec-orphan.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let file_len = 2 * BLOCK_SIZE as usize;
+    let v1 = generate_test_data("partial-ec-orphan-v1", file_len);
+
+    println!("  Step 1: Commit a two-block V1 file");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&fuse_path)
+            .expect("open V1 file");
+        file.write_all(&v1).expect("write V1 file");
+        file.sync_all().expect("commit V1 file");
+    }
+    unmount_fuse()?;
+
+    println!("  Step 2: Plant an interrupted overwrite: burn a version, land 3 of 6 shards");
+    let base = fetch_object_layout(&bucket, key).await?;
+    let blob_guid = base
+        .blob_guid()
+        .map_err(|e| std::io::Error::other(format!("blob_guid: {e:?}")))?;
+    let orphan_version = base.next_burn_version();
+    let mut prepared = base.clone();
+    prepared.set_next_version(orphan_version + 1);
+    nss_cas_layout(&bucket, key, &base, &prepared).await?;
+
+    let orphan_body = generate_test_data("partial-ec-orphan-v2", BLOCK_SIZE as usize);
+    let padded_len = ec_padded_len(orphan_body.len(), 4);
+    let mut padded = orphan_body.clone();
+    padded.resize(padded_len, 0);
+    let cohort = ec_cohort_tag(&padded);
+    let shard_size = padded_len / 4;
+    let timeout = Duration::from_secs(5);
+    let trace_id = TraceId::new();
+    for (i, port) in [8088u16, 8089, 8090].iter().enumerate() {
+        let client = RpcClientBss::new_from_address(format!("127.0.0.1:{port}"), timeout);
+        let shard = Bytes::copy_from_slice(&padded[i * shard_size..(i + 1) * shard_size]);
+        let checksum = xxhash_rust::xxh3::xxh3_64(&shard);
+        client
+            .put_data_blob_with_cohort(
+                blob_guid,
+                1,
+                shard,
+                checksum,
+                orphan_version,
+                cohort,
+                Some(timeout),
+                &trace_id,
+                0,
+            )
+            .await
+            .map_err(|e| std::io::Error::other(format!("plant shard on {port}: {e:?}")))?;
+    }
+
+    println!("  Step 3: Append so the ceiling passes the orphan, then read");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let tail = generate_test_data("partial-ec-orphan-tail", 4096);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&fuse_path)
+            .expect("open for append");
+        file.write_all(&tail).expect("append tail");
+        file.sync_all().expect("commit append");
+    }
+    let committed = fetch_object_layout(&bucket, key).await?;
+    assert!(
+        committed.blob_version > orphan_version,
+        "the append commit must raise the ceiling past the orphan"
+    );
+    let mut expected = v1.clone();
+    expected.extend_from_slice(&tail);
+    let actual = std::fs::read(&fuse_path).expect("read across the dead orphan");
+    assert_eq!(
+        actual, expected,
+        "the census skip must serve the committed bytes below the orphan"
+    );
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: Partial EC orphan was censused dead and skipped".green()
+    );
+    Ok(())
 }
 
 /// Interrupted overwrite then same-mount retry: the failed attempt burns

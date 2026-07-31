@@ -653,6 +653,7 @@ mod tests {
                 version,
                 entry_type,
                 is_tombstone: false,
+                cohort_tag: 0,
             }
         };
 
