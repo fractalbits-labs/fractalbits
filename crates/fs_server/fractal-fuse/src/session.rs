@@ -469,9 +469,14 @@ async fn run_entry<F: Filesystem>(
         return Ok(());
     }
 
-    // Process requests in a loop: dispatch -> commit response + fetch next
+    // Process requests in a loop: dispatch, then commit response and fetch next.
     loop {
-        let (needs_response, panic_result) = dispatch::dispatch(fs, entry).await;
+        let Some((needs_response, panic_result)) = shutdown
+            .run_until_cancelled(dispatch::dispatch(fs, entry))
+            .await
+        else {
+            break;
+        };
 
         if let Err(e) = panic_result {
             if let Some(msg) = e

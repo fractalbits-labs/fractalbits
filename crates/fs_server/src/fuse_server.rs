@@ -1,6 +1,7 @@
 use fractal_fuse::*;
 use std::ffi::OsStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use fractal_vfs::cache::DirEntryKind;
 use fractal_vfs::error::FsError;
@@ -84,16 +85,23 @@ impl Filesystem for FuseServer {
         // re-snapshots so a cycle enqueued after the first snapshot is
         // waited on too; vfs_destroy's enqueue block guarantees progress.
         self.vfs.vfs_destroy();
-        // A failure here (e.g. NSS unreachable through the drain deadline)
-        // means buffered data / queued metadata could not be persisted and
-        // is lost on this otherwise-clean unmount: log at error level, not
-        // as a warning, so it is not mistaken for a benign shutdown notice.
-        if let Err(e) = self.vfs.flush_open_dirty_handles().await {
-            tracing::error!(error = %e, "destroy: dirty handle flush incomplete; buffered data lost");
-        }
-        if let Err(e) = self.vfs.drain_all_dirty_cycles_until_empty().await {
-            tracing::error!(error = %e, "destroy: writeback drain incomplete; queued metadata lost");
-        }
+        let cleanup = async {
+            // A failure here (e.g. NSS unreachable through the drain
+            // deadline) means buffered data or queued metadata could not be
+            // persisted and is lost on this otherwise-clean unmount.
+            if let Err(e) = self.vfs.flush_open_dirty_handles().await {
+                tracing::error!(error = %e, "destroy: dirty handle flush incomplete; buffered data lost");
+            }
+            if let Err(e) = self.vfs.drain_all_dirty_cycles_until_empty().await {
+                tracing::error!(error = %e, "destroy: writeback drain incomplete; queued metadata lost");
+            }
+            self.vfs.prepare_sweep_shutdown().await;
+            self.vfs.drain_sweep_work().await;
+        };
+        let _ = compio_runtime::time::timeout(Duration::from_secs(50), cleanup).await;
+        // Reports both the timeout case and grace-pending work the drain
+        // deliberately abandoned; silent when everything completed.
+        self.vfs.log_incomplete_sweep_work();
     }
 
     async fn lookup(&self, _req: Request, parent: InodeId, name: &OsStr) -> FsResult<ReplyEntry> {
