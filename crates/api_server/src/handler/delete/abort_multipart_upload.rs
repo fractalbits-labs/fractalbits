@@ -1,7 +1,9 @@
-use crate::handler::{
-    ObjectRequestContext,
-    common::{list_raw_objects, mpu_get_part_prefix, s3_error::S3Error},
-    delete::delete_object::delete_blob,
+use crate::{
+    blob_client::enqueue_blob_deletion,
+    handler::{
+        ObjectRequestContext,
+        common::{list_raw_objects, mpu_get_part_prefix, s3_error::S3Error},
+    },
 };
 use actix_web::HttpResponse;
 use file_ops::{parse_delete_inode, parse_get_inode};
@@ -25,7 +27,6 @@ pub async fn abort_multipart_upload_handler(
 
     let bucket = ctx.resolve_bucket().await?;
     let routing_key = &bucket.routing_key;
-    let blob_deletion = ctx.app.get_blob_deletion();
     let rpc_timeout = ctx.app.config.rpc_request_timeout();
     let nss_client = ctx.app.get_nss_rpc_client(routing_key).await?;
 
@@ -81,7 +82,13 @@ pub async fn abort_multipart_upload_handler(
             &ctx.trace_id
         )
         .await?;
-        delete_blob(part_obj, blob_deletion.clone()).await?;
+        enqueue_blob_deletion(
+            ctx.app.clone(),
+            *routing_key,
+            &bucket.root_blob_name,
+            part_obj,
+        )
+        .await?;
     }
 
     // Delete the main MPU inode
