@@ -276,6 +276,7 @@ impl AppState {
                     rx,
                     self.config.rss_rpc_timeout(),
                     self.config.rpc_connection_timeout(),
+                    self.config.ec_read_hedge_delay(),
                     data_vg_info,
                 )
                 .await

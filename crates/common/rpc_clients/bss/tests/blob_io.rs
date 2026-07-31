@@ -49,6 +49,7 @@ async fn test_basic_blob_io_with_fixed_bytes() {
             .get_data_blob(
                 blob_guid,
                 0,
+                1,
                 &mut readback_content,
                 content.len(),
                 None,
@@ -100,6 +101,7 @@ async fn test_basic_blob_io_with_random_bytes() {
             .get_data_blob(
                 blob_guid,
                 0,
+                1,
                 &mut readback_content,
                 content.len(),
                 None,

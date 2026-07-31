@@ -453,6 +453,7 @@ async fn get_full_blob_stream(
         .get_blob(
             blob_guid,
             0,
+            1,
             first_block_len,
             blob_location,
             &mut first_block,
@@ -484,6 +485,7 @@ async fn get_full_blob_stream(
                 .get_blob(
                     blob_guid,
                     i as u32,
+                    1,
                     content_len,
                     blob_location,
                     &mut block,
@@ -538,6 +540,7 @@ fn get_range_blob_stream(
                     .get_blob(
                         blob_guid,
                         i as u32,
+                        1,
                         content_len,
                         blob_location,
                         &mut block,
