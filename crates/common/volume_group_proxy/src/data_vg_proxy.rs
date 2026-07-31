@@ -1,6 +1,6 @@
 use crate::DataVgError;
 use bytes::Bytes;
-use data_types::ec_utils::{ec_padded_len, ec_rotation};
+use data_types::ec_utils::{ec_cohort_tag, ec_padded_len, ec_rotation};
 use data_types::{DataBlobGuid, DataVgInfo, TraceId, Volume, VolumeMode};
 use futures::future::Either;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -38,6 +38,32 @@ fn current_timestamp_nanos() -> u64 {
 
 fn delete_result_succeeded(result: &Result<(), RpcError>) -> bool {
     matches!(result, Ok(()) | Err(RpcError::NotFound))
+}
+
+struct NodeBlob {
+    body: Bytes,
+    cohort_tag: u64,
+}
+
+fn decodable_cohort(shards: &[Option<NodeBlob>], data_shards: usize) -> Option<u64> {
+    for shard in shards.iter().flatten() {
+        if shard.cohort_tag == 0 {
+            continue;
+        }
+        let matching = shards
+            .iter()
+            .flatten()
+            .filter(|candidate| candidate.cohort_tag == shard.cohort_tag)
+            .count();
+        if matching >= data_shards {
+            return Some(shard.cohort_tag);
+        }
+    }
+    None
+}
+
+fn cohort_matches_padded_body(cohort_tag: u64, padded_body: &[u8]) -> bool {
+    cohort_tag != 0 && ec_cohort_tag(padded_body) == cohort_tag
 }
 
 /// Configuration for circuit breaker behavior
@@ -341,6 +367,12 @@ impl DataVgProxy {
                             volume.volume_id
                         )));
                     }
+                    if *parity_shards >= *data_shards {
+                        return Err(DataVgError::InitializationError(format!(
+                            "EC volume {} requires parity_shards < data_shards for unique cohort decoding",
+                            volume.volume_id
+                        )));
+                    }
                     let total_shards = data_shards + parity_shards;
                     if volume.bss_nodes.len() != total_shards as usize {
                         return Err(DataVgError::InitializationError(format!(
@@ -527,7 +559,7 @@ impl DataVgProxy {
         content_len: usize,
         trace_id: &TraceId,
         fast_path: bool,
-    ) -> Result<Bytes, RpcError> {
+    ) -> Result<NodeBlob, RpcError> {
         tracing::debug!(%blob_guid, bss_address=%bss_node.address, block_number, version, content_len, fast_path, "get_blob_from_node_instance calling BSS");
 
         let start_node = Instant::now();
@@ -549,7 +581,6 @@ impl DataVgProxy {
                     0,
                 )
                 .await
-                .map(|_| ())
         } else {
             // Normal path with retries
             let mut retries = 3;
@@ -570,7 +601,7 @@ impl DataVgProxy {
                     )
                     .await
                 {
-                    Ok(_) => break Ok(()),
+                    Ok(metadata) => break Ok(metadata),
                     Err(e) if e.retryable() && retries > 0 => {
                         retries -= 1;
                         retry_count += 1;
@@ -589,11 +620,14 @@ impl DataVgProxy {
         };
         histogram!("datavg_get_blob_node_nanos", "bss_node" => bss_node.address.clone(), "result" => _result_label)
             .record(start_node.elapsed().as_nanos() as f64);
-        result?;
+        let metadata = result?;
 
         tracing::debug!(%blob_guid, bss_address=%bss_node.address, block_number, version, data_size=body.len(), "get_blob_from_node_instance result");
 
-        Ok(body)
+        Ok(NodeBlob {
+            body,
+            cohort_tag: metadata.cohort_tag,
+        })
     }
 
     async fn delete_blob_from_node(
@@ -760,6 +794,7 @@ impl DataVgProxy {
                 version,
                 rpc_timeout,
                 trace_id,
+                0,
             ));
         }
 
@@ -1033,6 +1068,7 @@ impl DataVgProxy {
         version: u64,
         rpc_timeout: Duration,
         trace_id: TraceId,
+        cohort_tag: u64,
     ) -> (Arc<BssNode>, String, Result<(), RpcError>) {
         let start_node = Instant::now();
         let address = bss_node.address.clone();
@@ -1040,12 +1076,13 @@ impl DataVgProxy {
         let bss_client = bss_node.get_client();
         let result = {
             bss_client
-                .put_data_blob(
+                .put_data_blob_with_cohort(
                     blob_guid,
                     block_number,
                     body,
                     body_checksum,
                     version,
+                    cohort_tag,
                     Some(rpc_timeout),
                     &trace_id,
                     0,
@@ -1175,7 +1212,7 @@ impl DataVgProxy {
                     selected_node.record_success();
                     histogram!("datavg_get_blob_nanos", "result" => "fast_path_success")
                         .record(start.elapsed().as_nanos() as f64);
-                    *body = blob_data;
+                    *body = blob_data.body;
                     return Ok(());
                 }
                 Err(RpcError::NotFound) => {
@@ -1245,7 +1282,7 @@ impl DataVgProxy {
             match result {
                 Ok(blob_data) => {
                     node.record_success();
-                    successful_blob_data = Some(blob_data);
+                    successful_blob_data = Some(blob_data.body);
                     break;
                 }
                 Err(rpc_error) => {
@@ -1588,6 +1625,7 @@ impl DataVgProxy {
 
         let mut padded = body.to_vec();
         padded.resize(padded_len, 0u8);
+        let cohort_tag = ec_cohort_tag(&padded);
 
         // Split into k data shards
         let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total);
@@ -1646,6 +1684,7 @@ impl DataVgProxy {
                 version,
                 rpc_timeout,
                 trace_id,
+                cohort_tag,
             ));
         }
 
@@ -1721,11 +1760,9 @@ impl DataVgProxy {
 
     /// EC get of one exact generation: fetch the k data shards of
     /// `(blob_guid, block_number, version)` in parallel, RS-decode if
-    /// degraded. Every shard under a versioned key belongs to the single
-    /// write attempt that produced it, so shards can never mix bodies and
-    /// no version selection or cohort filtering exists. Missing shards of
-    /// an existing generation are inline-repaired (re-encoded and written
-    /// back) best-effort.
+    /// degraded. Shards are grouped by their durable write cohort before
+    /// decoding so concurrent write attempts cannot be combined. Missing
+    /// shards of a decoded generation are inline-repaired best-effort.
     async fn get_blob_ec(
         &self,
         blob_guid: DataBlobGuid,
@@ -1769,7 +1806,7 @@ impl DataVgProxy {
         // or the first failed data response. This preserves the normal k-read
         // fast path without letting one slow data node hold reconstruction to
         // the full RPC timeout.
-        let mut shard_results: Vec<Option<Vec<u8>>> = vec![None; total];
+        let mut shard_results: Vec<Option<NodeBlob>> = (0..total).map(|_| None).collect();
         let mut shard_missing: Vec<bool> = vec![false; total];
         let mut data_shards_received = 0;
         let mut shards_not_found = 0usize;
@@ -1817,7 +1854,7 @@ impl DataVgProxy {
             match result {
                 Ok(data) => {
                     ec_vol.bss_nodes[node_idx].record_success();
-                    shard_results[shard_idx] = Some(data.to_vec());
+                    shard_results[shard_idx] = Some(data);
                     data_shards_received += 1;
                 }
                 Err(RpcError::NotFound) => {
@@ -1852,11 +1889,16 @@ impl DataVgProxy {
             }
         }
 
-        if data_shards_received == k {
+        if let Some(selected_cohort) = decodable_cohort(&shard_results, k) {
             // All data shards received, concatenate directly (no RS decode needed).
-            let mut result_data = Vec::new();
+            let mut result_data = Vec::with_capacity(padded_len);
             for shard in shard_results.iter().take(k) {
-                result_data.extend_from_slice(shard.as_ref().unwrap());
+                result_data.extend_from_slice(&shard.as_ref().expect("complete data cohort").body);
+            }
+            if !cohort_matches_padded_body(selected_cohort, &result_data) {
+                return Err(DataVgError::QuorumFailure(
+                    "EC read: reconstructed body does not match its cohort".to_string(),
+                ));
             }
             result_data.truncate(content_len);
             *body = Bytes::from(result_data);
@@ -1900,7 +1942,7 @@ impl DataVgProxy {
             match result {
                 Ok(data) => {
                     ec_vol.bss_nodes[node_idx].record_success();
-                    shard_results[shard_idx] = Some(data.to_vec());
+                    shard_results[shard_idx] = Some(data);
                 }
                 Err(RpcError::NotFound) => {
                     ec_vol.bss_nodes[node_idx].record_success();
@@ -1919,9 +1961,8 @@ impl DataVgProxy {
                     );
                 }
             }
-            let total_shards_received =
-                shard_results.iter().filter(|shard| shard.is_some()).count();
-            if total_shards_received >= k {
+            let total_shards_received = shard_results.iter().flatten().count();
+            if decodable_cohort(&shard_results, k).is_some() {
                 break;
             }
             if total_shards_received == 0 && shards_not_found >= absence_quorum {
@@ -1931,8 +1972,8 @@ impl DataVgProxy {
             }
         }
 
-        let total_shards_received = shard_results.iter().filter(|s| s.is_some()).count();
-        if total_shards_received < k {
+        let total_shards_received = shard_results.iter().flatten().count();
+        let Some(selected_cohort) = decodable_cohort(&shard_results, k) else {
             // An explicit absence quorum intersects every successful EC
             // write quorum. A partial surviving shard set is an error, not
             // a sparse hole.
@@ -1944,22 +1985,29 @@ impl DataVgProxy {
             histogram!("datavg_get_blob_nanos", "result" => "ec_quorum_failure")
                 .record(start.elapsed().as_nanos() as f64);
             return Err(DataVgError::QuorumFailure(format!(
-                "EC read: only {} shards available, need {}",
-                total_shards_received, k
+                "EC read: no single cohort has {} shards ({} total received)",
+                k, total_shards_received
             )));
-        }
+        };
 
         // RS reconstruct
         let shard_size = shard_results
             .iter()
-            .find_map(|s| s.as_ref().map(|d| d.len()))
+            .flatten()
+            .find(|shard| shard.cohort_tag == selected_cohort)
+            .map(|shard| shard.body.len())
             .ok_or_else(|| {
                 DataVgError::Internal("EC read: no shards received at all".to_string())
             })?;
 
         let shards_for_rs: Vec<Option<Vec<u8>>> = shard_results
             .into_iter()
-            .map(|s| s.filter(|d| d.len() == shard_size))
+            .map(|shard| {
+                shard.and_then(|shard| {
+                    (shard.cohort_tag == selected_cohort && shard.body.len() == shard_size)
+                        .then(|| shard.body.to_vec())
+                })
+            })
             .collect();
         let original_shards: Vec<_> = shards_for_rs
             .iter()
@@ -1994,6 +2042,11 @@ impl DataVgProxy {
             }
         }
         let padded_body = result_data.clone();
+        if !cohort_matches_padded_body(selected_cohort, &padded_body) {
+            return Err(DataVgError::QuorumFailure(
+                "EC read: reconstructed body does not match its cohort".to_string(),
+            ));
+        }
         result_data.truncate(content_len);
         *body = Bytes::from(result_data);
 
@@ -2038,6 +2091,7 @@ impl DataVgProxy {
                     version,
                     self.rpc_timeout,
                     *trace_id,
+                    selected_cohort,
                 ));
             }
             spawn_background(async move {
@@ -2187,6 +2241,32 @@ mod tests {
         assert!(delete_result_succeeded(&Ok(())));
         assert!(delete_result_succeeded(&Err(RpcError::NotFound)));
         assert!(!delete_result_succeeded(&Err(RpcError::ConnectionClosed)));
+    }
+
+    #[test]
+    fn ec_decode_selects_only_a_complete_cohort() {
+        let shard = |cohort_tag| {
+            Some(NodeBlob {
+                body: Bytes::from_static(b"shard"),
+                cohort_tag,
+            })
+        };
+        let mixed = vec![shard(11), shard(11), shard(22), shard(22), None, None];
+        assert_eq!(decodable_cohort(&mixed, 4), None);
+        let untagged = vec![shard(0), shard(0), shard(0), shard(0), None, None];
+        assert_eq!(decodable_cohort(&untagged, 4), None);
+
+        let complete = vec![shard(11), shard(11), shard(11), shard(11), shard(22), None];
+        assert_eq!(decodable_cohort(&complete, 4), Some(11));
+    }
+
+    #[test]
+    fn ec_cohort_validates_the_reconstructed_padded_body() {
+        let padded_body = b"body with stripe padding\0\0";
+        let cohort_tag = ec_cohort_tag(padded_body);
+        assert!(cohort_matches_padded_body(cohort_tag, padded_body));
+        assert!(!cohort_matches_padded_body(cohort_tag, b"different body"));
+        assert!(!cohort_matches_padded_body(0, b"untagged body"));
     }
 
     #[test]

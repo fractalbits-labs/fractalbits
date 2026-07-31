@@ -19,7 +19,8 @@ use actix_web::{
 use bytes::Bytes;
 use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
 use data_types::ovr_map::{
-    BlockFetchPlan, OvrRow, OvrRowMap, block_fetch_plan, ovr_row_prefix, parse_ovr_row_block, zeros,
+    BlockFetchPlan, OVR_ABORT_VALUE, OvrRow, OvrRowMap, block_fetch_plan, ovr_row_prefix,
+    parse_ovr_abort_range, parse_ovr_row_block, zeros,
 };
 use data_types::{Bucket, DataBlobGuid, RoutingKey, TraceId};
 use file_ops::parse_list_inodes_raw;
@@ -33,9 +34,9 @@ use tracing::{Instrument, Span};
 /// size, bounds coverage (never trust one clamped page).
 const ROW_LOAD_PAGE: u32 = 1_000;
 
-/// The blob's committed `@ovr/` row snapshot for `layout`, or `None`
-/// for an unmapped blob. Cached per (blob_id, map_epoch): rows change
-/// only under a commit CAS that bumps the epoch.
+/// The blob's committed `@ovr/` snapshot for `layout`, or `None` for an
+/// unmapped blob. Cached per (blob_id, map_epoch): every change that can
+/// affect resolution is published by a commit CAS that bumps the epoch.
 async fn load_row_map(
     app: &Arc<AppState>,
     routing_key: &RoutingKey,
@@ -85,12 +86,22 @@ async fn load_row_map(
         };
         let last_key = page.last().map(|(key, _)| key.clone());
         for (key, value) in page {
-            let (Some(block), Some(row)) = (parse_ovr_row_block(&key), OvrRow::decode(&value))
-            else {
-                tracing::error!(%blob_guid, %key, "malformed @ovr row");
+            if let Some(block) = parse_ovr_row_block(&key) {
+                let Some(row) = OvrRow::decode(&value) else {
+                    tracing::error!(%blob_guid, %key, "malformed @ovr row");
+                    return Err(S3Error::InternalError);
+                };
+                map.insert(block, row);
+            } else if let Some((lo, hi)) = parse_ovr_abort_range(&key) {
+                if value.as_ref() != OVR_ABORT_VALUE {
+                    tracing::error!(%blob_guid, %key, "malformed @ovr abort record");
+                    return Err(S3Error::InternalError);
+                }
+                map.add_aborted_range(lo, hi);
+            } else {
+                tracing::error!(%blob_guid, %key, "malformed @ovr key");
                 return Err(S3Error::InternalError);
-            };
-            map.insert(block, row);
+            }
         }
         let Some(last_key) = last_key else { break };
         if !has_more {

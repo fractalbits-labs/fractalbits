@@ -8,6 +8,8 @@ pub struct DataVolumeReport {
     pub repaired_blobs: u64,
     pub failed_repairs: u64,
     pub unrecoverable_blobs: u64,
+    #[serde(default)]
+    pub deferred_blobs: u64,
     pub degraded: bool,
     pub failed_nodes: Vec<String>,
     pub repair_failed_nodes: Vec<String>,
@@ -24,6 +26,8 @@ pub struct DataRepairReport {
     pub repaired_blobs: u64,
     pub failed_repairs: u64,
     pub unrecoverable_blobs: u64,
+    #[serde(default)]
+    pub deferred_blobs: u64,
     pub volume_reports: Vec<DataVolumeReport>,
 }
 

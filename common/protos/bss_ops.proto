@@ -22,6 +22,8 @@ message ListBlobsResponse {
     uint64 checksum_body = 3;
     uint64 version = 4;
     bool is_deleted = 5;
+    // Nonzero EC write cohort shared by every shard in one stripe.
+    uint64 cohort_tag = 7;
   }
 
   message Blobs {
@@ -48,6 +50,7 @@ message ListBlobBlocksResponse {
   message BlobBlockEntry {
     uint32 block_number = 1;
     uint64 version = 3;
+    uint64 cohort_tag = 4;
   }
 
   message Blocks {
