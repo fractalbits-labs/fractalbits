@@ -522,6 +522,7 @@ async fn put_object_streaming_internal(
                 let request = BlobDeletionRequest {
                     blob_guid: old_blob_guid,
                     block_number: block_number as u32,
+                    version: 1,
                     location: blob_location,
                 };
 
@@ -731,6 +732,7 @@ async fn put_object_with_no_trailer(
                 let request = BlobDeletionRequest {
                     blob_guid: old_blob_guid,
                     block_number: block_number as u32,
+                    version: 1,
                     location: blob_location,
                 };
 
