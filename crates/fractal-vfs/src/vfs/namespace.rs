@@ -245,6 +245,7 @@ impl VfsCore {
                 version_id: ObjectLayout::gen_version_id(),
                 block_size: DEFAULT_BLOCK_SIZE,
                 blob_version: 0,
+                fs_ext: None,
                 state: ObjectState::Indirect(IndirectEntry { inode_id: id }),
             };
             let b: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&l, Vec::new())
@@ -767,6 +768,7 @@ impl VfsCore {
             block_size: DEFAULT_BLOCK_SIZE,
             timestamp: now_ns() / 1_000_000,
             blob_version: 0,
+            fs_ext: ObjectLayout::fs_ext_from(Some(posix)),
             state: ObjectState::Special(SpecialData {
                 kind,
                 rdev,
@@ -775,7 +777,6 @@ impl VfsCore {
                     etag: String::new(),
                     headers: vec![],
                     checksum: None,
-                    posix: Some(Box::new(posix)),
                 },
             }),
         };
@@ -922,6 +923,7 @@ impl VfsCore {
             block_size: DEFAULT_BLOCK_SIZE,
             timestamp,
             blob_version: 0,
+            fs_ext: ObjectLayout::fs_ext_from(Some(posix)),
             state: ObjectState::Symlink(SymlinkData {
                 target: target.to_vec(),
                 core_meta_data: ObjectCoreMetaData {
@@ -929,7 +931,6 @@ impl VfsCore {
                     etag: String::new(),
                     headers: vec![],
                     checksum: None,
-                    posix: Some(Box::new(posix)),
                 },
             }),
         };
@@ -1239,6 +1240,7 @@ impl VfsCore {
             block_size: DEFAULT_BLOCK_SIZE,
             timestamp: now / 1_000_000,
             blob_version: 1,
+            fs_ext: None,
             state: ObjectState::Directory(DirectoryData { posix }),
         };
         let layout_bytes: Bytes = to_bytes_in::<_, rkyv::rancor::Error>(&layout, Vec::new())

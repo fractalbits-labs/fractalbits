@@ -356,6 +356,7 @@ impl VfsCore {
                 block_size: DEFAULT_BLOCK_SIZE,
                 timestamp,
                 blob_version: new_version,
+                fs_ext: ObjectLayout::fs_ext_from(Some(effective_posix)),
                 state: ObjectState::Normal(ObjectMetaData {
                     blob_guid,
                     core_meta_data: ObjectCoreMetaData {
@@ -363,7 +364,6 @@ impl VfsCore {
                         etag: blob_guid.blob_id.simple().to_string(),
                         headers: vec![],
                         checksum: None,
-                        posix: Some(Box::new(effective_posix)),
                     },
                 }),
             };
