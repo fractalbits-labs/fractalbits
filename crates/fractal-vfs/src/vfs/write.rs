@@ -14,6 +14,10 @@ use volume_group_proxy::AtOrBeforeRead;
 
 use crate::vfs::RESERVATION_CONCURRENCY;
 
+/// Concurrent body/tombstone puts per flush (independent write-once
+/// keys; ordering only matters against the commit CAS).
+const BODY_WRITE_CONCURRENCY: usize = 16;
+
 use crate::cache::DirEntryKind;
 use crate::config::WritebackMode;
 use crate::disk_cache::{MIRROR_BYTE_BUDGET, MirrorJob};
@@ -383,21 +387,26 @@ impl VfsCore {
                         matches!(state, BlockState::Rewrite(_)).then_some((*block, 1))
                     })
                     .collect();
-                let mut flush_err: Option<FsError> = None;
-                for (b, st) in snap.blocks.iter() {
-                    let BlockState::Rewrite(bytes) = st else {
-                        continue;
-                    };
-                    if let Err(e) = self
-                        .backend()
-                        .write_block(blob_guid, *b, bytes.clone(), 1, &trace_id)
-                        .await
-                    {
-                        flush_err = Some(e);
-                        break;
-                    }
-                }
-                if let Some(e) = flush_err {
+                // Bodies are independent write-once keys: pipeline them.
+                let body_writes = stream::iter(snap.blocks.iter())
+                    .filter_map(|(b, st)| async move {
+                        match st {
+                            BlockState::Rewrite(bytes) => Some((*b, bytes.clone())),
+                            _ => None,
+                        }
+                    })
+                    .map(|(b, bytes)| {
+                        let trace_id = &trace_id;
+                        async move {
+                            self.backend()
+                                .write_block(blob_guid, b, bytes, 1, trace_id)
+                                .await
+                        }
+                    })
+                    .buffer_unordered(BODY_WRITE_CONCURRENCY)
+                    .try_collect::<Vec<_>>()
+                    .await;
+                if let Err(e) = body_writes {
                     self.cleanup_unpublished_blob(blob_guid, unpublished_identities, &trace_id)
                         .await;
                     return Err(e);
@@ -754,36 +763,46 @@ impl VfsCore {
 
             // Step 4: write every dirty block. Burned generations are
             // padded to a full block_size (constant EC shard size).
-            let mut flush_err: Option<FsError> = None;
-            for (b, st) in snap.blocks.iter() {
-                let BlockState::Rewrite(bytes) = st else {
-                    continue;
-                };
-                let body = if bytes.len() < block_size {
-                    let mut buf = BytesMut::with_capacity(block_size);
-                    buf.extend_from_slice(bytes);
-                    buf.resize(block_size, 0);
-                    buf.freeze()
-                } else {
-                    bytes.clone()
-                };
-                if let Err(e) = self
-                    .backend()
-                    .write_block(blob_guid, *b, body, version, &trace_id)
-                    .await
-                {
-                    flush_err = Some(e);
-                    break;
-                }
-            }
-            if let Some(e) = flush_err {
-                return Err(e);
-            }
-            for b in tombstone_blocks.iter().copied() {
-                self.backend()
-                    .write_tombstone_block(blob_guid, b, version, &trace_id)
-                    .await?;
-            }
+            // Bodies are independent write-once keys: pipeline them, as
+            // are tombstones.
+            stream::iter(snap.blocks.iter())
+                .filter_map(|(b, st)| async move {
+                    match st {
+                        BlockState::Rewrite(bytes) => Some((*b, bytes.clone())),
+                        _ => None,
+                    }
+                })
+                .map(|(b, bytes)| {
+                    let trace_id = &trace_id;
+                    async move {
+                        let body = if bytes.len() < block_size {
+                            let mut buf = BytesMut::with_capacity(block_size);
+                            buf.extend_from_slice(&bytes);
+                            buf.resize(block_size, 0);
+                            buf.freeze()
+                        } else {
+                            bytes.clone()
+                        };
+                        self.backend()
+                            .write_block(blob_guid, b, body, version, trace_id)
+                            .await
+                    }
+                })
+                .buffer_unordered(BODY_WRITE_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await?;
+            stream::iter(tombstone_blocks.iter().copied())
+                .map(|b| {
+                    let trace_id = &trace_id;
+                    async move {
+                        self.backend()
+                            .write_tombstone_block(blob_guid, b, version, trace_id)
+                            .await
+                    }
+                })
+                .buffer_unordered(BODY_WRITE_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await?;
 
             // Reservation quorum is a precondition of the metadata commit.
             // Publishing first would let fallocate report success after
