@@ -9,6 +9,7 @@ mod cmd_repo;
 mod cmd_run_tests;
 mod cmd_service;
 mod cmd_tool;
+mod cmd_overwrite_bench;
 mod cmd_untar_bench;
 mod docker_utils;
 mod etcd_utils;
@@ -52,6 +53,18 @@ enum Cmd {
     },
 
     #[clap(about = "Untar a tarball onto a read-write FUSE mount and time it")]
+    #[clap(about = "Overwrite-heavy fio benchmark (randwrite + fdatasync, cold reads) on a FUSE mount")]
+    OverwriteBench {
+        #[clap(long, default_value = "512")]
+        file_mb: u32,
+
+        #[clap(long, default_value = "60")]
+        write_secs: u32,
+
+        #[clap(long, default_value = "30")]
+        read_secs: u32,
+    },
+
     UntarBench {
         #[clap(long, long_help = "enable the fs_server disk cache")]
         disk_cache: bool,
@@ -936,6 +949,11 @@ async fn main() -> CmdResult {
             let test_type = test_type.unwrap_or(TestType::All);
             cmd_run_tests::run_tests(test_type).await?
         }
+        Cmd::OverwriteBench {
+            file_mb,
+            write_secs,
+            read_secs,
+        } => cmd_overwrite_bench::run(file_mb, write_secs, read_secs).await?,
         Cmd::UntarBench {
             disk_cache,
             writeback_mode,
