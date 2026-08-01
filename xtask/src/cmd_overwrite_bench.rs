@@ -13,7 +13,7 @@ use cmd_lib::*;
 /// data volume is erasure coded (4+2). Deterministic fio seeds keep
 /// the offset sequence identical across runs and branches. Run
 /// `just build --release` first.
-pub async fn run(file_mb: u32, write_secs: u32, read_secs: u32) -> CmdResult {
+pub async fn run(disk_cache: bool, file_mb: u32, write_secs: u32, read_secs: u32) -> CmdResult {
     let mode = BuildMode::Release;
 
     // Clean slate.
@@ -41,12 +41,20 @@ pub async fn run(file_mb: u32, write_secs: u32, read_secs: u32) -> CmdResult {
     }?;
     run_cmd!(mkdir -p $mount_point)?;
 
-    let fs_cfg = FsServerConfig {
+    let dc_path = format!("{}/data/owbench_disk_cache", run_fun!(pwd)?);
+    let mut fs_cfg = FsServerConfig {
         bucket_name: bucket.clone(),
         mount_point: mount_point.to_string(),
         read_write: true,
         ..Default::default()
     };
+    if disk_cache {
+        run_cmd!(rm -rf $dc_path)?;
+        run_cmd!(mkdir -p $dc_path)?;
+        fs_cfg.disk_cache_enabled = true;
+        fs_cfg.disk_cache_path = dc_path.clone();
+        fs_cfg.disk_cache_size_gb = 20;
+    }
     cmd_service::init_service(
         ServiceName::FsServer,
         mode,
@@ -61,7 +69,7 @@ pub async fn run(file_mb: u32, write_secs: u32, read_secs: u32) -> CmdResult {
     let bench_file = format!("{mount_point}/owbench.bin");
     let size = format!("{file_mb}M");
     println!(
-        "=== overwrite bench: file={file_mb}MiB overwrite={write_secs}s reads={read_secs}s ==="
+        "=== overwrite bench: file={file_mb}MiB overwrite={write_secs}s reads={read_secs}s disk_cache={disk_cache} ==="
     );
 
     // Phase 0: lay the file down sequentially and commit it.
