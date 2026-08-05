@@ -19,7 +19,7 @@ output "nss_instance_group" {
 }
 
 output "api_lb_ip" {
-  value       = google_compute_forwarding_rule.api_lb.ip_address
+  value       = var.with_bench ? "" : google_compute_forwarding_rule.api_lb[0].ip_address
   description = "API server load balancer IP"
 }
 

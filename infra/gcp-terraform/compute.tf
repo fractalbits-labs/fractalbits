@@ -234,7 +234,7 @@ resource "google_compute_instance" "bench" {
     cluster-id    = var.cluster_id
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
-      role_args  = "--role bench_server --api-server-endpoint ${google_compute_forwarding_rule.api_lb.ip_address}"
+      role_args  = "--role bench_server"
     })
   }
 
@@ -253,6 +253,5 @@ resource "google_compute_instance" "bench" {
     google_project_iam_member.compute,
     google_project_iam_member.logging,
     google_project_iam_member.monitoring,
-    google_compute_forwarding_rule.api_lb,
   ]
 }
