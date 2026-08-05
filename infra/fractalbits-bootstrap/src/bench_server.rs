@@ -54,12 +54,7 @@ fn workload_configs(bss_count: usize, bench_clients: usize) -> Vec<WorkloadConfi
     ]
 }
 
-pub fn bootstrap(
-    config: &BootstrapConfig,
-    api_server_endpoint: String,
-    bench_client_num: usize,
-    use_nlb: bool,
-) -> CmdResult {
+pub fn bootstrap(config: &BootstrapConfig, bench_client_num: usize) -> CmdResult {
     let barrier = WorkflowBarrier::from_config(config, WorkflowServiceType::Bench)?;
     InstancesReadyStage::complete(&barrier)?;
 
@@ -87,26 +82,20 @@ pub fn bootstrap(
         warp_client_ips.push_str(&format!("  - {ip}:7761\n"));
     }
 
-    // warp_host: benchmark target. cli_endpoint: single host for bucket setup /
-    // readiness probe. Default targets API server IPs directly; --use-nlb uses
-    // the NLB.
-    let (warp_host, cli_endpoint) = if use_nlb {
-        (api_server_endpoint.clone(), api_server_endpoint.clone())
-    } else {
-        let num_api_servers = config.global.num_api_servers.unwrap_or(1);
-        let api_ips = get_service_ips_with_backend(config, "api-server", num_api_servers);
-        let first = api_ips
-            .first()
-            .cloned()
-            .ok_or_else(|| std::io::Error::other("no api-server IPs discovered"))?;
-        // Comma-separated list; warp round-robins across them.
-        let warp_host = api_ips
-            .iter()
-            .map(|ip| format!("{ip}:80"))
-            .collect::<Vec<_>>()
-            .join(",");
-        (warp_host, first)
-    };
+    // Target API server IPs directly. warp_host: benchmark target;
+    // cli_endpoint: single host for bucket setup / readiness probe.
+    let num_api_servers = config.global.num_api_servers.unwrap_or(1);
+    let api_ips = get_service_ips_with_backend(config, "api-server", num_api_servers);
+    let cli_endpoint = api_ips
+        .first()
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("no api-server IPs discovered"))?;
+    // Comma-separated list; warp round-robins across them.
+    let warp_host = api_ips
+        .iter()
+        .map(|ip| format!("{ip}:80"))
+        .collect::<Vec<_>>()
+        .join(",");
     info!("Bench warp target host(s): {warp_host}; CLI endpoint: {cli_endpoint}");
 
     let bss_count = config.global.num_bss_nodes.unwrap_or(1);
