@@ -35,14 +35,6 @@ pub struct CliArgs {
     /// NSS sub-role: primary or standby (for nss_server)
     #[clap(long)]
     pub nss_role: Option<String>,
-
-    /// API server NLB endpoint (for bench_server — injected via UserData)
-    #[clap(long)]
-    pub api_server_endpoint: Option<String>,
-
-    /// Benchmark against the API NLB instead of the API server IPs directly (bench_server only).
-    #[clap(long)]
-    pub use_nlb: bool,
 }
 
 /// Discover service type from CLI args (cloud deployments with `--role` arg).

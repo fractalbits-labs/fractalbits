@@ -390,27 +390,31 @@ export class FractalbitsVpcStack extends cdk.Stack {
       );
     }
 
-    // NLB for API servers - always create regardless of benchType
-    const nlb = new elbv2.NetworkLoadBalancer(this, "ApiNLB", {
-      vpc: this.vpc,
-      internetFacing: false,
-      vpcSubnets: { subnetType: privateSubnetType },
-      crossZoneEnabled: false,
-    });
-    const listener = nlb.addListener("ApiListener", { port: 80 });
-    listener.addTargets("ApiTargets", {
-      port: 80,
-      targets: [apiServerAsg],
-      healthCheck: {
-        enabled: true,
-        healthyThresholdCount: 2,
-        unhealthyThresholdCount: 2,
-        interval: cdk.Duration.seconds(5),
-        timeout: cdk.Duration.seconds(2),
-      },
-    });
+    // Skip the NLB in external bench mode: bench_server hits API IPs directly
+    // (no --use-nlb), so it would be unused. Kept for other deploys.
+    let nlb: elbv2.NetworkLoadBalancer | undefined;
+    if (props.benchType !== "external") {
+      nlb = new elbv2.NetworkLoadBalancer(this, "ApiNLB", {
+        vpc: this.vpc,
+        internetFacing: false,
+        vpcSubnets: { subnetType: privateSubnetType },
+        crossZoneEnabled: false,
+      });
+      const listener = nlb.addListener("ApiListener", { port: 80 });
+      listener.addTargets("ApiTargets", {
+        port: 80,
+        targets: [apiServerAsg],
+        healthCheck: {
+          enabled: true,
+          healthyThresholdCount: 2,
+          unhealthyThresholdCount: 2,
+          interval: cdk.Duration.seconds(5),
+          timeout: cdk.Duration.seconds(2),
+        },
+      });
+    }
 
-    // Third pass: create bench_server after NLB so UserData can embed the NLB DNS name.
+    // bench_server discovers API IPs directly, so no NLB endpoint is passed.
     if (props.benchType === "external") {
       const benchServerConfig = instanceConfigs.find(
         ({ id }) => id === "bench_server",
@@ -419,7 +423,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
         const benchServerUserData = createUserData(
           this,
           deployOS,
-          `--role bench_server --api-server-endpoint ${nlb.loadBalancerDnsName}`,
+          "--role bench_server",
         );
         instances["bench_server"] = createInstance(
           this,
@@ -451,12 +455,14 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
-    new cdk.CfnOutput(this, "ApiNLBDnsName", {
-      value: nlb.loadBalancerDnsName,
-      description: "DNS name of the API NLB",
-    });
+    this.nlbLoadBalancerDnsName = nlb ? nlb.loadBalancerDnsName : "";
 
-    this.nlbLoadBalancerDnsName = nlb.loadBalancerDnsName;
+    if (nlb) {
+      new cdk.CfnOutput(this, "ApiNLBDnsName", {
+        value: nlb.loadBalancerDnsName,
+        description: "DNS name of the API NLB",
+      });
+    }
 
     new cdk.CfnOutput(this, "apiServerAsgName", {
       value: apiServerAsg.autoScalingGroupName,

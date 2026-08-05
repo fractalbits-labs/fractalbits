@@ -19,7 +19,6 @@ use clap::Parser;
 use cmd_lib::*;
 use common::*;
 use discovery::{CliArgs, ServiceType, discover_from_args, discover_service_type};
-use std::io;
 
 #[cmd_lib::main]
 fn main() -> CmdResult {
@@ -109,16 +108,6 @@ fn generic_bootstrap_with_args(cli_args: CliArgs) -> CmdResult {
             "gui_server"
         }
         ServiceType::BenchServer { bench_client_num } => {
-            let api_endpoint = cli_args
-                .api_server_endpoint
-                .as_deref()
-                .or_else(|| {
-                    config
-                        .endpoints
-                        .as_ref()
-                        .and_then(|e| e.api_server_endpoint.as_deref())
-                })
-                .ok_or_else(|| io::Error::other("api_server_endpoint not set"))?;
             // bench_client_num is 0 for cloud (CLI) path; read from global config.
             // For on-prem (TOML) path, it comes from per-instance config.
             let actual_bench_client_num = if bench_client_num > 0 {
@@ -126,12 +115,7 @@ fn generic_bootstrap_with_args(cli_args: CliArgs) -> CmdResult {
             } else {
                 config.global.num_bench_clients.unwrap_or(1)
             };
-            bench_server::bootstrap(
-                &config,
-                api_endpoint.to_string(),
-                actual_bench_client_num,
-                cli_args.use_nlb,
-            )?;
+            bench_server::bootstrap(&config, actual_bench_client_num)?;
             "bench_server"
         }
         ServiceType::BenchClient => {
