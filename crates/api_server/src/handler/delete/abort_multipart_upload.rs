@@ -55,7 +55,7 @@ pub async fn abort_multipart_upload_handler(
     }
 
     // Delete all uploaded parts and their blobs
-    let mpu_prefix = mpu_get_part_prefix(ctx.key.clone(), 0);
+    let mpu_prefix = mpu_get_part_prefix(ctx.key.clone(), object.version_id, 0);
     let parts = list_raw_objects(
         &ctx.app,
         routing_key,

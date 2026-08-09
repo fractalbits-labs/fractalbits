@@ -11,7 +11,7 @@ use crate::AppState;
 use actix_web::http::header::{self, HeaderMap};
 use data_types::object_layout::{HeaderList, ObjectLayout};
 use data_types::{RoutingKey, TraceId};
-pub use file_ops::mpu_get_part_prefix;
+pub use file_ops::{mpu_get_part_prefix, mpu_get_uploads_prefix};
 use file_ops::{parse_get_inode, parse_list_inodes};
 use futures::StreamExt;
 use rpc_client_common::nss_rpc_retry;
@@ -155,7 +155,7 @@ pub fn reject_trailing_slash_key(key: &str) -> Result<(), S3Error> {
 
 pub fn mpu_parse_part_number(mpu_key: &str) -> Result<u32, S3Error> {
     let part_str = mpu_key
-        .split('#')
+        .split('/')
         .next_back()
         .ok_or(S3Error::InternalError)?;
     Ok(part_str
