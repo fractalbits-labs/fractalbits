@@ -9,7 +9,7 @@ use data_types::ovr_map::{
     OVR_ABORT_VALUE, OvrRow, PrevSlot, RowState, encode_ovr_gc_rows_ready, ovr_gc_key, ovr_row_key,
     ovr_row_prefix, parse_ovr_abort_range, parse_ovr_row_block,
 };
-use data_types::{Bucket, TraceId};
+use data_types::{Bucket, DataBlobGuid, TraceId};
 use file_ops::{parse_get_inode, parse_list_inodes_raw, parse_put_inode, parse_put_inode_cas};
 use rpc_client_nss::RpcClientNss;
 use rpc_client_rss::RpcClientRss;
@@ -17,6 +17,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Child, Command};
 use std::time::Duration;
+use volume_group_proxy::DataVgProxy;
 
 use super::{MOUNT_POINT, cleanup_objects, generate_test_data, setup_test_bucket};
 
@@ -301,15 +302,20 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         std::fs::remove_dir_all(&dc_path).ok();
     }
 
+    // FUSE_TEST_FILTER=<substring> runs only matching tests (dev iteration).
+    let test_filter = std::env::var("FUSE_TEST_FILTER").unwrap_or_default();
+
     macro_rules! run_test {
         ($name:expr, $func:ident) => {
-            println!(
-                "\n{}",
-                format!("=== Test: {}{} ===", $name, dc_label).bold()
-            );
-            if let Err(e) = $func(disk_cache).await {
-                eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-                return Err(e);
+            if test_filter.is_empty() || $name.contains(test_filter.as_str()) {
+                println!(
+                    "\n{}",
+                    format!("=== Test: {}{} ===", $name, dc_label).bold()
+                );
+                if let Err(e) = $func(disk_cache).await {
+                    eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+                    return Err(e);
+                }
             }
         };
     }
@@ -501,8 +507,20 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
             test_trim_regrow_zeroes_after_interrupted_overwrite
         );
         run_test!(
+            "Pending Append Crash Recovery",
+            test_pending_append_crash_recovery
+        );
+        run_test!(
             "Teardown Scavenger Spares Live Blob Rows",
             test_scavenger_spares_live_blob_rows
+        );
+        run_test!(
+            "S3 Slow Stream Fails After Reclaim",
+            test_s3_slow_stream_fails_after_reclaim
+        );
+        run_test!(
+            "Fenced Bucket Teardown Sweeps Internal Keyspaces",
+            test_fenced_bucket_teardown_sweeps_internal_keys
         );
     }
 
@@ -3930,6 +3948,18 @@ async fn nss_raw_access(bucket: &str) -> std::io::Result<(RpcClientNss, String)>
     ))
 }
 
+async fn data_vg_raw_access() -> std::io::Result<DataVgProxy> {
+    let timeout = Duration::from_secs(5);
+    let trace_id = TraceId::new();
+    let rss = RpcClientRss::new_from_addresses(vec!["127.0.0.1:8086".to_string()], timeout);
+    let data_vg_info = rss
+        .get_data_vg_info(Some(timeout), &trace_id)
+        .await
+        .map_err(|e| std::io::Error::other(format!("rss get data vg info: {e:?}")))?;
+    DataVgProxy::new(data_vg_info, timeout, timeout)
+        .map_err(|e| std::io::Error::other(format!("build data vg proxy: {e}")))
+}
+
 /// Fetch the committed NSS layout for `key`: the bare ObjectLayout stored
 /// at the s3_key (not valid for hardlink-promoted inodes).
 async fn fetch_object_layout(bucket: &str, key: &str) -> std::io::Result<ObjectLayout> {
@@ -3943,6 +3973,37 @@ async fn fetch_object_layout(bucket: &str, key: &str) -> std::io::Result<ObjectL
         .await
         .map_err(|e| std::io::Error::other(format!("nss get_inode: {e:?}")))?;
     parse_get_inode(resp).map_err(|e| std::io::Error::other(format!("parse layout: {e:?}")))
+}
+
+async fn install_object_layout_cas(
+    bucket: &str,
+    key: &str,
+    base: &ObjectLayout,
+    prepared: &ObjectLayout,
+) -> std::io::Result<()> {
+    let timeout = Duration::from_secs(5);
+    let trace_id = TraceId::new();
+    let (nss, root_blob_name) = nss_raw_access(bucket).await?;
+    let old_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(base)
+        .map_err(|e| std::io::Error::other(format!("serialize base: {e}")))?;
+    let new_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(prepared)
+        .map_err(|e| std::io::Error::other(format!("serialize prepared: {e}")))?;
+    let nss_key = format!("/{key}");
+    let resp = nss
+        .put_inode_cas(
+            &root_blob_name,
+            &nss_key,
+            Bytes::from(new_bytes.to_vec()),
+            Bytes::from(old_bytes.to_vec()),
+            Some(timeout),
+            &trace_id,
+            0,
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("nss put_inode_cas: {e:?}")))?;
+    parse_put_inode_cas(resp)
+        .map(|_| ())
+        .map_err(|e| std::io::Error::other(format!("prepare injection lost a CAS race: {e:?}")))
 }
 
 /// All row and aborted-generation records under one blob's `@ovr/`
@@ -4026,9 +4087,6 @@ async fn prepare_interrupted_row_flush(
     key: &str,
     block: u32,
 ) -> std::io::Result<InterruptedRowFlush> {
-    let timeout = Duration::from_secs(5);
-    let trace_id = TraceId::new();
-    let (nss, root_blob_name) = nss_raw_access(bucket).await?;
     let base = fetch_object_layout(bucket, key).await?;
     let blob_id = base
         .blob_guid()
@@ -4039,25 +4097,7 @@ async fn prepare_interrupted_row_flush(
     // The prepare CAS an interrupted attempt durably landed.
     let mut prepared = base.clone();
     prepared.set_next_version(staged_version + 1);
-    let old_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&base)
-        .map_err(|e| std::io::Error::other(format!("serialize base: {e}")))?;
-    let new_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&prepared)
-        .map_err(|e| std::io::Error::other(format!("serialize prepared: {e}")))?;
-    let nss_key = format!("/{key}");
-    let resp = nss
-        .put_inode_cas(
-            &root_blob_name,
-            &nss_key,
-            Bytes::from(new_bytes.to_vec()),
-            Bytes::from(old_bytes.to_vec()),
-            Some(timeout),
-            &trace_id,
-            0,
-        )
-        .await
-        .map_err(|e| std::io::Error::other(format!("nss put_inode_cas: {e:?}")))?;
-    parse_put_inode_cas(resp)
-        .map_err(|e| std::io::Error::other(format!("prepare injection lost a CAS race: {e:?}")))?;
+    install_object_layout_cas(bucket, key, &base, &prepared).await?;
 
     // The row the interrupted attempt can still CAS after its prepare.
     let prev = list_ovr_rows(bucket, &blob_id)
@@ -4110,6 +4150,85 @@ async fn inject_interrupted_row_flush(
     let interrupted = prepare_interrupted_row_flush(bucket, key, block).await?;
     install_interrupted_row(bucket, &interrupted).await?;
     Ok(interrupted)
+}
+
+/// An append that durably prepared and wrote only part of its version-1 span.
+struct InterruptedAppendFlush {
+    blob_guid: DataBlobGuid,
+    pending_append: (u32, u32),
+    burned_version: u64,
+    base_ceiling: u64,
+}
+
+async fn inject_interrupted_append_flush(
+    bucket: &str,
+    key: &str,
+    pending_append: (u32, u32),
+    v1_bodies: &[(u32, Bytes)],
+) -> std::io::Result<InterruptedAppendFlush> {
+    let (lo, hi) = pending_append;
+    let block_count = hi
+        .checked_sub(lo)
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| std::io::Error::other("invalid pending append range"))?;
+    if v1_bodies.is_empty() || v1_bodies.len() as u64 >= u64::from(block_count) {
+        return Err(std::io::Error::other(
+            "interrupted append must write a nonempty proper subset",
+        ));
+    }
+    if v1_bodies
+        .iter()
+        .any(|(block, _)| *block < lo || *block > hi)
+    {
+        return Err(std::io::Error::other(
+            "interrupted append body lies outside pending range",
+        ));
+    }
+
+    let base = fetch_object_layout(bucket, key).await?;
+    let blob_guid = base
+        .blob_guid()
+        .map_err(|e| std::io::Error::other(format!("blob_guid: {e:?}")))?;
+    let burned_version = base.next_burn_version();
+    let base_ceiling = base.blob_version;
+    let mut prepared = base.clone();
+    prepared.set_next_version(burned_version + 1);
+    prepared.set_pending_append(Some(pending_append));
+    install_object_layout_cas(bucket, key, &base, &prepared).await?;
+
+    let trace_id = TraceId::new();
+    let data_vg = data_vg_raw_access().await?;
+    for (block, body) in v1_bodies {
+        data_vg
+            .put_blob(blob_guid, *block, body.clone(), 1, &trace_id)
+            .await
+            .map_err(|e| std::io::Error::other(format!("write partial v1 body: {e}")))?;
+    }
+
+    let entries = data_vg
+        .list_blob_blocks(blob_guid, lo, block_count, &trace_id)
+        .await
+        .map_err(|e| std::io::Error::other(format!("list partial v1 bodies: {e}")))?;
+    for block in lo..=hi {
+        let expected = v1_bodies
+            .iter()
+            .any(|(written_block, _)| *written_block == block);
+        let present = entries
+            .iter()
+            .any(|entry| entry.block_number == block && entry.version == 1);
+        if expected != present {
+            return Err(std::io::Error::other(format!(
+                "partial v1 body state mismatch for block {block}: expected={expected}, present={present}"
+            )));
+        }
+    }
+
+    Ok(InterruptedAppendFlush {
+        blob_guid,
+        pending_append,
+        burned_version,
+        base_ceiling,
+    })
 }
 
 /// Commit a two-block file and overwrite its second block, so the blob
@@ -4325,6 +4444,179 @@ async fn test_trim_regrow_zeroes_after_interrupted_overwrite(disk_cache: bool) -
     Ok(())
 }
 
+/// Recover a crash after prepare and midway through version-1 append bodies.
+/// The retry must use a burned generation for contested data and Hole rows
+/// for the abandoned remainder before a later regrow can expose it.
+async fn test_pending_append_crash_recovery(disk_cache: bool) -> CmdResult {
+    assert!(!disk_cache, "this crash injection requires no disk cache");
+    let (ctx, bucket) = setup_test_bucket().await;
+    let key = "pending-append-crash.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let base_body = generate_test_data("pending-append-base", BLOCK_SIZE as usize);
+    let crashed_block1 = generate_test_data("pending-append-crash-b1", BLOCK_SIZE as usize);
+    let crashed_block2 = generate_test_data("pending-append-crash-b2", BLOCK_SIZE as usize);
+    let recovered_block1 = generate_test_data("pending-append-recovery-b1", BLOCK_SIZE as usize);
+    assert_ne!(
+        crashed_block1, recovered_block1,
+        "A1 must encounter a write-once conflict if it retries version 1"
+    );
+
+    println!("  Step 1: Commit a one-block base file and unmount");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&fuse_path)
+            .expect("open pending-append base");
+        file.write_all(&base_body)
+            .expect("write pending-append base");
+        file.sync_all().expect("commit pending-append base");
+    }
+    unmount_fuse()?;
+
+    println!("  Step 2: Inject pending range 1..=3 with only blocks 1 and 2 at version 1");
+    let interrupted = inject_interrupted_append_flush(
+        &bucket,
+        key,
+        (1, 3),
+        &[
+            (1, Bytes::copy_from_slice(&crashed_block1)),
+            (2, Bytes::copy_from_slice(&crashed_block2)),
+        ],
+    )
+    .await?;
+    let prepared = fetch_object_layout(&bucket, key).await?;
+    assert_eq!(
+        prepared.pending_append(),
+        Some(interrupted.pending_append),
+        "prepare must durably record the contested version-1 range"
+    );
+    assert_eq!(
+        prepared.blob_version, interrupted.base_ceiling,
+        "prepare must not move the reader ceiling"
+    );
+    assert!(
+        prepared.next_burn_version() > interrupted.burned_version,
+        "prepare must durably burn its generation"
+    );
+
+    println!("  Step 3: Remount and recover block 1 with different bytes");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fuse_path)
+            .expect("open pending-append recovery");
+        file.seek(SeekFrom::Start(BLOCK_SIZE))
+            .expect("seek pending-append recovery");
+        file.write_all(&recovered_block1)
+            .expect("write pending-append recovery");
+        file.sync_all().expect("commit pending-append recovery");
+    }
+    let mut expected_recovered = base_body.clone();
+    expected_recovered.extend_from_slice(&recovered_block1);
+    let actual = std::fs::read(&fuse_path).expect("read pending-append recovery");
+    assert_eq!(
+        actual, expected_recovered,
+        "recovery must not expose the crashed version-1 body"
+    );
+    unmount_fuse()?;
+
+    println!("  Step 4: Verify A1 generation, A2 Hole rows, and cleared pending state");
+    let recovered = fetch_object_layout(&bucket, key).await?;
+    assert_eq!(
+        recovered.size().expect("recovered size"),
+        2 * BLOCK_SIZE,
+        "recovery must commit only the rewritten prefix"
+    );
+    assert_eq!(
+        recovered.pending_append(),
+        None,
+        "successful recovery must clear pending_append"
+    );
+    assert!(
+        recovered.blob_version > interrupted.burned_version,
+        "recovery must advance past the interrupted generation"
+    );
+    let rows = list_ovr_rows(&bucket, &interrupted.blob_guid.blob_id).await?;
+    let recovered_row = rows
+        .iter()
+        .find(|(block, _)| *block == 1)
+        .map(|(_, row)| row)
+        .expect("A1 must publish a row for block 1");
+    assert_eq!(
+        recovered_row.cur_state,
+        RowState::Written,
+        "A1 block must resolve to written data"
+    );
+    assert_eq!(
+        recovered_row.cur_version, recovered.blob_version,
+        "A1 row must name the recovery generation"
+    );
+    assert!(
+        recovered_row.cur_version > 1,
+        "A1 must not retry the contested version 1"
+    );
+    for block in 2..=3 {
+        let remainder_row = rows
+            .iter()
+            .find(|(candidate, _)| *candidate == block)
+            .map(|(_, row)| row)
+            .expect("A2 must publish a row for every remainder block");
+        assert_eq!(
+            remainder_row.cur_state,
+            RowState::Hole,
+            "A2 remainder block {block} must resolve to a hole"
+        );
+        assert_eq!(
+            remainder_row.cur_version, recovered.blob_version,
+            "A2 remainder block {block} must commit atomically with recovery"
+        );
+    }
+
+    println!("  Step 5: Cold-remount, regrow through block 3, and verify zeroes");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fuse_path)
+            .expect("open pending-append regrow");
+        file.set_len(4 * BLOCK_SIZE)
+            .expect("regrow pending-append file");
+        file.sync_all().expect("commit pending-append regrow");
+    }
+    let actual = std::fs::read(&fuse_path).expect("read pending-append regrow");
+    assert_eq!(actual.len(), 4 * BLOCK_SIZE as usize, "regrown length");
+    assert_eq!(
+        &actual[..2 * BLOCK_SIZE as usize],
+        expected_recovered.as_slice(),
+        "regrow must preserve committed prefix"
+    );
+    assert!(
+        actual[2 * BLOCK_SIZE as usize..]
+            .iter()
+            .all(|byte| *byte == 0),
+        "regrow must not expose the abandoned version-1 fragment"
+    );
+    unmount_fuse()?;
+    let regrown = fetch_object_layout(&bucket, key).await?;
+    assert_eq!(
+        regrown.pending_append(),
+        None,
+        "regrow must not recreate pending_append"
+    );
+
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+    println!(
+        "{}",
+        "SUCCESS: Pending append crash recovered through A1 and A2".green()
+    );
+    Ok(())
+}
+
 /// A teardown marker is an intent, not proof: a failed unlink leaves a
 /// marker naming a live file, and the mount-time scavenger must retain it
 /// and never delete the live blob's rows. A committed probe marker proves
@@ -4457,6 +4749,204 @@ async fn test_scavenger_spares_live_blob_rows(disk_cache: bool) -> CmdResult {
     println!(
         "{}",
         "SUCCESS: Scavenger spared live rows and retained the conditional marker".green()
+    );
+    Ok(())
+}
+
+/// A streamed S3 GET must never turn reclaimed data into zeroes. The
+/// stream captures its layout, emits early blocks, then the object is
+/// deleted and a far block's exact base-version key reclaimed before
+/// the client drains the rest. The response must terminate with an
+/// error, never a fabricated zero tail.
+async fn test_s3_slow_stream_fails_after_reclaim(disk_cache: bool) -> CmdResult {
+    let _ = disk_cache;
+    let (ctx, bucket) = setup_test_bucket().await;
+    let key = "slow-stream-reclaim.bin";
+    // Far larger than any loopback socket buffering, so the final block
+    // cannot have been prefetched while the client stalls early on.
+    const NUM_BLOCKS: u64 = 256;
+    let object_size = (NUM_BLOCKS * BLOCK_SIZE) as usize;
+    let body = generate_test_data("slow-stream-reclaim", object_size);
+
+    println!("  Step 1: PUT a {NUM_BLOCKS}-block object");
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await
+        .expect("put slow-stream object");
+    let layout = fetch_object_layout(&bucket, key).await?;
+    let blob_guid = layout
+        .blob_guid()
+        .map_err(|e| std::io::Error::other(format!("blob_guid: {e:?}")))?;
+
+    println!("  Step 2: Start a GET and consume only the first blocks");
+    let resp = ctx
+        .client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("start slow GET");
+    let mut stream = resp.body;
+    let mut received: usize = 0;
+    while received < 2 * BLOCK_SIZE as usize {
+        let chunk = stream
+            .try_next()
+            .await
+            .map_err(|e| std::io::Error::other(format!("early stream read: {e}")))?
+            .ok_or_else(|| std::io::Error::other("stream ended before two blocks"))?;
+        assert!(
+            chunk.as_ref() == &body[received..received + chunk.len()],
+            "early streamed bytes must match the committed object"
+        );
+        received += chunk.len();
+    }
+
+    println!("  Step 3: Delete the object and reclaim the final block");
+    ctx.client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("delete streamed object");
+    let trace_id = TraceId::new();
+    let data_vg = data_vg_raw_access().await?;
+    data_vg
+        .delete_blob(blob_guid, (NUM_BLOCKS - 1) as u32, 1, &trace_id)
+        .await
+        .map_err(|e| std::io::Error::other(format!("reclaim final block: {e}")))?;
+
+    println!("  Step 4: Drain the rest; the stream must fail, not zero-fill");
+    let mut tail_failed = false;
+    loop {
+        match stream.try_next().await {
+            Ok(Some(chunk)) => {
+                assert!(
+                    chunk.as_ref() == &body[received..received + chunk.len()],
+                    "stream must never substitute reclaimed data at offset {received}"
+                );
+                received += chunk.len();
+                assert!(
+                    received < object_size,
+                    "server outran the backpressure window; the reclaim raced the stream"
+                );
+            }
+            Ok(None) => break,
+            Err(_) => {
+                tail_failed = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        tail_failed,
+        "stream must terminate in an error once its snapshot is gone \
+         (received {received}/{object_size})"
+    );
+
+    println!(
+        "{}",
+        "SUCCESS: Slow GET failed closed after reclamation".green()
+    );
+    Ok(())
+}
+
+/// Bucket teardown must reach the fenced-cleanup path over the real
+/// Rust-to-Zig NSS RPC boundary: a fenced nonempty probe returns the
+/// NSS-issued generation (never the legacy not-empty error), and the
+/// generation-carrying sweep must page through more than 1000 internal
+/// keys before the retried root delete succeeds.
+async fn test_fenced_bucket_teardown_sweeps_internal_keys(disk_cache: bool) -> CmdResult {
+    let _ = disk_cache;
+    let ctx = test_common::context();
+    let bucket = ctx.create_bucket("teardown-fence-sweep").await;
+    let hold_key = "hold.bin";
+
+    println!("  Step 1: A bucket holding a real object must refuse deletion");
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(hold_key)
+        .body(ByteStream::from(generate_test_data("teardown-hold", 128)))
+        .send()
+        .await
+        .expect("put hold object");
+    ctx.client
+        .delete_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect_err("nonempty bucket deletion must fail");
+
+    println!("  Step 2: Remove the object, then plant >1000 internal keys");
+    ctx.client
+        .delete_object()
+        .bucket(&bucket)
+        .key(hold_key)
+        .send()
+        .await
+        .expect("delete hold object");
+
+    let timeout = Duration::from_secs(5);
+    let (nss, root_blob_name) = nss_raw_access(&bucket).await?;
+    let mut internal_keys = Vec::new();
+    for _ in 0..3 {
+        let blob_id = uuid::Uuid::new_v4();
+        for block in 0..350u32 {
+            internal_keys.push(ovr_row_key(&blob_id, block));
+        }
+        internal_keys.push(ovr_gc_key(&blob_id));
+        internal_keys.push(format!(
+            "{}{}",
+            data_types::object_layout::HARDLINK_PREFIX,
+            blob_id.simple()
+        ));
+    }
+    assert!(
+        internal_keys.len() > 1000,
+        "the sweep must cover more than one NSS listing page"
+    );
+    for internal_key in &internal_keys {
+        let resp = nss
+            .put_inode(
+                &root_blob_name,
+                internal_key,
+                Bytes::from_static(b"x"),
+                Some(timeout),
+                &TraceId::new(),
+                0,
+            )
+            .await
+            .map_err(|e| std::io::Error::other(format!("nss put {internal_key}: {e:?}")))?;
+        parse_put_inode(resp)
+            .map_err(|e| std::io::Error::other(format!("put {internal_key}: {e:?}")))?;
+    }
+
+    println!("  Step 3: Bucket deletion must sweep the fenced keyspaces and finish");
+    ctx.client
+        .delete_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("fenced teardown must sweep internal keys and delete the bucket");
+
+    let buckets = ctx.list_buckets().await;
+    assert!(
+        buckets
+            .buckets()
+            .iter()
+            .all(|b| b.name() != Some(bucket.as_str())),
+        "bucket must be gone after fenced teardown"
+    );
+
+    println!(
+        "{}",
+        "SUCCESS: Fenced teardown swept >1000 internal keys over the RPC boundary".green()
     );
     Ok(())
 }
