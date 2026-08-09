@@ -34,6 +34,83 @@ use tracing::{Instrument, Span};
 /// size, bounds coverage (never trust one clamped page).
 const ROW_LOAD_PAGE: u32 = 1_000;
 
+#[derive(Clone)]
+struct ReadNamespace {
+    app: Arc<AppState>,
+    routing_key: RoutingKey,
+    root_blob_name: String,
+    bucket_name: String,
+}
+
+impl ReadNamespace {
+    fn new(app: Arc<AppState>, bucket: &Bucket) -> Arc<Self> {
+        Arc::new(Self {
+            app,
+            routing_key: bucket.routing_key,
+            root_blob_name: bucket.root_blob_name.clone(),
+            bucket_name: bucket.bucket_name.clone(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct ReadSnapshot {
+    namespace: Arc<ReadNamespace>,
+    key: String,
+    layout: ObjectLayout,
+}
+
+impl ReadSnapshot {
+    fn new(namespace: Arc<ReadNamespace>, key: String, layout: ObjectLayout) -> Arc<Self> {
+        Arc::new(Self {
+            namespace,
+            key,
+            layout,
+        })
+    }
+
+    async fn validate_base_miss(&self, trace_id: &TraceId) -> Result<(), S3Error> {
+        let current = get_raw_object(
+            &self.namespace.app,
+            &self.namespace.routing_key,
+            &self.namespace.root_blob_name,
+            &self.namespace.bucket_name,
+            &self.key,
+            trace_id,
+        )
+        .await;
+        match current {
+            Ok(current) if same_committed_read_snapshot(&self.layout, &current) => Ok(()),
+            Ok(current) => {
+                tracing::warn!(
+                    key = %self.key,
+                    expected_version_id = %self.layout.version_id,
+                    current_version_id = %current.version_id,
+                    "base generation disappeared after the GET snapshot changed"
+                );
+                Err(S3Error::InternalError)
+            }
+            Err(S3Error::NoSuchKey | S3Error::NoSuchBucket) => {
+                tracing::warn!(
+                    key = %self.key,
+                    expected_version_id = %self.layout.version_id,
+                    "base generation disappeared after the GET snapshot was removed"
+                );
+                Err(S3Error::InternalError)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn same_committed_read_snapshot(expected: &ObjectLayout, current: &ObjectLayout) -> bool {
+    expected.version_id == current.version_id
+        && expected.block_size == current.block_size
+        && expected.blob_version == current.blob_version
+        && expected.map_epoch() == current.map_epoch()
+        && expected.state == current.state
+}
+
 /// The blob's committed `@ovr/` snapshot for `layout`, or `None` for an
 /// unmapped blob. Cached per (blob_id, map_epoch): every change that can
 /// affect resolution is published by a commit CAS that bumps the epoch.
@@ -117,10 +194,12 @@ async fn load_row_map(
 
 /// Read one block at its exact committed identity. A `Hole` returns
 /// zeros with no RPC; a row-committed miss is detected data loss (never
-/// a hole); a base-version miss is a sparse hole.
+/// a hole); a base-version miss is a sparse hole only after the exact
+/// committed namespace snapshot is revalidated.
 #[allow(clippy::too_many_arguments)]
 async fn read_block(
     blob_client: &BlobClient,
+    snapshot: &ReadSnapshot,
     blob_guid: DataBlobGuid,
     block_number: u32,
     content_len: usize,
@@ -176,6 +255,7 @@ async fn read_block(
                 );
                 return Err(S3Error::InternalError);
             }
+            snapshot.validate_base_miss(trace_id).await?;
             Ok(zeros(content_len))
         }
         Err(error) => Err(error.into()),
@@ -370,6 +450,7 @@ pub async fn get_object_content(
     ),
     S3Error,
 > {
+    let read_namespace = ReadNamespace::new(app.clone(), bucket);
     let blob_client = app
         .get_blob_client(&bucket.routing_key)
         .await
@@ -389,8 +470,10 @@ pub async fn get_object_content(
                 trace_id,
             )
             .await?;
+            let snapshot = ReadSnapshot::new(read_namespace, key, object.clone());
             let body_stream = get_full_blob_stream(
                 blob_client,
+                snapshot,
                 blob_guid,
                 num_blocks,
                 size,
@@ -420,7 +503,7 @@ pub async fn get_object_content(
                 Err(S3Error::InvalidObjectState)
             }
             MpuState::Completed(core_meta_data) => {
-                let mpu_prefix = mpu_get_part_prefix(key, 0);
+                let mpu_prefix = mpu_get_part_prefix(key, object.version_id, 0);
                 let mut mpus = list_raw_objects(
                     &app,
                     &bucket.routing_key,
@@ -446,9 +529,11 @@ pub async fn get_object_content(
                 // Create a stream that concatenates all multipart streams
                 // Following the axum pattern for multipart streaming
                 let trace_id = *trace_id;
+                let read_namespace = read_namespace.clone();
                 let mpu_stream = stream::iter(mpus_vec)
-                    .then(move |(_key, mpu_obj)| {
+                    .then(move |(mpu_key, mpu_obj)| {
                         let blob_client = blob_client.clone();
+                        let read_namespace = read_namespace.clone();
                         async move {
                             let blob_guid = mpu_obj.blob_guid()?;
                             let num_blocks = mpu_obj.num_blocks()?;
@@ -459,8 +544,11 @@ pub async fn get_object_content(
                             // overwritten in place (a FUSE overwrite
                             // republishes as a Normal layout with a fresh
                             // blob), so they carry no rows.
+                            let snapshot =
+                                ReadSnapshot::new(read_namespace, mpu_key, mpu_obj.clone());
                             get_full_blob_stream(
                                 blob_client,
+                                snapshot,
                                 blob_guid,
                                 num_blocks,
                                 mpu_size,
@@ -489,6 +577,7 @@ async fn get_object_range_content(
     range: &std::ops::Range<usize>,
     trace_id: &TraceId,
 ) -> Result<std::pin::Pin<Box<dyn stream::Stream<Item = Result<Bytes, S3Error>> + Send>>, S3Error> {
+    let read_namespace = ReadNamespace::new(app.clone(), bucket);
     let blob_client = app
         .get_blob_client(&bucket.routing_key)
         .await
@@ -508,8 +597,10 @@ async fn get_object_range_content(
                 trace_id,
             )
             .await?;
+            let snapshot = ReadSnapshot::new(read_namespace, key, object.clone());
             let body_stream = get_range_blob_stream(
                 blob_client,
+                snapshot,
                 blob_guid,
                 block_size,
                 object_size,
@@ -538,7 +629,7 @@ async fn get_object_range_content(
                 Err(S3Error::InvalidObjectState)
             }
             MpuState::Completed { .. } => {
-                let mpu_prefix = mpu_get_part_prefix(key, 0);
+                let mpu_prefix = mpu_get_part_prefix(key, object.version_id, 0);
                 let mpus = list_raw_objects(
                     &app,
                     &bucket.routing_key,
@@ -552,9 +643,9 @@ async fn get_object_range_content(
                 )
                 .await?;
 
-                let mut mpu_blobs: Vec<(DataBlobGuid, u64, usize, usize, usize)> = Vec::new();
+                let mut mpu_blobs: Vec<(String, ObjectLayout, usize, usize)> = Vec::new();
                 let mut obj_offset = 0;
-                for (_mpu_key, mpu_obj) in mpus {
+                for (mpu_key, mpu_obj) in mpus {
                     let mpu_size = mpu_obj.size()? as usize;
                     if obj_offset >= range.end {
                         break;
@@ -567,43 +658,41 @@ async fn get_object_range_content(
                         } else {
                             range.end - obj_offset
                         };
-                        let part_size = mpu_obj.size()?;
-                        let part_num_blocks = mpu_obj.num_blocks()?;
-                        mpu_blobs.push((
-                            mpu_obj.blob_guid()?,
-                            part_size,
-                            part_num_blocks,
-                            blob_start,
-                            blob_end,
-                        ));
+                        mpu_blobs.push((mpu_key, mpu_obj, blob_start, blob_end));
                     }
                     obj_offset += mpu_size;
                 }
 
                 let trace_id = *trace_id;
+                let read_namespace = read_namespace.clone();
                 let body_stream = stream::iter(mpu_blobs)
-                    .then(
-                        move |(blob_guid, part_size, part_num_blocks, blob_start, blob_end)| {
-                            let blob_client = blob_client.clone();
-                            async move {
-                                // Note: In MPU range case, we need to determine blob_location from the specific MPU object
-                                // For now, assume all MPU parts use S3 storage (large objects)
-                                Ok::<_, S3Error>(get_range_blob_stream(
-                                    blob_client,
-                                    blob_guid,
-                                    block_size,
-                                    part_size,
-                                    part_num_blocks,
-                                    blob_start,
-                                    blob_end,
-                                    BlobLocation::S3,
-                                    None,
-                                    1,
-                                    trace_id,
-                                ))
-                            }
-                        },
-                    )
+                    .then(move |(mpu_key, mpu_obj, blob_start, blob_end)| {
+                        let blob_client = blob_client.clone();
+                        let read_namespace = read_namespace.clone();
+                        async move {
+                            let blob_guid = mpu_obj.blob_guid()?;
+                            let part_size = mpu_obj.size()?;
+                            let part_num_blocks = mpu_obj.num_blocks()?;
+                            let block_size = mpu_obj.block_size as usize;
+                            let blob_location = mpu_obj.get_blob_location()?;
+                            let ceiling = mpu_obj.blob_version;
+                            let snapshot = ReadSnapshot::new(read_namespace, mpu_key, mpu_obj);
+                            Ok::<_, S3Error>(get_range_blob_stream(
+                                blob_client,
+                                snapshot,
+                                blob_guid,
+                                block_size,
+                                part_size,
+                                part_num_blocks,
+                                blob_start,
+                                blob_end,
+                                blob_location,
+                                None,
+                                ceiling,
+                                trace_id,
+                            ))
+                        }
+                    })
                     .try_flatten();
                 Ok(Box::pin(body_stream))
             }
@@ -614,6 +703,7 @@ async fn get_object_range_content(
 #[allow(clippy::too_many_arguments)]
 async fn get_full_blob_stream(
     blob_client: Arc<BlobClient>,
+    snapshot: Arc<ReadSnapshot>,
     blob_guid: DataBlobGuid,
     num_blocks: usize,
     object_size: u64,
@@ -635,6 +725,7 @@ async fn get_full_blob_stream(
 
     let first_block = read_block(
         &blob_client,
+        &snapshot,
         blob_guid,
         0,
         first_block_len,
@@ -657,6 +748,7 @@ async fn get_full_blob_stream(
     // Multi-block case: stream first block + remaining blocks
     let remaining_stream = stream::iter(1..num_blocks).then(move |i| {
         let blob_client = blob_client.clone();
+        let snapshot = snapshot.clone();
         let rows = rows.clone();
         async move {
             let is_last_block = i == num_blocks - 1;
@@ -667,6 +759,7 @@ async fn get_full_blob_stream(
             };
             read_block(
                 &blob_client,
+                &snapshot,
                 blob_guid,
                 i as u32,
                 content_len,
@@ -690,6 +783,7 @@ async fn get_full_blob_stream(
 #[allow(clippy::too_many_arguments)]
 fn get_range_blob_stream(
     blob_client: Arc<BlobClient>,
+    snapshot: Arc<ReadSnapshot>,
     blob_guid: DataBlobGuid,
     block_size: usize,
     object_size: u64,
@@ -709,6 +803,7 @@ fn get_range_blob_stream(
     futures::stream::iter(start_block_i..=end_block_i)
         .then(move |i| {
             let blob_client = blob_client.clone();
+            let snapshot = snapshot.clone();
             let rows = rows.clone();
             async move {
                 // For range reads, we always read full blocks and trim in the scan below
@@ -721,6 +816,7 @@ fn get_range_blob_stream(
                 };
                 read_block(
                     &blob_client,
+                    &snapshot,
                     blob_guid,
                     i as u32,
                     content_len,
@@ -817,4 +913,73 @@ fn parse_range_header(
         None => None,
     };
     Ok(range)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_committed_read_snapshot;
+    use data_types::DataBlobGuid;
+    use data_types::object_layout::{
+        ObjectCoreMetaData, ObjectLayout, ObjectMetaData, ObjectState,
+    };
+    use uuid::Uuid;
+
+    fn normal_layout() -> ObjectLayout {
+        let blob_id = Uuid::now_v7();
+        ObjectLayout {
+            timestamp: 1,
+            version_id: Uuid::now_v7(),
+            block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
+            blob_version: 3,
+            fs_ext: None,
+            state: ObjectState::Normal(ObjectMetaData {
+                blob_guid: DataBlobGuid {
+                    blob_id,
+                    volume_id: 7,
+                },
+                core_meta_data: ObjectCoreMetaData {
+                    size: u64::from(ObjectLayout::DEFAULT_BLOCK_SIZE) * 2,
+                    etag: blob_id.simple().to_string(),
+                    headers: Vec::new(),
+                    checksum: None,
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn read_snapshot_ignores_prepare_only_and_posix_changes() {
+        let expected = normal_layout();
+        let mut current = expected.clone();
+        current.timestamp += 1;
+        current.set_next_version(expected.blob_version + 2);
+        current.set_pending_append(Some((2, 4)));
+
+        assert!(same_committed_read_snapshot(&expected, &current));
+    }
+
+    #[test]
+    fn read_snapshot_rejects_committed_data_changes() {
+        let expected = normal_layout();
+
+        let mut current = expected.clone();
+        current.version_id = Uuid::now_v7();
+        assert!(!same_committed_read_snapshot(&expected, &current));
+
+        let mut current = expected.clone();
+        current.blob_version += 1;
+        assert!(!same_committed_read_snapshot(&expected, &current));
+
+        let mut current = expected.clone();
+        current.set_map_epoch(4);
+        assert!(!same_committed_read_snapshot(&expected, &current));
+
+        let metadata = match &mut current.state {
+            ObjectState::Normal(metadata) => Some(metadata),
+            _ => None,
+        }
+        .expect("normal layout helper must create a normal state");
+        metadata.core_meta_data.size += 1;
+        assert!(!same_committed_read_snapshot(&expected, &current));
+    }
 }

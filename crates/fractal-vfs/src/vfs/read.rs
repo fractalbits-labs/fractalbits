@@ -118,7 +118,10 @@ impl VfsCore {
         let actual_len = (read_end - offset) as usize;
         let trace_id = TraceId::new();
 
-        let parts = self.backend().list_mpu_parts(key, &trace_id).await?;
+        let parts = self
+            .backend()
+            .list_mpu_parts(key, layout.version_id, &trace_id)
+            .await?;
 
         let mut result = BytesMut::with_capacity(actual_len);
         let mut obj_offset: u64 = 0;

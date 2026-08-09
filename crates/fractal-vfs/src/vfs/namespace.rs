@@ -1055,7 +1055,11 @@ impl VfsCore {
                 self.teardown_blob(&old_layout).await;
             }
             ObjectState::Mpu(MpuState::Completed(_)) => {
-                if let Ok(parts) = self.backend().list_mpu_parts(key, trace_id).await {
+                if let Ok(parts) = self
+                    .backend()
+                    .list_mpu_parts(key, old_layout.version_id, trace_id)
+                    .await
+                {
                     for (part_key, part_layout) in &parts {
                         self.teardown_blob(part_layout).await;
                         let _ = self.backend().delete_inode(part_key, trace_id).await;

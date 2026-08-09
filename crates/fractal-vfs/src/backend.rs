@@ -291,9 +291,10 @@ impl StorageBackend {
     pub async fn list_mpu_parts(
         &self,
         key: &str,
+        upload_id: uuid::Uuid,
         trace_id: &TraceId,
     ) -> Result<Vec<(String, ObjectLayout)>, FsError> {
-        let mpu_prefix = mpu_get_part_prefix(key.to_string(), 0);
+        let mpu_prefix = mpu_get_part_prefix(key.to_string(), upload_id, 0);
         let resp = nss_rpc_retry!(
             self.nss_client.borrow(),
             list_inodes(

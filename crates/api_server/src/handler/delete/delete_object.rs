@@ -2,7 +2,9 @@ use crate::{
     blob_client::enqueue_blob_deletion,
     handler::{
         ObjectRequestContext,
-        common::{list_raw_objects, mpu_get_part_prefix, s3_error::S3Error},
+        common::{
+            list_raw_objects, mpu_get_part_prefix, mpu_get_uploads_prefix, s3_error::S3Error,
+        },
     },
 };
 use actix_web::HttpResponse;
@@ -52,7 +54,7 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
                 bucket.bucket_name,
                 ctx.key
             );
-            let mpu_prefix = mpu_get_part_prefix(ctx.key.clone(), 0);
+            let mpu_prefix = mpu_get_uploads_prefix(ctx.key.clone());
             if let Ok(mpus) = list_raw_objects(
                 &ctx.app,
                 routing_key,
@@ -132,7 +134,7 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
                 }
                 MpuState::Completed { .. } => {
                     // Clean up completed multipart upload parts
-                    let mpu_prefix = mpu_get_part_prefix(ctx.key.clone(), 0);
+                    let mpu_prefix = mpu_get_part_prefix(ctx.key.clone(), object.version_id, 0);
                     let mpus = list_raw_objects(
                         &ctx.app,
                         routing_key,

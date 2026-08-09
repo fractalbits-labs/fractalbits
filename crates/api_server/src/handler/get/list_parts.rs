@@ -152,7 +152,9 @@ async fn fetch_mpu_parts(
     max_parts: u32,
     trace_id: &TraceId,
 ) -> Result<(Vec<Part>, Option<u32>), S3Error> {
-    let mpu_prefix = mpu_get_part_prefix(key.clone(), 0);
+    let upload_id =
+        uuid::Uuid::parse_str(&query_opts.upload_id).map_err(|_| S3Error::NoSuchUpload)?;
+    let mpu_prefix = mpu_get_part_prefix(key.clone(), upload_id, 0);
     let mpus = list_raw_objects(
         &app,
         &bucket.routing_key,
