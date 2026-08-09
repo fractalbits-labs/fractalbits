@@ -33,11 +33,9 @@ pub async fn upload_part_handler(
     }
 
     // Basic upload_id validation - check it's a valid UUID format
-    if uuid::Uuid::parse_str(&upload_id).is_err() {
-        return Err(S3Error::NoSuchUpload);
-    }
+    let upload_uuid = uuid::Uuid::parse_str(&upload_id).map_err(|_| S3Error::NoSuchUpload)?;
 
-    let part_key = mpu_get_part_prefix(ctx.key.clone(), part_number);
+    let part_key = mpu_get_part_prefix(ctx.key.clone(), upload_uuid, part_number);
     tracing::debug!(
         "Upload part {} for upload {} to {}/{}",
         part_number,
