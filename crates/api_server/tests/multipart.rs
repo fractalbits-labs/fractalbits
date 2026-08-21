@@ -189,6 +189,57 @@ async fn test_multipart_upload() {
         }
     }
 
+    {
+        // Ranged GETs across part boundaries. An unaligned start that ran past
+        // its part used to come back short by the in-part offset. Aligned
+        // starts cancelled it out, so only unaligned readers hit it.
+        let full = [&u2[..], &u3[..], &u5[..]].concat();
+        let total = full.len();
+        let p = SZ_5MB;
+
+        let cases: [(usize, usize, &str); 8] = [
+            (1, p - 1, "unaligned start, stays inside part 0"),
+            (p, 2 * p - 1, "aligned start, exactly part 1"),
+            (p + 128, 2 * p - 1, "unaligned start, ends on part boundary"),
+            (
+                p + 128,
+                2 * p + 127,
+                "unaligned start, crosses one boundary",
+            ),
+            (p - 1024, p + 1023, "small range straddling a boundary"),
+            (p + 1, 3 * p - 1, "unaligned by 1, crosses two boundaries"),
+            (0, total - 1, "whole object as an explicit range"),
+            (total - 5, total - 1, "tail of the object"),
+        ];
+
+        for (start, end, what) in cases {
+            let o = ctx
+                .client
+                .get_object()
+                .bucket(&bucket)
+                .key("a")
+                .range(format!("bytes={start}-{end}"))
+                .send()
+                .await
+                .unwrap();
+
+            let want_len = end - start + 1;
+            assert_eq!(
+                o.content_length.unwrap(),
+                want_len as i64,
+                "content-length mismatch for {what} (bytes={start}-{end})"
+            );
+            assert_eq!(
+                o.content_range.as_deref().unwrap(),
+                format!("bytes {start}-{end}/{total}"),
+                "content-range mismatch for {what}"
+            );
+            // Catches a short body and a right-sized one read from the wrong
+            // offset.
+            assert_bytes_eq!(o.body, &full[start..=end]);
+        }
+    }
+
     ctx.client
         .delete_object()
         .bucket(&bucket)

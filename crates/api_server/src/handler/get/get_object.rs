@@ -378,9 +378,11 @@ async fn get_object_range_content(
                     }
                     // with intersection
                     if obj_offset < range.end && obj_offset + mpu_size > range.start {
+                        // [start, end) within this part. If the range runs past
+                        // the part, read to its end.
                         let blob_start = range.start.saturating_sub(obj_offset);
                         let blob_end = if range.end > obj_offset + mpu_size {
-                            mpu_size - blob_start
+                            mpu_size
                         } else {
                             range.end - obj_offset
                         };
