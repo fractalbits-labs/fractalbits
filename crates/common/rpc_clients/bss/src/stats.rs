@@ -72,6 +72,25 @@ impl BssStats {
     }
 }
 
+/// In-flight counter guard: decrements on drop so a cancelled RPC
+/// future does not leak the count.
+pub struct BssStatsGuard {
+    op: OperationType,
+}
+
+impl BssStatsGuard {
+    pub fn new(op: OperationType) -> Self {
+        get_global_bss_stats().increment(op);
+        Self { op }
+    }
+}
+
+impl Drop for BssStatsGuard {
+    fn drop(&mut self) {
+        get_global_bss_stats().decrement(self.op);
+    }
+}
+
 static GLOBAL_BSS_STATS: OnceLock<BssStats> = OnceLock::new();
 
 pub fn get_global_bss_stats() -> &'static BssStats {
