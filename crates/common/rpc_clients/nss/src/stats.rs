@@ -109,6 +109,25 @@ impl NssStats {
     }
 }
 
+/// In-flight counter guard: decrements on drop so a cancelled RPC
+/// future does not leak the count.
+pub struct NssStatsGuard {
+    op: NssOperation,
+}
+
+impl NssStatsGuard {
+    pub fn new(op: NssOperation) -> Self {
+        get_global_nss_stats().increment(op);
+        Self { op }
+    }
+}
+
+impl Drop for NssStatsGuard {
+    fn drop(&mut self) {
+        get_global_nss_stats().decrement(self.op);
+    }
+}
+
 static GLOBAL_NSS_STATS: OnceLock<NssStats> = OnceLock::new();
 
 pub fn get_global_nss_stats() -> &'static NssStats {
