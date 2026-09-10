@@ -20,12 +20,12 @@ output "nss_instance_group" {
 
 output "api_lb_ip" {
   value       = var.with_bench ? "" : google_compute_forwarding_rule.api_lb[0].ip_address
-  description = "API server load balancer IP"
+  description = "S3 gateway load balancer IP"
 }
 
 output "api_instance_group" {
-  value       = google_compute_instance_group_manager.api_servers.instance_group
-  description = "API server instance group URL"
+  value       = google_compute_instance_group_manager.s3_gateways.instance_group
+  description = "S3 gateway instance group URL"
 }
 
 output "bss_instance_group" {

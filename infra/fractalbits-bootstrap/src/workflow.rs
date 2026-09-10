@@ -34,7 +34,7 @@ impl WorkflowServiceType {
             Self::Rss => "root_server",
             Self::Nss => "nss_server",
             Self::Bss => "bss_server",
-            Self::Api => "api_server",
+            Self::Api => "s3_gateway",
             Self::Bench => "bench",
         }
     }

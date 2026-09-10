@@ -1,5 +1,5 @@
 [package]
-name = "api_server"
+name = "s3_gateway"
 version = "0.1.0"
 edition = "2024"
 

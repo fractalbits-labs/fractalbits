@@ -28,7 +28,7 @@ const SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const ROW_TEARDOWN_PAGE: u32 = 1000;
 
 // Grace before reclaiming a superseded generation: see
-// `rpc_client_common::reclamation_grace` (shared with the api_server
+// `rpc_client_common::reclamation_grace` (shared with the s3_gateway
 // deletion worker). A read that outlives it can fail mid-flight but
 // never sees wrong bytes (keys are write-once: the failure mode is a
 // miss, not stale data).

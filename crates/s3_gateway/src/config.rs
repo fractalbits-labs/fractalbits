@@ -148,7 +148,7 @@ impl Config {
             rss_rpc_timeout_seconds: 30,
             client_request_timeout_seconds: 120,
             ec_read_hedge_delay_ms: default_ec_read_hedge_delay_ms(),
-            stats_dir: "data/api-server/local/stats".into(),
+            stats_dir: "data/s3-gateway/local/stats".into(),
             enable_stats_writer: false,
             blob_storage: BlobStorageConfig {
                 backend: BlobStorageBackend::S3HybridSingleAz,
@@ -182,7 +182,7 @@ impl Config {
             rss_rpc_timeout_seconds: 30,
             client_request_timeout_seconds: 120,
             ec_read_hedge_delay_ms: default_ec_read_hedge_delay_ms(),
-            stats_dir: "data/api-server/local/stats".into(),
+            stats_dir: "data/s3-gateway/local/stats".into(),
             enable_stats_writer: false,
             blob_storage: BlobStorageConfig {
                 backend: BlobStorageBackend::AllInBssSingleAz,

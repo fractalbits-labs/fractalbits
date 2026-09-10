@@ -1,4 +1,3 @@
-mod api_server;
 mod aws;
 mod bench_client;
 mod bench_server;
@@ -12,6 +11,7 @@ mod gcp;
 mod gui_server;
 mod nss_server;
 mod root_server;
+mod s3_gateway;
 mod stage_helpers;
 mod workflow;
 
@@ -95,9 +95,9 @@ fn generic_bootstrap_with_args(cli_args: CliArgs) -> CmdResult {
             nss_server::bootstrap(&config, journal_uuid.as_deref())?;
             "nss_server"
         }
-        ServiceType::ApiServer => {
-            api_server::bootstrap(&config)?;
-            "api_server"
+        ServiceType::S3Gateway => {
+            s3_gateway::bootstrap(&config)?;
+            "s3_gateway"
         }
         ServiceType::BssServer => {
             bss_server::bootstrap(&config)?;

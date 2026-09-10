@@ -20,12 +20,12 @@ This will output information about all instances in the stack:
 
 ```
 Name                                      InstanceId           State    InstanceType  AvailabilityZone  ZoneId    PrivateIP
-FractalbitsVpcStack/ApiServerAsgTemplate  i-0dc3f71d451869872  running  c8g.xlarge    us-west-2c        usw2-az3  10.0.0.30
+FractalbitsVpcStack/S3GatewayAsgTemplate  i-0dc3f71d451869872  running  c8g.xlarge    us-west-2c        usw2-az3  10.0.0.30
 FractalbitsVpcStack/BssAsgTemplate        i-091d633bef683dd77  running  i8g.2xlarge   us-west-2c        usw2-az3  10.0.0.47
 FractalbitsVpcStack/nss-A                 i-05efb2e685f5133e7  running  m7gd.2xlarge  us-west-2c        usw2-az3  10.0.0.51
 FractalbitsVpcStack/rss-A                 i-0b97a853c3e223dc0  running  c7g.medium    us-west-2c        usw2-az3  10.0.0.239
 
-API Server NLB Endpoint: Fracta-ApiNL-MjXkOlrQipZk-46642fe5831d2804.elb.us-west-2.amazonaws.com
+S3 Gateway NLB Endpoint: Fracta-ApiNL-MjXkOlrQipZk-46642fe5831d2804.elb.us-west-2.amazonaws.com
 ```
 
 Note the Instance ID of the RSS instance (look for the row with name ending in `/rss-A`).
@@ -92,10 +92,10 @@ Note that the list command only shows the Access Key ID, not the Secret Access K
 
 ## Using the API Key
 
-Once created, use the credentials to authenticate S3 API requests against the API Server NLB endpoint shown in the stack description.
+Once created, use the credentials to authenticate S3 API requests against the S3 Gateway NLB endpoint shown in the stack description.
 
 Configure your S3 client with:
-- **Endpoint URL**: The API Server NLB Endpoint from `just describe-stack`
+- **Endpoint URL**: The S3 Gateway NLB Endpoint from `just describe-stack`
 - **Access Key ID**: From the create command output
 - **Secret Access Key**: From the create command output
 

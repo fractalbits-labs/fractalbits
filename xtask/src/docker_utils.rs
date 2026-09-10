@@ -6,7 +6,7 @@
 use cmd_lib::*;
 
 /// Rust binaries built from the main repo (always built from source for Docker)
-pub const LOCAL_RUST_BINS: &[&str] = &["api_server", "container-all-in-one"];
+pub const LOCAL_RUST_BINS: &[&str] = &["s3_gateway", "container-all-in-one"];
 
 /// Rust binaries from external repos (may use prebuilt fallback)
 pub const EXTERNAL_RUST_BINS: &[&str] = &["root_server", "rss_admin", "nss_role_agent"];

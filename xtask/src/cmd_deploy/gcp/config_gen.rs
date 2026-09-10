@@ -15,7 +15,7 @@ pub struct GcpDeployParams<'a> {
     pub rss_backend: xtask_common::RssBackend,
     pub rss_ha_enabled: bool,
     pub num_bss_nodes: usize,
-    pub num_api_servers: usize,
+    pub num_s3_gateways: usize,
     pub num_bench_clients: usize,
     pub with_bench: bool,
     pub use_generic_binaries: bool,
@@ -58,7 +58,7 @@ pub fn generate_bootstrap_config(
             rss_backend: params.rss_backend,
             num_nss_nodes: Some(1), // NSS MIG runs as managed singleton (target_size=1)
             num_bss_nodes: Some(params.num_bss_nodes),
-            num_api_servers: Some(params.num_api_servers),
+            num_s3_gateways: Some(params.num_s3_gateways),
             num_bench_clients: if params.with_bench {
                 Some(params.num_bench_clients)
             } else {
