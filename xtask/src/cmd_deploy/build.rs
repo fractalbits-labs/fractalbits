@@ -157,10 +157,17 @@ fn build_rust_for_target(
     let arch = target.arch;
 
     // Common excludes for all deploy builds
-    let mut excludes: Vec<String> = ["xtask", "fractalbits-bootstrap", "fractal-s3", "rewrk_rpc"]
-        .iter()
-        .flat_map(|pkg| vec!["--exclude".to_string(), pkg.to_string()])
-        .collect();
+    let mut excludes: Vec<String> = [
+        "xtask",
+        "fractalbits-bootstrap",
+        "fractal-s3",
+        "rewrk_rpc",
+        "fs_gateway",
+        "fs_client",
+    ]
+    .iter()
+    .flat_map(|pkg| vec!["--exclude".to_string(), pkg.to_string()])
+    .collect();
     for pkg in extra_excludes {
         excludes.push("--exclude".to_string());
         excludes.push(pkg.to_string());
@@ -192,6 +199,25 @@ fn build_rust_for_target(
                 --package s3_gateway;
         }?;
     }
+
+    let compio_target_dir = cmd_build::COMPIO_TARGET_DIR;
+    let profile = if rust_build_opt.is_empty() {
+        "debug"
+    } else {
+        "release"
+    };
+    let destination = format!("target/{rust_target}/{profile}");
+    run_cmd! {
+        info "Building fs_gateway + fractalbits-mount for $rust_target (isolated compio build)";
+        RUSTFLAGS="-C target-cpu=$rust_cpu"
+        CARGO_TARGET_DIR=$compio_target_dir
+        $[build_envs] cargo zigbuild
+            --target $rust_target $rust_build_opt -p fs_gateway -p fs_client;
+        mkdir -p $destination;
+        cp $compio_target_dir/$rust_target/$profile/fs_gateway $destination/fs_gateway;
+        cp $compio_target_dir/$rust_target/$profile/fractalbits-mount
+            $destination/fractalbits-mount;
+    }?;
     Ok(())
 }
 

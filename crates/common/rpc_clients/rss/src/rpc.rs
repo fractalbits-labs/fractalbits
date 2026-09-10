@@ -30,7 +30,7 @@ impl RpcClient {
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
-        header.command = Command::Put;
+        header.command = Command::Put as i32;
         header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
         header.retry_count = retry_count as u8;
         header.set_trace_id(trace_id);
@@ -84,7 +84,7 @@ impl RpcClient {
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
-        header.command = Command::Get;
+        header.command = Command::Get as i32;
         header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
         header.retry_count = retry_count as u8;
         header.set_trace_id(trace_id);
@@ -138,7 +138,7 @@ impl RpcClient {
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
-        header.command = Command::Delete;
+        header.command = Command::Delete as i32;
         header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
         header.retry_count = retry_count as u8;
         header.set_trace_id(trace_id);
@@ -187,7 +187,7 @@ impl RpcClient {
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
-        header.command = Command::GetNssRole;
+        header.command = Command::GetNssRole as i32;
         header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
         header.retry_count = retry_count as u8;
         header.set_trace_id(trace_id);
@@ -236,7 +236,7 @@ impl RpcClient {
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
-        header.command = Command::List;
+        header.command = Command::List as i32;
         header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
         header.retry_count = retry_count as u8;
         header.set_trace_id(trace_id);
@@ -287,7 +287,7 @@ impl RpcClient {
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
-        header.command = Command::CreateBucket;
+        header.command = Command::CreateBucket as i32;
         header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
         header.retry_count = retry_count as u8;
         header.set_trace_id(trace_id);
@@ -349,7 +349,7 @@ impl RpcClient {
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
-        header.command = Command::DeleteBucket;
+        header.command = Command::DeleteBucket as i32;
         header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
         header.retry_count = retry_count as u8;
         header.set_trace_id(trace_id);
@@ -393,7 +393,7 @@ impl RpcClient {
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
-        header.command = Command::GetDataVgInfo;
+        header.command = Command::GetDataVgInfo as i32;
         header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
         header.set_trace_id(trace_id);
 
@@ -462,7 +462,7 @@ impl RpcClient {
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
-        header.command = Command::GetMetadataVgInfo;
+        header.command = Command::GetMetadataVgInfo as i32;
         header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
         header.retry_count = retry_count as u8;
         header.set_trace_id(trace_id);
@@ -507,7 +507,7 @@ impl RpcClient {
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
-        header.command = Command::GetJournalVgInfo;
+        header.command = Command::GetJournalVgInfo as i32;
         header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
         header.retry_count = retry_count as u8;
         header.set_trace_id(trace_id);
@@ -552,7 +552,7 @@ impl RpcClient {
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
-        header.command = Command::GetJournalConfig;
+        header.command = Command::GetJournalConfig as i32;
         header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
         header.retry_count = retry_count as u8;
         header.set_trace_id(trace_id);
@@ -600,7 +600,7 @@ impl RpcClient {
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
-        header.command = Command::GetActiveNssAddress;
+        header.command = Command::GetActiveNssAddress as i32;
         header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
         header.retry_count = retry_count as u8;
         header.set_trace_id(trace_id);

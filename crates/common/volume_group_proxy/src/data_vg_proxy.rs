@@ -276,6 +276,15 @@ pub enum VolumeSelectionPolicy {
 
 /// Grace period before an EC read hedges with parity shards. Set near
 /// the per-shard p95 fetch latency (see `datavg_get_blob_node_nanos`).
+/// Result of a write-once `put_blob`. See `DataVgProxy::put_blob`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutBlobOutcome {
+    /// Every acknowledging replica stored the caller's bytes.
+    Stored,
+    /// Some replica already held this exact key and skipped the write.
+    AlreadyPresent,
+}
+
 pub const DEFAULT_EC_HEDGE_DELAY: Duration = Duration::from_millis(5);
 
 pub struct DataVgProxy {
@@ -697,6 +706,10 @@ impl DataVgProxy {
     }
 
     /// Multi-BSS put_blob with quorum-based replication or EC encoding
+    /// Write-once put. `AlreadyPresent` means at least one replica already
+    /// held this exact key (BSS `VersionSkipped`), so the stored bytes are
+    /// not necessarily the caller's; callers that cache what they wrote
+    /// must not trust `body` in that case.
     pub async fn put_blob(
         &self,
         blob_guid: DataBlobGuid,
@@ -704,7 +717,7 @@ impl DataVgProxy {
         body: Bytes,
         version: u64,
         trace_id: &TraceId,
-    ) -> Result<(), DataVgError> {
+    ) -> Result<PutBlobOutcome, DataVgError> {
         self.put_blob_inner(blob_guid, block_number, body, version, trace_id)
             .await
     }
@@ -716,7 +729,7 @@ impl DataVgProxy {
         body: Bytes,
         version: u64,
         trace_id: &TraceId,
-    ) -> Result<(), DataVgError> {
+    ) -> Result<PutBlobOutcome, DataVgError> {
         let selected_volume = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
             DataVgError::InitializationError(format!(
                 "Volume {} not found in DataVgProxy",
@@ -799,12 +812,16 @@ impl DataVgProxy {
         }
 
         let mut successful_writes = 0;
+        let mut outcome = PutBlobOutcome::Stored;
         let mut errors = Vec::with_capacity(available_nodes.len());
 
         // Wait only until we achieve write quorum
         while let Some((node, address, result)) = write_futures.next().await {
             match result {
                 Ok(()) | Err(RpcError::VersionSkipped) => {
+                    if result.is_err() {
+                        outcome = PutBlobOutcome::AlreadyPresent;
+                    }
                     node.record_success();
                     successful_writes += 1;
                     debug!("Successful write to BSS node: {}", address);
@@ -855,7 +872,7 @@ impl DataVgProxy {
                     blob_guid.blob_id,
                     block_number
                 );
-                return Ok(());
+                return Ok(outcome);
             }
         }
 
@@ -903,7 +920,8 @@ impl DataVgProxy {
                     version,
                     trace_id,
                 )
-                .await;
+                .await
+                .map(|_| ());
         }
 
         selected_volume.inflight.fetch_add(1, Ordering::Relaxed);
@@ -1587,7 +1605,7 @@ impl DataVgProxy {
         body: Bytes,
         version: u64,
         trace_id: &TraceId,
-    ) -> Result<(), DataVgError> {
+    ) -> Result<PutBlobOutcome, DataVgError> {
         let start = Instant::now();
         let trace_id = *trace_id;
         histogram!("blob_size", "operation" => "put_ec").record(body.len() as f64);
@@ -1596,7 +1614,7 @@ impl DataVgProxy {
         if body.is_empty() {
             histogram!("datavg_put_blob_nanos", "result" => "ec_empty")
                 .record(start.elapsed().as_nanos() as f64);
-            return Ok(());
+            return Ok(PutBlobOutcome::Stored);
         }
 
         let ec_vol = self.find_volume(blob_guid.volume_id).ok_or_else(|| {
@@ -1689,11 +1707,15 @@ impl DataVgProxy {
         }
 
         let mut successful_writes = 0;
+        let mut outcome = PutBlobOutcome::Stored;
         let mut errors = Vec::new();
 
         while let Some((node, address, result)) = write_futures.next().await {
             match result {
                 Ok(()) | Err(RpcError::VersionSkipped) => {
+                    if result.is_err() {
+                        outcome = PutBlobOutcome::AlreadyPresent;
+                    }
                     node.record_success();
                     successful_writes += 1;
                     debug!("EC shard write success to {}", address);
@@ -1740,7 +1762,7 @@ impl DataVgProxy {
                     "EC write quorum achieved ({}/{}) for blob {}:{}, original_len={}",
                     successful_writes, total, blob_guid.blob_id, block_number, original_len
                 );
-                return Ok(());
+                return Ok(outcome);
             }
         }
 

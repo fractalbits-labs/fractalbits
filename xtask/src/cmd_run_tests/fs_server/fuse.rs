@@ -3925,6 +3925,7 @@ impl RawDataAccess {
             Self::DataVg(proxy) => proxy
                 .put_blob(blob_guid, block, body, version, &TraceId::new())
                 .await
+                .map(|_| ())
                 .map_err(std::io::Error::other),
             Self::S3(store) => store
                 .put(blob_guid.blob_id, block, version, body.into())
