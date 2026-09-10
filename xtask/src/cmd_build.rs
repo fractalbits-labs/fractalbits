@@ -333,6 +333,8 @@ pub fn build_prebuilt_dev() -> CmdResult {
             "nss_role_agent",
             "root_server",
             "rss_admin",
+            "fs_gateway",
+            "fractalbits-mount",
             "zig-out/bin/bss_server",
             "zig-out/bin/nss_server",
         ] {

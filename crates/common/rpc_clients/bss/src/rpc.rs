@@ -148,7 +148,7 @@ impl RpcClient {
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
-        header.command = Command::ListBlobs;
+        header.command = Command::ListBlobs as i32;
         header.volume_id = volume_id;
         header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
         header.retry_count = retry_count as u8;
@@ -199,7 +199,7 @@ impl RpcClient {
             header.id = request_id;
             header.blob_id = blob_guid.blob_id.into_bytes();
             header.volume_id = blob_guid.volume_id;
-            header.command = Command::ListBlobBlocks;
+            header.command = Command::ListBlobBlocks as i32;
             header.size = (size_of::<MessageHeader>() + body_bytes.len()) as u32;
             header.retry_count = retry_count as u8;
             header.trace_id = trace_id.0;
@@ -317,7 +317,7 @@ impl RpcClient {
         header.blob_id = blob_guid.blob_id.into_bytes();
         header.volume_id = blob_guid.volume_id;
         header.block_number = block_number;
-        header.command = Command::PutDataBlob;
+        header.command = Command::PutDataBlob as i32;
         header.body_len = body.len() as u32;
         header.size = size_of::<MessageHeader>() as u32 + header.body_len;
         header.retry_count = retry_count as u8;
@@ -359,7 +359,7 @@ impl RpcClient {
         header.blob_id = blob_guid.blob_id.into_bytes();
         header.volume_id = blob_guid.volume_id;
         header.block_number = block_number;
-        header.command = Command::PutDataBlob;
+        header.command = Command::PutDataBlob as i32;
         let total_size: usize = chunks.iter().map(|c| c.len()).sum();
         header.body_len = total_size as u32;
         header.size = size_of::<MessageHeader>() as u32 + header.body_len;
@@ -409,7 +409,7 @@ impl RpcClient {
         header.blob_id = blob_guid.blob_id.into_bytes();
         header.volume_id = blob_guid.volume_id;
         header.block_number = block_number;
-        header.command = Command::GetDataBlob;
+        header.command = Command::GetDataBlob as i32;
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
         header.body_len = content_len as u32;
@@ -465,7 +465,7 @@ impl RpcClient {
         header.blob_id = blob_guid.blob_id.into_bytes();
         header.volume_id = blob_guid.volume_id;
         header.block_number = block_number;
-        header.command = Command::DeleteDataBlob;
+        header.command = Command::DeleteDataBlob as i32;
         header.size = size_of::<MessageHeader>() as u32;
         header.retry_count = retry_count as u8;
         header.trace_id = trace_id.0;
@@ -500,7 +500,7 @@ impl RpcClient {
         header.id = request_id;
         header.blob_id = blob_id;
         header.volume_id = volume_id;
-        header.command = Command::GetMetadataBlob;
+        header.command = Command::GetMetadataBlob as i32;
         header.skip_fence_token = 1;
         header.body_len = content_len as u32;
         header.size = size_of::<MessageHeader>() as u32;
@@ -548,7 +548,7 @@ impl RpcClient {
         header.id = request_id;
         header.blob_id = blob_id;
         header.volume_id = volume_id;
-        header.command = Command::PutMetadataBlob;
+        header.command = Command::PutMetadataBlob as i32;
         header.body_len = body.len() as u32;
         header.size = size_of::<MessageHeader>() as u32 + header.body_len;
         header.version = version;
@@ -587,7 +587,7 @@ impl RpcClient {
         header.id = request_id;
         header.blob_id = blob_id;
         header.volume_id = volume_id;
-        header.command = Command::DeleteMetadataBlob;
+        header.command = Command::DeleteMetadataBlob as i32;
         header.is_deleted = 1;
         header.version = version;
         header.skip_fence_token = 1;

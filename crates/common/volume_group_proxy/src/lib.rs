@@ -1,6 +1,7 @@
 pub mod data_vg_proxy;
 pub use data_vg_proxy::{
-    CircuitBreakerConfig, DEFAULT_EC_HEDGE_DELAY, DataVgProxy, VolumeSelectionPolicy,
+    CircuitBreakerConfig, DEFAULT_EC_HEDGE_DELAY, DataVgProxy, PutBlobOutcome,
+    VolumeSelectionPolicy,
 };
 
 #[derive(Debug, thiserror::Error)]
