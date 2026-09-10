@@ -579,6 +579,9 @@ pub struct FsServerConfig {
     /// FUSE mount. The host's `/etc/fuse.conf` must have
     /// `user_allow_other` enabled for this to take effect.
     pub allow_other: bool,
+    /// Data volume for files created through the mount: `bss`, `s3`, or
+    /// empty to follow the cluster's blob backend (S3 when hybrid).
+    pub data_volume: String,
 }
 
 impl Default for InitConfig {
@@ -651,6 +654,13 @@ pub enum TestType {
     FsServer {
         #[clap(long, help = "Run only with disk cache enabled")]
         disk_cache_only: bool,
+        #[clap(
+            long,
+            value_enum,
+            default_value = "all_in_bss_single_az",
+            help = "Data blob backend; s3_hybrid_single_az also puts fs_server data on S3"
+        )]
+        data_blob_storage: DataBlobStorage,
     },
     /// Build (on first run) and execute the pjdfstest POSIX
     /// compliance suite against a FUSE mount in writeback default
@@ -662,6 +672,13 @@ pub enum TestType {
             help = "Restrict to a single tests/<NAME>/ subgroup (e.g. chmod, mkdir, rename)"
         )]
         subdir: Option<String>,
+        #[clap(
+            long,
+            value_enum,
+            default_value = "all_in_bss_single_az",
+            help = "Data blob backend; s3_hybrid_single_az also puts fs_server data on S3"
+        )]
+        data_blob_storage: DataBlobStorage,
     },
 }
 

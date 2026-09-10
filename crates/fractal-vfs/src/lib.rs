@@ -11,6 +11,7 @@ pub mod disk_cache;
 pub mod error;
 pub mod inode;
 pub mod prefetch;
+pub mod s3_volume;
 pub mod slice_mut;
 pub mod vfs;
 pub mod writeback;

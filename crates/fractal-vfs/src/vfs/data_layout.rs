@@ -7,9 +7,9 @@ use crate::error::FsError;
 use crate::vfs::VfsCore;
 
 impl VfsCore {
-    /// Reject layouts whose data lives on the S3 hybrid volume: the FUSE
-    /// data path only speaks the BSS block protocol. Indirect (hardlink)
-    /// layouts are resolved to the shared record first.
+    /// Reject layouts whose data lives on the S3 volume when this mount
+    /// has no S3 access configured. Indirect (hardlink) layouts are
+    /// resolved to the shared record first.
     pub(crate) async fn ensure_data_layout_supported(
         &self,
         layout: &ObjectLayout,
@@ -28,6 +28,7 @@ impl VfsCore {
         };
         if let ObjectState::Normal(_) = &layout.state
             && layout.blob_guid()?.volume_id == DataBlobGuid::S3_VOLUME
+            && !self.backend().supports_s3_volume()
         {
             return Err(FsError::InvalidState);
         }

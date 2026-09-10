@@ -13,6 +13,7 @@ use data_types::{Bucket, DataBlobGuid, TraceId};
 use file_ops::{parse_get_inode, parse_list_inodes_raw, parse_put_inode, parse_put_inode_cas};
 use rpc_client_nss::RpcClientNss;
 use rpc_client_rss::RpcClientRss;
+use s3_blob_store::{S3BlobStore, create_s3_client};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Child, Command};
@@ -221,6 +222,9 @@ fn spawn_second_fuse(bucket: &str, read_write: bool) -> std::io::Result<Child> {
         .env("FS_SERVER_READ_WRITE", read_write.to_string())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    for (key, value) in cmd_service::fs_server_data_volume_env("") {
+        cmd.env(key, value);
+    }
     // Propagate LLVM_PROFILE_FILE for coverage instrumentation
     if let Ok(profile_file) = std::env::var("LLVM_PROFILE_FILE") {
         cmd.env("LLVM_PROFILE_FILE", profile_file);
@@ -304,6 +308,12 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
 
     // FUSE_TEST_FILTER=<substring> runs only matching tests (dev iteration).
     let test_filter = std::env::var("FUSE_TEST_FILTER").unwrap_or_default();
+
+    // BSS partition tests stop replicas to force write failures; with data
+    // on the S3 volume those outages are invisible to the mount.
+    let bss_data_volume = cmd_service::fs_server_data_volume_env("")
+        .iter()
+        .any(|(key, value)| *key == "FS_SERVER_DATA_VOLUME" && value == "bss");
 
     macro_rules! run_test {
         ($name:expr, $func:ident) => {
@@ -482,18 +492,25 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     // recovery between phases. The reference branch invokes it via a separate
     // wrapper for the same reason.
     if !disk_cache {
-        run_test!(
-            "Override Survives BSS Partition-Rejoin",
-            test_override_survives_bss_partition_rejoin
-        );
-        run_test!(
-            "Failed EC Overwrite Keeps Committed V1",
-            test_failed_ec_overwrite_keeps_committed_v1
-        );
-        run_test!(
-            "Overwrite Retry After EC Quorum Failure",
-            test_overwrite_retry_after_quorum_failure
-        );
+        if bss_data_volume {
+            run_test!(
+                "Override Survives BSS Partition-Rejoin",
+                test_override_survives_bss_partition_rejoin
+            );
+            run_test!(
+                "Failed EC Overwrite Keeps Committed V1",
+                test_failed_ec_overwrite_keeps_committed_v1
+            );
+            run_test!(
+                "Overwrite Retry After EC Quorum Failure",
+                test_overwrite_retry_after_quorum_failure
+            );
+        } else {
+            println!(
+                "\n{}",
+                "=== Skipping BSS partition tests: data volume is S3 ===".bold()
+            );
+        }
         run_test!(
             "Aborted Row Survives Row-Free Commit",
             test_aborted_row_survives_row_free_commit
@@ -3960,6 +3977,91 @@ async fn data_vg_raw_access() -> std::io::Result<DataVgProxy> {
         .map_err(|e| std::io::Error::other(format!("build data vg proxy: {e}")))
 }
 
+/// Direct block access for planting or reclaiming state behind the
+/// mount's back, routed by the blob's volume: BSS through the proxy, the
+/// S3 volume through the shared store (same endpoint xtask gives fs_server).
+enum RawDataAccess {
+    DataVg(DataVgProxy),
+    S3(S3BlobStore),
+}
+
+impl RawDataAccess {
+    async fn for_blob(blob_guid: DataBlobGuid) -> std::io::Result<Self> {
+        if blob_guid.volume_id == DataBlobGuid::S3_VOLUME {
+            let client = create_s3_client("http://127.0.0.1", 9000, "localdev", false).await;
+            return Ok(Self::S3(S3BlobStore::new(
+                client,
+                "fractalbits-bucket".to_string(),
+            )));
+        }
+        Ok(Self::DataVg(data_vg_raw_access().await?))
+    }
+
+    async fn put_block(
+        &self,
+        blob_guid: DataBlobGuid,
+        block: u32,
+        body: Bytes,
+        version: u64,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::DataVg(proxy) => proxy
+                .put_blob(blob_guid, block, body, version, &TraceId::new())
+                .await
+                .map_err(std::io::Error::other),
+            Self::S3(store) => store
+                .put(blob_guid.blob_id, block, version, body.into())
+                .await
+                .map_err(std::io::Error::other),
+        }
+    }
+
+    async fn list_blocks(
+        &self,
+        blob_guid: DataBlobGuid,
+        first_block: u32,
+        block_count: u32,
+    ) -> std::io::Result<Vec<(u32, u64)>> {
+        match self {
+            Self::DataVg(proxy) => Ok(proxy
+                .list_blob_blocks(blob_guid, first_block, block_count, &TraceId::new())
+                .await
+                .map_err(std::io::Error::other)?
+                .into_iter()
+                .map(|entry| (entry.block_number, entry.version))
+                .collect()),
+            Self::S3(store) => {
+                let end = first_block.saturating_add(block_count);
+                Ok(store
+                    .list_blob_blocks(blob_guid.blob_id)
+                    .await
+                    .map_err(std::io::Error::other)?
+                    .into_iter()
+                    .filter(|(block, _)| *block >= first_block && *block < end)
+                    .collect())
+            }
+        }
+    }
+
+    async fn delete_block(
+        &self,
+        blob_guid: DataBlobGuid,
+        block: u32,
+        version: u64,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::DataVg(proxy) => proxy
+                .delete_blob(blob_guid, block, version, &TraceId::new())
+                .await
+                .map_err(std::io::Error::other),
+            Self::S3(store) => store
+                .delete(blob_guid.blob_id, block, version)
+                .await
+                .map_err(std::io::Error::other),
+        }
+    }
+}
+
 /// Fetch the committed NSS layout for `key`: the bare ObjectLayout stored
 /// at the s3_key (not valid for hardlink-promoted inodes).
 async fn fetch_object_layout(bucket: &str, key: &str) -> std::io::Result<ObjectLayout> {
@@ -4196,17 +4298,16 @@ async fn inject_interrupted_append_flush(
     prepared.set_pending_append(Some(pending_append));
     install_object_layout_cas(bucket, key, &base, &prepared).await?;
 
-    let trace_id = TraceId::new();
-    let data_vg = data_vg_raw_access().await?;
+    let data_vg = RawDataAccess::for_blob(blob_guid).await?;
     for (block, body) in v1_bodies {
         data_vg
-            .put_blob(blob_guid, *block, body.clone(), 1, &trace_id)
+            .put_block(blob_guid, *block, body.clone(), 1)
             .await
             .map_err(|e| std::io::Error::other(format!("write partial v1 body: {e}")))?;
     }
 
     let entries = data_vg
-        .list_blob_blocks(blob_guid, lo, block_count, &trace_id)
+        .list_blocks(blob_guid, lo, block_count)
         .await
         .map_err(|e| std::io::Error::other(format!("list partial v1 bodies: {e}")))?;
     for block in lo..=hi {
@@ -4215,7 +4316,7 @@ async fn inject_interrupted_append_flush(
             .any(|(written_block, _)| *written_block == block);
         let present = entries
             .iter()
-            .any(|entry| entry.block_number == block && entry.version == 1);
+            .any(|(entry_block, version)| *entry_block == block && *version == 1);
         if expected != present {
             return Err(std::io::Error::other(format!(
                 "partial v1 body state mismatch for block {block}: expected={expected}, present={present}"
@@ -4814,10 +4915,9 @@ async fn test_s3_slow_stream_fails_after_reclaim(disk_cache: bool) -> CmdResult 
         .send()
         .await
         .expect("delete streamed object");
-    let trace_id = TraceId::new();
-    let data_vg = data_vg_raw_access().await?;
+    let data_vg = RawDataAccess::for_blob(blob_guid).await?;
     data_vg
-        .delete_blob(blob_guid, (NUM_BLOCKS - 1) as u32, 1, &trace_id)
+        .delete_block(blob_guid, (NUM_BLOCKS - 1) as u32, 1)
         .await
         .map_err(|e| std::io::Error::other(format!("reclaim final block: {e}")))?;
 

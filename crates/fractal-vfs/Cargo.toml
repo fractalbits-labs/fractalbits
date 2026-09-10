@@ -13,6 +13,7 @@ rpc_client_bss = { workspace = true, default-features = false, features = ["comp
 rpc_client_nss = { workspace = true, default-features = false, features = ["compio-runtime"] }
 rpc_client_rss = { workspace = true, default-features = false, features = ["compio-runtime"] }
 volume_group_proxy = { workspace = true, default-features = false, features = ["compio-runtime"] }
+s3_blob_store.workspace = true
 nss_codec.workspace = true
 file_ops.workspace = true
 rss_codec.workspace = true
@@ -21,8 +22,9 @@ rpc_codec_common.workspace = true
 data_types.workspace = true
 metrics_wrapper.workspace = true
 
-# Async runtime.
+# Async runtime. tokio hosts only the S3 SDK (see s3_volume.rs).
 compio-runtime.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 compio-net.workspace = true
 compio-io.workspace = true
 compio-buf.workspace = true

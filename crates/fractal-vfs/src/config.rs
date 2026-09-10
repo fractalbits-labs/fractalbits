@@ -17,6 +17,18 @@ pub enum WritebackMode {
     Default,
 }
 
+fn default_data_volume() -> String {
+    "bss".to_string()
+}
+fn default_s3_host() -> String {
+    "http://127.0.0.1".to_string()
+}
+fn default_s3_port() -> u16 {
+    9000
+}
+fn default_s3_region() -> String {
+    "localdev".to_string()
+}
 fn default_ec_read_hedge_delay_ms() -> u64 {
     DEFAULT_EC_HEDGE_DELAY.as_millis() as u64
 }
@@ -50,6 +62,19 @@ pub struct Config {
     pub mount_point: String,
 
     pub rpc_request_timeout_seconds: u64,
+    /// Where new file data goes: `bss` (data volume group) or `s3`.
+    #[serde(default = "default_data_volume")]
+    pub data_volume: String,
+    /// Bucket holding S3-resident blocks. Empty disables S3 access, in
+    /// which case S3-resident files are rejected at open/unlink/rename.
+    #[serde(default)]
+    pub s3_bucket: String,
+    #[serde(default = "default_s3_host")]
+    pub s3_host: String,
+    #[serde(default = "default_s3_port")]
+    pub s3_port: u16,
+    #[serde(default = "default_s3_region")]
+    pub s3_region: String,
     /// EC read grace period before parity shards are requested.
     #[serde(default = "default_ec_read_hedge_delay_ms")]
     pub ec_read_hedge_delay_ms: u64,
@@ -106,6 +131,14 @@ impl Config {
         Duration::from_millis(self.ec_read_hedge_delay_ms)
     }
 
+    pub fn s3_enabled(&self) -> bool {
+        !self.s3_bucket.is_empty()
+    }
+
+    pub fn data_volume_is_s3(&self) -> bool {
+        self.data_volume == "s3"
+    }
+
     pub fn rpc_connection_timeout(&self) -> Duration {
         Duration::from_secs(self.rpc_connection_timeout_seconds)
     }
@@ -154,6 +187,21 @@ impl Config {
         if let Ok(v) = std::env::var("FS_SERVER_ALLOW_OTHER") {
             self.allow_other = v.parse().unwrap_or(self.allow_other);
         }
+        if let Ok(v) = std::env::var("FS_SERVER_DATA_VOLUME") {
+            self.data_volume = v;
+        }
+        if let Ok(v) = std::env::var("FS_SERVER_S3_BUCKET") {
+            self.s3_bucket = v;
+        }
+        if let Ok(v) = std::env::var("FS_SERVER_S3_HOST") {
+            self.s3_host = v;
+        }
+        if let Ok(v) = std::env::var("FS_SERVER_S3_PORT") {
+            self.s3_port = v.parse().unwrap_or(self.s3_port);
+        }
+        if let Ok(v) = std::env::var("FS_SERVER_S3_REGION") {
+            self.s3_region = v;
+        }
     }
 }
 
@@ -164,6 +212,11 @@ impl Default for Config {
             bucket_name: "default".to_string(),
             mount_point: "/mnt/fractalbits".to_string(),
             rpc_request_timeout_seconds: 30,
+            data_volume: default_data_volume(),
+            s3_bucket: String::new(),
+            s3_host: default_s3_host(),
+            s3_port: default_s3_port(),
+            s3_region: default_s3_region(),
             ec_read_hedge_delay_ms: default_ec_read_hedge_delay_ms(),
             rpc_connection_timeout_seconds: 5,
             rss_rpc_timeout_seconds: 30,
