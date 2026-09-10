@@ -20,6 +20,7 @@ rpc_client_rss = { workspace = true, features = ["tokio-runtime"] }
 volume_group_proxy = { workspace = true, features = ["tokio-runtime"] }
 file_ops.workspace = true
 aws-sdk-s3.workspace = true
+s3_blob_store.workspace = true
 aws-config.workspace = true
 tokio = { workspace = true, features = ["full"] }
 serde.workspace = true
