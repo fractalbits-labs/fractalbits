@@ -14,10 +14,13 @@ use rpc_client_nss::RpcClientNss;
 use rpc_client_rss::RpcClientRss;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use uuid::Uuid;
 use volume_group_proxy::DataVgProxy;
 
 use crate::config::Config;
 use crate::error::FsError;
+use crate::s3_volume::S3DataVolume;
 use data_types::object_layout::{InodeRecord, ObjectLayout};
 
 fn exact_blob_identities(
@@ -36,6 +39,8 @@ pub struct BackendConfig {
     pub root_blob_name: String,
     pub routing_key: RoutingKey,
     pub config: Config,
+    /// Present when an S3 bucket is configured; shared by every thread.
+    pub s3: Option<Arc<S3DataVolume>>,
 }
 
 impl BackendConfig {
@@ -87,12 +92,15 @@ impl BackendConfig {
             .map_err(|e| format!("Failed to get DataVgInfo from RSS: {e}"))?;
         tracing::info!("Got DataVgInfo with {} volumes", data_vg_info.volumes.len());
 
+        let s3 = S3DataVolume::from_config(config)?.map(Arc::new);
+
         Ok(Self {
             nss_address: nss_addr,
             data_vg_info,
             root_blob_name: bucket.root_blob_name,
             routing_key: bucket.routing_key,
             config: config.clone(),
+            s3,
         })
     }
 }
@@ -105,6 +113,7 @@ pub struct StorageBackend {
     nss_client: RefCell<RpcClientNss>,
     nss_address: RefCell<String>,
     data_vg_proxy: DataVgProxy,
+    s3: Option<Arc<S3DataVolume>>,
     root_blob_name: String,
     routing_key: RoutingKey,
     config: Config,
@@ -131,10 +140,25 @@ impl StorageBackend {
             nss_client: RefCell::new(nss_client),
             nss_address: RefCell::new(backend_config.nss_address.clone()),
             data_vg_proxy,
+            s3: backend_config.s3.clone(),
             root_blob_name: backend_config.root_blob_name.clone(),
             routing_key: backend_config.routing_key,
             config: backend_config.config.clone(),
         })
+    }
+
+    /// Whether S3-resident blobs can be served by this mount.
+    pub fn supports_s3_volume(&self) -> bool {
+        self.s3.is_some()
+    }
+
+    /// `Some` when the blob lives on the S3 volume; `Err` inside when this
+    /// mount has no S3 access. `None` routes to the data volume group.
+    fn s3_volume(&self, blob_guid: DataBlobGuid) -> Option<Result<&S3DataVolume, FsError>> {
+        if blob_guid.volume_id != DataBlobGuid::S3_VOLUME {
+            return None;
+        }
+        Some(self.s3.as_deref().ok_or(FsError::InvalidState))
     }
 
     /// Returns a borrow of the NSS client.
@@ -330,22 +354,32 @@ impl StorageBackend {
         trace_id: &TraceId,
     ) -> Result<(Bytes, u64), FsError> {
         let mut body = Bytes::new();
-        self.data_vg_proxy
-            .get_blob(
-                blob_guid,
-                block_number,
-                version,
-                content_len,
-                &mut body,
-                trace_id,
-            )
-            .await?;
+        if let Some(s3) = self.s3_volume(blob_guid) {
+            body = s3?.read_block(blob_guid, block_number, version).await?;
+        } else {
+            self.data_vg_proxy
+                .get_blob(
+                    blob_guid,
+                    block_number,
+                    version,
+                    content_len,
+                    &mut body,
+                    trace_id,
+                )
+                .await?;
+        }
         let checksum = xxhash_rust::xxh3::xxh3_64(&body);
         Ok((body, checksum))
     }
 
-    /// Create a new data blob GUID via DataVgProxy.
+    /// Create a new data blob GUID on the configured data volume.
     pub fn create_blob_guid(&self) -> DataBlobGuid {
+        if self.config.data_volume_is_s3() {
+            return DataBlobGuid {
+                blob_id: Uuid::now_v7(),
+                volume_id: DataBlobGuid::S3_VOLUME,
+            };
+        }
         self.data_vg_proxy.create_data_blob_guid()
     }
 
@@ -360,6 +394,11 @@ impl StorageBackend {
         version: u64,
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
+        if let Some(s3) = self.s3_volume(blob_guid) {
+            return s3?
+                .write_block(blob_guid, block_number, body, version)
+                .await;
+        }
         self.data_vg_proxy
             .put_blob(blob_guid, block_number, body, version, trace_id)
             .await?;
@@ -376,6 +415,12 @@ impl StorageBackend {
         block_count: u32,
         trace_id: &TraceId,
     ) -> Result<Vec<bss_codec::list_blob_blocks_response::BlobBlockEntry>, FsError> {
+        if let Some(s3) = self.s3_volume(blob_guid) {
+            let end = first_block.saturating_add(block_count);
+            let mut entries = s3?.list_blob_blocks(blob_guid).await?;
+            entries.retain(|e| e.block_number >= first_block && e.block_number < end);
+            return Ok(entries);
+        }
         Ok(self
             .data_vg_proxy
             .list_blob_blocks(blob_guid, first_block, block_count, trace_id)
@@ -390,6 +435,9 @@ impl StorageBackend {
         blob_guid: DataBlobGuid,
         trace_id: &TraceId,
     ) -> Result<Vec<bss_codec::list_blob_blocks_response::BlobBlockEntry>, FsError> {
+        if let Some(s3) = self.s3_volume(blob_guid) {
+            return s3?.list_blob_blocks(blob_guid).await;
+        }
         Ok(self
             .data_vg_proxy
             .list_all_blob_blocks(blob_guid, trace_id)
@@ -619,6 +667,9 @@ impl StorageBackend {
         version: u64,
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
+        if let Some(s3) = self.s3_volume(blob_guid) {
+            return s3?.delete_block(blob_guid, block_number, version).await;
+        }
         self.data_vg_proxy
             .delete_blob(blob_guid, block_number, version, trace_id)
             .await?;
