@@ -54,6 +54,29 @@ pub struct RpcClient<Codec: RpcCodec<Header>, Header: MessageHeaderTrait> {
     _phantom: PhantomData<Codec>,
 }
 
+/// Removes the pending map entry if the request future is dropped or
+/// times out before the receive task delivers its response. The receive
+/// task normally removes the entry, so `armed` is cleared on that path.
+struct PendingRequestGuard<'a, Header: MessageHeaderTrait> {
+    requests: &'a RequestMap<Header>,
+    request_id: u32,
+    rpc_type: &'static str,
+    armed: bool,
+}
+
+impl<Header: MessageHeaderTrait> Drop for PendingRequestGuard<'_, Header> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.requests.lock().remove(&self.request_id).is_some() {
+            debug!(rpc_type = %self.rpc_type, request_id = %self.request_id,
+                "pending request dropped before response");
+            gauge!("rpc_request_pending_in_resp_map", "type" => self.rpc_type).decrement(1.0);
+        }
+    }
+}
+
 #[derive(AsRefStr)]
 #[strum(serialize_all = "snake_case")]
 enum DrainFrom {
@@ -102,14 +125,17 @@ where
         let tx: oneshot::Sender<MessageFrame<Header>> = match requests.lock().remove(&request_id) {
             Some(tx) => tx,
             None => {
-                warn!(%rpc_type, %socket_fd, %request_id,
+                // Late reply for a request that timed out or was dropped
+                // (hedged read); the guard already removed its entry.
+                debug!(%rpc_type, %socket_fd, %request_id,
                     "received rpc message with id not in the resp_map");
                 return;
             }
         };
         gauge!("rpc_request_pending_in_resp_map", "type" => rpc_type).decrement(1.0);
         if tx.send(frame).is_err() {
-            warn!(%rpc_type, %socket_fd, %request_id, "oneshot response send failed");
+            // Expected when the caller gave up (hedged or cancelled read).
+            debug!(%rpc_type, %socket_fd, %request_id, "response arrived after caller dropped");
         }
     }
 
@@ -163,11 +189,17 @@ where
         }
 
         let rpc_type = Codec::RPC_TYPE;
-        let (tx, rx) = oneshot::channel();
-        self.requests.lock().insert(frame.header.get_id(), tx);
-        gauge!("rpc_request_pending_in_resp_map", "type" => rpc_type).increment(1.0);
-
         let request_id = frame.header.get_id();
+        let (tx, rx) = oneshot::channel();
+        self.requests.lock().insert(request_id, tx);
+        gauge!("rpc_request_pending_in_resp_map", "type" => rpc_type).increment(1.0);
+        let mut pending = PendingRequestGuard {
+            requests: &self.requests,
+            request_id,
+            rpc_type,
+            armed: true,
+        };
+
         self.sender
             .send(frame)
             .await
@@ -184,6 +216,9 @@ where
                 }
             },
         };
+        // rx resolved (response or drain): the map entry is already gone,
+        // so skip the guard's lock on the hot path.
+        pending.armed = false;
         result.map_err(|e| RpcError::InternalResponseError(e.to_string()))
     }
 
@@ -893,5 +928,71 @@ mod tests {
         assert!(client.is_closed());
 
         server_task.await.unwrap();
+    }
+
+    /// Silent server: accepts the connection and never replies, so the
+    /// client side alone decides when a pending entry is released.
+    async fn silent_client() -> (
+        RpcClient<TestCodec, TestHeader>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client = RpcClient::new_internal_tokio(stream).await.unwrap();
+        (client, server_task)
+    }
+
+    fn echo_frame(id: u32) -> MessageFrame<TestHeader, Bytes> {
+        let mut header = TestHeader::default();
+        header.0.id = id;
+        header.0.size = size_of::<TestHeader>() as u32;
+        header.0.checksum_body = rpc_codec_common::EMPTY_BODY_CHECKSUM;
+        header.0.command = TestCommand::Echo;
+        MessageFrame::new(header, Bytes::new())
+    }
+
+    #[tokio::test]
+    async fn test_timeout_releases_pending_entry() {
+        let (client, server_task) = silent_client().await;
+
+        let result = client
+            .send_request(echo_frame(7), Some(Duration::from_millis(20)))
+            .await;
+        assert!(result.is_err(), "silent server must time out");
+        assert!(
+            client.requests.lock().is_empty(),
+            "timed-out request must not linger in the pending map"
+        );
+        assert!(!client.is_closed(), "timeout must not close the connection");
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_dropped_future_releases_pending_entry() {
+        let (client, server_task) = silent_client().await;
+
+        let mut request = Box::pin(client.send_request(echo_frame(9), None));
+        // Poll once so the entry is inserted and the frame is queued, then
+        // drop the future as a hedged/cancelled caller would.
+        let polled = futures::poll!(request.as_mut());
+        assert!(polled.is_pending(), "silent server cannot have answered");
+        assert_eq!(
+            client.requests.lock().len(),
+            1,
+            "entry inserted while in flight"
+        );
+        drop(request);
+        assert!(
+            client.requests.lock().is_empty(),
+            "dropped request must remove its pending entry"
+        );
+
+        server_task.abort();
     }
 }

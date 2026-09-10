@@ -22,31 +22,13 @@ message ListBlobsResponse {
     uint64 checksum_body = 3;
     uint64 version = 4;
     bool is_deleted = 5;
+    // Nonzero EC write cohort shared by every shard in one stripe.
+    uint64 cohort_tag = 7;
   }
 
   message Blobs {
     repeated BlobEntry blobs = 1;
     bool has_more = 2;
-  }
-}
-
-// ReserveBlocks: pre-allocate `block_count` contiguous blocks starting at
-// header.block_number without writing data, stamped at header.version.
-message ReserveBlocksRequest {
-  uint32 block_count = 1;
-  uint32 block_size = 2;
-}
-
-message ReserveBlocksResponse {
-  oneof result {
-    Stats ok = 1;
-    string err = 2;
-  }
-
-  message Stats {
-    uint32 reserved = 1;
-    uint32 skipped_newer = 2;
-    uint32 idempotent = 3;
   }
 }
 
@@ -56,6 +38,7 @@ message ReserveBlocksResponse {
 message ListBlobBlocksRequest {
   uint32 first_block = 1;
   uint32 block_count = 2;
+  string marker = 3;
 }
 
 message ListBlobBlocksResponse {
@@ -66,12 +49,13 @@ message ListBlobBlocksResponse {
 
   message BlobBlockEntry {
     uint32 block_number = 1;
-    // 0 = Data, 1 = Reserved.
-    uint32 entry_type = 2;
     uint64 version = 3;
+    uint64 cohort_tag = 4;
   }
 
   message Blocks {
     repeated BlobBlockEntry blocks = 1;
+    bool has_more = 2;
+    string next_marker = 3;
   }
 }

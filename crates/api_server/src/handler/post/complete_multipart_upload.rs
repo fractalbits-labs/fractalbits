@@ -198,7 +198,7 @@ pub async fn complete_multipart_upload_handler(
     }
 
     let max_parts = 10000;
-    let mpu_prefix = mpu_get_part_prefix(ctx.key.clone(), 0);
+    let mpu_prefix = mpu_get_part_prefix(ctx.key.clone(), object.version_id, 0);
     let mpu_objs = list_raw_objects(
         &ctx.app,
         routing_key,
@@ -283,7 +283,6 @@ pub async fn complete_multipart_upload_handler(
         etag: etag.clone(),
         headers,
         checksum: expected_checksum,
-        ..Default::default()
     }));
     let new_object_bytes: Bytes = to_bytes_in::<_, Error>(&object, Vec::new())?.into();
     let nss_client = ctx.app.get_nss_rpc_client(routing_key).await?;

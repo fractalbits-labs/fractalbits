@@ -45,19 +45,8 @@ impl RpcClient {
         operation: Option<crate::stats::OperationType>,
     ) -> Result<rpc_codec_common::MessageFrame<bss_codec::MessageHeader>, rpc_client_common::RpcError>
     {
-        if let Some(op) = operation {
-            let stats = crate::stats::get_global_bss_stats();
-            stats.increment(op);
-        }
-
-        let result = self.get_connection().send_request(frame, timeout).await;
-
-        if let Some(op) = operation {
-            let stats = crate::stats::get_global_bss_stats();
-            stats.decrement(op);
-        }
-
-        result
+        let _guard = operation.map(crate::stats::BssStatsGuard::new);
+        self.get_connection().send_request(frame, timeout).await
     }
 
     pub async fn send_request_vectored(
@@ -67,21 +56,9 @@ impl RpcClient {
         operation: Option<crate::stats::OperationType>,
     ) -> Result<rpc_codec_common::MessageFrame<bss_codec::MessageHeader>, rpc_client_common::RpcError>
     {
-        if let Some(op) = operation {
-            let stats = crate::stats::get_global_bss_stats();
-            stats.increment(op);
-        }
-
-        let result = self
-            .get_connection()
+        let _guard = operation.map(crate::stats::BssStatsGuard::new);
+        self.get_connection()
             .send_request_vectored(frame, timeout)
-            .await;
-
-        if let Some(op) = operation {
-            let stats = crate::stats::get_global_bss_stats();
-            stats.decrement(op);
-        }
-
-        result
+            .await
     }
 }

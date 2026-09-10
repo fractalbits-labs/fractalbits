@@ -9,6 +9,13 @@ use rpc_client_common::{InflightRpcGuard, RpcError, encode_protobuf};
 use rpc_codec_common::MessageFrame;
 use tracing::error;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TeardownFence {
+    pub token: u64,
+    pub session: u64,
+    pub generation: u64,
+}
+
 impl RpcClient {
     pub async fn put_inode(
         &self,
@@ -205,12 +212,35 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<DeleteInodeResponse, RpcError> {
+        self.delete_inode_with_teardown(
+            root_blob_name,
+            key,
+            TeardownFence::default(),
+            timeout,
+            trace_id,
+            retry_count,
+        )
+        .await
+    }
+
+    pub async fn delete_inode_with_teardown(
+        &self,
+        root_blob_name: &str,
+        key: &str,
+        teardown: TeardownFence,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<DeleteInodeResponse, RpcError> {
         let _guard = InflightRpcGuard::new("nss", "delete_inode");
         let mut nss_key = key.to_string();
         nss_key.push('\0');
         let body = DeleteInodeRequest {
             root_blob_name: root_blob_name.to_string(),
             key: nss_key,
+            teardown_token: teardown.token,
+            teardown_session: teardown.session,
+            teardown_generation: teardown.generation,
         };
 
         let mut header = MessageHeader::default();
@@ -282,9 +312,33 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<DeleteRootInodeResponse, RpcError> {
+        self.delete_root_inode_with_teardown(
+            root_blob_name,
+            TeardownFence::default(),
+            false,
+            timeout,
+            trace_id,
+            retry_count,
+        )
+        .await
+    }
+
+    pub async fn delete_root_inode_with_teardown(
+        &self,
+        root_blob_name: &str,
+        teardown: TeardownFence,
+        abort_teardown: bool,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+    ) -> Result<DeleteRootInodeResponse, RpcError> {
         let _guard = InflightRpcGuard::new("nss", "delete_root_inode");
         let body = DeleteRootInodeRequest {
             root_blob_name: root_blob_name.to_string(),
+            teardown_token: teardown.token,
+            abort_teardown,
+            teardown_session: teardown.session,
+            teardown_generation: teardown.generation,
         };
 
         let mut header = MessageHeader::default();

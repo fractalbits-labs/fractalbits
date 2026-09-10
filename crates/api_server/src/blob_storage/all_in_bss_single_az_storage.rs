@@ -14,13 +14,16 @@ impl AllInBssSingleAzStorage {
         data_vg_info: DataVgInfo,
         rpc_request_timeout: Duration,
         rpc_connection_timeout: Duration,
+        ec_read_hedge_delay: Duration,
     ) -> Result<Self, BlobStorageError> {
         debug!("Initializing AllInBssSingleAzStorage with pre-fetched DataVgInfo");
 
         let data_vg_proxy = Arc::new(
-            DataVgProxy::new(data_vg_info, rpc_request_timeout, rpc_connection_timeout).map_err(
-                |e| BlobStorageError::Config(format!("Failed to initialize DataVgProxy: {}", e)),
-            )?,
+            DataVgProxy::new(data_vg_info, rpc_request_timeout, rpc_connection_timeout)
+                .map_err(|e| {
+                    BlobStorageError::Config(format!("Failed to initialize DataVgProxy: {}", e))
+                })?
+                .with_ec_hedge_delay(ec_read_hedge_delay),
         );
 
         Ok(Self { data_vg_proxy })
@@ -37,6 +40,20 @@ impl AllInBssSingleAzStorage {
 }
 
 impl AllInBssSingleAzStorage {
+    pub async fn list_blob_blocks(
+        &self,
+        blob_guid: DataBlobGuid,
+        trace_id: &TraceId,
+    ) -> Result<Vec<(u32, u64)>, BlobStorageError> {
+        Ok(self
+            .data_vg_proxy
+            .list_all_blob_blocks(blob_guid, trace_id)
+            .await?
+            .into_iter()
+            .map(|entry| (entry.block_number, entry.version))
+            .collect())
+    }
+
     pub async fn put_blob(
         &self,
         blob_id: uuid::Uuid,
@@ -78,12 +95,20 @@ impl AllInBssSingleAzStorage {
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         content_len: usize,
         body: &mut Bytes,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         self.data_vg_proxy
-            .get_blob(blob_guid, block_number, content_len, body, trace_id)
+            .get_blob(
+                blob_guid,
+                block_number,
+                version,
+                content_len,
+                body,
+                trace_id,
+            )
             .await?;
 
         histogram!("blob_size", "operation" => "get").record(body.len() as f64);
@@ -94,10 +119,11 @@ impl AllInBssSingleAzStorage {
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
+        version: u64,
         trace_id: &TraceId,
     ) -> Result<(), BlobStorageError> {
         self.data_vg_proxy
-            .delete_blob(blob_guid, block_number, 1, trace_id)
+            .delete_blob(blob_guid, block_number, version, trace_id)
             .await?;
 
         Ok(())

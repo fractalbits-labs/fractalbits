@@ -1,6 +1,7 @@
 use crate::blob_storage::S3RetryConfig;
 use serde::Deserialize;
 use std::time::Duration;
+use volume_group_proxy::DEFAULT_EC_HEDGE_DELAY;
 
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "snake_case")]
@@ -72,6 +73,9 @@ pub struct Config {
     pub rpc_connection_timeout_seconds: u64,
     pub rss_rpc_timeout_seconds: u64,
     pub client_request_timeout_seconds: u64,
+    /// EC read grace period before parity shards are requested.
+    #[serde(default = "default_ec_read_hedge_delay_ms")]
+    pub ec_read_hedge_delay_ms: u64,
     pub stats_dir: String,
     pub enable_stats_writer: bool,
     pub blob_storage: BlobStorageConfig,
@@ -80,9 +84,17 @@ pub struct Config {
     pub set_thread_affinity: bool,
 }
 
+fn default_ec_read_hedge_delay_ms() -> u64 {
+    DEFAULT_EC_HEDGE_DELAY.as_millis() as u64
+}
+
 impl Config {
     pub fn rpc_request_timeout(&self) -> Duration {
         Duration::from_secs(self.rpc_request_timeout_seconds)
+    }
+
+    pub fn ec_read_hedge_delay(&self) -> Duration {
+        Duration::from_millis(self.ec_read_hedge_delay_ms)
     }
 
     pub fn rpc_connection_timeout(&self) -> Duration {
@@ -135,6 +147,7 @@ impl Config {
             rpc_connection_timeout_seconds: 5,
             rss_rpc_timeout_seconds: 30,
             client_request_timeout_seconds: 120,
+            ec_read_hedge_delay_ms: default_ec_read_hedge_delay_ms(),
             stats_dir: "data/api-server/local/stats".into(),
             enable_stats_writer: false,
             blob_storage: BlobStorageConfig {
@@ -168,6 +181,7 @@ impl Config {
             rpc_connection_timeout_seconds: 5,
             rss_rpc_timeout_seconds: 30,
             client_request_timeout_seconds: 120,
+            ec_read_hedge_delay_ms: default_ec_read_hedge_delay_ms(),
             stats_dir: "data/api-server/local/stats".into(),
             enable_stats_writer: false,
             blob_storage: BlobStorageConfig {
