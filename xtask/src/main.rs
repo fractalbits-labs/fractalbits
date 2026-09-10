@@ -23,7 +23,7 @@ use xtask_common::DeployTarget;
 pub use xtask_common::{DataBlobStorage, DeployOS, JournalType, RssBackend};
 
 pub const TS_FMT: &str = "%b %d %H:%M:%.S";
-// Need to match with api_server's default config to make authentication work
+// Need to match with s3_gateway's default config to make authentication work
 pub const UI_DEFAULT_REGION: &str = "localdev";
 pub const UI_REPO_PATH: &str = "ui";
 pub const ZIG_DEBUG_OUT: &str = "target/debug/zig-out";
@@ -100,9 +100,9 @@ enum Cmd {
 
         #[clap(
             long,
-            long_help = "Debug by recompiling and restarting api_server only"
+            long_help = "Debug by recompiling and restarting s3_gateway only"
         )]
-        debug_api_server: bool,
+        debug_s3_gateway: bool,
 
         #[clap(long, long_help = "Run fractal art tests in addition to other tests")]
         with_fractal_art_tests: bool,
@@ -282,9 +282,9 @@ pub enum DeployCommand {
         #[clap(
             long,
             value_delimiter = ',',
-            long_help = "Api server extra build environment variables in format: KEY=value,KEY2=value2"
+            long_help = "S3 gateway extra build environment variables in format: KEY=value,KEY2=value2"
         )]
-        api_server_build_env: Vec<String>,
+        s3_gateway_build_env: Vec<String>,
     },
 
     #[clap(about = "Upload prebuilt binaries to s3 builds bucket")]
@@ -310,8 +310,8 @@ pub enum DeployCommand {
         )]
         template: Option<VpcTemplate>,
 
-        #[clap(long, long_help = "Number of API servers", default_value = "1")]
-        num_api_servers: u32,
+        #[clap(long, long_help = "Number of S3 gateways", default_value = "1")]
+        num_s3_gateways: u32,
 
         #[clap(long, long_help = "Number of benchmark clients", default_value = "1")]
         num_bench_clients: u32,
@@ -330,10 +330,10 @@ pub enum DeployCommand {
 
         #[clap(
             long,
-            long_help = "API server instance type",
+            long_help = "S3 gateway instance type",
             default_value = "c8g.xlarge"
         )]
-        api_server_instance_type: String,
+        s3_gateway_instance_type: String,
 
         #[clap(
             long,
@@ -487,7 +487,7 @@ pub enum ServiceAction {
 #[strum(serialize_all = "snake_case")]
 #[clap(rename_all = "snake_case")]
 pub enum ServiceName {
-    ApiServer,
+    S3Gateway,
     Bss,
     NssRoleAgent,
     Nss,
@@ -802,7 +802,7 @@ async fn main() -> CmdResult {
         Cmd::Precheckin {
             s3_api_only,
             zig_unit_tests_only,
-            debug_api_server,
+            debug_s3_gateway,
             with_fractal_art_tests,
             with_https,
             data_blob_storage,
@@ -818,7 +818,7 @@ async fn main() -> CmdResult {
                 init_config,
                 s3_api_only,
                 zig_unit_tests_only,
-                debug_api_server,
+                debug_s3_gateway,
                 with_fractal_art_tests,
                 docker,
             )?;
@@ -886,19 +886,19 @@ async fn main() -> CmdResult {
                 target,
                 release,
                 zig_extra_build,
-                api_server_build_env,
-            } => cmd_deploy::build(target, release, &zig_extra_build, &api_server_build_env)?,
+                s3_gateway_build_env,
+            } => cmd_deploy::build(target, release, &zig_extra_build, &s3_gateway_build_env)?,
             DeployCommand::Upload { target } => cmd_deploy::upload(target)?,
             DeployCommand::CreateVpc {
                 target,
                 template,
-                num_api_servers,
+                num_s3_gateways,
                 num_bench_clients,
                 num_bss_nodes,
                 with_bench,
                 bss_instance_type,
                 nss_instance_type,
-                api_server_instance_type,
+                s3_gateway_instance_type,
                 bench_client_instance_type,
                 az,
                 root_server_ha,
@@ -912,13 +912,13 @@ async fn main() -> CmdResult {
             } => {
                 let vpc_config = cmd_deploy::VpcConfig {
                     template,
-                    num_api_servers,
+                    num_s3_gateways,
                     num_bench_clients,
                     num_bss_nodes,
                     with_bench,
                     bss_instance_type,
                     nss_instance_type,
-                    api_server_instance_type,
+                    s3_gateway_instance_type,
                     bench_client_instance_type,
                     az,
                     root_server_ha,

@@ -205,7 +205,7 @@ pub fn build_for_nightly() -> CmdResult {
     Ok(())
 }
 
-/// Build only what's needed for Docker container (api_server, nss_role_agent, root_server, rss_admin, zig servers)
+/// Build only what's needed for Docker container (s3_gateway, nss_role_agent, root_server, rss_admin, zig servers)
 pub fn build_for_docker(release: bool) -> CmdResult {
     let build_envs = get_build_envs();
     let build_flag = if release { "--release" } else { "" };
@@ -214,7 +214,7 @@ pub fn build_for_docker(release: bool) -> CmdResult {
     run_cmd! {
         info "Building rust binaries for Docker...";
         $[build_envs] cargo build $build_flag
-            -p api_server
+            -p s3_gateway
             -p container-all-in-one;
     }?;
 

@@ -28,7 +28,7 @@ resource "google_compute_firewall" "internal" {
   allow {
     protocol = "tcp"
     ports = [
-      "80",    # API server HTTP
+      "80",    # S3 gateway HTTP
       "2379",  # etcd client
       "2380",  # etcd peer
       "8080",  # Docker S3 API
@@ -69,7 +69,7 @@ resource "google_compute_firewall" "ssh_iap" {
   target_tags   = ["fractalbits-private"]
 }
 
-# Allow GCP health check probes to reach API servers
+# Allow GCP health check probes to reach S3 gateways
 resource "google_compute_firewall" "health_check" {
   name    = "fractalbits-health-check-${var.cluster_id}"
   network = google_compute_network.fractalbits.id

@@ -32,7 +32,7 @@ variable "vpc_template" {
   }
 }
 
-variable "num_api_servers" {
+variable "num_s3_gateways" {
   type    = number
   default = 1
 }

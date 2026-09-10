@@ -3,13 +3,13 @@
 use actix_files::Files;
 use actix_web::HttpResponse;
 use actix_web::{App, HttpServer, middleware::Logger, rt::System, web};
-use api_server::{AppState, Config, api_key_routes, handler};
 use clap::Parser;
 use rustls::{
     ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer},
 };
 use rustls_pemfile::{certs, private_key};
+use s3_gateway::{AppState, Config, api_key_routes, handler};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::IsTerminal;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
@@ -26,7 +26,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser)]
-#[clap(name = "api_server", about = "API server")]
+#[clap(name = "s3_gateway", about = "S3 gateway")]
 struct Opt {
     #[clap(short = 'c', long = "config", long_help = "Config file path")]
     config_file: Option<PathBuf>,
@@ -179,7 +179,7 @@ fn main() -> std::io::Result<()> {
                 .expect("Failed to build stats writer runtime");
 
             rt.block_on(async {
-                match api_server::unified_stats::init_unified_stats_writer(stats_dir).await {
+                match s3_gateway::unified_stats::init_unified_stats_writer(stats_dir).await {
                     Ok(mut writer) => {
                         info!("Unified stats writer initialized");
                         let shutdown_rx_async = tokio::task::spawn_blocking(move || {
@@ -357,7 +357,7 @@ fn main() -> std::io::Result<()> {
                                 web::get().to(|| async {
                                     HttpResponse::Ok().json(serde_json::json!({
                                         "status": "healthy",
-                                        "service": "api_server"
+                                        "service": "s3_gateway"
                                     }))
                                 }),
                             ))

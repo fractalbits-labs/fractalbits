@@ -326,7 +326,7 @@ pub fn init_service(
         Ok(())
     };
     match service {
-        ServiceName::ApiServer => {
+        ServiceName::S3Gateway => {
             if init_config.with_https {
                 generate_https_certificates()?;
             }
@@ -816,7 +816,7 @@ fn all_services(
     let mut services = match data_blob_storage {
         DataBlobStorage::S3HybridSingleAz => {
             let mut services = vec![
-                ServiceName::ApiServer,
+                ServiceName::S3Gateway,
                 ServiceName::NssRoleAgent,
                 ServiceName::Bss,
                 ServiceName::Rss,
@@ -829,7 +829,7 @@ fn all_services(
         }
         DataBlobStorage::AllInBssSingleAz => {
             let mut services = vec![
-                ServiceName::ApiServer,
+                ServiceName::S3Gateway,
                 ServiceName::NssRoleAgent,
                 ServiceName::Bss,
                 ServiceName::Rss,
@@ -879,7 +879,7 @@ pub fn fs_server_data_volume_env(data_volume: &str) -> Vec<(&'static str, String
 }
 
 fn get_data_blob_storage_setting() -> DataBlobStorage {
-    if run_cmd!(grep -q s3_hybrid_single_az data/etc/api_server.service &>/dev/null).is_ok() {
+    if run_cmd!(grep -q s3_hybrid_single_az data/etc/s3_gateway.service &>/dev/null).is_ok() {
         DataBlobStorage::S3HybridSingleAz
     } else {
         DataBlobStorage::AllInBssSingleAz
@@ -1031,7 +1031,7 @@ pub fn start_service(service: ServiceName) -> CmdResult {
             // Post-start actions
             match service {
                 ServiceName::Minio => create_minio_bucket(9000, "fractalbits-bucket")?,
-                ServiceName::ApiServer => register_local_api_server()?,
+                ServiceName::S3Gateway => register_local_s3_gateway()?,
                 _ => {}
             }
 
@@ -1127,7 +1127,7 @@ fn start_all_services() -> CmdResult {
             // instance 0 (active NSS).
             start_nss_role_agent_instance(1)?;
             start_nss_role_agent_instance(0)?;
-            start_service(ServiceName::ApiServer)?;
+            start_service(ServiceName::S3Gateway)?;
         }
     }
 
@@ -1141,7 +1141,7 @@ fn create_systemd_unit_files_for_init(
     init_config: &InitConfig,
 ) -> CmdResult {
     match service {
-        ServiceName::ApiServer => {
+        ServiceName::S3Gateway => {
             create_systemd_unit_file(service, build_mode, init_config)?;
         }
         ServiceName::Bss
@@ -1244,7 +1244,7 @@ Environment="RUST_LOG=warn""##
             env_settings += "\nEnvironment=\"OBSERVER_INITIAL_GRACE_PERIOD_SECS=15\"";
             resolve_binary_path("root_server", build_mode)
         }
-        ServiceName::ApiServer => {
+        ServiceName::S3Gateway => {
             env_settings += env_rust_log(build_mode);
             env_settings += &format!(
                 "\nEnvironment=\"APP_BLOB_STORAGE_BACKEND={}\"",
@@ -1257,7 +1257,7 @@ Environment="RUST_LOG=warn""##
                 env_settings += r##"
 Environment="GUI_WEB_ROOT=../ui/dist""##;
             }
-            format!("{pwd}/target/{build}/api_server")
+            format!("{pwd}/target/{build}/s3_gateway")
         }
         ServiceName::DdbLocal => {
             let java = run_fun!(bash -c "command -v java")?;
@@ -1334,7 +1334,7 @@ Environment="MINIO_REGION=localdev""##
                 "After=firestore_emulator.service\nWants=firestore_emulator.service\n".to_string()
             }
         },
-        ServiceName::ApiServer => {
+        ServiceName::S3Gateway => {
             match init_config.data_blob_storage {
                 DataBlobStorage::AllInBssSingleAz => {
                     "After=rss.service nss_role_agent@0.service\nWants=rss.service nss_role_agent@0.service\n".to_string()
@@ -1395,7 +1395,7 @@ StartLimitBurst=100
         _ => service_name.to_string(),
     };
     let timeout_stop_sec = match service {
-        ServiceName::ApiServer | ServiceName::FsServer => 60,
+        ServiceName::S3Gateway | ServiceName::FsServer => 60,
         _ => 5,
     };
 
@@ -1488,7 +1488,7 @@ pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdRes
             ("BSS ports", ports)
         }
         ServiceName::Nss => ("port 8087", vec![8087]),
-        ServiceName::ApiServer => ("port 8080", vec![8080]),
+        ServiceName::S3Gateway => ("port 8080", vec![8080]),
         ServiceName::NssRoleAgent => {
             unreachable!(
                 "nss_role_agent is templated; start_service dispatches to start_nss_role_agent_instance"
@@ -1532,15 +1532,15 @@ pub fn check_port_ready(port: u16) -> bool {
     .is_ok()
 }
 
-fn register_local_api_server() -> CmdResult {
-    info!("Registering local api_server with service discovery");
+fn register_local_s3_gateway() -> CmdResult {
+    info!("Registering local s3_gateway with service discovery");
 
     let backend = get_rss_backend_setting();
     match backend {
         RssBackend::Ddb => {
             // Create the JSON item for DynamoDB
             let item_json = r#"{
-                "service_id": {"S": "api-server"},
+                "service_id": {"S": "s3-gateway"},
                 "instances": {
                     "M": {
                         "local-dev": {"S": "127.0.0.1:8080"}
@@ -1549,7 +1549,7 @@ fn register_local_api_server() -> CmdResult {
             }"#;
 
             // Try to update existing item first, if it doesn't exist, create it
-            let key_json = "{\"service_id\": {\"S\": \"api-server\"}}";
+            let key_json = "{\"service_id\": {\"S\": \"s3-gateway\"}}";
             let attr_names = "{\"#instances\": \"instances\", \"#local\": \"local-dev\"}";
             let attr_values = "{\":ip\": {\"S\": \"127.0.0.1:8080\"}}";
 
@@ -1575,18 +1575,18 @@ fn register_local_api_server() -> CmdResult {
             }
         }
         RssBackend::Etcd => {
-            // Use individual keys per instance: /fractalbits-service-discovery/api-server/<id> -> <ip>
+            // Use individual keys per instance: /fractalbits-service-discovery/s3-gateway/<id> -> <ip>
             let etcdctl = resolve_etcd_bin("etcdctl");
             run_cmd!(
-                $etcdctl put /fractalbits-service-discovery/api-server/local-dev "127.0.0.1" >/dev/null
+                $etcdctl put /fractalbits-service-discovery/s3-gateway/local-dev "127.0.0.1" >/dev/null
             )?;
         }
         RssBackend::Firestore => {
-            // Register api_server in Firestore service discovery
+            // Register s3_gateway in Firestore service discovery
             let doc_json = r#"{"fields":{"ip":{"stringValue":"127.0.0.1"}}}"#;
             run_cmd!(
                 curl -sf -X POST
-                    "http://localhost:8282/v1/projects/test-project/databases/fractalbits/documents/fractalbits-service-discovery?documentId=api-server/local-dev"
+                    "http://localhost:8282/v1/projects/test-project/databases/fractalbits/documents/fractalbits-service-discovery?documentId=s3-gateway/local-dev"
                     -H "Content-Type: application/json"
                     -d $doc_json
                     >/dev/null
@@ -1594,7 +1594,7 @@ fn register_local_api_server() -> CmdResult {
         }
     }
 
-    info!("Local api_server registered in service discovery");
+    info!("Local s3_gateway registered in service discovery");
     Ok(())
 }
 

@@ -56,7 +56,7 @@ fn build_local_docker_image(
         cmd_build::build_for_docker(release)?;
     } else {
         info!("Using prebuilt binaries from prebuilt/ directory");
-        run_cmd!($[build_envs] cargo build $build_flag -p api_server -p container-all-in-one)?;
+        run_cmd!($[build_envs] cargo build $build_flag -p s3_gateway -p container-all-in-one)?;
     }
 
     // Ensure etcd is available

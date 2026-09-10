@@ -1,5 +1,5 @@
-# API Server instance template
-resource "google_compute_instance_template" "api_server" {
+# S3 Gateway instance template
+resource "google_compute_instance_template" "s3_gateway" {
   name_prefix  = "api-${var.cluster_id}-"
   machine_type = var.api_machine_type
   region       = var.region
@@ -17,12 +17,12 @@ resource "google_compute_instance_template" "api_server" {
   }
 
   metadata = {
-    service-role  = "api_server"
+    service-role  = "s3_gateway"
     instance-role = "api"
     cluster-id    = var.cluster_id
     startup-script = templatefile("${path.module}/templates/startup-script.sh.tpl", {
       gcs_bucket = "${var.project_id}-deploy-staging"
-      role_args  = "--role api_server"
+      role_args  = "--role s3_gateway"
     })
   }
 
@@ -46,15 +46,15 @@ resource "google_compute_instance_template" "api_server" {
   ]
 }
 
-# API Server managed instance group
-resource "google_compute_instance_group_manager" "api_servers" {
-  name               = "api-servers-${var.cluster_id}"
+# S3 Gateway managed instance group
+resource "google_compute_instance_group_manager" "s3_gateways" {
+  name               = "s3-gateways-${var.cluster_id}"
   base_instance_name = "api-${var.cluster_id}"
   zone               = var.zone_a
-  target_size        = var.num_api_servers
+  target_size        = var.num_s3_gateways
 
   version {
-    instance_template = google_compute_instance_template.api_server.id
+    instance_template = google_compute_instance_template.s3_gateway.id
   }
 
   named_port {

@@ -104,4 +104,4 @@ coverage-report:
 
 # Quick unit-test-only coverage (no services needed)
 coverage-unit:
-  cargo llvm-cov --no-cfg-coverage --workspace --exclude api_server --exclude fs_server --ignore-filename-regex 'xtask/.*' --html
+  cargo llvm-cov --no-cfg-coverage --workspace --exclude s3_gateway --exclude fs_server --ignore-filename-regex 'xtask/.*' --html

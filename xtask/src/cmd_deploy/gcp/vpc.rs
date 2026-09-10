@@ -32,7 +32,7 @@ pub fn create_vpc(config: VpcConfig) -> CmdResult {
         rss_backend: config.rss_backend,
         rss_ha_enabled: config.root_server_ha,
         num_bss_nodes: config.num_bss_nodes as usize,
-        num_api_servers: config.num_api_servers as usize,
+        num_s3_gateways: config.num_s3_gateways as usize,
         num_bench_clients: config.num_bench_clients as usize,
         with_bench: config.with_bench,
         use_generic_binaries: config.use_generic_binaries,
@@ -181,7 +181,7 @@ fn build_terraform_vars(
     add("cluster_id", &cluster_id);
     add("region", region);
     add("zone_a", zone);
-    add("num_api_servers", &config.num_api_servers.to_string());
+    add("num_s3_gateways", &config.num_s3_gateways.to_string());
     add("num_bss_nodes", &config.num_bss_nodes.to_string());
     add("root_server_ha", &config.root_server_ha.to_string());
     add(

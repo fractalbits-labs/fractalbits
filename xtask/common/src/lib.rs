@@ -52,8 +52,8 @@ pub fn generate_blueprint(config: &BootstrapClusterConfig) -> StageBlueprint {
     let num_rss = if config.global.rss_ha_enabled { 2 } else { 1 };
     let num_api = config
         .global
-        .num_api_servers
-        .unwrap_or_else(|| config.nodes.get("api_server").map(|v| v.len()).unwrap_or(0));
+        .num_s3_gateways
+        .unwrap_or_else(|| config.nodes.get("s3_gateway").map(|v| v.len()).unwrap_or(0));
     let num_bench = if config.global.for_bench {
         config.global.num_bench_clients.map(|n| n + 1).unwrap_or(0)
     } else {
@@ -266,7 +266,7 @@ pub struct ClusterGlobalConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_bss_nodes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub num_api_servers: Option<usize>,
+    pub num_s3_gateways: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_bench_clients: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,7 +305,7 @@ pub struct ClusterEndpointsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nss_endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_server_endpoint: Option<String>,
+    pub s3_gateway_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

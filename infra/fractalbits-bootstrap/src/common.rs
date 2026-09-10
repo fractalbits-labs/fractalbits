@@ -15,7 +15,7 @@ pub use crate::gcp::firestore_put_document;
 pub const BIN_PATH: &str = "/opt/fractalbits/bin/";
 pub const ETC_PATH: &str = "/opt/fractalbits/etc/";
 pub const GUI_WEB_ROOT: &str = "/opt/fractalbits/www/";
-pub const API_SERVER_CONFIG: &str = "api_server_cloud_config.toml";
+pub const S3_GATEWAY_CONFIG: &str = "s3_gateway_cloud_config.toml";
 pub const BSS_SERVER_CONFIG: &str = "bss_server_cloud_config.toml";
 pub const NSS_SERVER_CONFIG: &str = "nss_server_cloud_config.toml";
 pub const ROOT_SERVER_CONFIG: &str = "root_server_cloud_config.toml";
@@ -129,7 +129,7 @@ pub fn create_systemd_unit_file(service_name: &str, enable_now: bool) -> CmdResu
     let mut scheduling = "";
     let instance_id = crate::aws::get_aws_instance_id().unwrap_or_else(|_| "unknown".to_string());
     let exec_start = match service_name {
-        "api_server" => {
+        "s3_gateway" => {
             env_settings = format!(
                 r##"
 Environment="RUST_LOG=info"
@@ -139,7 +139,7 @@ Environment="HOST_ID={instance_id}""##
 CPUSchedulingPriority=50
 IOSchedulingClass=realtime
 IOSchedulingPriority=0";
-            format!("{BIN_PATH}{service_name} -c {ETC_PATH}{API_SERVER_CONFIG}")
+            format!("{BIN_PATH}{service_name} -c {ETC_PATH}{S3_GATEWAY_CONFIG}")
         }
         "gui_server" => {
             env_settings = format!(
@@ -149,7 +149,7 @@ Environment="GUI_WEB_ROOT={GUI_WEB_ROOT}"
 Environment="HOST_ID={instance_id}"
 "##
             );
-            format!("{BIN_PATH}api_server -c {ETC_PATH}{API_SERVER_CONFIG}")
+            format!("{BIN_PATH}s3_gateway -c {ETC_PATH}{S3_GATEWAY_CONFIG}")
         }
         "nss" => {
             managed_service = true;
@@ -618,7 +618,7 @@ pub fn create_nvme_tuning_service() -> CmdResult {
         r##"[Unit]
 Description=NVMe Direct I/O Tuning
 After=local-fs.target
-Before=api_server.service bss.service nss.service bench_client.service
+Before=s3_gateway.service bss.service nss.service bench_client.service
 
 [Service]
 Type=oneshot
