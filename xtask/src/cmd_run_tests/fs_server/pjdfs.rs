@@ -1,5 +1,5 @@
 //! pjdfstest driver. Clones, bootstraps, and runs the POSIX
-//! filesystem compliance suite against an fs_server FUSE mount in
+//! filesystem compliance suite against a fractalbits-mount FUSE mount in
 //! `writeback_mode=default` so the writeback queue path is exercised.
 //!
 //! pjdfstest is a third-party C + Perl test suite that walks the
@@ -11,17 +11,16 @@
 //!
 //! Failures are documented but not fatal: many subdirs assume
 //! Linux/BSD-specific features (chflags, capabilities, ACLs) that
-//! fs_server intentionally doesn't expose. The promotion gate looks
+//! the mount intentionally doesn't expose. The promotion gate looks
 //! at the regression delta against strict mode, not the absolute
 //! pass count.
 
-use crate::cmd_service;
-use crate::{CmdResult, FsServerConfig, InitConfig, ServiceName};
+use crate::cmd_build::BuildMode;
+use crate::{CmdResult, FsMountConfig};
 use cmd_lib::run_cmd;
 use std::path::PathBuf;
-use std::time::Duration;
 
-use super::MOUNT_POINT;
+use super::{MOUNT_POINT, ensure_gateway, gateway_config, mount_fs, unmount_fs};
 
 const PJDFSTEST_REPO: &str = "https://github.com/pjd/pjdfstest.git";
 const PJDFSTEST_DIR: &str = "data/third_party/pjdfstest";
@@ -182,72 +181,26 @@ fn ensure_pjdfstest_built() -> CmdResult {
     Ok(())
 }
 
-fn disk_cache_path() -> String {
-    let base = std::env::current_dir().expect("Failed to get cwd");
-    base.join("data/fuse_test_disk_cache")
-        .to_string_lossy()
-        .to_string()
-}
-
-fn fs_cfg(bucket: &str) -> FsServerConfig {
-    FsServerConfig {
-        bucket_name: bucket.to_string(),
-        mount_point: MOUNT_POINT.to_string(),
-        read_write: true,
-        disk_cache_enabled: false,
-        disk_cache_path: disk_cache_path(),
-        // pjdfstest forks and `setuid(65534)` to verify the cross-user
-        // EPERM contract, so the suite must run as root (via sudo).
-        // FUSE only lets a different user reach the mount if it was
-        // mounted with `allow_other`, and the host needs
-        // `user_allow_other` in /etc/fuse.conf for that to take effect.
-        allow_other: true,
-        ..Default::default()
-    }
-}
-
 fn mount_fuse_default(bucket: &str) -> CmdResult {
-    let mount_point = MOUNT_POINT;
-    run_cmd! {
-        ignore fusermount3 -u $mount_point 2>/dev/null;
-        ignore fusermount -u $mount_point 2>/dev/null;
-    }?;
-    run_cmd!(mkdir -p $mount_point)?;
-
-    // writeback_mode left empty so fs_server uses its config default
-    // (writeback on), exercising the cache-by-default path.
-    let cfg = fs_cfg(bucket);
-    cmd_service::init_service(
-        ServiceName::FsServer,
-        crate::cmd_build::BuildMode::Debug,
-        &InitConfig {
-            fs_server: cfg,
+    // No disk cache: the suite is metadata-shaped and the gateway cache
+    // is exercised by the FUSE suite.
+    ensure_gateway(BuildMode::Debug, &gateway_config(false, "", 0))?;
+    // writeback_mode left empty so the mount uses its config default
+    // (`default`), the mode this suite gates.
+    mount_fs(
+        BuildMode::Debug,
+        &FsMountConfig {
+            bucket_name: bucket.to_string(),
+            mount_point: MOUNT_POINT.to_string(),
+            read_write: true,
+            allow_other: true,
             ..Default::default()
         },
-    )?;
-    cmd_service::start_service(ServiceName::FsServer)?;
-
-    for _ in 0..40 {
-        std::thread::sleep(Duration::from_millis(500));
-        if run_cmd!(mountpoint -q $mount_point).is_ok() {
-            return Ok(());
-        }
-    }
-    Err(std::io::Error::other(format!(
-        "FUSE mount at {mount_point} not ready after 20 seconds"
-    )))
+    )
 }
 
 fn unmount() -> CmdResult {
-    let mount_point = MOUNT_POINT;
-    run_cmd! {
-        ignore fusermount3 -u $mount_point 2>/dev/null;
-        ignore fusermount -u $mount_point 2>/dev/null;
-    }?;
-    let _ = cmd_service::stop_service(ServiceName::FsServer);
-    run_cmd! { ignore pkill -x fs_server 2>/dev/null; }?;
-    std::thread::sleep(Duration::from_millis(500));
-    Ok(())
+    unmount_fs(MOUNT_POINT)
 }
 
 pub async fn run_pjdfstest(subdir: Option<&str>) -> CmdResult {
@@ -338,7 +291,7 @@ pub async fn run_pjdfstest(subdir: Option<&str>) -> CmdResult {
     match prove_result {
         Ok(()) => println!("  pjdfstest: all subgroups passed"),
         // Per-suite failures are common (chflags, capabilities, ACLs
-        // that fs_server doesn't expose). Surface as a warning, not
+        // that the mount doesn't expose). Surface as a warning, not
         // a hard error, so the workload-validation flow stays unblocked.
         Err(e) => eprintln!(
             "  pjdfstest reported failures ({e}) -- inspect the prove log \

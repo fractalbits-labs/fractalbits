@@ -57,7 +57,7 @@ enum Cmd {
         about = "Overwrite-heavy fio benchmark (randwrite + fdatasync, cold reads) on a FUSE mount"
     )]
     OverwriteBench {
-        #[clap(long, long_help = "enable the fs_server disk cache")]
+        #[clap(long, long_help = "enable the fs_gateway disk cache")]
         disk_cache: bool,
 
         #[clap(long, default_value = "512")]
@@ -71,7 +71,7 @@ enum Cmd {
     },
 
     UntarBench {
-        #[clap(long, long_help = "enable the fs_server disk cache")]
+        #[clap(long, long_help = "enable the fs_gateway disk cache")]
         disk_cache: bool,
 
         #[clap(long, value_enum, default_value = "default")]
@@ -497,7 +497,8 @@ pub enum ServiceName {
     DdbLocal,
     Etcd,
     FirestoreEmulator,
-    FsServer,
+    FsGateway,
+    FsMount,
 }
 
 impl ServiceName {
@@ -557,31 +558,38 @@ pub struct InitConfig {
     pub with_https: bool,
     pub bss_count: u32,
     pub rss_backend: RssBackend,
-    pub fs_server: FsServerConfig,
+    pub fs_gateway: FsGatewayConfig,
+    pub fs_mount: FsMountConfig,
 }
 
-#[derive(Clone, Default)]
-pub struct FsServerConfig {
-    pub bucket_name: String,
-    pub mount_point: String,
-    pub mode: String,
-    pub read_write: bool,
+/// Local `fs_gateway` unit: the stateless storage gateway that owns the
+/// disk cache and the data-volume choice for every mount.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct FsGatewayConfig {
     pub disk_cache_enabled: bool,
     pub disk_cache_path: String,
     pub disk_cache_size_gb: u64,
-    /// Writeback durability mode passed through to fs_server via the
-    /// `FS_SERVER_WRITEBACK_MODE` env var. Empty string = use the
-    /// fs_server config default (`default`).
+    /// Data volume for files created through the mount: `bss`, `s3`, or
+    /// empty to follow the cluster's blob backend (S3 when hybrid).
+    pub data_volume: String,
+}
+
+/// Local `fs_mount` unit: `fractalbits-mount` against the local gateway.
+#[derive(Clone, Default)]
+pub struct FsMountConfig {
+    pub bucket_name: String,
+    pub mount_point: String,
+    pub read_write: bool,
+    /// Writeback durability mode passed through via the
+    /// `FS_MOUNT_WRITEBACK_MODE` env var. Empty string = use the
+    /// client config default (`default`).
     pub writeback_mode: String,
-    /// When true, fs_server gets `FS_SERVER_ALLOW_OTHER=true` so users
+    /// When true, the mount gets `FS_MOUNT_ALLOW_OTHER=true` so users
     /// other than the mounting daemon (notably root, when the
     /// pjdfstest harness drives the suite via `sudo`) can reach the
     /// FUSE mount. The host's `/etc/fuse.conf` must have
     /// `user_allow_other` enabled for this to take effect.
     pub allow_other: bool,
-    /// Data volume for files created through the mount: `bss`, `s3`, or
-    /// empty to follow the cluster's blob backend (S3 when hybrid).
-    pub data_volume: String,
 }
 
 impl Default for InitConfig {
@@ -592,7 +600,8 @@ impl Default for InitConfig {
             with_https: false,
             bss_count: 1,
             rss_backend: RssBackend::Etcd,
-            fs_server: Default::default(),
+            fs_gateway: Default::default(),
+            fs_mount: Default::default(),
         }
     }
 }
@@ -658,7 +667,7 @@ pub enum TestType {
             long,
             value_enum,
             default_value = "all_in_bss_single_az",
-            help = "Data blob backend; s3_hybrid_single_az also puts fs_server data on S3"
+            help = "Data blob backend; s3_hybrid_single_az also puts fs_gateway data on S3"
         )]
         data_blob_storage: DataBlobStorage,
     },
@@ -676,7 +685,7 @@ pub enum TestType {
             long,
             value_enum,
             default_value = "all_in_bss_single_az",
-            help = "Data blob backend; s3_hybrid_single_az also puts fs_server data on S3"
+            help = "Data blob backend; s3_hybrid_single_az also puts fs_gateway data on S3"
         )]
         data_blob_storage: DataBlobStorage,
     },
@@ -862,7 +871,8 @@ async fn main() -> CmdResult {
                     with_https,
                     bss_count,
                     rss_backend,
-                    fs_server: Default::default(),
+                    fs_gateway: Default::default(),
+                    fs_mount: Default::default(),
                 };
                 cmd_service::init_service(service, cmd_build::build_mode(release), &init_config)?;
             }

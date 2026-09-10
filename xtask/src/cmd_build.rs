@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 use strum::{AsRefStr, EnumString};
 
-/// Isolated target directory for fs_server builds to prevent workspace
+/// Isolated target directory for fs_gateway / fs_client builds to prevent workspace
 /// feature unification from enabling tokio-runtime on compio-only RPC deps.
 pub const COMPIO_TARGET_DIR: &str = "target/compio";
 
@@ -140,13 +140,15 @@ pub fn build_rust_servers(mode: BuildMode) -> CmdResult {
                 $[build_envs] cargo build --workspace
                     --exclude fractalbits-bootstrap
                     --exclude rewrk*
-                    --exclude fs_server;
+                    --exclude fs_gateway --exclude fs_client;
             }?;
             run_cmd! {
-                info "Building fs_server (isolated compio build) ...";
+                info "Building fs_gateway + fractalbits-mount (isolated compio build) ...";
                 CARGO_TARGET_DIR=$compio_target_dir
-                $[build_envs] cargo build -p fs_server;
-                cp $compio_target_dir/debug/fs_server target/debug/fs_server;
+                $[build_envs] cargo build -p fs_gateway -p fs_client;
+                rm -f target/debug/fs_gateway target/debug/fractalbits-mount;
+                cp $compio_target_dir/debug/fs_gateway target/debug/fs_gateway;
+                cp $compio_target_dir/debug/fractalbits-mount target/debug/fractalbits-mount;
             }?;
         }
         BuildMode::Release => {
@@ -154,14 +156,16 @@ pub fn build_rust_servers(mode: BuildMode) -> CmdResult {
                 info "Building rust-based servers in release mode ...";
                 $[build_envs] cargo build --workspace
                     --exclude container-all-in-one
-                    --exclude fs_server
+                    --exclude fs_gateway --exclude fs_client
                     --release;
             }?;
             run_cmd! {
-                info "Building fs_server (isolated compio build) ...";
+                info "Building fs_gateway + fractalbits-mount (isolated compio build) ...";
                 CARGO_TARGET_DIR=$compio_target_dir
-                $[build_envs] cargo build -p fs_server --release;
-                cp $compio_target_dir/release/fs_server target/release/fs_server;
+                $[build_envs] cargo build -p fs_gateway -p fs_client --release;
+                rm -f target/release/fs_gateway target/release/fractalbits-mount;
+                cp $compio_target_dir/release/fs_gateway target/release/fs_gateway;
+                cp $compio_target_dir/release/fractalbits-mount target/release/fractalbits-mount;
             }?;
         }
     }
@@ -307,16 +311,18 @@ pub fn build_prebuilt_dev() -> CmdResult {
             RUSTFLAGS="-C target-cpu=$rust_cpu -C opt-level=z -C codegen-units=1 -C strip=symbols"
             $[build_envs] cargo zigbuild --release --target $rust_target
                 --workspace --exclude fractalbits-bootstrap --exclude rewrk* --exclude fractal-s3
-                --exclude xtask --exclude container-all-in-one --exclude fs_server;
+                --exclude xtask --exclude container-all-in-one
+                --exclude fs_gateway --exclude fs_client;
         }?;
 
         let compio_target_dir = COMPIO_TARGET_DIR;
         run_cmd! {
-            info "Building fs_server for $arch (isolated compio build)...";
+            info "Building fs_gateway + fractalbits-mount for $arch (isolated compio build)...";
             RUSTFLAGS="-C target-cpu=$rust_cpu -C opt-level=z -C codegen-units=1 -C strip=symbols"
             CARGO_TARGET_DIR=$compio_target_dir
-            $[build_envs] cargo zigbuild --release --target $rust_target -p fs_server;
-            cp $compio_target_dir/$rust_target/release/fs_server $build_dir/fs_server;
+            $[build_envs] cargo zigbuild --release --target $rust_target -p fs_gateway -p fs_client;
+            cp $compio_target_dir/$rust_target/release/fs_gateway $build_dir/fs_gateway;
+            cp $compio_target_dir/$rust_target/release/fractalbits-mount $build_dir/fractalbits-mount;
         }?;
 
         info!("Copying binaries to prebuilt/dev/{arch} directory...");
