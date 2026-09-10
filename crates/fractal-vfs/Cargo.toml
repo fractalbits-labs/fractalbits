@@ -34,7 +34,7 @@ lru.workspace = true
 libc.workspace = true
 
 # InodeId / FileHandleId / Errno types shared with the FUSE adapter.
-fractal-fuse = { path = "../fs_client/fractal-fuse" }
+fractal-fuse = { path = "../fractal-fuse" }
 
 [dev-dependencies]
 compio-macros.workspace = true

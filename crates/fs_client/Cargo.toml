@@ -8,7 +8,7 @@ name = "fractalbits-mount"
 path = "src/main.rs"
 
 [dependencies]
-fractal-fuse = { path = "fractal-fuse" }
+fractal-fuse = { path = "../fractal-fuse" }
 fractal-vfs = { path = "../fractal-vfs" }
 data_types.workspace = true
 
