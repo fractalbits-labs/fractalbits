@@ -188,7 +188,7 @@ async fn test_nss_failover_with_data(backend: RssBackend) -> CmdResult {
     wait_for_port_ready(8087, 30)?;
     println!("    OK: port 8087 is ready");
 
-    // Step 6: Verify reads work after failover (with retries for api_server reconnection)
+    // Step 6: Verify reads work after failover (with retries for s3_gateway reconnection)
     println!("  Step 6: Verify data reads after failover");
     for i in 0..5 {
         let key = format!("failover-obj-{i}");

@@ -13,7 +13,7 @@ FractalBits uses a multi-tier architecture optimized for performance:
 ┌───────────────────────────────────┐
 │┌──────────────────────────────────┴┐
 ││┌──────────────────────────────────┴┐
-│││       API Server (Actix)          │ ← S3 API Frontend (N instances)
+│││       S3 Gateway (Actix)          │ ← S3 API Frontend (N instances)
 │││       - AWS SigV4 Auth            │
 │││       - Request Routing           │
 └┤│       - Connection Pooling        │
@@ -70,7 +70,7 @@ Metadata management with:
 - [LeanStore](https://www.cs.cit.tum.de/dis/research/leanstore/) inspired lightweight buffer manager for efficient memory management
 - Lock coupling (crab-latching) for concurrent access
 
-### **API Server**
+### **S3 Gateway**
 The S3-compatible HTTP frontend that handles:
 - All S3 API requests (GET, PUT, DELETE, HEAD, POST)
 - AWS Signature V4 authentication
@@ -97,7 +97,7 @@ Cluster coordination providing:
 **Key Technologies:**
 - **Fractal ART (Adaptive Radix Tree)**: Efficient metadata and data storage engine
 - **io_uring**: Linux async I/O (custom library based on TigerBeetle's IO)
-- **Actix**: Modern thread-per-core async web framework for API server
+- **Actix**: Modern thread-per-core async web framework for S3 gateway
 - **High Performance RPC Protocols**:
   - Data: Zero-copy RPC from network to disk, without serialization
   - Metadata: Fixed small size header + ProtoBuf Protocol

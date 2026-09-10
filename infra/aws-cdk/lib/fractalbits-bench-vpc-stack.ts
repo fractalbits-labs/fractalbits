@@ -114,7 +114,7 @@ export class FractalbitsBenchVpcStack extends cdk.Stack {
       },
       endpoints: {
         nss_endpoint: "unused",
-        api_server_endpoint: props.serviceEndpoint,
+        s3_gateway_endpoint: props.serviceEndpoint,
       },
       resources: {
         nss_id: "unused",

@@ -115,7 +115,7 @@ pub struct InputClusterGlobal {
     #[serde(default = "default_num_bss_nodes")]
     pub num_bss_nodes: usize,
     #[serde(default)]
-    pub num_api_servers: Option<usize>,
+    pub num_s3_gateways: Option<usize>,
     #[serde(default)]
     pub num_bench_clients: Option<usize>,
 }
@@ -133,7 +133,7 @@ pub struct InputClusterEndpoints {
     #[serde(default)]
     pub nss_endpoint: Option<String>,
     #[serde(default)]
-    pub api_server_endpoint: Option<String>,
+    pub s3_gateway_endpoint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,7 +195,7 @@ impl InputClusterConfig {
             rss_backend: RssBackend::Etcd,
             num_nss_nodes: None, // derived from populated nodes map at blueprint time
             num_bss_nodes: Some(self.global.num_bss_nodes),
-            num_api_servers: self.global.num_api_servers,
+            num_s3_gateways: self.global.num_s3_gateways,
             num_bench_clients: self.global.num_bench_clients,
             workflow_cluster_id: Some(cluster_id),
             meta_stack_testing: false,
@@ -215,13 +215,13 @@ impl InputClusterConfig {
             })
             .unwrap_or_default();
 
-        let api_server_endpoint = self
+        let s3_gateway_endpoint = self
             .endpoints
             .as_ref()
-            .and_then(|e| e.api_server_endpoint.clone())
+            .and_then(|e| e.s3_gateway_endpoint.clone())
             .or_else(|| {
                 self.nodes
-                    .get("api_server")
+                    .get("s3_gateway")
                     .and_then(|nodes| nodes.first())
                     .map(|n| n.ip.clone())
             });
@@ -232,7 +232,7 @@ impl InputClusterConfig {
             } else {
                 Some(nss_endpoint)
             },
-            api_server_endpoint,
+            s3_gateway_endpoint,
         };
 
         // On-prem always uses etcd

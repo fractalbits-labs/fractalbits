@@ -70,7 +70,7 @@ use generic_client::RpcClient as GenericRpcClient;
 /// write-once data keys. INTERIM: with no positive reader pinning, this
 /// wall-clock window (one request timeout plus slack) is the only cover
 /// an in-flight read of a doomed generation gets; both the fs_server
-/// sweep and the api_server deletion worker apply it.
+/// sweep and the s3_gateway deletion worker apply it.
 pub fn reclamation_grace(rpc_timeout: std::time::Duration) -> std::time::Duration {
     rpc_timeout.saturating_add(std::time::Duration::from_secs(10))
 }
@@ -91,7 +91,7 @@ pub enum RpcError {
     AlreadyExists,
     /// The bucket's NSS root blob does not exist (deleted or never created).
     /// Distinct from `NotFound`, which is "key not present in an existing
-    /// tree". Maps to `S3Error::NoSuchBucket` in api_server.
+    /// tree". Maps to `S3Error::NoSuchBucket` in s3_gateway.
     #[error("Root blob does not exist")]
     NoSuchRootBlob,
     #[error("Bucket already owned by you")]
@@ -338,7 +338,7 @@ macro_rules! bss_rpc_retry {
 /// Internal: shared retry loop body used by both nss_rpc_retry! arms.
 /// Callers supply the expressions for refresh/get-client so the retry logic
 /// itself lives in exactly one place, independent of whether the caller caches
-/// NSS clients per routing_key (api_server) or holds a single client
+/// NSS clients per routing_key (s3_gateway) or holds a single client
 /// (fs_server). Do not invoke directly — use `nss_rpc_retry!`.
 #[doc(hidden)]
 #[macro_export]
@@ -433,7 +433,7 @@ macro_rules! __nss_rpc_retry_body {
 /// Two forms:
 /// - 5-arg (multi-NSS): `(client, method(args), app, routing_key, trace_id)` —
 ///   caller's `app` exposes `get_nss_rpc_client(&RoutingKey)` and
-///   `try_refresh_nss_address(&RoutingKey, &TraceId)`. Used by api_server.
+///   `try_refresh_nss_address(&RoutingKey, &TraceId)`. Used by s3_gateway.
 /// - 4-arg (single-NSS): `(client, method(args), app, trace_id)` — caller's
 ///   `app` exposes `get_nss_rpc_client()` and `try_refresh_nss_address(&TraceId)`.
 ///   Used by fs_server.
@@ -460,7 +460,7 @@ macro_rules! nss_rpc_retry {
             $app.get_nss_rpc_client()
         )
     };
-    // No-refresh form (used outside api_server/fs_server).
+    // No-refresh form (used outside s3_gateway/fs_server).
     ($client:expr, $method:ident($($args:expr),*)) => {
         $crate::rpc_retry!("nss", $client, $method($($args),*))
     };

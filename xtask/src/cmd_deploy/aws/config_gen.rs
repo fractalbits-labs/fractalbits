@@ -24,7 +24,7 @@ pub fn generate_bootstrap_config(vpc_config: &VpcConfig) -> Result<BootstrapClus
 
     let aws_config = ClusterAwsConfig {
         // data_blob_bucket: for AllInBss it's unused; for S3Hybrid it comes from CDK output
-        // and is not pre-knowable. Leave None — API server reads it from DDB service discovery.
+        // and is not pre-knowable. Leave None — S3 gateway reads it from DDB service discovery.
         data_blob_bucket: None,
     };
 
@@ -38,7 +38,7 @@ pub fn generate_bootstrap_config(vpc_config: &VpcConfig) -> Result<BootstrapClus
             rss_backend: vpc_config.rss_backend,
             num_nss_nodes: Some(1), // CDK creates nss-0 only
             num_bss_nodes: Some(vpc_config.num_bss_nodes as usize),
-            num_api_servers: Some(vpc_config.num_api_servers as usize),
+            num_s3_gateways: Some(vpc_config.num_s3_gateways as usize),
             num_bench_clients: if vpc_config.with_bench {
                 Some(vpc_config.num_bench_clients as usize)
             } else {

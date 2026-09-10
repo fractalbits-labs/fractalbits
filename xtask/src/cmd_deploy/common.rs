@@ -4,13 +4,13 @@ pub use xtask_common::*;
 
 pub struct VpcConfig {
     pub template: Option<crate::VpcTemplate>,
-    pub num_api_servers: u32,
+    pub num_s3_gateways: u32,
     pub num_bench_clients: u32,
     pub num_bss_nodes: u32,
     pub with_bench: bool,
     pub bss_instance_type: String,
     pub nss_instance_type: String,
-    pub api_server_instance_type: String,
+    pub s3_gateway_instance_type: String,
     pub bench_client_instance_type: String,
     pub az: Option<String>,
     pub root_server_ha: bool,
@@ -81,7 +81,7 @@ pub(super) const AWS_CPU_TARGETS: &[ArchTarget] = &[
 pub(super) const RUST_BINS: &[&str] = &[
     "fractalbits-bootstrap",
     "root_server",
-    "api_server",
+    "s3_gateway",
     "nss_role_agent",
     "rss_admin",
 ];

@@ -12,7 +12,7 @@ pub enum NssError {
     AlreadyExists,
     /// The bucket's root blob does not exist on NSS — either it was never
     /// created or it has been deleted (e.g. by a `delete_bucket` on another
-    /// api_server). Distinct from `NotFound`, which means the key is not
+    /// s3_gateway). Distinct from `NotFound`, which means the key is not
     /// present in an existing tree.
     NoSuchRootBlob,
     Internal(String),

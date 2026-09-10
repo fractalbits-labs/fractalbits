@@ -82,14 +82,14 @@ pub fn bootstrap(config: &BootstrapConfig, bench_client_num: usize) -> CmdResult
         warp_client_ips.push_str(&format!("  - {ip}:7761\n"));
     }
 
-    // Target API server IPs directly. warp_host: benchmark target;
+    // Target S3 gateway IPs directly. warp_host: benchmark target;
     // cli_endpoint: single host for bucket setup / readiness probe.
-    let num_api_servers = config.global.num_api_servers.unwrap_or(1);
-    let api_ips = get_service_ips_with_backend(config, "api-server", num_api_servers);
+    let num_s3_gateways = config.global.num_s3_gateways.unwrap_or(1);
+    let api_ips = get_service_ips_with_backend(config, "s3-gateway", num_s3_gateways);
     let cli_endpoint = api_ips
         .first()
         .cloned()
-        .ok_or_else(|| std::io::Error::other("no api-server IPs discovered"))?;
+        .ok_or_else(|| std::io::Error::other("no s3-gateway IPs discovered"))?;
     // Comma-separated list; warp round-robins across them.
     let warp_host = api_ips
         .iter()
@@ -127,11 +127,11 @@ pub fn bootstrap(config: &BootstrapConfig, bench_client_num: usize) -> CmdResult
         )?;
     }
 
-    info!("Waiting for api_server endpoint {cli_endpoint} to be ready");
+    info!("Waiting for s3_gateway endpoint {cli_endpoint} to be ready");
     while !check_port_ready(&cli_endpoint, 80) {
         std::thread::sleep(Duration::from_secs(1));
     }
-    info!("api_server endpoint {cli_endpoint}:80 is reachable");
+    info!("s3_gateway endpoint {cli_endpoint}:80 is reachable");
 
     create_bench_start_script(region, &cli_endpoint)?;
 
@@ -140,7 +140,7 @@ pub fn bootstrap(config: &BootstrapConfig, bench_client_num: usize) -> CmdResult
     Ok(())
 }
 
-fn create_bench_start_script(region: &str, api_server_ip: &str) -> CmdResult {
+fn create_bench_start_script(region: &str, s3_gateway_ip: &str) -> CmdResult {
     let script_content = format!(
         r##"#!/bin/bash
 
@@ -149,7 +149,7 @@ export AWS_SECRET_ACCESS_KEY=test_api_secret
 
 set -ex
 export AWS_DEFAULT_REGION={region}
-export AWS_ENDPOINT_URL_S3=http://{api_server_ip}
+export AWS_ENDPOINT_URL_S3=http://{s3_gateway_ip}
 bench_bucket=warp-benchmark-bucket
 
 if ! aws s3api head-bucket --bucket $bench_bucket &>/dev/null; then

@@ -260,7 +260,7 @@ async fn any_handler_inner<'a>(
         .record(start.elapsed().as_nanos() as f64);
 
     // Check authorization. If denied against the cached api_key, fall through
-    // to a single refresh-from-RSS retry: another api_server may have just
+    // to a single refresh-from-RSS retry: another s3_gateway may have just
     // added this bucket to the api_key's authorized_buckets (e.g. a freshly
     // created bucket) and our cache has not yet expired.
     let authorization_type = endpoint.authorization_type();

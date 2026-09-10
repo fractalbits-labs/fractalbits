@@ -85,7 +85,7 @@ pub async fn get_raw_object(
     match parse_get_inode(resp) {
         Ok(layout) => Ok(layout),
         Err(file_ops::NssError::NoSuchRootBlob) => {
-            // Bucket was deleted upstream (e.g. by another api_server). Drop
+            // Bucket was deleted upstream (e.g. by another s3_gateway). Drop
             // our stale cache entry so subsequent ops stop using it; the
             // From<NssError> conversion already maps to S3Error::NoSuchBucket.
             app.invalidate_bucket_cache(bucket_name).await;

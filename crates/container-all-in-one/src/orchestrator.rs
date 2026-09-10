@@ -84,12 +84,12 @@ impl Orchestrator {
         nss_result?;
         info!("Phase 3 (api_key+nss ready): {:?}", phase_start.elapsed());
 
-        // Phase 4: Start api_server (depends on RSS and NSS)
+        // Phase 4: Start s3_gateway (depends on RSS and NSS)
         let phase_start = Instant::now();
-        info!("Starting api_server");
-        self.start_api_server()?;
+        info!("Starting s3_gateway");
+        self.start_s3_gateway()?;
         self.wait_for_port(self.api_port, 30).await?;
-        info!("Phase 4 (api_server ready): {:?}", phase_start.elapsed());
+        info!("Phase 4 (s3_gateway ready): {:?}", phase_start.elapsed());
 
         info!(
             "All services started successfully in {:?}",
@@ -261,27 +261,27 @@ impl Orchestrator {
         Ok(())
     }
 
-    fn start_api_server(&mut self) -> Result<()> {
-        let mut child = Command::new(self.bin_dir.join("api_server"))
+    fn start_s3_gateway(&mut self) -> Result<()> {
+        let mut child = Command::new(self.bin_dir.join("s3_gateway"))
             .env("RUST_LOG", "info")
             .env("HTTPS_DISABLED", "1")
             .env("APP_BLOB_STORAGE_BACKEND", "all_in_bss_single_az")
             .env(
                 "APP_STATS_DIR",
-                self.data_dir.join("api-server/local/stats"),
+                self.data_dir.join("s3-gateway/local/stats"),
             )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
 
         if let Some(stdout) = child.stdout.take() {
-            self.spawn_output_streamer("api_server", stdout);
+            self.spawn_output_streamer("s3_gateway", stdout);
         }
         if let Some(stderr) = child.stderr.take() {
-            self.spawn_output_streamer("api_server", stderr);
+            self.spawn_output_streamer("s3_gateway", stderr);
         }
 
-        self.children.push(("api_server", child));
+        self.children.push(("s3_gateway", child));
         Ok(())
     }
 

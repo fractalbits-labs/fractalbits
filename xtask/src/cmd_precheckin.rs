@@ -4,7 +4,7 @@ pub fn run_cmd_precheckin(
     init_config: InitConfig,
     s3_api_only: bool,
     zig_unit_tests_only: bool,
-    debug_api_server: bool,
+    debug_s3_gateway: bool,
     with_fractal_art_tests: bool,
     docker: DockerTestMode,
 ) -> CmdResult {
@@ -12,10 +12,10 @@ pub fn run_cmd_precheckin(
         return run_docker_tests();
     }
 
-    if debug_api_server {
-        cmd_service::stop_service(ServiceName::ApiServer)?;
+    if debug_s3_gateway {
+        cmd_service::stop_service(ServiceName::S3Gateway)?;
         run_cmd! {
-            cargo build -p api_server;
+            cargo build -p s3_gateway;
         }?;
     } else {
         cmd_service::stop_service(ServiceName::All)?;
@@ -27,7 +27,7 @@ pub fn run_cmd_precheckin(
     }
 
     if s3_api_only {
-        return run_s3_api_tests(&init_config, debug_api_server);
+        return run_s3_api_tests(&init_config, debug_s3_gateway);
     }
 
     if zig_unit_tests_only {
@@ -38,7 +38,7 @@ pub fn run_cmd_precheckin(
     run_zig_unit_tests()?;
     run_cmd! {
         info "Run cargo tests (except s3 api and fs_server)";
-        cargo test --workspace --exclude api_server --exclude fs_server;
+        cargo test --workspace --exclude s3_gateway --exclude fs_server;
     }?;
 
     run_s3_api_tests(&init_config, false)?;
@@ -104,17 +104,17 @@ fn run_fractal_art_tests() -> CmdResult {
     Ok(())
 }
 
-fn run_s3_api_tests(init_config: &InitConfig, debug_api_server: bool) -> CmdResult {
-    if debug_api_server {
-        cmd_service::start_service(ServiceName::ApiServer)?;
+fn run_s3_api_tests(init_config: &InitConfig, debug_s3_gateway: bool) -> CmdResult {
+    if debug_s3_gateway {
+        cmd_service::start_service(ServiceName::S3Gateway)?;
         run_cmd! {
             info "Run cargo tests (s3 api tests)";
-            cargo test --package api_server;
+            cargo test --package s3_gateway;
         }?;
         if init_config.with_https {
             run_cmd! {
                 info "Run cargo tests (s3 https api tests)";
-                USE_HTTPS_ENDPOINT=true cargo test --package api_server;
+                USE_HTTPS_ENDPOINT=true cargo test --package s3_gateway;
             }?;
         }
         return Ok(());
@@ -130,13 +130,13 @@ fn run_s3_api_tests(init_config: &InitConfig, debug_api_server: bool) -> CmdResu
     cmd_service::start_service(ServiceName::All)?;
     run_cmd! {
         info "Run cargo tests (s3 api tests - DDB backend)";
-        cargo test --package api_server;
+        cargo test --package s3_gateway;
     }?;
 
     if init_config.with_https {
         run_cmd! {
             info "Run cargo tests (s3 https api tests - DDB backend)";
-            USE_HTTPS_ENDPOINT=true cargo test --package api_server;
+            USE_HTTPS_ENDPOINT=true cargo test --package s3_gateway;
         }?;
     }
 
@@ -152,13 +152,13 @@ fn run_s3_api_tests(init_config: &InitConfig, debug_api_server: bool) -> CmdResu
     cmd_service::start_service(ServiceName::All)?;
     run_cmd! {
         info "Run cargo tests (s3 api tests - etcd backend)";
-        cargo test --package api_server;
+        cargo test --package s3_gateway;
     }?;
 
     if init_config.with_https {
         run_cmd! {
             info "Run cargo tests (s3 https api tests - etcd backend)";
-            USE_HTTPS_ENDPOINT=true cargo test --package api_server;
+            USE_HTTPS_ENDPOINT=true cargo test --package s3_gateway;
         }?;
     }
 
@@ -203,8 +203,8 @@ fn run_docker_tests() -> CmdResult {
     })?;
 
     let result = (|| -> CmdResult {
-        info!("Running api_server tests against Docker container...");
-        let test_result = run_cmd!(cargo test --package api_server);
+        info!("Running s3_gateway tests against Docker container...");
+        let test_result = run_cmd!(cargo test --package s3_gateway);
         if test_result.is_err() {
             info!("Tests failed, showing container logs...");
             run_cmd! { ignore docker logs fractalbits-dev 2>&1 | tail -200; }?;

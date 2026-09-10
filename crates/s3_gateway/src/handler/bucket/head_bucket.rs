@@ -26,7 +26,7 @@ pub async fn head_bucket_handler(ctx: BucketRequestContext) -> Result<HttpRespon
 
     // HEAD bucket is a metadata-only existence check; serving it from a
     // possibly-stale local cache could falsely report "exists" for a bucket
-    // that was just deleted on another api_server. Always re-validate
+    // that was just deleted on another s3_gateway. Always re-validate
     // against RSS.
     resolve_bucket_no_cache(&ctx.app, &ctx.bucket_name, &ctx.trace_id)
         .await

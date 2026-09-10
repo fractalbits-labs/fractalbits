@@ -4,7 +4,7 @@ use super::*;
 pub fn create_put_workload_config(
     warp_client_ips: &str,
     region: &str,
-    api_server_ips: &str,
+    s3_gateway_ips: &str,
     duration: &str,
     size_kb: usize,
     concurrent_ops: usize,
@@ -54,7 +54,7 @@ pub fn create_put_workload_config(
     # Multiple servers can be specified with ellipsis notation;
     # for example '10.0.0.{{1...10}}:9000' specifies 10 hosts.
     # See more at https://github.com/minio/warp?tab=readme-ov-file#multiple-hosts
-    host: {api_server_ips}
+    host: {s3_gateway_ips}
 
     # Use TLS for calls.
     tls: false
