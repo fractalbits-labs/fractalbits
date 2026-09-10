@@ -179,7 +179,7 @@ impl VfsCore {
     }
 
     /// Drop the cached layout for `inode` so the next access cold-fetches
-    /// from NSS. Called when a publish taint is consumed: the local
+    /// from the metadata store. Called when a publish taint is consumed: the local
     /// layout (and any symlink target it carries) is what failed to
     /// publish, so re-serving it after the one-shot EIO would hand back
     /// stale state that lost to the remote winner. Clearing it forces the
@@ -232,10 +232,10 @@ impl VfsCore {
     }
 
     /// True if a regular-file child lives under `dir_key` in local state
-    /// that the NSS emptiness probe cannot yet see. A file create publishes
+    /// that the metadata-store emptiness probe cannot yet see. A file create publishes
     /// its final layout on FUSE_RELEASE (a writeback cycle), not as a
     /// PutInode intent, so between create and the release publish landing in
-    /// NSS the child is visible only here: as an open handle or an in-flight
+    /// the metadata store the child is visible only here: as an open handle or an in-flight
     /// writeback cycle. `rmdir` consults this so it honours the POSIX
     /// non-empty contract instead of deleting a directory out from under an
     /// in-flight child publish. `dir_key` ends in '/'; the directory marker
@@ -279,8 +279,8 @@ impl VfsCore {
     /// timeout still aborts (an intent may still be in flight).
     ///
     /// Returns `true` if a taint was cleared: the entry's create publish
-    /// failed, so NSS has nothing for the (still locally visible) name and
-    /// the caller must treat a NSS miss as a successful local-only delete,
+    /// failed, so the metadata store has nothing for the (still locally visible) name and
+    /// the caller must treat a metadata-store miss as a successful local-only delete,
     /// not ENOENT.
     pub async fn drain_inode_for_delete(&self, inode: InodeId) -> Result<bool, FsError> {
         if let Some(barrier) = self.writeback.fsync_barrier(inode) {
@@ -547,7 +547,7 @@ impl VfsCore {
             }
             // Retry transient flush errors before the deferred-taint
             // path: for a brand-new file a failed FIRST publish leaves
-            // nothing in NSS, so every retry here is one less silently
+            // nothing in the metadata store, so every retry here is one less silently
             // lost file. `flush_write_buffer` re-arms its snapshot on
             // failure, so a retry republishes the same data.
             for attempt in 1..3u32 {

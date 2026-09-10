@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::config::WritebackMode;
 use crate::error::FsError;
 use crate::inode::EntryType;
-use crate::prefetch::{cache_pressure_high, prefetch_blob, should_prefetch};
+use crate::prefetch::{prefetch_plan, should_prefetch};
 use crate::vfs::write_buffer::WriteBuffer;
 use crate::vfs::{DEFAULT_BLOCK_SIZE, FileHandle, VfsCore};
 
@@ -208,7 +208,7 @@ impl VfsCore {
             }
         };
 
-        // The FUSE data path only speaks the BSS block protocol; an S3
+        // The FUSE data path only speaks the block-store block protocol; an S3
         // hybrid-volume object cannot be opened for data access.
         if let Some(ref l) = layout
             && let Err(error) = self.ensure_data_layout_supported(l, &TraceId::new()).await
@@ -217,23 +217,6 @@ impl VfsCore {
                 self.release_write_lock(inode, fh);
             }
             return Err(error);
-        }
-
-        // Cross-instance staleness reconciliation: if the cache file's
-        // authoritative_blob_v lags the inode's blob_version, another
-        // instance has bumped the version since we last sync'd. Clear
-        // the cache file so subsequent reads cold-fetch from BSS.
-        // Done on every open (read or write) so read-only handles
-        // don't keep serving stale bytes.
-        if let Some(dc) = &self.disk_cache
-            && let Some(ref l) = layout
-            && let Ok(blob_guid) = l.blob_guid()
-            && let Err(e) = dc.reconcile_on_open(blob_guid, l.blob_version).await
-        {
-            tracing::warn!(
-                %blob_guid, error = %e,
-                "disk cache reconcile_on_open failed; continuing"
-            );
         }
 
         let has_trunc = flags & libc::O_TRUNC as u32 != 0;
@@ -258,57 +241,37 @@ impl VfsCore {
                 wb.dirty = true;
                 Some(wb)
             } else {
-                // Brand-new file (NSS lookup returned NotFound).
+                // Brand-new file (the metadata store lookup returned NotFound).
                 Some(WriteBuffer::new(None, 0, DEFAULT_BLOCK_SIZE))
             }
         } else {
             None
         };
 
-        // Promote the cached entry to MRU on every open. Reads served
-        // by `FUSE_PASSTHROUGH` bypass the per-block touch path
-        // entirely, so without this hook a hot file served via
-        // passthrough would never advance in LRU and the evictor would
-        // treat it as cold.
+        // Ask the gateway to warm its disk cache with the whole blob when
+        // the open-time policy says yes. Read-only opens only; writers own
+        // the blob's bytes via `WriteBuffer` and have no need for it. The
+        // gateway applies its own cache-pressure and completeness checks.
         if !is_write
-            && let Some(dc) = &self.disk_cache
-            && let Some(ref l) = layout
-            && let Ok(blob_guid) = l.blob_guid()
-        {
-            dc.touch_blob(blob_guid);
-        }
-
-        // Spawn a whole-blob prefetch when the open-time policy says
-        // yes and the cache is not already complete. Read-only opens
-        // only; writers own the blob's bytes via `WriteBuffer` and
-        // have no need for a parallel prefetch.
-        if !is_write
-            && let Some(dc) = &self.disk_cache
             && let Some(ref l) = layout
             && let Ok(file_size) = l.size()
             && let Ok(blob_guid) = l.blob_guid()
         {
-            let usage = dc.current_usage();
-            let capacity = dc.capacity_bytes();
-            // FOPEN_KEEP_CACHE is the kernel's sequential-read hint;
-            // the open(2) flag itself does not directly map, so for
-            // now we treat any non-O_RANDOM read as a candidate.
-            // O_RANDOM is not a portable flag; absent it on Linux,
-            // the conservative default is `false`; only the
-            // full-threshold and workload_bulk_read branches fire.
+            // FOPEN_KEEP_CACHE is the kernel's sequential-read hint; the
+            // open(2) flag itself does not directly map, so the
+            // conservative default is `false`: only the full-threshold and
+            // workload_bulk_read branches fire.
             let keep_cache_hint = false;
-            if !cache_pressure_high(usage, capacity, &self.prefetch_policy)
-                && should_prefetch(file_size, keep_cache_hint, &self.prefetch_policy)
-                && !dc.is_complete(blob_guid, file_size)
-            {
-                let dc_arc = Arc::clone(dc);
-                let backend_cfg = Arc::clone(&self.backend_config);
-                let layout_clone = l.clone();
+            if should_prefetch(file_size, keep_cache_hint, &self.prefetch_policy) {
                 let rows = self.row_map_for_prefetch(l).await;
-                compio_runtime::spawn(async move {
-                    prefetch_blob(backend_cfg, dc_arc, layout_clone, rows).await;
-                })
-                .detach();
+                let plan = prefetch_plan(l, rows.as_deref());
+                if !plan.is_empty() {
+                    let backend = self.backend();
+                    compio_runtime::spawn(async move {
+                        backend.prefetch_blob(blob_guid, file_size, plan).await;
+                    })
+                    .detach();
+                }
             }
         }
 
@@ -321,7 +284,6 @@ impl VfsCore {
                 layout_refreshed_at: Instant::now(),
                 operation_lock: Arc::new(futures::lock::Mutex::new(())),
                 write_buf,
-                backing_id: None,
             },
         );
 

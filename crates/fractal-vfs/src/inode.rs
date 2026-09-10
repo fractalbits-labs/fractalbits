@@ -68,13 +68,13 @@ pub struct InodeEntry {
     /// uid 0 / mode 0; trusting that default makes the setattr owner
     /// check reject the real owner with EPERM. The async attr paths
     /// (`vfs_getattr`, `lookup_or_insert` when a marker arrives) refresh
-    /// `posix` from the NSS marker and flip this true.
+    /// `posix` from the metadata-store marker and flip this true.
     pub posix_known: bool,
     /// `true` once unlink/rmdir has removed the name mapping for this
-    /// inode and issued the NSS delete. The kernel's dcache may still
+    /// inode and issued the metadata-store delete. The kernel's dcache may still
     /// hold a stale dentry pointing at this inode; subsequent FUSE
     /// SETATTR / WRITE / RELEASE ops via that dentry must NOT write
-    /// the inode's bytes back to NSS, otherwise the unlinked file
+    /// the inode's bytes back to the metadata store, otherwise the unlinked file
     /// resurrects (deterministic EEXIST on the next create at the same
     /// name). Cleared on lookup_or_insert when a new inode is
     /// allocated for the same key.
@@ -159,7 +159,7 @@ impl InodeTable {
             next_ino: AtomicU64::new(2), // 1 is root
             key_to_ino: DashMap::new(),
         };
-        // Insert root inode. Root key is "/" matching NSS key convention
+        // Insert root inode. Root key is "/" matching metadata-store key convention
         // where all keys are stored with a leading "/".
         table.map.insert(
             ROOT_INODE,
@@ -169,7 +169,7 @@ impl InodeTable {
                 layout: None,
                 cache_expiry: Instant::now(),
                 posix: PosixAttrs::default(),
-                // Root has no NSS marker; make_dir_attr special-cases it
+                // Root has no metadata-store marker; make_dir_attr special-cases it
                 // (mode 0o777) and it is never owner-checked, so treat its
                 // placeholder posix as authoritative to skip marker fetches.
                 posix_known: true,
@@ -259,7 +259,7 @@ impl InodeTable {
             self.key_to_ino
                 .remove(&(entry.s3_key.clone(), entry.entry_type));
             // Mark the inode so any in-flight FUSE op via a now-stale
-            // dentry stops re-publishing to NSS and resurrecting the
+            // dentry stops re-publishing to the metadata store and resurrecting the
             // deleted name.
             entry.name_removed = true;
         }

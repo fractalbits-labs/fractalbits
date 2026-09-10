@@ -5,7 +5,7 @@ use bytes::Bytes;
 
 /// Per-block content intent for the sparse WriteBuffer.
 ///
-/// Blocks NOT in the map are implicitly "Keep": no buffered work, BSS is
+/// Blocks NOT in the map are implicitly "Keep": no buffered work, the block store is
 /// authoritative. The override flush uploads only `Rewrite` blocks (in
 /// place at the bumped blob_version), replays `Delete` intents as
 /// versioned block deletes, and never touches "Keep"/absent blocks. The
@@ -18,7 +18,7 @@ pub(crate) enum BlockState {
     /// these (zero-padded to block_size) at the new blob_version.
     Rewrite(Bytes),
     /// PUNCH_HOLE intent: the override flush schedules a versioned
-    /// `delete_block` so the BSS entry is dropped at the new blob_version.
+    /// `delete_block` so the block-store entry is dropped at the new blob_version.
     /// Reads (dirty-handle merge and post-flush via `BlockNotFound`) treat
     /// the block as zeros. Distinguished from a plain hole because a
     /// punched block sits inside the file's logical range and the deletion
@@ -46,7 +46,7 @@ pub(crate) struct WriteBuffer {
     pub(crate) dirty: bool,
     /// Smallest `ceil(new_size / block_size)` reached by any shrink in this
     /// session. Blocks at index `>= eof_low_watermark` had their committed
-    /// BSS data logically destroyed by the shrink and must read as zeros
+    /// block-store data logically destroyed by the shrink and must read as zeros
     /// until the flush trim deletes them, even if a later grow brings the
     /// index back into the file. Reset to `None` only on a successful
     /// flush. Without it, `truncate(small); write(past old EOF)` would
@@ -83,7 +83,7 @@ impl WriteBuffer {
         self.blocks.retain(|b, _| *b < new_last_block_excl);
     }
 
-    /// True when block `b` sits in a range whose committed BSS bytes were
+    /// True when block `b` sits in a range whose committed block-store bytes were
     /// destroyed by a shrink earlier this session; lazy-load and
     /// dirty-read paths must return zeros for such blocks.
     pub(crate) fn block_destroyed_by_shrink(&self, b: u32) -> bool {

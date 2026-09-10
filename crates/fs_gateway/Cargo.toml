@@ -1,0 +1,59 @@
+[package]
+name = "fs_gateway"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "fs_gateway"
+path = "src/main.rs"
+
+[dependencies]
+# Storage backend (rpc clients + codecs).
+rpc_client_common = { workspace = true, default-features = false, features = ["compio-runtime"] }
+rpc_client_bss = { workspace = true, default-features = false, features = ["compio-runtime"] }
+rpc_client_nss = { workspace = true, default-features = false, features = ["compio-runtime"] }
+rpc_client_rss = { workspace = true, default-features = false, features = ["compio-runtime"] }
+volume_group_proxy = { workspace = true, default-features = false, features = ["compio-runtime"] }
+s3_blob_store.workspace = true
+nss_codec.workspace = true
+file_ops.workspace = true
+bss_codec.workspace = true
+rpc_codec_common.workspace = true
+fs_gateway_codec.workspace = true
+data_types.workspace = true
+metrics_wrapper.workspace = true
+
+# Async runtime. tokio hosts only the S3 SDK (see s3_volume.rs) and the
+# signal handler.
+compio-runtime.workspace = true
+compio-driver = { version = "0.12", features = ["io-uring"] }
+compio-net.workspace = true
+compio-io.workspace = true
+compio-buf.workspace = true
+compio-fs.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "signal"] }
+
+# Common.
+prost.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rkyv.workspace = true
+clap.workspace = true
+config.workspace = true
+parking_lot.workspace = true
+futures.workspace = true
+uuid.workspace = true
+rand.workspace = true
+xxhash-rust.workspace = true
+lru.workspace = true
+libc.workspace = true
+nix.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+compio-macros.workspace = true

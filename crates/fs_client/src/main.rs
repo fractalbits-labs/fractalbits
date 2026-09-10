@@ -18,7 +18,10 @@ use fractal_vfs::vfs::VfsCore;
 use crate::fuse_server::FuseServer;
 
 #[derive(Parser)]
-#[clap(name = "fs_server", about = "FUSE file server for FractalBits S3")]
+#[clap(
+    name = "fractalbits-mount",
+    about = "Mount a fractalbits bucket over FUSE via an fs_gateway endpoint"
+)]
 struct Opt {
     #[clap(short = 'c', long = "config", help = "Config file path")]
     config_file: Option<PathBuf>,
@@ -116,17 +119,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(
         bucket = %cfg.bucket_name,
+        gateway = ?cfg.gateway_addrs,
         read_write = read_write,
-        "Starting fs_server"
+        "Starting fractalbits-mount"
     );
 
-    // Discover backend configuration (NSS address, DataVgInfo, bucket) via RSS.
+    // Establish the gateway session before touching the kernel: a refused
+    // mount exits with an error instead of a half-working mount point.
     let backend_config = {
         let cfg_ref = &cfg;
         compio_runtime::Runtime::new()
-            .expect("Failed to create compio runtime for discovery")
+            .expect("Failed to create compio runtime for mount")
             .block_on(backend::BackendConfig::discover(cfg_ref))
-            .map_err(|e| std::io::Error::other(format!("Backend discovery failed: {e}")))?
+            .map_err(|e| std::io::Error::other(format!("Gateway mount failed: {e}")))?
     };
     let backend_config = Arc::new(backend_config);
 
@@ -146,14 +151,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // gating and the cross-user EPERM / EACCES contract can't be
         // exercised.
         .default_permissions(cfg.allow_other)
-        .write_back(read_write && !cfg.passthrough_enabled)
-        .passthrough(cfg.passthrough_enabled);
+        .write_back(read_write);
 
     let session =
         Session::new(mount_point.into(), mount_options)?.with_worker_count(cfg.worker_threads);
     install_shutdown_signal_handler(session.shutdown_handle())?;
-    let vfs_core = Arc::new(vfs_core.with_fuse_fd(session.fuse_fd()));
-    session.run(FuseServer::new(vfs_core))?;
+    session.run(FuseServer::new(Arc::new(vfs_core)))?;
     tracing::info!("FUSE server exited");
 
     Ok(())

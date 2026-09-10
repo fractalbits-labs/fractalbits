@@ -30,7 +30,7 @@ impl VfsCore {
 
         // A cold listing races the async worker: a queued create
         // (mkdir/symlink/mknod PutInode) or an in-flight release publish
-        // may not be in NSS yet, and the incomplete listing would then be
+        // may not be in the metadata store yet, and the incomplete listing would then be
         // cached until the TTL, hiding an entry the caller already saw
         // created. Wait for those cycles to commit first. Taints are left
         // in place (readdir is not an error-reporting point); a failed
@@ -38,7 +38,7 @@ impl VfsCore {
         if self.writeback_mode == WritebackMode::Default {
             // Flush still-dirty open handles first: a file in the
             // close(2)-to-FUSE_RELEASE window has no registered cycle yet,
-            // so draining only known cycles/intents would list NSS without
+            // so draining only known cycles/intents would list the metadata store without
             // it and cache the incomplete listing. Flushing registers the
             // cycle so the wait below blocks on it. Mirrors
             // drain_writeback_under_prefix / vfs_fsyncdir.

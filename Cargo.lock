@@ -2465,46 +2465,28 @@ dependencies = [
 name = "fractal-vfs"
 version = "0.1.0"
 dependencies = [
- "bss_codec",
  "bytes",
- "compio-buf",
- "compio-fs",
- "compio-io",
  "compio-macros",
- "compio-net",
  "compio-runtime",
  "config",
  "dashmap",
  "data_types",
- "file_ops",
  "fractal-fuse",
+ "fs_gateway_codec",
  "futures",
  "libc",
  "lru 0.13.0",
- "metrics_wrapper",
  "moka",
- "nix",
- "nss_codec",
  "parking_lot",
- "prost 0.14.1",
  "rand 0.10.1",
  "rkyv",
- "rpc_client_bss",
  "rpc_client_common",
- "rpc_client_nss",
- "rpc_client_rss",
- "rpc_codec_common",
- "rss_codec",
- "s3_blob_store",
+ "rpc_client_fs",
  "serde",
- "serde_json",
  "strum",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
  "uuid",
- "volume_group_proxy",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -2526,13 +2508,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fs_extra"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
-
-[[package]]
-name = "fs_server"
+name = "fs_client"
 version = "0.1.0"
 dependencies = [
  "clap",
@@ -2546,6 +2522,75 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "fs_extra"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
+
+[[package]]
+name = "fs_gateway"
+version = "0.1.0"
+dependencies = [
+ "bss_codec",
+ "bytes",
+ "clap",
+ "compio-buf",
+ "compio-driver",
+ "compio-fs",
+ "compio-io",
+ "compio-macros",
+ "compio-net",
+ "compio-runtime",
+ "config",
+ "data_types",
+ "file_ops",
+ "fs_gateway_codec",
+ "futures",
+ "hmac 0.12.1",
+ "libc",
+ "lru 0.13.0",
+ "metrics_wrapper",
+ "nix",
+ "nss_codec",
+ "parking_lot",
+ "prost 0.14.1",
+ "rand 0.10.1",
+ "rkyv",
+ "rpc_client_bss",
+ "rpc_client_common",
+ "rpc_client_nss",
+ "rpc_client_rss",
+ "rpc_codec_common",
+ "s3_blob_store",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "volume_group_proxy",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "fs_gateway_codec"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "bytes",
+ "data_types",
+ "hmac 0.12.1",
+ "prost 0.14.1",
+ "prost-build",
+ "rpc_client_common",
+ "rpc_codec_common",
+ "sha2 0.10.9",
+ "uuid",
 ]
 
 [[package]]
@@ -4931,6 +4976,21 @@ dependencies = [
  "tokio",
  "tracing",
  "xxhash-rust",
+]
+
+[[package]]
+name = "rpc_client_fs"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "data_types",
+ "fs_gateway_codec",
+ "metrics",
+ "metrics_wrapper",
+ "prost 0.14.1",
+ "rpc_client_common",
+ "rpc_codec_common",
+ "tracing",
 ]
 
 [[package]]

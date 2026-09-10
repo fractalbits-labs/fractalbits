@@ -1,12 +1,11 @@
 use serde::Deserialize;
 use std::time::Duration;
 use strum::EnumString;
-use volume_group_proxy::DEFAULT_EC_HEDGE_DELAY;
 
 /// Writeback-cache durability mode.
 ///
 /// `Strict` is the legacy synchronous path: every FUSE op blocks until
-/// the corresponding NSS / BSS RPC completes. `Default` enables the
+/// the corresponding gateway RPC completes. `Default` enables the
 /// writeback fast path for the enabled operation slice and falls back
 /// to strict for the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, EnumString)]
@@ -17,21 +16,6 @@ pub enum WritebackMode {
     Default,
 }
 
-fn default_data_volume() -> String {
-    "bss".to_string()
-}
-fn default_s3_host() -> String {
-    "http://127.0.0.1".to_string()
-}
-fn default_s3_port() -> u16 {
-    9000
-}
-fn default_s3_region() -> String {
-    "localdev".to_string()
-}
-fn default_ec_read_hedge_delay_ms() -> u64 {
-    DEFAULT_EC_HEDGE_DELAY.as_millis() as u64
-}
 fn default_writeback_mode() -> String {
     "default".to_string()
 }
@@ -51,52 +35,31 @@ fn default_prefetch_partial_threshold_mb() -> u64 {
     4096
 }
 
-fn default_prefetch_pressure_decline() -> f64 {
-    0.90
-}
-
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
-    pub rss_addrs: Vec<String>,
+    /// `host:port` of one or more fs_gateway instances (tried in order).
+    pub gateway_addrs: Vec<String>,
     pub bucket_name: String,
     pub mount_point: String,
+    /// API key used to sign `Mount`. Empty only for local development
+    /// against a gateway that does not require authentication.
+    #[serde(default)]
+    pub api_key_id: String,
+    #[serde(default)]
+    pub api_key_secret: String,
 
     pub rpc_request_timeout_seconds: u64,
-    /// Where new file data goes: `bss` (data volume group) or `s3`.
-    #[serde(default = "default_data_volume")]
-    pub data_volume: String,
-    /// Bucket holding S3-resident blocks. Empty disables S3 access, in
-    /// which case S3-resident files are rejected at open/unlink/rename.
-    #[serde(default)]
-    pub s3_bucket: String,
-    #[serde(default = "default_s3_host")]
-    pub s3_host: String,
-    #[serde(default = "default_s3_port")]
-    pub s3_port: u16,
-    #[serde(default = "default_s3_region")]
-    pub s3_region: String,
-    /// EC read grace period before parity shards are requested.
-    #[serde(default = "default_ec_read_hedge_delay_ms")]
-    pub ec_read_hedge_delay_ms: u64,
     pub rpc_connection_timeout_seconds: u64,
-    pub rss_rpc_timeout_seconds: u64,
     pub worker_threads: usize,
     pub allow_other: bool,
     pub auto_unmount: bool,
 
     pub dir_cache_ttl_seconds: u64,
     pub attr_cache_ttl_seconds: u64,
-    pub block_cache_size_mb: u64,
     pub read_write: bool,
 
-    pub disk_cache_enabled: bool,
-    pub disk_cache_path: String,
-    pub disk_cache_size_gb: u64,
-    pub passthrough_enabled: bool,
-    pub passthrough_max_object_size_gb: u64,
-
     /// Open-time whole-blob prefetch threshold. Files at or below this
-    /// size always prefetch on open. Default 256 MiB.
+    /// size always ask the gateway to prefetch on open. Default 256 MiB.
     #[serde(default = "default_prefetch_full_threshold_mb")]
     pub prefetch_full_threshold_mb: u64,
     /// Larger files prefetch only when the kernel sets `FOPEN_KEEP_CACHE`
@@ -108,10 +71,6 @@ pub struct Config {
     /// Suitable for log / training / backup workloads.
     #[serde(default)]
     pub workload_bulk_read: bool,
-    /// Decline prefetch when current disk-cache usage is at or above
-    /// this fraction of capacity (0.0-1.0). Default 0.90.
-    #[serde(default = "default_prefetch_pressure_decline")]
-    pub prefetch_pressure_decline: f64,
 
     /// Writeback durability mode; `default` (cache on) or `strict`.
     #[serde(default = "default_writeback_mode")]
@@ -127,24 +86,8 @@ impl Config {
         Duration::from_secs(self.rpc_request_timeout_seconds)
     }
 
-    pub fn ec_read_hedge_delay(&self) -> Duration {
-        Duration::from_millis(self.ec_read_hedge_delay_ms)
-    }
-
-    pub fn s3_enabled(&self) -> bool {
-        !self.s3_bucket.is_empty()
-    }
-
-    pub fn data_volume_is_s3(&self) -> bool {
-        self.data_volume == "s3"
-    }
-
     pub fn rpc_connection_timeout(&self) -> Duration {
         Duration::from_secs(self.rpc_connection_timeout_seconds)
-    }
-
-    pub fn rss_rpc_timeout(&self) -> Duration {
-        Duration::from_secs(self.rss_rpc_timeout_seconds)
     }
 
     pub fn dir_cache_ttl(&self) -> Duration {
@@ -155,52 +98,37 @@ impl Config {
         Duration::from_secs(self.attr_cache_ttl_seconds)
     }
 
-    /// Override config fields from FS_SERVER_* environment variables.
+    /// Override config fields from FS_MOUNT_* environment variables.
     pub fn apply_env_overrides(&mut self) {
-        if let Ok(v) = std::env::var("FS_SERVER_BUCKET_NAME") {
+        if let Ok(v) = std::env::var("FS_MOUNT_GATEWAY_ADDRS") {
+            self.gateway_addrs = v.split(',').map(|s| s.trim().to_string()).collect();
+        }
+        if let Ok(v) = std::env::var("FS_MOUNT_BUCKET_NAME") {
             self.bucket_name = v;
         }
-        if let Ok(v) = std::env::var("FS_SERVER_MOUNT_POINT") {
+        if let Ok(v) = std::env::var("FS_MOUNT_MOUNT_POINT") {
             self.mount_point = v;
         }
-        if let Ok(v) = std::env::var("FS_SERVER_READ_WRITE") {
+        if let Ok(v) = std::env::var("FS_MOUNT_API_KEY_ID") {
+            self.api_key_id = v;
+        }
+        if let Ok(v) = std::env::var("FS_MOUNT_API_KEY_SECRET") {
+            self.api_key_secret = v;
+        }
+        if let Ok(v) = std::env::var("FS_MOUNT_READ_WRITE") {
             self.read_write = v.parse().unwrap_or(self.read_write);
         }
-        if let Ok(v) = std::env::var("FS_SERVER_DISK_CACHE_ENABLED") {
-            self.disk_cache_enabled = v.parse().unwrap_or(self.disk_cache_enabled);
-        }
-        if let Ok(v) = std::env::var("FS_SERVER_DISK_CACHE_PATH") {
-            self.disk_cache_path = v;
-        }
-        if let Ok(v) = std::env::var("FS_SERVER_DISK_CACHE_SIZE_GB") {
-            self.disk_cache_size_gb = v.parse().unwrap_or(self.disk_cache_size_gb);
-        }
-        if let Ok(v) = std::env::var("FS_SERVER_WORKER_THREADS") {
+        if let Ok(v) = std::env::var("FS_MOUNT_WORKER_THREADS") {
             self.worker_threads = v.parse().unwrap_or(self.worker_threads);
         }
-        if let Ok(v) = std::env::var("FS_SERVER_WRITEBACK_MODE") {
+        if let Ok(v) = std::env::var("FS_MOUNT_WRITEBACK_MODE") {
             self.writeback_mode = v;
         }
-        if let Ok(v) = std::env::var("FS_SERVER_WRITEBACK_POLL_MS") {
+        if let Ok(v) = std::env::var("FS_MOUNT_WRITEBACK_POLL_MS") {
             self.writeback_poll_ms = v.parse().unwrap_or(self.writeback_poll_ms);
         }
-        if let Ok(v) = std::env::var("FS_SERVER_ALLOW_OTHER") {
+        if let Ok(v) = std::env::var("FS_MOUNT_ALLOW_OTHER") {
             self.allow_other = v.parse().unwrap_or(self.allow_other);
-        }
-        if let Ok(v) = std::env::var("FS_SERVER_DATA_VOLUME") {
-            self.data_volume = v;
-        }
-        if let Ok(v) = std::env::var("FS_SERVER_S3_BUCKET") {
-            self.s3_bucket = v;
-        }
-        if let Ok(v) = std::env::var("FS_SERVER_S3_HOST") {
-            self.s3_host = v;
-        }
-        if let Ok(v) = std::env::var("FS_SERVER_S3_PORT") {
-            self.s3_port = v.parse().unwrap_or(self.s3_port);
-        }
-        if let Ok(v) = std::env::var("FS_SERVER_S3_REGION") {
-            self.s3_region = v;
         }
     }
 }
@@ -208,34 +136,22 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            rss_addrs: vec!["127.0.0.1:8086".to_string()],
+            gateway_addrs: vec!["127.0.0.1:8180".to_string()],
             bucket_name: "default".to_string(),
             mount_point: "/mnt/fractalbits".to_string(),
+            api_key_id: String::new(),
+            api_key_secret: String::new(),
             rpc_request_timeout_seconds: 30,
-            data_volume: default_data_volume(),
-            s3_bucket: String::new(),
-            s3_host: default_s3_host(),
-            s3_port: default_s3_port(),
-            s3_region: default_s3_region(),
-            ec_read_hedge_delay_ms: default_ec_read_hedge_delay_ms(),
             rpc_connection_timeout_seconds: 5,
-            rss_rpc_timeout_seconds: 30,
             worker_threads: 2,
             allow_other: false,
             auto_unmount: false,
             dir_cache_ttl_seconds: 5,
             attr_cache_ttl_seconds: 5,
-            block_cache_size_mb: 256,
             read_write: false,
-            disk_cache_enabled: false,
-            disk_cache_path: "/var/cache/fractalbits/".to_string(),
-            disk_cache_size_gb: 50,
-            passthrough_enabled: false,
-            passthrough_max_object_size_gb: 10,
             prefetch_full_threshold_mb: default_prefetch_full_threshold_mb(),
             prefetch_partial_threshold_mb: default_prefetch_partial_threshold_mb(),
             workload_bulk_read: false,
-            prefetch_pressure_decline: default_prefetch_pressure_decline(),
             writeback_mode: default_writeback_mode(),
             writeback_poll_ms: default_writeback_poll_ms(),
         }

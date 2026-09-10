@@ -76,7 +76,7 @@ impl Filesystem for FuseServer {
         // metadata intents (mkdir directory markers, chmod/chown/utimes,
         // symlink/mknod) are persisted before the process exits. Without the
         // await, a shutdown with a non-empty queue loses that metadata: the
-        // dir/file still resolves via its NSS data/children, but its posix
+        // dir/file still resolves via its stored data/children, but its posix
         // reverts to defaults (uid 0, epoch-0 mtime) on the next mount. This
         // reuses the same generation-aware barrier as fsyncdir(2), so it
         // only waits for the worker to commit what is already queued.
@@ -86,7 +86,7 @@ impl Filesystem for FuseServer {
         // waited on too; vfs_destroy's enqueue block guarantees progress.
         self.vfs.vfs_destroy();
         let cleanup = async {
-            // A failure here (e.g. NSS unreachable through the drain
+            // A failure here (e.g. the gateway unreachable through the drain
             // deadline) means buffered data or queued metadata could not be
             // persisted and is lost on this otherwise-clean unmount.
             if let Err(e) = self.vfs.flush_open_dirty_handles().await {
@@ -161,10 +161,10 @@ impl Filesystem for FuseServer {
         // block.
         if req.uid != 0 {
             // In-memory attrs are sufficient for ordinary inodes. Hardlinks
-            // store owner/mode in the shared NSS record, and a directory
+            // store owner/mode in the shared metadata record, and a directory
             // materialised from a delimiter listing carries only placeholder
             // posix (uid 0); both must read the authoritative owner via the
-            // async path (which refreshes from the NSS marker) instead of a
+            // async path (which refreshes from the stored marker) instead of a
             // stale/placeholder in-memory value, or the owner check rejects
             // the real owner with EPERM.
             let cur = if self.vfs.is_hardlink(inode) || self.vfs.is_dir(inode) {
@@ -307,7 +307,7 @@ impl Filesystem for FuseServer {
         // updates the write buffer, which vfs_getattr_inmem reads.)
         //
         // Exception: a hardlinked inode's nlink (and shared posix) live in
-        // the NSS record, which the in-memory attr can't see. It reports
+        // the stored record, which the in-memory attr can't see. It reports
         // nlink=1, and the kernel caches that for every name, so a later
         // lstat on any link returns the wrong count (link/00.t: a
         // chmod/chown clobbers nlink for all names). Reply through the full
@@ -357,18 +357,10 @@ impl Filesystem for FuseServer {
             }
         }
 
-        // Try passthrough for fully-cached read-only files
-        let (open_flags, backing_id) = if flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) == 0
-        {
-            self.vfs.try_passthrough_for_fh(fh).unwrap_or((0, 0))
-        } else {
-            (0, 0)
-        };
-
         Ok(ReplyOpen {
             fh,
-            flags: open_flags,
-            backing_id,
+            flags: 0,
+            backing_id: 0,
         })
     }
 
@@ -416,7 +408,7 @@ impl Filesystem for FuseServer {
         // no work here: the actual publish runs in FUSE_RELEASE, off the
         // FUSE worker thread (see `release`). That lets create-heavy
         // workloads (tar -xf, cp -r) pipeline closes instead of serialising
-        // each one against a synchronous BSS+NSS publish. Read-after-close
+        // each one against a synchronous data + metadata publish. Read-after-close
         // visibility is preserved by vfs_open, which publishes any dirty
         // buffered writes for the inode inline before snapshotting the
         // layout (covering an OPEN that wins the race against RELEASE, and
@@ -475,11 +467,10 @@ impl Filesystem for FuseServer {
         _flush: bool,
         _flock_release: bool,
     ) -> FsResult<()> {
-        self.vfs.release_passthrough(fh);
         // In Default writeback mode a dirty handle flushes asynchronously:
         // spawn the publish off the FUSE worker thread and reply to the
         // kernel immediately, so distinct-inode closes (every tar file)
-        // pipeline their BSS+NSS round-trips instead of serialising. The
+        // pipeline their data + metadata round-trips instead of serialising. The
         // spawned flush registers a writeback cycle, so fsync / unlink /
         // open barriers still wait for it. Read-only / clean handles and
         // Strict mode fall through to the synchronous inline release.

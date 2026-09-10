@@ -1,0 +1,388 @@
+syntax = "proto3";
+
+package fs_gateway_ops;
+
+import "google/protobuf/empty.proto";
+
+enum Command {
+  Invalid = 0;
+  Handshake = 1;
+
+  // Session
+  Mount = 16;
+
+  // Inode primitives
+  GetInode = 17;
+  ListInodes = 18;
+  PutInode = 19;
+  PutInodeCas = 20;
+  DeleteInode = 21;
+  RenameFile = 22;
+  RenameFolder = 23;
+  PutDirMarker = 24;
+  ListMpuParts = 25;
+
+  // Block primitives
+  AllocateBlobGuid = 26;
+  ReadBlock = 27;
+  WriteBlock = 28;
+  ListBlobBlocks = 29;
+  DeleteBlock = 30;
+  DeleteBlobBlocks = 31;
+
+  // Gateway-side cache / reclamation hints
+  PrefetchBlob = 32;
+  SweepBlob = 33;
+}
+
+// Backend outcomes VfsCore distinguishes. Kept as an enum (not errno) so
+// the client's retry and CAS-rebase logic keeps working over the wire.
+enum ErrorKind {
+  Internal = 0;
+  NotFound = 1;
+  AlreadyExists = 2;
+  CasConflict = 3;
+  NoSpace = 4;
+  // Write-once key addressed with different bytes.
+  Mismatch = 5;
+  BlockNotFound = 6;
+  Corrupted = 7;
+  InvalidState = 8;
+  Unauthorized = 9;
+  ReadOnly = 10;
+  Deserialize = 11;
+}
+
+message Error {
+  ErrorKind kind = 1;
+  string message = 2;
+}
+
+// Session token issued by Mount, carried by every other request.
+message Caller {
+  bytes token = 1;
+}
+
+message BlobGuid {
+  bytes blob_id = 1;
+  uint32 volume_id = 2;
+}
+
+message BlockIdentity {
+  uint32 block_number = 1;
+  uint64 version = 2;
+}
+
+// ---------- Mount ----------
+
+message MountRequest {
+  string bucket = 1;
+  bool read_write = 2;
+  string api_key_id = 3;
+  uint64 timestamp_ms = 4;
+  bytes nonce = 5;
+  // HMAC-SHA256(secret_key, key_id | bucket | timestamp_ms | nonce)
+  bytes signature = 6;
+}
+
+message MountResponse {
+  oneof result {
+    Session ok = 1;
+    Error err = 2;
+  }
+
+  message Session {
+    bytes token = 1;
+    bool supports_s3_volume = 2;
+  }
+}
+
+// ---------- Inode primitives ----------
+
+message GetInodeRequest {
+  Caller caller = 1;
+  string key = 2;
+}
+
+message GetInodeResponse {
+  oneof result {
+    bytes ok = 1;
+    Error err = 2;
+  }
+}
+
+message ListInodesRequest {
+  Caller caller = 1;
+  string prefix = 2;
+  string delimiter = 3;
+  string start_after = 4;
+  uint32 max_keys = 5;
+}
+
+message ListInodesResponse {
+  oneof result {
+    Page ok = 1;
+    Error err = 2;
+  }
+
+  message Entry {
+    string key = 1;
+    // Empty for a common prefix (directory).
+    bytes value = 2;
+  }
+
+  message Page {
+    repeated Entry entries = 1;
+    bool has_more = 2;
+  }
+}
+
+message PutInodeRequest {
+  Caller caller = 1;
+  string key = 2;
+  bytes value = 3;
+}
+
+message PutInodeResponse {
+  oneof result {
+    // Previous bytes (empty if new).
+    bytes ok = 1;
+    Error err = 2;
+  }
+}
+
+message PutInodeCasRequest {
+  Caller caller = 1;
+  string key = 2;
+  bytes value = 3;
+  bytes expected_old_value = 4;
+}
+
+message PutInodeCasResponse {
+  oneof result {
+    bytes ok = 1;
+    Error err = 2;
+  }
+}
+
+message DeleteInodeRequest {
+  Caller caller = 1;
+  string key = 2;
+}
+
+message DeleteInodeResponse {
+  oneof result {
+    Deleted ok = 1;
+    Error err = 2;
+  }
+
+  message Deleted {
+    bool existed = 1;
+    bytes previous = 2;
+  }
+}
+
+message RenameFileRequest {
+  Caller caller = 1;
+  string src_key = 2;
+  string dst_key = 3;
+  bool force_overwrite = 4;
+}
+
+message RenameFileResponse {
+  oneof result {
+    // Prior destination bytes (empty if none).
+    bytes ok = 1;
+    Error err = 2;
+  }
+}
+
+message RenameFolderRequest {
+  Caller caller = 1;
+  string src_key = 2;
+  string dst_key = 3;
+}
+
+message RenameFolderResponse {
+  oneof result {
+    google.protobuf.Empty ok = 1;
+    Error err = 2;
+  }
+}
+
+message PutDirMarkerRequest {
+  Caller caller = 1;
+  string key = 2;
+}
+
+message PutDirMarkerResponse {
+  oneof result {
+    google.protobuf.Empty ok = 1;
+    Error err = 2;
+  }
+}
+
+message ListMpuPartsRequest {
+  Caller caller = 1;
+  string key = 2;
+  bytes upload_id = 3;
+}
+
+message ListMpuPartsResponse {
+  oneof result {
+    Parts ok = 1;
+    Error err = 2;
+  }
+
+  message Part {
+    string key = 1;
+    bytes layout = 2;
+  }
+
+  message Parts {
+    repeated Part parts = 1;
+  }
+}
+
+// ---------- Block primitives ----------
+
+message AllocateBlobGuidRequest {
+  Caller caller = 1;
+}
+
+message AllocateBlobGuidResponse {
+  oneof result {
+    BlobGuid ok = 1;
+    Error err = 2;
+  }
+}
+
+message ReadBlockRequest {
+  Caller caller = 1;
+  BlobGuid blob = 2;
+  uint32 block_number = 3;
+  uint64 version = 4;
+  uint32 content_len = 5;
+}
+
+message ReadBlockResponse {
+  oneof result {
+    Block ok = 1;
+    Error err = 2;
+  }
+
+  message Block {
+    bytes data = 1;
+  }
+}
+
+message WriteBlockRequest {
+  Caller caller = 1;
+  BlobGuid blob = 2;
+  uint32 block_number = 3;
+  uint64 version = 4;
+  bytes data = 5;
+}
+
+message WriteBlockResponse {
+  oneof result {
+    google.protobuf.Empty ok = 1;
+    Error err = 2;
+  }
+}
+
+message ListBlobBlocksRequest {
+  Caller caller = 1;
+  BlobGuid blob = 2;
+  uint32 first_block = 3;
+  uint32 block_count = 4;
+  // Enumerate every stored generation (reclamation) instead of the committed view.
+  bool all_nodes = 5;
+}
+
+message ListBlobBlocksResponse {
+  oneof result {
+    Entries ok = 1;
+    Error err = 2;
+  }
+
+  message Entries {
+    repeated BlockIdentity entries = 1;
+  }
+}
+
+message DeleteBlockRequest {
+  Caller caller = 1;
+  BlobGuid blob = 2;
+  uint32 block_number = 3;
+  uint64 version = 4;
+}
+
+message DeleteBlockResponse {
+  oneof result {
+    google.protobuf.Empty ok = 1;
+    Error err = 2;
+  }
+}
+
+message DeleteBlobBlocksRequest {
+  Caller caller = 1;
+  BlobGuid blob = 2;
+}
+
+message DeleteBlobBlocksResponse {
+  oneof result {
+    google.protobuf.Empty ok = 1;
+    Error err = 2;
+  }
+}
+
+// ---------- Hints ----------
+
+// Best-effort whole-blob warm of the gateway disk cache. The client
+// resolves each block's exact committed identity from its row map.
+message PrefetchBlobRequest {
+  Caller caller = 1;
+  BlobGuid blob = 2;
+  uint64 file_size = 3;
+  repeated PrefetchBlock blocks = 4;
+
+  message PrefetchBlock {
+    uint32 block_number = 1;
+    uint64 version = 2;
+    uint32 read_len = 3;
+    uint32 content_len = 4;
+  }
+}
+
+message PrefetchBlobResponse {
+  oneof result {
+    google.protobuf.Empty ok = 1;
+    Error err = 2;
+  }
+}
+
+// Reclamation work the client derived from a commit or teardown. The
+// gateway coalesces per blob, applies the reader grace and retries.
+message SweepBlobRequest {
+  Caller caller = 1;
+  BlobGuid blob = 2;
+  repeated BlockIdentity victims = 3;
+  repeated BlockFloor below = 4;
+  bool delete_all_blocks = 5;
+  bool delete_rows = 6;
+  bool with_grace = 7;
+  optional uint64 marker_data_pending_unix_ms = 8;
+
+  message BlockFloor {
+    uint32 block_number = 1;
+    uint64 keep_from = 2;
+  }
+}
+
+message SweepBlobResponse {
+  oneof result {
+    google.protobuf.Empty ok = 1;
+    Error err = 2;
+  }
+}

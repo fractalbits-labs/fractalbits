@@ -170,7 +170,7 @@ impl VfsCore {
             ctime_ns_part,
             mode,
             // We do not maintain the traditional `2 + immediate_subdirs`
-            // directory link count (it would cost an NSS listing per
+            // directory link count (it would cost a metadata-store listing per
             // stat), so report `1` (the btrfs convention) instead of a
             // constant `2`. A constant `nlink == 2` falsely tells
             // `find`/`du`/`fts` the directory has zero subdirectories, so
@@ -309,10 +309,10 @@ impl VfsCore {
                     let mut attr = self.make_file_attr(inode, &layout)?;
                     // Cross-instance size authority: this entry's cached layout
                     // (size + blob_version) may lag a peer instance's most
-                    // recent overwrite. The NSS layout is the sole size
-                    // authority (the BSS geometry sentinel is gone with the
+                    // recent overwrite. The metadata-store layout is the sole size
+                    // authority (the block-store geometry sentinel is gone with the
                     // versioned-key design), so refresh it here. getattr is
-                    // gated by the 1s FUSE attr TTL, so this NSS read happens
+                    // gated by the 1s FUSE attr TTL, so this metadata-store read happens
                     // at most about once/sec/inode: a bounded, throttled read.
                     // Only move forward (a racing older fetch must never
                     // downgrade a fresher local size), and skip symlinks /
@@ -371,7 +371,7 @@ impl VfsCore {
                             }
                             Ok(attr)
                         }
-                        // A freshly created file that hasn't flushed to NSS
+                        // A freshly created file that hasn't flushed to the metadata store
                         // yet has no committed layout, so it isn't resolvable
                         // by key. It still exists in memory behind an open
                         // write handle; synthesize its attr from the cached
@@ -411,7 +411,7 @@ impl VfsCore {
     /// the kernel re-issues a full `getattr`.
     ///
     /// True if the inode is a promoted hardlink (its `nlink` and shared
-    /// posix live in the NSS `InodeRecord`, not the in-memory entry). The
+    /// posix live in the metadata-store `InodeRecord`, not the in-memory entry). The
     /// in-memory attr fast path below can't see that nlink, so a caller
     /// that replies an attr to the kernel must resolve the record for
     /// these (otherwise it clobbers the kernel's cached link count to 1).
@@ -431,7 +431,7 @@ impl VfsCore {
 
     /// Seed authoritative posix into a directory entry whose owner/mode is
     /// still a listing-materialised placeholder (`posix_known == false`),
-    /// by reading its NSS marker. No-op for files, the root, an entry with
+    /// by reading its metadata-store marker. No-op for files, the root, an entry with
     /// known posix, or a marker that has no directory layout (a legacy
     /// Normal marker / implicit directory keeps its default). Guarded on
     /// `!posix_known` again after the fetch so a concurrent local posix
@@ -503,8 +503,8 @@ impl VfsCore {
     /// on unlink/rmdir (so a delete can't race a not-yet-drained
     /// publish) and by `vfs_lookup`'s in-memory read-your-writes
     /// fallback (so a pending create is still visible), not by
-    /// forcing every publish through NSS. `rmdir` additionally checks
-    /// the queue for pending child creates before trusting the NSS
+    /// forcing every publish through the metadata store. `rmdir` additionally checks
+    /// the queue for pending child creates before trusting the metadata-store
     /// emptiness probe.
     pub(crate) async fn publish_inode_layout(
         &self,
@@ -726,7 +726,7 @@ impl VfsCore {
             let new_posix = entry.posix;
             // Fold the new posix into the cached layout when we have
             // one. With no cached layout we can't synthesise one
-            // without an NSS round-trip; the in-memory mutation still
+            // without a metadata-store round-trip; the in-memory mutation still
             // stands and the next op picks it up. The unfolded base is
             // kept too: the worker CAS-guards its publish on it.
             let base_layout = entry.layout.clone();
@@ -757,7 +757,7 @@ impl VfsCore {
             )
         };
 
-        // The dentry was unlinked; skip the NSS publish so we don't
+        // The dentry was unlinked; skip the metadata-store publish so we don't
         // resurrect the deleted file. The in-memory mutation already
         // happened, which is the right semantic for a still-open fd.
         if name_removed {

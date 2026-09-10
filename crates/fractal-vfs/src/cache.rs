@@ -66,10 +66,10 @@ impl DirCache {
     /// A directory child can be a phantom: readdir lists with a "/"
     /// delimiter, and a fully-tombstoned subtree still emits a CommonPrefix
     /// entry that lands in this cache, so a dir child here is not proof of
-    /// non-emptiness (rmdir's no-delimiter NSS list, which filters
+    /// non-emptiness (rmdir's no-delimiter metadata-store list, which filters
     /// tombstones, is authoritative for those, and a still-queued dir
     /// create is caught by the writeback-intent check). A non-directory
-    /// child, however, is a real local create not yet in NSS and must keep
+    /// child, however, is a real local create not yet in the metadata store and must keep
     /// rmdir from winning the race.
     pub fn has_file_children(&self, prefix: &str) -> Option<bool> {
         let cached = self.inner.get(prefix)?;
