@@ -25,7 +25,7 @@ impl RpcClient {
         let mut header = MessageHeader::default();
         let request_id = self.gen_request_id();
         header.id = request_id;
-        header.command = command;
+        header.command = command as i32;
         header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
         header.retry_count = retry_count as u8;
         header.set_trace_id(trace_id);
@@ -130,18 +130,6 @@ rpc_method!(
     ListBlobBlocks,
     ListBlobBlocksRequest,
     ListBlobBlocksResponse
-);
-rpc_method!(
-    delete_block,
-    DeleteBlock,
-    DeleteBlockRequest,
-    DeleteBlockResponse
-);
-rpc_method!(
-    delete_blob_blocks,
-    DeleteBlobBlocks,
-    DeleteBlobBlocksRequest,
-    DeleteBlobBlocksResponse
 );
 rpc_method!(
     prefetch_blob,

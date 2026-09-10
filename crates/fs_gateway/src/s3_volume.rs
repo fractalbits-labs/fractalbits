@@ -81,13 +81,15 @@ impl S3DataVolume {
 
     /// Write-once put. A key that already exists is treated like BSS's
     /// VersionSkipped: the generation is present, so the write succeeded.
+    /// Returns `false` in that case: the stored bytes are not necessarily
+    /// `body`, so the caller must not cache them as such.
     pub async fn write_block(
         &self,
         blob_guid: DataBlobGuid,
         block_number: u32,
         body: Bytes,
         version: u64,
-    ) -> Result<(), FsError> {
+    ) -> Result<bool, FsError> {
         let store = self.store.clone();
         let result = self
             .run(async move {
@@ -102,10 +104,10 @@ impl S3DataVolume {
             })
             .await;
         match result {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(true),
             Err(S3BlobError::AlreadyExists) => {
                 tracing::debug!(%blob_guid, block_number, version, "S3 block already present");
-                Ok(())
+                Ok(false)
             }
             Err(e) => Err(map_err(e)),
         }

@@ -267,8 +267,11 @@ impl VfsCore {
                 let plan = prefetch_plan(l, rows.as_deref());
                 if !plan.is_empty() {
                     let backend = self.backend();
+                    let key = s3_key.clone();
                     compio_runtime::spawn(async move {
-                        backend.prefetch_blob(blob_guid, file_size, plan).await;
+                        backend
+                            .prefetch_blob(&key, blob_guid, file_size, plan)
+                            .await;
                     })
                     .detach();
                 }

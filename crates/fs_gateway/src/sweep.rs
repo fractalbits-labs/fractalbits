@@ -5,7 +5,9 @@
 //! The client derives the work (which generations a commit superseded,
 //! which blobs became unreachable) and ships it as `SweepBlob`; the
 //! gateway coalesces per blob, applies the reader grace, retries, and
-//! survives the client disconnecting mid-sweep.
+//! survives the client disconnecting mid-sweep. The hint is untrusted:
+//! before deleting anything the worker re-derives from the bucket's own
+//! rows, layout and teardown marker that nothing live is named.
 
 use std::collections::{HashMap, HashSet, hash_map};
 use std::sync::Arc;
@@ -14,12 +16,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use data_types::ovr_map::{
-    OVR_GC_PREFIX, OvrGcMarker, encode_ovr_gc_data_pending, encode_ovr_gc_rows_ready, ovr_gc_key,
-    ovr_row_prefix, parse_ovr_gc_blob_id, parse_ovr_gc_marker,
+    BlockResolution, OVR_GC_PREFIX, OvrGcMarker, OvrRow, encode_ovr_gc_data_pending,
+    encode_ovr_gc_rows_ready, ovr_gc_key, ovr_row_key, ovr_row_prefix, parse_ovr_gc_blob_id,
+    parse_ovr_gc_marker, resolve_row,
 };
 use data_types::{DataBlobGuid, TraceId};
 use fs_gateway_codec::SweepBlobRequest;
-use futures::{FutureExt, StreamExt, stream};
+use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use rpc_client_common::reclamation_grace;
 use uuid::Uuid;
 
@@ -27,6 +30,11 @@ use crate::backend::{BackendConfig, StorageBackend};
 use crate::error::FsError;
 
 const SWEEP_CONCURRENCY: usize = 8;
+/// Distinct blobs with queued work. Teardowns wait out the reader grace
+/// before they run, so a bulk `rm -rf` parks tens of thousands here.
+const SWEEP_QUEUE_LIMIT: usize = 1 << 18;
+/// Concurrent NSS row reads while validating one blob's candidates.
+const VALIDATE_CONCURRENCY: usize = 32;
 const SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// NSS listing page size for row teardown. Deliberately above the NSS
 /// clamp so the `has_more` loop, not the request size, bounds coverage.
@@ -99,6 +107,9 @@ fn instant_for_unix_deadline(deadline_unix_ms: u64) -> Instant {
 pub(crate) struct SweepWork {
     /// Bucket the blob belongs to. `None` only in unit tests.
     backend_config: Option<Arc<BackendConfig>>,
+    /// Inode the blob was published under, per the client; empty when
+    /// the work came from a marker replay. Validation reads it back.
+    key: String,
     /// Exact identities to delete on every placement node: superseded
     /// generations handed over by the row CAS (the outgoing `cur`), plus
     /// orphan fragments of failed unpublished creates.
@@ -126,6 +137,7 @@ impl SweepWork {
     fn new(backend_config: Option<Arc<BackendConfig>>) -> Self {
         Self {
             backend_config,
+            key: String::new(),
             victims: HashSet::new(),
             below: HashMap::new(),
             delete_all_blocks: false,
@@ -149,6 +161,9 @@ impl SweepWork {
     fn merge(&mut self, mut other: Self) {
         if self.backend_config.is_none() {
             self.backend_config = other.backend_config.take();
+        }
+        if self.key.is_empty() {
+            self.key = std::mem::take(&mut other.key);
         }
         self.victims.extend(other.victims.drain());
         for (block, keep_from) in other.below.drain() {
@@ -189,6 +204,10 @@ impl SweepQueue {
     /// Coalesce `work` into the blob's pending entry (merge, never
     /// replace: a replace would silently drop queued victims).
     fn enqueue(&mut self, blob_guid: DataBlobGuid, work: SweepWork) {
+        if !self.pending.contains_key(&blob_guid) && self.pending.len() >= SWEEP_QUEUE_LIMIT {
+            tracing::warn!(%blob_guid, "blob reclamation queue full; dropping hint");
+            return;
+        }
         match self.pending.entry(blob_guid) {
             hash_map::Entry::Occupied(mut entry) => entry.get_mut().merge(work),
             hash_map::Entry::Vacant(entry) => {
@@ -213,6 +232,7 @@ pub fn enqueue_sweep_request(
     req: &SweepBlobRequest,
 ) {
     let mut work = SweepWork::new(Some(backend_config.clone()));
+    work.key = req.key.clone();
     work.victims
         .extend(req.victims.iter().map(|v| (v.block_number, v.version)));
     for floor in &req.below {
@@ -441,6 +461,193 @@ async fn delete_all_ovr_rows(
     }
 }
 
+/// What the bucket's namespace currently says about a blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Published {
+    /// No key to consult; only a committed marker can justify teardown.
+    Unknown,
+    /// Nothing at the key names this blob.
+    Unreferenced,
+    /// The key still publishes the blob under this ceiling.
+    Referenced { ceiling: u64 },
+}
+
+async fn published_state(
+    backend: &StorageBackend,
+    blob_guid: DataBlobGuid,
+    key: &str,
+    trace_id: &TraceId,
+) -> Result<Published, FsError> {
+    if key.is_empty() {
+        return Ok(Published::Unknown);
+    }
+    let layout = match backend.layout_at(key, trace_id).await {
+        Ok(layout) => layout,
+        // A value that is not a layout does not name the blob.
+        Err(FsError::Deserialize(_)) => None,
+        Err(error) => return Err(error),
+    };
+    Ok(match layout {
+        Some(layout) if layout.blob_guid().ok() == Some(blob_guid) => Published::Referenced {
+            ceiling: layout.blob_version,
+        },
+        _ => Published::Unreferenced,
+    })
+}
+
+/// A committed (data-pending or rows-ready) `@ovr-gc/` marker for this
+/// exact blob is the durable record that a teardown was decided.
+async fn committed_teardown_marker(
+    backend: &StorageBackend,
+    blob_guid: DataBlobGuid,
+    trace_id: &TraceId,
+) -> Result<bool, FsError> {
+    match backend
+        .get_inode_raw(&ovr_gc_key(&blob_guid.blob_id), trace_id)
+        .await
+    {
+        Ok(value) => Ok(matches!(
+            parse_ovr_gc_marker(&value),
+            OvrGcMarker::DataPending { volume_id, .. } | OvrGcMarker::RowsReady { volume_id }
+                if volume_id == blob_guid.volume_id
+        )),
+        Err(FsError::NotFound) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+enum RowSnapshot {
+    Absent,
+    Present(OvrRow),
+    Malformed,
+}
+
+impl RowSnapshot {
+    fn resolution(&self, ceiling: u64) -> Option<BlockResolution> {
+        match self {
+            Self::Absent => Some(resolve_row(None, ceiling)),
+            Self::Present(row) => Some(resolve_row(Some(row), ceiling)),
+            Self::Malformed => None,
+        }
+    }
+}
+
+/// Drop every victim or floor that would delete the generation the
+/// committed rows resolve to under `ceiling`. Unresolvable blocks (a
+/// row pair above the ceiling, a malformed row) are dropped too: a leak
+/// is recoverable, a deleted live generation is not.
+async fn retain_reclaimable(
+    backend: &StorageBackend,
+    blob_guid: DataBlobGuid,
+    ceiling: u64,
+    work: &mut SweepWork,
+    trace_id: &TraceId,
+) -> Result<(), FsError> {
+    let blocks: HashSet<u32> = work
+        .victims
+        .iter()
+        .map(|(block, _)| *block)
+        .chain(work.below.keys().copied())
+        .collect();
+    let rows: HashMap<u32, RowSnapshot> = stream::iter(blocks)
+        .map(|block| async move {
+            let snapshot = match backend
+                .get_inode_raw(&ovr_row_key(&blob_guid.blob_id, block), trace_id)
+                .await
+            {
+                Ok(value) => OvrRow::decode(&value)
+                    .map(RowSnapshot::Present)
+                    .unwrap_or(RowSnapshot::Malformed),
+                Err(FsError::NotFound) => RowSnapshot::Absent,
+                Err(error) => return Err(error),
+            };
+            Ok((block, snapshot))
+        })
+        .buffer_unordered(VALIDATE_CONCURRENCY)
+        .try_collect()
+        .await?;
+    let resolution = |block: u32| rows.get(&block).and_then(|row| row.resolution(ceiling));
+
+    let before = work.victims.len() + work.below.len();
+    work.victims
+        .retain(|(block, version)| match resolution(*block) {
+            Some(BlockResolution::Exact { version: live }) => live != *version,
+            Some(BlockResolution::Base) => *version != 1,
+            Some(BlockResolution::Hole) => true,
+            Some(BlockResolution::Stale) | None => false,
+        });
+    work.below
+        .retain(|block, keep_from| match resolution(*block) {
+            Some(BlockResolution::Exact { version: live }) => live >= *keep_from,
+            Some(BlockResolution::Base) => *keep_from <= 1,
+            Some(BlockResolution::Hole) => true,
+            Some(BlockResolution::Stale) | None => false,
+        });
+    let dropped = before - work.victims.len() - work.below.len();
+    if dropped > 0 {
+        tracing::warn!(
+            %blob_guid,
+            key = %work.key,
+            dropped,
+            "sweep hint named live or unresolvable generations; dropped"
+        );
+    }
+    Ok(())
+}
+
+/// Re-derive from the bucket's metadata which parts of the queued work
+/// are reclaimable, dropping the rest. Whole-blob teardown needs the
+/// blob to be unpublished at its key or a committed teardown marker;
+/// generation sweeps need the live layout's ceiling.
+async fn validate_work(
+    backend: &StorageBackend,
+    blob_guid: DataBlobGuid,
+    work: &mut SweepWork,
+    published: Published,
+    trace_id: &TraceId,
+) -> Result<(), FsError> {
+    if work.delete_all_blocks {
+        let allowed = published == Published::Unreferenced
+            || committed_teardown_marker(backend, blob_guid, trace_id).await?;
+        if !allowed {
+            tracing::warn!(
+                %blob_guid,
+                key = %work.key,
+                "whole-blob sweep names a published blob without a teardown marker; dropped"
+            );
+            work.delete_all_blocks = false;
+            work.delete_rows = false;
+            work.victims.clear();
+            work.below.clear();
+        }
+    }
+    let has_generation_work = !work.victims.is_empty() || !work.below.is_empty();
+    if !work.delete_all_blocks && has_generation_work {
+        match published {
+            Published::Referenced { ceiling } => {
+                retain_reclaimable(backend, blob_guid, ceiling, work, trace_id).await?;
+            }
+            // The key stopped naming the blob after the commit: the unlink
+            // or rename that did so queued a whole-blob teardown, which
+            // covers these generations.
+            Published::Unreferenced => {
+                tracing::debug!(%blob_guid, key = %work.key, "generation sweep superseded by teardown; dropped");
+                work.victims.clear();
+                work.below.clear();
+            }
+            Published::Unknown => {
+                tracing::warn!(
+                    %blob_guid,
+                    "generation sweep without a key to validate against; dropped"
+                );
+                work.victims.clear();
+                work.below.clear();
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn process_sweep_work(blob_guid: DataBlobGuid, work: &mut SweepWork) -> SweepAttempt {
     let Some(backend_config) = work.backend_config.clone() else {
         tracing::error!(%blob_guid, "sweep work without a bucket; dropping");
@@ -460,6 +667,22 @@ async fn process_sweep_work(blob_guid: DataBlobGuid, work: &mut SweepWork) -> Sw
         }
     };
     let trace_id = TraceId::new();
+    let lookup_published = || published_state(&backend, blob_guid, &work.key, &trace_id);
+    // Writing a teardown marker on the client's behalf is only safe once
+    // its key demonstrably no longer publishes the blob.
+    if work.marker_data_pending.is_some() {
+        match lookup_published().await {
+            Ok(Published::Unreferenced) => {}
+            Ok(_) => {
+                tracing::warn!(%blob_guid, key = %work.key, "teardown marker requested for a published blob; dropped");
+                work.marker_data_pending = None;
+            }
+            Err(error) => {
+                tracing::warn!(%blob_guid, %error, "sweep validation lookup failed");
+                return SweepAttempt::Failed;
+            }
+        }
+    }
     if let Some(not_before_unix_ms) = work.marker_data_pending {
         let target = TeardownMarkerWrite::DataPending {
             volume_id: blob_guid.volume_id,
@@ -478,6 +701,19 @@ async fn process_sweep_work(blob_guid: DataBlobGuid, work: &mut SweepWork) -> Sw
             return SweepAttempt::GracePending;
         }
         work.grace_until = None;
+    }
+    // Validate against the namespace as it stands after the grace, when
+    // the commit or unlink that produced this hint has long settled.
+    let validated = match lookup_published().await {
+        Ok(published) => validate_work(&backend, blob_guid, work, published, &trace_id).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = validated {
+        tracing::warn!(%blob_guid, %error, "sweep validation failed");
+        return SweepAttempt::Failed;
+    }
+    if work.is_empty() {
+        return SweepAttempt::Complete;
     }
 
     let mut failed = false;
@@ -504,13 +740,17 @@ async fn process_sweep_work(blob_guid: DataBlobGuid, work: &mut SweepWork) -> Sw
             work.delete_all_blocks = false;
             work.victims.clear();
             work.below.clear();
+            if let Err(error) = backend.release_blob(blob_guid, &trace_id).await {
+                tracing::warn!(%blob_guid, %error, "ownership marker release failed");
+            }
         }
     }
     if work.delete_rows && !work.delete_all_blocks {
-        if delete_all_ovr_rows(&backend, blob_guid.blob_id, &trace_id)
-            .await
-            .is_ok()
-        {
+        let teardown = match delete_all_ovr_rows(&backend, blob_guid.blob_id, &trace_id).await {
+            Ok(()) => backend.release_blob(blob_guid, &trace_id).await,
+            Err(error) => Err(error),
+        };
+        if teardown.is_ok() {
             work.delete_rows = false;
         } else {
             failed = true;
@@ -576,7 +816,7 @@ async fn process_sweep_work(blob_guid: DataBlobGuid, work: &mut SweepWork) -> Sw
 enum ScavengedMarker {
     Conditional,
     LegacyDataPending,
-    Work(DataBlobGuid, SweepWork),
+    Work(DataBlobGuid, Box<SweepWork>),
 }
 
 fn work_for_teardown_marker(
@@ -598,13 +838,13 @@ fn work_for_teardown_marker(
             work.ready_at = grace_until;
             work.delete_all_blocks = true;
             work.delete_rows = true;
-            ScavengedMarker::Work(blob_guid, work)
+            ScavengedMarker::Work(blob_guid, Box::new(work))
         }
         OvrGcMarker::RowsReady { volume_id } => {
             let blob_guid = DataBlobGuid { blob_id, volume_id };
             let mut work = SweepWork::new(backend_config);
             work.delete_rows = true;
-            ScavengedMarker::Work(blob_guid, work)
+            ScavengedMarker::Work(blob_guid, Box::new(work))
         }
     }
 }
@@ -670,7 +910,7 @@ pub async fn scavenge_teardown_markers(
                 }
                 ScavengedMarker::Work(blob_guid, work) => (blob_guid, work),
             };
-            coordinator.queue.lock().enqueue(blob_guid, work);
+            coordinator.queue.lock().enqueue(blob_guid, *work);
         }
         if !has_more {
             return;

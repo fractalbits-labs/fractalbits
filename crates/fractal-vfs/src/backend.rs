@@ -3,9 +3,9 @@
 //! The method set is the one `VfsCore` consumed from the in-cluster
 //! backend; each call is one round trip to the gateway, which owns the
 //! cluster clients, the disk cache, prefetch and reclamation. Every
-//! request carries the session token issued by `Mount`; a gateway that
-//! no longer recognises it (restart, expiry) answers `Unauthorized` and
-//! the call transparently re-mounts once and retries.
+//! request carries a session token issued by `Mount`; a gateway that no
+//! longer recognises it (restart, expiry, or load-balancer routing) answers
+//! `Unauthorized` and that worker's connection re-mounts once and retries.
 
 use bytes::Bytes;
 use data_types::object_layout::{InodeRecord, ObjectLayout};
@@ -35,9 +35,9 @@ pub struct BlobBlockEntry {
     pub version: u64,
 }
 
-/// Mount session shared by every worker thread.
+/// Mount capabilities shared by every worker thread.
 pub struct Session {
-    token: RwLock<Bytes>,
+    initial_token: Bytes,
     pub supports_s3_volume: bool,
 }
 
@@ -116,7 +116,7 @@ impl BackendConfig {
         Ok(Self {
             config: config.clone(),
             session: Arc::new(Session {
-                token: RwLock::new(session.token),
+                initial_token: session.token,
                 supports_s3_volume: session.supports_s3_volume,
             }),
         })
@@ -127,6 +127,7 @@ impl BackendConfig {
 pub struct StorageBackend {
     client: RpcClientFs,
     session: Arc<Session>,
+    token: RwLock<Bytes>,
     config: Config,
 }
 
@@ -169,6 +170,44 @@ macro_rules! gateway_call {
     };
 }
 
+/// Mutation call whose return value cannot be reconstructed after a lost
+/// reply. Authentication rejection is safe to remount and retry because the
+/// gateway rejects it before touching storage; transport failures surface.
+macro_rules! gateway_call_once {
+    ($self:expr, $method:ident, $module:ident, $trace_id:expr, |$token:ident| $req:expr) => {
+        async {
+            let mut remounted = false;
+            loop {
+                let $token = $self.token();
+                let resp = $self
+                    .client
+                    .$method($req, Some($self.config.rpc_request_timeout()), $trace_id, 0)
+                    .await
+                    .map_err(FsError::Rpc)?;
+                match resp.result {
+                    Some($module::Result::Ok(v)) => break Ok(v),
+                    Some($module::Result::Err(e))
+                        if e.error_kind() == ErrorKind::Unauthorized && !remounted =>
+                    {
+                        tracing::info!(reason = %e.message, "session rejected; re-mounting");
+                        $self.remount().await?;
+                        remounted = true;
+                    }
+                    Some($module::Result::Err(e)) => break Err(FsError::from(e)),
+                    None => {
+                        break Err(FsError::Internal(concat!(
+                            "empty ",
+                            stringify!($method),
+                            " response"
+                        )
+                        .into()));
+                    }
+                }
+            }
+        }
+    };
+}
+
 impl StorageBackend {
     pub fn new(backend_config: &BackendConfig) -> Result<Self, String> {
         let client = RpcClientFs::new_from_addresses(
@@ -178,12 +217,13 @@ impl StorageBackend {
         Ok(Self {
             client,
             session: backend_config.session.clone(),
+            token: RwLock::new(backend_config.session.initial_token.clone()),
             config: backend_config.config.clone(),
         })
     }
 
     fn token(&self) -> Bytes {
-        self.session.token.read().clone()
+        self.token.read().clone()
     }
 
     fn caller(&self, token: Bytes) -> Option<Caller> {
@@ -192,7 +232,7 @@ impl StorageBackend {
 
     async fn remount(&self) -> Result<(), FsError> {
         let session = mount(&self.client, &self.config).await?;
-        *self.session.token.write() = session.token;
+        *self.token.write() = session.token;
         Ok(())
     }
 
@@ -313,9 +353,12 @@ impl StorageBackend {
     }
 
     /// Read one block at its exact committed generation. The gateway
-    /// serves it from its disk cache when present.
+    /// serves it from its disk cache when present. `key` is the inode
+    /// whose layout references the blob (see the proto `Caller` note).
+    #[allow(clippy::too_many_arguments)]
     pub async fn read_block(
         &self,
+        key: &str,
         blob_guid: DataBlobGuid,
         version: u64,
         block_number: u32,
@@ -329,6 +372,7 @@ impl StorageBackend {
                 block_number,
                 version,
                 content_len: content_len as u32,
+                key: key.to_string(),
             }
         })
         .await?;
@@ -352,8 +396,10 @@ impl StorageBackend {
 
     /// Write a single block at a specific version. Override-style flush
     /// passes the bumped `blob_version`; initial-create passes `1`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn write_block(
         &self,
+        key: &str,
         blob_guid: DataBlobGuid,
         block_number: u32,
         body: Bytes,
@@ -367,17 +413,20 @@ impl StorageBackend {
                 block_number,
                 version,
                 data: body.clone(),
+                key: key.to_string(),
             }
         })
         .await
     }
 
-    async fn list_blocks(
+    /// Enumerate the committed block entries for one blob over
+    /// `[first_block, first_block + block_count)`. Absent blocks are holes.
+    pub async fn list_blob_blocks(
         &self,
+        key: &str,
         blob_guid: DataBlobGuid,
         first_block: u32,
         block_count: u32,
-        all_nodes: bool,
         trace_id: &TraceId,
     ) -> Result<Vec<BlobBlockEntry>, FsError> {
         let entries = gateway_call!(
@@ -390,7 +439,8 @@ impl StorageBackend {
                 blob: Some(BlobGuid::from(blob_guid)),
                 first_block,
                 block_count,
-                all_nodes,
+                all_nodes: false,
+                key: key.to_string(),
             }
         )
         .await?;
@@ -402,29 +452,6 @@ impl StorageBackend {
                 version: e.version,
             })
             .collect())
-    }
-
-    /// Enumerate the committed block entries for one blob over
-    /// `[first_block, first_block + block_count)`. Absent blocks are holes.
-    pub async fn list_blob_blocks(
-        &self,
-        blob_guid: DataBlobGuid,
-        first_block: u32,
-        block_count: u32,
-        trace_id: &TraceId,
-    ) -> Result<Vec<BlobBlockEntry>, FsError> {
-        self.list_blocks(blob_guid, first_block, block_count, false, trace_id)
-            .await
-    }
-
-    /// Enumerate every physical entry for a blob from every placement node.
-    pub async fn list_all_blob_blocks(
-        &self,
-        blob_guid: DataBlobGuid,
-        trace_id: &TraceId,
-    ) -> Result<Vec<BlobBlockEntry>, FsError> {
-        self.list_blocks(blob_guid, 0, u32::MAX, true, trace_id)
-            .await
     }
 
     /// Put (create/update) an inode. Returns the previous object bytes
@@ -521,7 +548,7 @@ impl StorageBackend {
         key: &str,
         trace_id: &TraceId,
     ) -> Result<Option<Bytes>, FsError> {
-        let deleted = gateway_call!(
+        let deleted = gateway_call_once!(
             self,
             delete_inode,
             delete_inode_response,
@@ -547,7 +574,7 @@ impl StorageBackend {
         force_overwrite: bool,
         trace_id: &TraceId,
     ) -> Result<Bytes, FsError> {
-        gateway_call!(self, rename_file, rename_file_response, trace_id, |token| {
+        gateway_call_once!(self, rename_file, rename_file_response, trace_id, |token| {
             RenameFileRequest {
                 caller: self.caller(token.clone()),
                 src_key: src_key.to_string(),
@@ -565,7 +592,7 @@ impl StorageBackend {
         dst_key: &str,
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
-        gateway_call!(
+        gateway_call_once!(
             self,
             rename_folder,
             rename_folder_response,
@@ -576,50 +603,6 @@ impl StorageBackend {
                     src_key: src_key.to_string(),
                     dst_key: dst_key.to_string(),
                 }
-            }
-        )
-        .await
-    }
-
-    /// Delete a single data block at its exact version.
-    pub async fn delete_block(
-        &self,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        version: u64,
-        trace_id: &TraceId,
-    ) -> Result<(), FsError> {
-        gateway_call!(
-            self,
-            delete_block,
-            delete_block_response,
-            trace_id,
-            |token| {
-                DeleteBlockRequest {
-                    caller: self.caller(token.clone()),
-                    blob: Some(BlobGuid::from(blob_guid)),
-                    block_number,
-                    version,
-                }
-            }
-        )
-        .await
-    }
-
-    /// Enumerate and delete every exact data or reservation key for a blob.
-    pub async fn delete_blob_blocks(
-        &self,
-        blob_guid: DataBlobGuid,
-        trace_id: &TraceId,
-    ) -> Result<(), FsError> {
-        gateway_call!(
-            self,
-            delete_blob_blocks,
-            delete_blob_blocks_response,
-            trace_id,
-            |token| DeleteBlobBlocksRequest {
-                caller: self.caller(token.clone()),
-                blob: Some(BlobGuid::from(blob_guid)),
             }
         )
         .await
@@ -646,6 +629,7 @@ impl StorageBackend {
     /// block identities. Errors are logged, never surfaced.
     pub async fn prefetch_blob(
         &self,
+        key: &str,
         blob_guid: DataBlobGuid,
         file_size: u64,
         blocks: Vec<PrefetchBlock>,
@@ -661,6 +645,7 @@ impl StorageBackend {
                 blob: Some(BlobGuid::from(blob_guid)),
                 file_size,
                 blocks: blocks.clone(),
+                key: key.to_string(),
             }
         )
         .await;
@@ -671,10 +656,13 @@ impl StorageBackend {
 
     /// Hand reclamation work to the gateway. Best effort: the durable
     /// `@ovr-gc/` markers cover a lost teardown; a lost superseded-block
-    /// sweep leaks invisible garbage until the block is rewritten.
+    /// sweep leaks invisible garbage until the block is rewritten. `key`
+    /// is the inode the blob was published under, or empty when the
+    /// client has none (a create whose publish never landed).
     #[allow(clippy::too_many_arguments)]
     pub async fn sweep_blob(
         &self,
+        key: &str,
         blob_guid: DataBlobGuid,
         victims: Vec<(u32, u64)>,
         below: Vec<(u32, u64)>,
@@ -708,6 +696,7 @@ impl StorageBackend {
                 delete_rows,
                 with_grace,
                 marker_data_pending_unix_ms,
+                key: key.to_string(),
             }
         })
         .await;

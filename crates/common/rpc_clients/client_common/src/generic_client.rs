@@ -1,5 +1,7 @@
 use crate::RpcError;
 use bytes::Bytes;
+#[cfg(feature = "tokio-runtime")]
+use bytes::{BufMut, BytesMut};
 use metrics_wrapper::{counter, gauge};
 use parking_lot::Mutex;
 use rpc_codec_common::{MessageFrame, MessageHeaderTrait};
@@ -726,24 +728,27 @@ where
                 Err(e) => return Err(RpcError::IoError(e)),
             };
 
-            // Read body directly into uninitialized buffer to avoid memset overhead
+            // Read the body into spare capacity through `BufMut`, which
+            // tracks initialization itself: no memset, no raw pointers. The
+            // limit keeps a read from running into the next header.
             let body_size = header.get_body_size();
             let body = if body_size > 0 {
-                let mut body_buf = Vec::<u8>::with_capacity(body_size);
-                // Safety: We create an uninitialized buffer and read data directly into it.
-                // This is safe because:
-                // 1. The buffer has allocated capacity >= body_size
-                // 2. read_exact guarantees it fills the entire buffer or returns an error
-                // 3. We only set_len after read_exact succeeds, ensuring all bytes are initialized
-                unsafe {
-                    let buf_ptr = body_buf.as_mut_ptr();
-                    let slice = std::slice::from_raw_parts_mut(buf_ptr, body_size);
-                    receiver.read_exact(slice).await?;
-                    body_buf.set_len(body_size);
+                let mut body_buf = BytesMut::with_capacity(body_size);
+                while body_buf.len() < body_size {
+                    let remaining = body_size - body_buf.len();
+                    let n = receiver
+                        .read_buf(&mut (&mut body_buf).limit(remaining))
+                        .await?;
+                    if n == 0 {
+                        return Err(RpcError::IoError(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "connection closed mid-body",
+                        )));
+                    }
                 }
-                Bytes::from(body_buf)
+                body_buf.freeze()
             } else {
-                bytes::Bytes::new()
+                Bytes::new()
             };
 
             // Verify body checksum (works for empty bodies too - they have a known XXH3 hash)
@@ -822,11 +827,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Default)]
-    struct TestHeader(ProtobufMessageHeader<TestCommand>);
-
-    // Manually implement Pod/Zeroable before using the macro (macro also implements them)
-    unsafe impl bytemuck::Pod for TestCommand {}
-    unsafe impl bytemuck::Zeroable for TestCommand {}
+    struct TestHeader(ProtobufMessageHeader);
 
     impl MessageHeaderTrait for TestHeader {
         fn encode(&self) -> &[u8] {
@@ -895,7 +896,7 @@ mod tests {
             response_header.0.id = request_header.get_id();
             response_header.0.size = (size_of::<TestHeader>() + body.len()) as u32;
             response_header.0.checksum_body = wrong_checksum;
-            response_header.0.command = TestCommand::Echo;
+            response_header.0.command = TestCommand::Echo as i32;
             response_header.set_checksum();
 
             socket.write_all(response_header.encode()).await.unwrap();
@@ -915,7 +916,7 @@ mod tests {
         request_header.0.id = 1;
         request_header.0.size = size_of::<TestHeader>() as u32;
         request_header.0.checksum_body = rpc_codec_common::EMPTY_BODY_CHECKSUM;
-        request_header.0.command = TestCommand::Echo;
+        request_header.0.command = TestCommand::Echo as i32;
 
         let frame = MessageFrame::new(request_header, Bytes::new());
         let result = client
@@ -952,7 +953,7 @@ mod tests {
         header.0.id = id;
         header.0.size = size_of::<TestHeader>() as u32;
         header.0.checksum_body = rpc_codec_common::EMPTY_BODY_CHECKSUM;
-        header.0.command = TestCommand::Echo;
+        header.0.command = TestCommand::Echo as i32;
         MessageFrame::new(header, Bytes::new())
     }
 
