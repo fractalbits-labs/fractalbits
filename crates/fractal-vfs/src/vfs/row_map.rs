@@ -1,6 +1,6 @@
 //! `@ovr/` row-map plumbing: bulk snapshot loads keyed by `map_epoch`,
 //! and the flush-side row writer. A block's row CAS is issued only
-//! after that block's BSS body write is acknowledged; rows still
+//! after that block's block-store body write is acknowledged; rows still
 //! pipeline across blocks.
 
 use std::sync::Arc;
@@ -18,9 +18,9 @@ use crate::error::FsError;
 use crate::vfs::VfsCore;
 use data_types::object_layout::ObjectLayout;
 
-/// Rows loaded per NSS listing page. Fixed-width block keys make one
+/// Rows loaded per metadata-store listing page. Fixed-width block keys make one
 /// page cover a contiguous block range; the has_more loop covers the
-/// rest (the NSS clamp must never silently truncate a snapshot).
+/// rest (the metadata-store clamp must never silently truncate a snapshot).
 const ROW_LOAD_PAGE: u32 = 1000;
 /// Concurrent row CASes per flush.
 const ROW_WRITE_CONCURRENCY: usize = 16;
@@ -274,7 +274,7 @@ async fn write_one_row(
     )))
 }
 
-/// Full-prefix snapshot load, paginated past the NSS clamp.
+/// Full-prefix snapshot load, paginated past the metadata-store clamp.
 async fn load_row_snapshot(
     backend: &crate::backend::StorageBackend,
     blob_id: Uuid,
@@ -290,7 +290,7 @@ async fn load_row_snapshot(
             .await
         {
             Ok(page) => page,
-            // `NotFound` here means the NSS root is gone, not that this
+            // `NotFound` here means the metadata-store root is gone, not that this
             // prefix is empty. Do not turn bucket deletion into a valid
             // empty map for a stale layout.
             Err(FsError::NotFound) => return Err(FsError::NotFound),

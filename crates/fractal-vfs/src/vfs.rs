@@ -18,21 +18,18 @@ use data_types::ovr_map::OvrRowMap;
 use fractal_fuse::{FileHandleId, InodeId};
 use rkyv::api::high::to_bytes_in;
 use std::cell::Cell;
-use std::os::fd::{AsRawFd, OwnedFd};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::backend::{BackendConfig, StorageBackend};
 use crate::cache::{DirCache, DirEntry, DirEntryKind};
 use crate::config::WritebackMode;
-use crate::disk_cache::{DiskCache, MirrorHandle, spawn_mirror_worker};
 use crate::error::FsError;
 use crate::inode::InodeTable;
 use crate::vfs::publish::spawn_writeback_worker;
-use crate::vfs::sweep::SweepCoordinator;
 use crate::vfs::write_buffer::WriteBuffer;
 use crate::writeback::WritebackQueue;
 pub const TTL: Duration = Duration::from_secs(1);
@@ -134,7 +131,7 @@ struct FileHandle {
     s3_key: String,
     layout: Option<ObjectLayout>,
     /// When the committed layout snapshot was last confirmed against
-    /// NSS. Clean handles refresh on the attr TTL so a long-lived open
+    /// the metadata store. Clean handles refresh on the attr TTL so a long-lived open
     /// fd cannot pin a superseded generation set past the sweep.
     layout_refreshed_at: Instant,
     /// Serializes this handle's data operations (read / write / flush /
@@ -142,7 +139,6 @@ struct FileHandle {
     /// cannot interleave with a flush's prepare/commit window.
     operation_lock: Arc<futures::lock::Mutex<()>>,
     write_buf: Option<WriteBuffer>,
-    backing_id: Option<i32>,
 }
 
 /// True when `current` differs from `expected` only in posix attributes:
@@ -181,13 +177,10 @@ fn posix_only_moved(expected: &ObjectLayout, current: &ObjectLayout) -> bool {
 pub struct VfsCore {
     backend_config: Arc<BackendConfig>,
     inodes: Arc<InodeTable>,
-    disk_cache: Option<Arc<DiskCache>>,
     dir_cache: DirCache,
     file_handles: DashMap<FileHandleId, FileHandle>,
     next_fh: AtomicU64,
     read_write: bool,
-    passthrough_enabled: bool,
-    passthrough_max_object_size: u64,
     prefetch_policy: crate::prefetch::PrefetchPolicy,
     /// Writeback queue. Always present, but only consulted when
     /// `writeback_mode` is `Default`. The worker is spawned from
@@ -202,7 +195,6 @@ pub struct VfsCore {
     /// One-shot guard for the writeback worker. Flipped by
     /// `ensure_writeback_worker_started`.
     writeback_worker_started: AtomicBool,
-    fuse_dev_fd: Option<Arc<OwnedFd>>,
     // Tracks blob data for unlinked files that still have open handles.
     // Cleanup is deferred until the last handle is released.
     deferred_blob_cleanup: DashMap<InodeId, Bytes>,
@@ -211,11 +203,6 @@ pub struct VfsCore {
     // can be reclaimed by the next opener. Reads do not touch
     // this lock.
     inode_write_owner: DashMap<InodeId, FileHandleId>,
-    // Handle to the dedicated disk-cache mirror thread. `None` when the
-    // disk cache is disabled or the mirror thread failed to start. Keeps
-    // the best-effort local-cache write off the FUSE worker threads so it
-    // does not steal foreground cycles on a create-heavy workload.
-    mirror: Option<MirrorHandle>,
     /// Per-blob `@ovr/` row snapshots keyed by blob_id, each tagged with
     /// the `map_epoch` it was loaded under. A snapshot at epoch M serves
     /// any read whose layout still carries M (every resolution change is
@@ -223,8 +210,9 @@ pub struct VfsCore {
     /// is a cheap epoch compare, never a TTL. LRU-bounded: eviction
     /// reloads one blob's prefix, one listing page per 1000 records.
     row_maps: parking_lot::Mutex<lru::LruCache<Uuid, Arc<OvrRowMap>>>,
-    /// Coalesces per-blob reclamation and bounds concurrent cleanup.
-    sweep_coordinator: Arc<SweepCoordinator>,
+    /// Sweep hand-offs to the gateway not yet acknowledged; `destroy`
+    /// waits for these before exiting.
+    sweep_inflight: Arc<AtomicUsize>,
 }
 
 impl VfsCore {
@@ -236,46 +224,6 @@ impl VfsCore {
         let config = &backend_config.config;
         let dir_cache_ttl = config.dir_cache_ttl();
 
-        let disk_cache = if config.disk_cache_enabled {
-            match DiskCache::new(
-                &config.disk_cache_path,
-                config.disk_cache_size_gb,
-                DEFAULT_BLOCK_SIZE as u64,
-            ) {
-                Ok(dc) => {
-                    tracing::info!(
-                        path = %config.disk_cache_path,
-                        size_gb = config.disk_cache_size_gb,
-                        "disk cache enabled"
-                    );
-                    Some(Arc::new(dc))
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to init disk cache, falling back to no cache");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // The mirror thread owns a clone of the disk-cache handle and
-        // drains queued writes off the FUSE worker threads.
-        let mirror = disk_cache
-            .as_ref()
-            .and_then(|dc| spawn_mirror_worker(dc.clone()));
-
-        // A passthrough backing fd cannot be revoked when another instance
-        // commits new row-mapped generations and the cache mirror changes
-        // the stable file in place. Keep the raw-fd path disabled until
-        // cache files are generation-specific or FUSE can revoke active
-        // backing mappings.
-        let passthrough_enabled = false;
-        if config.passthrough_enabled {
-            tracing::warn!("FUSE passthrough disabled for mutable versioned blobs");
-        }
-        let passthrough_max_object_size =
-            config.passthrough_max_object_size_gb * 1024 * 1024 * 1024;
         let prefetch_policy = crate::prefetch::PrefetchPolicy::from_config(config);
         // An unparseable mode is a misconfiguration: warn loudly and fall
         // back to Strict (fail-safe for durability) instead of silently
@@ -299,36 +247,22 @@ impl VfsCore {
         Self {
             backend_config,
             inodes,
-            disk_cache,
             dir_cache: DirCache::new(dir_cache_ttl),
             file_handles: DashMap::new(),
             next_fh: AtomicU64::new(1),
             read_write,
-            passthrough_enabled,
-            passthrough_max_object_size,
             prefetch_policy,
             writeback,
             writeback_mode,
             writeback_poll_ms,
             writeback_worker_started: AtomicBool::new(false),
-            fuse_dev_fd: None,
             deferred_blob_cleanup: DashMap::new(),
             inode_write_owner: DashMap::new(),
-            mirror,
             row_maps: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(ROW_MAP_CACHE_CAP).expect("row map cap is nonzero"),
             )),
-            sweep_coordinator: Arc::new(SweepCoordinator::default()),
+            sweep_inflight: Arc::new(AtomicUsize::new(0)),
         }
-    }
-
-    /// Install the shared `/dev/fuse` fd, obtained from
-    /// `Session::fuse_fd()`, before the session is run. The fd is needed
-    /// by passthrough open / close paths that may fire on the very first
-    /// FUSE request.
-    pub fn with_fuse_fd(mut self, fuse_dev_fd: Arc<OwnedFd>) -> Self {
-        self.fuse_dev_fd = Some(fuse_dev_fd);
-        self
     }
 
     // ---------- Internal helpers ----------
@@ -433,113 +367,9 @@ impl VfsCore {
         self.dirty_write_buffer_size(ino).unwrap_or(0)
     }
 
-    // ---------- Passthrough helpers ----------
-
-    /// Try to set up passthrough for a file handle. Returns (open_flags, backing_id)
-    /// if passthrough is activated, or (0, 0) otherwise.
-    pub fn try_passthrough(&self, fh: FileHandleId, layout: &ObjectLayout) -> (u32, i32) {
-        if !self.passthrough_enabled {
-            return (0, 0);
-        }
-        if self.read_write {
-            // A read-write mount can later override this blob. Once the
-            // kernel has a passthrough backing fd, metadata floors and cache
-            // file unlinks cannot revoke that raw fd, so only arm passthrough
-            // on read-only mounts.
-            return (0, 0);
-        }
-
-        let dc = match &self.disk_cache {
-            Some(dc) => dc,
-            None => return (0, 0),
-        };
-
-        let file_size = match layout.size() {
-            Ok(s) => s,
-            Err(_) => return (0, 0),
-        };
-
-        // Skip large files
-        if file_size > self.passthrough_max_object_size || file_size == 0 {
-            return (0, 0);
-        }
-
-        let blob_guid = match layout.blob_guid() {
-            Ok(g) => g,
-            Err(_) => return (0, 0),
-        };
-
-        // Passthrough bypasses the per-read exact-version check. Only arm
-        // it for never-overwritten, unmapped layouts, where every block is
-        // at its create-time identity.
-        if layout.blob_version > 1 || layout.may_have_ovr_records() {
-            return (0, 0);
-        }
-
-        // Check if fully cached
-        if !dc.is_complete(blob_guid, file_size) {
-            return (0, 0);
-        }
-
-        let fuse_fd = match self.fuse_dev_fd.as_ref() {
-            Some(fd) => fd.as_raw_fd(),
-            None => return (0, 0),
-        };
-
-        // Open the cache file and register as backing fd
-        let cache_path = dc.cache_file_path(blob_guid.blob_id, blob_guid.volume_id);
-        let backing_file = match std::fs::File::open(&cache_path) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to open cache file for passthrough");
-                return (0, 0);
-            }
-        };
-
-        let backing_fd = backing_file.as_raw_fd();
-
-        match fractal_fuse::passthrough::fuse_backing_open(fuse_fd, backing_fd) {
-            Ok(bid) => {
-                tracing::info!(fh = fh.0, backing_id = bid, "passthrough activated");
-                // Store backing_id in file handle for cleanup
-                if let Some(mut handle) = self.file_handles.get_mut(&fh) {
-                    handle.backing_id = Some(bid);
-                }
-                (fractal_fuse::abi::FOPEN_PASSTHROUGH, bid)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "passthrough ioctl failed (not supported?)");
-                (0, 0)
-            }
-        }
-    }
-
-    /// Try passthrough for an already-opened file handle.
-    pub fn try_passthrough_for_fh(&self, fh: FileHandleId) -> Option<(u32, i32)> {
-        let handle = self.file_handles.get(&fh)?;
-        let layout = handle.layout.as_ref()?;
-        Some(self.try_passthrough(fh, layout))
-    }
-
-    /// Clean up passthrough backing_id on file release.
-    pub fn release_passthrough(&self, fh: FileHandleId) {
-        let backing_id = self.file_handles.get(&fh).and_then(|h| h.backing_id);
-
-        if let Some(bid) = backing_id
-            && let Some(fuse_dev_fd) = self.fuse_dev_fd.as_ref()
-            && let Err(e) =
-                fractal_fuse::passthrough::fuse_backing_close(fuse_dev_fd.as_raw_fd(), bid)
-        {
-            tracing::warn!(backing_id = bid, error = %e, "failed to close backing");
-        }
-    }
-
     // ---------- Public VFS operations ----------
 
     pub fn vfs_init(&self) {
-        if let Some(dc) = &self.disk_cache {
-            dc.spawn_evictor();
-        }
         // Start the writeback worker here, on the FUSE lifecycle thread's
         // runtime. That runtime outlives the per-ring worker runtimes (it
         // drives `destroy` after every ring thread is joined), so the
@@ -548,7 +378,6 @@ impl VfsCore {
         // dead drainer. `ensure_writeback_worker_started` is idempotent, so
         // the lazy calls on the metadata paths become no-ops.
         self.ensure_writeback_worker_started();
-        self.ensure_sweep_worker_started();
         tracing::info!("Filesystem initialized");
     }
 

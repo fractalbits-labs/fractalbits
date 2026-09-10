@@ -2,42 +2,26 @@
 name = "fractal-vfs"
 version = "0.1.0"
 edition = "2024"
-description = "The fractalbits storage-cluster VFS: inode + cache + RPC backend used by the FUSE/NFS/etc adapters."
+description = "The fractalbits client-side VFS: inode table + writeback cache over the fs_gateway protocol, used by the FUSE/NFS/etc adapters."
 license = "Apache-2.0"
 repository = "https://github.com/fractalbits-labs/fractalbits-main"
 
 [dependencies]
-# Storage backend (rpc clients + codecs).
+# Storage backend: the fs_gateway protocol only.
 rpc_client_common = { workspace = true, default-features = false, features = ["compio-runtime"] }
-rpc_client_bss = { workspace = true, default-features = false, features = ["compio-runtime"] }
-rpc_client_nss = { workspace = true, default-features = false, features = ["compio-runtime"] }
-rpc_client_rss = { workspace = true, default-features = false, features = ["compio-runtime"] }
-volume_group_proxy = { workspace = true, default-features = false, features = ["compio-runtime"] }
-s3_blob_store.workspace = true
-nss_codec.workspace = true
-file_ops.workspace = true
-rss_codec.workspace = true
-bss_codec.workspace = true
-rpc_codec_common.workspace = true
+rpc_client_fs = { workspace = true, default-features = false, features = ["compio-runtime"] }
+fs_gateway_codec.workspace = true
 data_types.workspace = true
-metrics_wrapper.workspace = true
 
-# Async runtime. tokio hosts only the S3 SDK (see s3_volume.rs).
+# Async runtime.
 compio-runtime.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread"] }
-compio-net.workspace = true
-compio-io.workspace = true
-compio-buf.workspace = true
-compio-fs.workspace = true
 
 # Common.
-prost.workspace = true
 strum.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 rkyv.workspace = true
 moka = { workspace = true, features = ["sync"] }
 dashmap.workspace = true
@@ -46,15 +30,11 @@ futures.workspace = true
 uuid.workspace = true
 config.workspace = true
 rand.workspace = true
-xxhash-rust.workspace = true
 lru.workspace = true
 libc.workspace = true
-nix.workspace = true
 
-# Pulled in only for the FUSE passthrough call sites inside vfs.rs.
-# TODO: lift passthrough out of VfsCore into the FUSE adapter so
-# fractal-vfs becomes transport-agnostic.
-fractal-fuse = { path = "../fs_server/fractal-fuse" }
+# InodeId / FileHandleId / Errno types shared with the FUSE adapter.
+fractal-fuse = { path = "../fs_client/fractal-fuse" }
 
 [dev-dependencies]
 compio-macros.workspace = true

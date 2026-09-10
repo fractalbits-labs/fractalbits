@@ -37,9 +37,9 @@ impl VfsCore {
     /// PATH_MAX boundary guard, separate from `check_name_max`. The
     /// kernel enforces PATH_MAX on the path the syscall receives
     /// before forwarding to FUSE; what reaches us is the
-    /// bucket-relative key (`prefix + name`). NSS keys cap at 8 KiB
+    /// bucket-relative key (`prefix + name`). Metadata-store keys cap at 8 KiB
     /// (see `core/nss_server/configs.zig` user_max_key_size), so the
-    /// only thing we guard here is a key that would overflow the NSS
+    /// only thing we guard here is a key that would overflow the metadata-store
     /// protocol cap.
     #[inline]
     pub(crate) fn check_path_max(prefix: &str, name: &str) -> Result<(), FsError> {
@@ -258,7 +258,7 @@ impl VfsCore {
         //   - cached inode_id: already promoted; bump nlink under CAS.
         //   - src layout Indirect: promoted, cache cold; follow + bump.
         //   - fresh normal source: promote ATOMICALLY: mint a record then
-        //     CAS the source's NSS row from its exact normal bytes to an
+        //     CAS the source's metadata-store row from its exact normal bytes to an
         //     Indirect redirect. If that CAS loses (another client promoted
         //     first), discard our orphan record, re-read the now-Indirect
         //     redirect, and join the winner's record via the bump path, so
@@ -471,9 +471,9 @@ impl VfsCore {
 
         let trace_id = TraceId::new();
 
-        // Read-your-writes before the NSS probe only when local writeback
+        // Read-your-writes before the metadata-store probe only when local writeback
         // proves this name has an in-flight publish. This closes the race
-        // where NSS returns NotFound and the worker commits before the later
+        // where the metadata store returns NotFound and the worker commits before the later
         // fallback check, without serving arbitrary stale cached entries.
         if let Some(ino) = self.inodes.find_ino_by_key(&full_key, EntryType::File)
             && let Some(entry) = self.inodes.get(ino)
@@ -484,7 +484,7 @@ impl VfsCore {
             let layout = entry.layout.clone();
             drop(entry);
             // Decide what to serve BEFORE taking a refcount, so a layout we
-            // cannot resolve locally falls through to the NSS resolve path
+            // cannot resolve locally falls through to the metadata-store resolve path
             // instead of leaking the kernel-lookup count on an error reply.
             let ryw_attr = if let Some(size) = self.dirty_write_buffer_size(ino) {
                 // Fresh create whose first flush hasn't landed, or an
@@ -498,9 +498,9 @@ impl VfsCore {
                 match &layout {
                     // An Indirect hardlink redirect cached by a plain readdir
                     // has no servable size() (InvalidState). The alias already
-                    // exists in NSS (link publishes it synchronously), so
+                    // exists in the metadata store (link publishes it synchronously), so
                     // there is no negative-dentry race: fall through to the
-                    // NSS resolve path, which follows the redirect correctly.
+                    // metadata-store resolve path, which follows the redirect correctly.
                     Some(l) if matches!(l.state, ObjectState::Indirect(_)) => None,
                     Some(l) => Some(self.make_file_attr(ino, l)?),
                     None => Some(self.make_new_file_attr(ino, 0)),
@@ -562,7 +562,7 @@ impl VfsCore {
                     // size from entry.layout, so a follow-up stat (after the
                     // 1s lookup-attr TTL) would report the old size even
                     // though this lookup already fetched the fresh one from
-                    // NSS. Refresh the cached layout to the just-read
+                    // the metadata store. Refresh the cached layout to the just-read
                     // authoritative one. (Local unflushed writes live in the
                     // handle's write_buf, and unflushed setattr in
                     // entry.posix, so neither is clobbered here.)
@@ -578,7 +578,7 @@ impl VfsCore {
                 }
                 let mut attr = self.make_file_attr(ino, &real_layout)?;
                 attr.nlink = nlink;
-                // Size authority: the NSS layout size is a lazy copy that can
+                // Size authority: the metadata-store layout size is a lazy copy that can
                 // lag a peer instance's most recent override, so the dentry
                 // attr this LOOKUP installs (and the i_size the kernel derives
                 // from it) would otherwise be stale; a follow-up read clamps
@@ -615,10 +615,10 @@ impl VfsCore {
             Err(e) => return Err(e),
         }
 
-        // Read-your-writes: a just-created entry NSS doesn't have yet must
+        // Read-your-writes: a just-created entry the metadata store doesn't have yet must
         // still resolve from the in-memory inode, but only when there's a
-        // genuine in-flight reason it's missing from NSS, NOT for any stale
-        // cached entry. Otherwise an entry deleted by another instance (NSS
+        // genuine in-flight reason it's missing from the metadata store, NOT for any stale
+        // cached entry. Otherwise an entry deleted by another instance (the metadata store
         // says gone, but our cache still holds it because it was never
         // FUSE-unlinked here) would be resurrected and a follow-up read
         // would EIO on the deleted blocks instead of returning ENOENT.
@@ -626,14 +626,14 @@ impl VfsCore {
         // "In-flight" means either a pending writeback intent (async
         // metadata create/chmod/mkdir/symlink/mknod not yet drained) or an
         // open file handle (a regular-file create whose close-time flush
-        // hasn't published to NSS yet). When neither holds, NSS's miss is
+        // hasn't published to the metadata store yet). When neither holds, the metadata store's miss is
         // authoritative.
         if let Some(ino) = self.inodes.find_ino_by_key(&full_key, EntryType::File)
             && let Some(entry) = self.inodes.get(ino)
             && !entry.name_removed
             && (self.writeback.has_pending_intent_for_key(&full_key)
                 || self.has_open_handles_for_inode(ino, None)
-                // A tainted inode had its publish fail: NSS has nothing,
+                // A tainted inode had its publish fail: the metadata store has nothing,
                 // but the name must stay resolvable so the deferred EIO
                 // is reachable through the next open instead of the file
                 // silently vanishing as ENOENT.
@@ -860,7 +860,6 @@ impl VfsCore {
                     wb.size_changed = true;
                     wb
                 }),
-                backing_id: None,
             },
         );
 
@@ -873,8 +872,8 @@ impl VfsCore {
     }
 
     /// Create a symbolic link at `(parent, name)` whose body is
-    /// `target`. The layout is published to NSS via an unconditional
-    /// `put_inode` (this is a brand-new entry), no BSS blob is
+    /// `target`. The layout is published to the metadata store via an unconditional
+    /// `put_inode` (this is a brand-new entry), no block-store blob is
     /// allocated, and the parent dir cache is invalidated so the new
     /// name shows up in listings. Existing entries at the same name
     /// fail the create with `AlreadyExists`.
@@ -992,7 +991,7 @@ impl VfsCore {
             return Err(FsError::InvalidArg);
         }
 
-        // Cold path: re-fetch from NSS. This handles the case where
+        // Cold path: re-fetch from the metadata store. This handles the case where
         // the inode entry was created by lookup but the layout was
         // dropped (memory pressure / eviction).
         if self.writeback.has_pending_intent_for_key(&key) || self.writeback.is_tainted(inode) {
@@ -1138,7 +1137,7 @@ impl VfsCore {
 
         // With async metadata, a just-created (or just-chmod'd) inode
         // may still have a PutInode queued. Drain it before the delete
-        // so (a) the delete sees the entry in NSS instead of racing to
+        // so (a) the delete sees the entry in the metadata store instead of racing to
         // a spurious ENOENT, and (b) the worker can't re-publish it
         // after the delete and resurrect the name. The queue's own
         // per-key inode records are drained too: a FORGET can evict the
@@ -1178,12 +1177,12 @@ impl VfsCore {
             Err(error) => return Err(error),
         }
 
-        // Delete the inode from NSS
+        // Delete the inode from the metadata store
         let old_bytes = self.backend().delete_inode(&key, &trace_id).await?;
 
         let old_bytes = match old_bytes {
             Some(bytes) => bytes,
-            // A tainted target's create publish failed: NSS has nothing,
+            // A tainted target's create publish failed: the metadata store has nothing,
             // but the name is still locally visible (lookup keeps a tainted
             // name resolvable). Finish the delete locally instead of
             // failing a visible name with ENOENT.
@@ -1289,7 +1288,7 @@ impl VfsCore {
         let trace_id = TraceId::new();
 
         // Drain a pending async directory publish before the existence /
-        // emptiness probe, so a just-created dir is committed to NSS and
+        // emptiness probe, so a just-created dir is committed to the metadata store and
         // the worker can't re-publish it after the delete. Includes the
         // queue's per-key inode records: a FORGET can evict the
         // InodeTable entry while its intent is still queued.
@@ -1302,7 +1301,7 @@ impl VfsCore {
         }
 
         // A child create may have returned to the caller while its
-        // default-mode PutInode is still queued or in flight. NSS
+        // default-mode PutInode is still queued or in flight. The metadata store
         // listing alone can miss that child, so preserve the POSIX
         // non-empty contract from the in-memory writeback queue first.
         if self.writeback_mode == WritebackMode::Default
@@ -1318,7 +1317,7 @@ impl VfsCore {
         // Only files, not dirs: a cached dir child can be a phantom (a
         // tombstoned subtree still emits a CommonPrefix into the readdir
         // cache), so dir emptiness is decided by the tombstone-filtering
-        // no-delimiter NSS list below, not this cache (pjdfstest
+        // no-delimiter metadata-store list below, not this cache (pjdfstest
         // mkdir/03.t, rmdir/03.t: rm -rf of a deep tree after a
         // mkdir+rmdir of the leaf).
         if self.dir_cache.has_file_children(&key) == Some(true) {
@@ -1329,7 +1328,7 @@ impl VfsCore {
         // listing for. A file child created and released under `key` while
         // the parent listing was absent or invalidated publishes its layout
         // via an async release cycle (not a PutInode intent), so it is
-        // invisible to both checks above and not yet in NSS. Consult local
+        // invisible to both checks above and not yet in the metadata store. Consult local
         // open-handle / in-flight-cycle state so rmdir can't delete the
         // directory out from under it.
         if self.writeback_mode == WritebackMode::Default && self.has_local_file_child_under(&key) {
@@ -1337,7 +1336,7 @@ impl VfsCore {
         }
 
         // List to check existence and emptiness. Use NO delimiter so
-        // NSS walks leaves directly and filters tombstones: the list
+        // the metadata store walks leaves directly and filters tombstones: the list
         // path only drops tombstoned entries on the LEAF branch. With
         // delimiter "/" a fully-tombstoned subtree still emits a
         // CommonPrefix entry, so `rm -rf` of a deep tree would see a
@@ -1352,7 +1351,7 @@ impl VfsCore {
             .await?;
 
         // If no entries at all, directory doesn't exist. Exception: a
-        // tainted target's mkdir publish failed, so NSS has no marker but
+        // tainted target's mkdir publish failed, so the metadata store has no marker but
         // the name is still locally visible (lookup keeps a tainted dir
         // resolvable). Finish the delete locally instead of failing the
         // visible name with ENOENT.
@@ -1422,7 +1421,7 @@ impl VfsCore {
             self.drain_inode_to_barrier(ino).await?;
         }
         // A just-created directory publishes its marker via an async
-        // PutInode (Default writeback mode), so the NSS probe + rename below
+        // PutInode (Default writeback mode), so the metadata-store probe + rename below
         // would otherwise miss it and ENOENT, and a queued publish could
         // resurrect the old name after the rename. Drain the source (and a
         // replaced destination) directory barrier first, mirroring the file
@@ -1459,7 +1458,7 @@ impl VfsCore {
             Err(error) => return Err(error),
         }
 
-        // Determine type by probing NSS backend directly (no inode side effects)
+        // Determine type by probing metadata-store backend directly (no inode side effects)
         let is_dir = match self.backend().get_inode(&src_key, &trace_id).await {
             Ok(_) => false,
             Err(FsError::NotFound) => true,
@@ -1512,14 +1511,14 @@ impl VfsCore {
                 self.touch_parent_times(new_parent);
             }
         } else {
-            // Drain pending writeback on src AND dst before the NSS
+            // Drain pending writeback on src AND dst before the metadata-store
             // rename so we operate on the post-flush layout and a queued
             // publish can't resurrect either name after the atomic
             // replace (create+close returns to userspace before the
-            // close-time publish lands in NSS; rename/09.t / 10.t fire
+            // close-time publish lands in the metadata store; rename/09.t / 10.t fire
             // the rename immediately after).
             // POSIX rename(2) atomically replaces an existing
-            // regular-file dst. NSS does the swap via
+            // regular-file dst. The metadata store does the swap via
             // `force_overwrite=true` and hands back the prior dst value
             // so we can GC the orphaned blob.
             let old_bytes = self

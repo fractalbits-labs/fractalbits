@@ -72,7 +72,7 @@ coverage-add +args:
 
 # Generate coverage report from accumulated data.
 # Uses llvm tools directly (instead of cargo llvm-cov report) to include
-# fs_server from the isolated compio build that cargo llvm-cov can't discover.
+# fs_gateway / fractalbits-mount from the isolated compio build that cargo llvm-cov can't discover.
 coverage-report:
   #!/usr/bin/env bash
   set -euo pipefail
@@ -104,4 +104,4 @@ coverage-report:
 
 # Quick unit-test-only coverage (no services needed)
 coverage-unit:
-  cargo llvm-cov --no-cfg-coverage --workspace --exclude s3_gateway --exclude fs_server --ignore-filename-regex 'xtask/.*' --html
+  cargo llvm-cov --no-cfg-coverage --workspace --exclude s3_gateway --exclude fs_gateway --exclude fs_client --ignore-filename-regex 'xtask/.*' --html

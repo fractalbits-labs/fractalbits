@@ -4,8 +4,8 @@
 //! write path. Each inbound op updates `InodeTable` / `DirCache`
 //! immediately, enqueues an intent (see `InodeOp` for the kinds), and
 //! returns success to the kernel. A background worker drains the queue
-//! with one NSS publish per intent, so single-threaded create storms
-//! (tar -xf, cp -r) pipeline their NSS round-trips instead of
+//! with one metadata-store publish per intent, so single-threaded create storms
+//! (tar -xf, cp -r) pipeline their metadata-store round-trips instead of
 //! serialising one per file.
 //!
 //! Scope: metadata mutations (the `InodeOp` kinds) on exclusive-writer
@@ -99,7 +99,7 @@ pub enum CoalesceOutcome {
     Blocked,
 }
 
-/// A pending intent the worker has popped and is about to ship to NSS.
+/// A pending intent the worker has popped and is about to ship to the metadata store.
 /// Carries everything needed to fire the RPC and route the result back
 /// via `mark_committed` / `mark_failed`.
 #[derive(Debug, Clone)]
@@ -273,10 +273,10 @@ impl WritebackQueue {
     }
 
     /// `true` iff any not-yet-committed intent exists for `key`.
-    /// `vfs_lookup` uses this to decide whether a NSS miss is
+    /// `vfs_lookup` uses this to decide whether a metadata-store miss is
     /// authoritative: a key with a pending intent is an entry the worker
     /// has not drained yet (serve read-your-writes from cache), whereas a
-    /// NSS miss with no pending intent is genuinely gone and must surface
+    /// metadata-store miss with no pending intent is genuinely gone and must surface
     /// ENOENT.
     pub fn has_pending_intent_for_key(&self, key: &str) -> bool {
         let inner = self.inner.lock();
@@ -285,7 +285,7 @@ impl WritebackQueue {
 
     /// `true` iff a not-yet-committed child create exists under
     /// `parent_key`. Directory emptiness checks use this before
-    /// consulting NSS: a successful FUSE create has already made the child
+    /// consulting the metadata store: a successful FUSE create has already made the child
     /// visible to the caller even when the worker has not published the
     /// child layout yet.
     pub fn has_pending_child_put_inode_for_parent(&self, parent_key: &str) -> bool {
@@ -586,7 +586,7 @@ impl WritebackQueue {
     /// name is being removed: the failed publish is moot (the inode is
     /// going away) and the deferred EIO must not block the delete.
     /// Returns `true` if a taint was cleared, so the delete path knows
-    /// the entry's create publish failed (NSS has nothing) and a NSS
+    /// the entry's create publish failed (the metadata store has nothing) and a metadata-store
     /// miss must not surface as ENOENT for a locally-visible name.
     pub fn clear_taint(&self, inode: InodeId) -> bool {
         let mut inner = self.inner.lock();

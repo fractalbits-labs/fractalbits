@@ -1,10 +1,10 @@
 [package]
-name = "fs_server"
+name = "fs_client"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "fs_server"
+name = "fractalbits-mount"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,6 +1,6 @@
 //! Write buffering and the flush/commit path, truncate, fallocate, lseek.
 //!
-//! The flush is a prepare/commit protocol over versioned write-once BSS
+//! The flush is a prepare/commit protocol over versioned write-once the block store
 //! keys and `@ovr/` rows:
 //!
 //! 1. Classify dirty blocks. First writes beyond the committed EOF are
@@ -34,12 +34,10 @@ use fractal_fuse::{FileHandleId, InodeId};
 use futures::{StreamExt, TryStreamExt, stream};
 use rkyv::api::high::to_bytes_in;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::cache::DirEntryKind;
 use crate::config::WritebackMode;
-use crate::disk_cache::{MIRROR_BYTE_BUDGET, MirrorJob};
 use crate::error::FsError;
 use crate::inode::{layout_posix, layout_with_posix};
 use crate::vfs::row_map::RowWrite;
@@ -49,7 +47,7 @@ use crate::vfs::{
     DEFAULT_BLOCK_SIZE, MAX_INMEM_FILE_SIZE, VfsAttr, VfsCore, parent_prefix_of, posix_only_moved,
 };
 
-/// Concurrent BSS body writes per flush. Bodies are independent
+/// Concurrent block-store body writes per flush. Bodies are independent
 /// write-once keys, so pipelining them is safe: the ordering rule is
 /// per block, body before that block's row, never body after body.
 const BODY_WRITE_CONCURRENCY: usize = 16;
@@ -133,7 +131,7 @@ fn classify_create_publish(
 }
 
 impl VfsCore {
-    /// Load one block's committed bytes from BSS for an RMW / dirty read /
+    /// Load one block's committed bytes from the block store for an RMW / dirty read /
     /// flush tail-zero, at the exact identity the committed rows resolve.
     /// Returns zeros (length `fallback_content_len`) for a brand-new file,
     /// a hole (row `Hole` / `committed_content_len == 0` / a base-version
@@ -185,7 +183,7 @@ impl VfsCore {
             .read_block(guid, version, block_num, read_len, trace_id)
             .await
         {
-            Ok((data, _)) => Ok(if data.len() > committed_content_len {
+            Ok(data) => Ok(if data.len() > committed_content_len {
                 data.slice(0..committed_content_len)
             } else {
                 data
@@ -198,7 +196,7 @@ impl VfsCore {
                         version,
                         "DATA LOSS: row-committed generation missing during flush load"
                     );
-                    return Err(FsError::DataVg(volume_group_proxy::DataVgError::Corrupted));
+                    return Err(FsError::Corrupted);
                 }
                 Ok(zeros(fallback_content_len))
             }
@@ -400,11 +398,11 @@ impl VfsCore {
         };
 
         // A name unlinked while its fd stayed open must not be resurrected
-        // in NSS, unless the inode was promoted to a hardlink, in which
+        // in the metadata store, unless the inode was promoted to a hardlink, in which
         // case its data lives in the shared `@hardlink/<id>` InodeRecord
         // blob and the other names still reference it, so the write must
         // still flush (routed to the record below, not this s3_key, whose
-        // NSS row holds only an Indirect redirect).
+        // metadata-store row holds only an Indirect redirect).
         let (name_removed, promoted_inode_id) = self
             .inodes
             .get(ino)
@@ -471,7 +469,7 @@ impl VfsCore {
         // Hold the exact base snapshot through commit so LRU eviction by
         // another reader cannot make write-through construct a partial map.
         let mut committed_base_rows: Option<std::sync::Arc<OvrRowMap>> = None;
-        let (mut final_layout, final_committed_size) = loop {
+        let mut final_layout = loop {
             let publish_key = promoted_record_key
                 .clone()
                 .unwrap_or_else(|| s3_key.clone());
@@ -525,7 +523,7 @@ impl VfsCore {
             // fallocate claims alike) lands at version 1, unpadded, with
             // no rows.
             let Some((blob_guid, base)) = base else {
-                let blob_guid = self.backend().create_blob_guid();
+                let blob_guid = self.backend().create_blob_guid(&trace_id).await?;
                 let unpublished_identities: Vec<(u32, u64)> = snap
                     .blocks
                     .iter()
@@ -596,7 +594,7 @@ impl VfsCore {
                     }
                 }
                 snap.armed = false;
-                break (layout, 0);
+                break layout;
             };
 
             // Overwrite/append path against a committed base.
@@ -1004,7 +1002,7 @@ impl VfsCore {
             committed_aborted_range = aborted_range;
             committed_base_rows = base_rows;
             snap.armed = false;
-            break (layout, committed_size);
+            break layout;
         };
 
         // Write-through the committed rows into the cached snapshot so
@@ -1090,127 +1088,6 @@ impl VfsCore {
             .map(|(_, n)| n.to_string())
             .unwrap_or_else(|| s3_key.clone());
         self.cache_dir_entry(&parent_prefix, &name, ino, DirEntryKind::RegularFile);
-
-        // Sync the local disk cache to the writer's just-published
-        // state: rewrites land at their natural offsets with their exact
-        // committed generation, deletes punch holes, and the file-level
-        // commit epoch advances to fence stale mirror jobs.
-        //
-        // Best-effort on the create path: a sync failure is logged and
-        // the next read cold-fetches from BSS.
-        if let Some(dc) = &self.disk_cache
-            && let Ok(final_blob_guid) = final_layout.blob_guid()
-        {
-            let bsz_u64 = block_size as u64;
-            let rewrites: Vec<(u32, Bytes)> = snap
-                .blocks
-                .iter()
-                .filter_map(|(b, s)| match s {
-                    BlockState::Rewrite(bytes) => Some((*b, bytes.clone())),
-                    _ => None,
-                })
-                .collect();
-
-            let new_bc = file_size.div_ceil(bsz_u64) as u32;
-            let committed_bc = final_committed_size.div_ceil(bsz_u64) as u32;
-            let trim_lo = eof_low_watermark.map(|w| w.min(new_bc)).unwrap_or(new_bc);
-            let trim_hi = trim_upper.unwrap_or(committed_bc).max(committed_bc);
-
-            let mut deletes: Vec<u32> = (trim_lo..trim_hi)
-                .filter(|b| !matches!(snap.blocks.get(b), Some(BlockState::Rewrite(_))))
-                .collect();
-            for (b, s) in snap.blocks.iter() {
-                if matches!(s, BlockState::Delete) {
-                    deletes.push(*b);
-                }
-            }
-
-            let blob_version = final_layout.blob_version;
-
-            if blob_version > 1 {
-                // Overwrite path: mirror the cache SYNCHRONOUSLY before
-                // the flush returns. An overwrite can have a pre-existing
-                // cache file that concurrent readers already trust; each
-                // rewritten block is stamped with its exact committed
-                // generation, and the file epoch fences any still-queued
-                // older mirror job. fdatasync is still dropped, so this
-                // is page-cache-cheap.
-                let exact_rewrites: Vec<(u32, u64, Bytes)> = rewrites
-                    .iter()
-                    .map(|(block, bytes)| {
-                        (
-                            *block,
-                            committed_write_versions
-                                .get(block)
-                                .copied()
-                                .unwrap_or(blob_version),
-                            bytes.clone(),
-                        )
-                    })
-                    .collect();
-                if let Err(e) = dc
-                    .sync_after_flush_exact(
-                        final_blob_guid,
-                        blob_version,
-                        &exact_rewrites,
-                        &deletes,
-                    )
-                    .await
-                {
-                    // An overwrite mirror cannot be best-effort: a partial
-                    // failure can leave a superseded block as a valid
-                    // populated+checksum hit. Drop the whole cache file so
-                    // every block cold-fetches the authoritative bytes.
-                    tracing::warn!(
-                        %final_blob_guid,
-                        error = %e,
-                        "disk cache overwrite mirror failed; dropping cache file"
-                    );
-                    dc.drop_blob(final_blob_guid, blob_version).await;
-                }
-            } else if let Some(mirror) = &self.mirror {
-                // Fresh create (the create-storm hot path): hand the cache
-                // write to the dedicated mirror thread so the local I/O +
-                // xxh3 never run on a FUSE worker. A fresh blob has no pre-
-                // existing cache file and a single version, so there is no
-                // stale-byte window for any reader. `try_send` never
-                // blocks; the queue is bounded by both job count and
-                // retained bytes, and over budget the job is dropped (best-
-                // effort; the block cold-fills from BSS on the next read).
-                let byte_len: usize = rewrites.iter().map(|(_, b)| b.len()).sum();
-                let queued = mirror.queued_bytes.fetch_add(byte_len, Ordering::Relaxed);
-                if queued + byte_len > MIRROR_BYTE_BUDGET {
-                    mirror.queued_bytes.fetch_sub(byte_len, Ordering::Relaxed);
-                    tracing::trace!(
-                        %final_blob_guid,
-                        byte_len,
-                        "disk cache mirror byte budget exceeded; dropping (best-effort)"
-                    );
-                } else {
-                    let job = MirrorJob {
-                        blob_guid: final_blob_guid,
-                        blob_version,
-                        rewrites,
-                        deletes,
-                        byte_len,
-                    };
-                    if let Err(e) = mirror.tx.clone().try_send(job) {
-                        mirror.queued_bytes.fetch_sub(byte_len, Ordering::Relaxed);
-                        if e.is_full() {
-                            tracing::trace!(
-                                %final_blob_guid,
-                                "disk cache mirror queue full; dropping (best-effort)"
-                            );
-                        } else {
-                            tracing::warn!(
-                                %final_blob_guid,
-                                "disk cache mirror channel closed; dropping (best-effort)"
-                            );
-                        }
-                    }
-                }
-            }
-        }
 
         // Reclaim what this commit superseded: the exact identities the
         // row CASes displaced, the base-version keys of re-identified
@@ -1505,7 +1382,7 @@ impl VfsCore {
 
                 // Determine which edge blocks need a lazy load. We only
                 // load when:
-                //   - The block has committed bytes in BSS, AND
+                //   - The block has committed bytes in the block store, AND
                 //   - There isn't already a buffered `Rewrite`
                 //     copy we can edit in place, AND
                 //   - The shrink-destroys watermark hasn't already
@@ -1742,7 +1619,7 @@ impl VfsCore {
         let last_block_excl = file_size.div_ceil(bsz_u64) as u32;
 
         // Per-block classifier. `Some(true)` -> data, `Some(false)` -> hole,
-        // `None` -> not buffered, fall through to rows / the BSS probe.
+        // `None` -> not buffered, fall through to rows / the block-store probe.
         let buffered_kind = |b: u32| -> Option<bool> {
             match blocks.get(&b) {
                 Some(BlockState::Rewrite(_)) => Some(true),

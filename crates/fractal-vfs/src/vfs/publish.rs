@@ -1,4 +1,4 @@
-//! NSS publish primitives and the long-running writeback worker that
+//! metadata-store publish primitives and the long-running writeback worker that
 //! drives them. The `publish_*` helpers are shared: the worker calls them
 //! for queued intents, and the metadata paths in `vfs::attr` call the same
 //! functions inline when a publish must land synchronously.
@@ -16,11 +16,11 @@ use data_types::object_layout::{InodeRecord, ObjectState, PosixAttrs};
 
 /// Max concurrent `put_inode` RPCs per drained batch. Intents in a batch
 /// are on distinct inodes (see `drain_pending`), so they publish in
-/// parallel; the cap bounds in-flight RPCs against NSS.
+/// parallel; the cap bounds in-flight RPCs against the metadata store.
 const PUBLISH_CONCURRENCY: usize = 32;
 
 /// Long-running writeback worker. Polls the queue every `poll_ms`,
-/// drains pending intents, and fires NSS `put_inode` for each.
+/// drains pending intents, and fires the metadata store `put_inode` for each.
 /// Spawned at FUSE init when `WritebackMode::Default` is configured;
 /// runs until the process exits. Each intent ships as a single-op
 /// `put_inode` RPC; the pipelining win comes from overlapping many such
@@ -35,7 +35,7 @@ pub(crate) fn spawn_writeback_worker(
         // One backend per concurrent publish lane. StorageBackend has
         // RefCell-backed clients so independent futures must not share one
         // instance across awaits, especially when failover refresh mutates the
-        // cached NSS client.
+        // cached the metadata store client.
         let mut backends = Vec::with_capacity(PUBLISH_CONCURRENCY);
         for lane in 0..PUBLISH_CONCURRENCY {
             match StorageBackend::new(&backend_cfg) {
@@ -65,7 +65,7 @@ pub(crate) fn spawn_writeback_worker(
             // Publish independent intents concurrently. `drain_pending`
             // returns at most one generation per inode, so no two intents in
             // the batch touch the same inode; they are order-independent and
-            // safe to fire together. Bounded chunks cap the fan-out on NSS so
+            // safe to fire together. Bounded chunks cap the fan-out on the metadata store so
             // a large batch cannot open thousands of in-flight RPCs at once.
             let queue = &queue;
             for chunk in drained.chunks(PUBLISH_CONCURRENCY) {
@@ -136,7 +136,7 @@ pub(crate) async fn put_inode_create_idempotent(
     }
 }
 
-/// Ship one intent to NSS with bounded retries, so a transient backend
+/// Ship one intent to the metadata store with bounded retries, so a transient backend
 /// blip doesn't taint the inode and silently drop metadata the caller
 /// already saw succeed.
 async fn publish_intent_with_retry(

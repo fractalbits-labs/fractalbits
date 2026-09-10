@@ -10,20 +10,24 @@ use data_types::TraceId;
 use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
 use data_types::ovr_map::{BlockFetchPlan, OvrRowMap, block_fetch_plan, zeros};
 use fractal_fuse::FileHandleId;
+use futures::{StreamExt, TryStreamExt, stream};
 
 use crate::error::FsError;
 use crate::vfs::{TTL, VfsCore};
 
+/// Blocks fetched in parallel for one multi-block read.
+const READ_CONCURRENCY: usize = 8;
+
 impl VfsCore {
     /// Read a block by resolving its exact committed identity from the
-    /// row snapshot (base version 1 when unmapped/absent), checking the
-    /// disk cache at that identity, then fetching from BSS. A `Hole`
-    /// resolution returns zeros with no BSS access.
+    /// row snapshot (base version 1 when unmapped/absent), then fetching
+    /// it from the gateway (which serves its disk cache first). A `Hole`
+    /// resolution returns zeros with no gateway access.
     ///
     /// Miss semantics carry the row's durability contract: a
     /// row-committed generation missing on every replica is detected
     /// data loss (fail loudly), while a base-version miss is a sparse
-    /// hole only after the layout is revalidated against NSS (the
+    /// hole only after the layout is revalidated against the metadata store (the
     /// `validated_sparse_blocks` / `StaleLayout` protocol).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn read_block_cached(
@@ -53,15 +57,7 @@ impl VfsCore {
                 } => (version, read_len, miss_is_loss),
             };
 
-        if let Some(dc) = &self.disk_cache
-            && let Some(cached) = dc
-                .get_block_exact(blob_guid, block_num, version, block_content_len)
-                .await
-        {
-            return Ok(cached);
-        }
-
-        let (mut data, _checksum) = match self
+        let mut data = match self
             .backend()
             .read_block(blob_guid, version, block_num, read_len, trace_id)
             .await
@@ -78,9 +74,9 @@ impl VfsCore {
                         version,
                         "DATA LOSS: row-committed generation missing on every replica"
                     );
-                    return Err(FsError::DataVg(volume_group_proxy::DataVgError::Corrupted));
+                    return Err(FsError::Corrupted);
                 }
-                // A base-version miss is zeros only after NSS confirms
+                // A base-version miss is zeros only after the metadata store confirms
                 // this handle still names the layout that issued it.
                 if validated_sparse_blocks.contains(&(blob_guid, block_num)) {
                     return Ok(zeros(block_content_len));
@@ -91,11 +87,6 @@ impl VfsCore {
         };
         if data.len() > block_content_len {
             data = data.slice(0..block_content_len);
-        }
-
-        // Populate the disk cache at the exact identity fetched.
-        if let Some(dc) = &self.disk_cache {
-            let _ = dc.insert_block(blob_guid, block_num, version, &data).await;
         }
 
         Ok(data)
@@ -192,46 +183,8 @@ impl VfsCore {
         Ok(result.freeze())
     }
 
-    /// Read a cached block directly into `buf`. Returns bytes written on
-    /// hit (including a metadata-resolved hole), `None` on cache miss
-    /// (caller falls back to the Bytes path). A hit counts only when the
-    /// cached entry carries the block's exact committed identity; a
-    /// `Stale` resolution is a miss so the Bytes path surfaces it.
-    pub(crate) async fn read_block_cached_into(
-        &self,
-        blob_guid: data_types::DataBlobGuid,
-        rows: Option<&OvrRowMap>,
-        ceiling: u64,
-        block_num: u32,
-        block_content_len: usize,
-        buf: &mut [u8],
-    ) -> Option<usize> {
-        let version = match block_fetch_plan(
-            rows,
-            block_num,
-            ceiling,
-            block_content_len,
-            block_content_len,
-        ) {
-            BlockFetchPlan::Zeros => {
-                let n = block_content_len.min(buf.len());
-                buf[..n].fill(0);
-                return Some(n);
-            }
-            BlockFetchPlan::Stale => return None,
-            BlockFetchPlan::Fetch { version, .. } => version,
-        };
-        if let Some(dc) = &self.disk_cache {
-            dc.get_block_into_exact(blob_guid, block_num, version, block_content_len, buf)
-                .await
-        } else {
-            None
-        }
-    }
-
-    /// Read a normal (non-MPU) object directly into a buffer.
-    /// Returns the number of bytes written, or falls back to the Bytes path
-    /// on any cache miss.
+    /// Read a normal (non-MPU) object directly into a buffer. Returns the
+    /// number of bytes written.
     pub(crate) async fn read_normal_buf(
         &self,
         layout: &ObjectLayout,
@@ -239,7 +192,7 @@ impl VfsCore {
         buf: &mut [u8],
         validated_sparse_blocks: &HashSet<(data_types::DataBlobGuid, u32)>,
     ) -> Result<usize, FsError> {
-        // The NSS layout is the sole size authority (the BSS geometry
+        // The metadata-store layout is the sole size authority (the block-store geometry
         // sentinel is gone with the versioned-key design); freshness
         // comes from the attr-TTL-bounded layout refresh.
         let file_size = layout.size()?;
@@ -258,12 +211,38 @@ impl VfsCore {
         let first_block = (offset / block_size) as u32;
         let last_block = ((read_end - 1) / block_size) as u32;
 
+        // Blocks are fetched from the gateway concurrently (in order) so
+        // a multi-block read pays one round trip, not one per block.
+        let trace_id = TraceId::new();
+        let fetched = stream::iter(first_block..=last_block)
+            .map(|block_num| {
+                let trace_id = &trace_id;
+                let rows = rows.as_deref();
+                async move {
+                    let block_start = block_num as u64 * block_size;
+                    let block_content_len =
+                        std::cmp::min(block_size, file_size - block_start) as usize;
+                    self.read_block_cached(
+                        blob_guid,
+                        rows,
+                        ceiling,
+                        block_num,
+                        block_content_len,
+                        block_size as usize,
+                        validated_sparse_blocks,
+                        trace_id,
+                    )
+                    .await
+                    .map(|data| (block_num, data))
+                }
+            })
+            .buffered(READ_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+
         let mut written = 0usize;
-
-        for block_num in first_block..=last_block {
+        for (block_num, block_data) in fetched {
             let block_start = block_num as u64 * block_size;
-            let block_content_len = std::cmp::min(block_size, file_size - block_start) as usize;
-
             let slice_start = if block_num == first_block {
                 (offset - block_start) as usize
             } else {
@@ -272,97 +251,14 @@ impl VfsCore {
             let slice_end = if block_num == last_block {
                 (read_end - block_start) as usize
             } else {
-                block_content_len
+                block_data.len()
             };
-            let chunk_len = slice_end.saturating_sub(slice_start);
-
-            if slice_start == 0 && chunk_len == block_content_len {
-                // Whole block: read directly into the output buffer
-                if let Some(n) = self
-                    .read_block_cached_into(
-                        blob_guid,
-                        rows.as_deref(),
-                        ceiling,
-                        block_num,
-                        block_content_len,
-                        &mut buf[written..written + chunk_len],
-                    )
-                    .await
-                {
-                    let copy_len = n.min(chunk_len);
-                    written += copy_len;
-                    continue;
-                }
-            } else {
-                // Partial block: try to read full block into a temp region, then
-                // slice the needed portion
-                let mut tmp = vec![0u8; block_content_len];
-                if let Some(n) = self
-                    .read_block_cached_into(
-                        blob_guid,
-                        rows.as_deref(),
-                        ceiling,
-                        block_num,
-                        block_content_len,
-                        &mut tmp,
-                    )
-                    .await
-                {
-                    let end = slice_end.min(n);
-                    if slice_start < end {
-                        let copy_len = end - slice_start;
-                        buf[written..written + copy_len].copy_from_slice(&tmp[slice_start..end]);
-                        written += copy_len;
-                        continue;
-                    }
-                }
+            if slice_start < block_data.len() {
+                let end = std::cmp::min(slice_end, block_data.len());
+                let copy_len = end - slice_start;
+                buf[written..written + copy_len].copy_from_slice(&block_data[slice_start..end]);
+                written += copy_len;
             }
-
-            // Cache miss: fall back to the Bytes path for this block and
-            // the remaining blocks
-            let trace_id = TraceId::new();
-            let remaining = &mut buf[written..];
-            let mut remaining_offset = written;
-
-            for bn in block_num..=last_block {
-                let bs = bn as u64 * block_size;
-                let bcl = std::cmp::min(block_size, file_size - bs) as usize;
-
-                let block_data = self
-                    .read_block_cached(
-                        blob_guid,
-                        rows.as_deref(),
-                        ceiling,
-                        bn,
-                        bcl,
-                        block_size as usize,
-                        validated_sparse_blocks,
-                        &trace_id,
-                    )
-                    .await?;
-
-                let ss = if bn == first_block {
-                    (offset - bs) as usize
-                } else {
-                    0
-                };
-                let se = if bn == last_block {
-                    (read_end - bs) as usize
-                } else {
-                    block_data.len()
-                };
-
-                if ss < block_data.len() {
-                    let end = std::cmp::min(se, block_data.len());
-                    let copy_len = end - ss;
-                    let dest_end = (remaining_offset - written) + copy_len;
-                    remaining[remaining_offset - written..dest_end]
-                        .copy_from_slice(&block_data[ss..end]);
-                    remaining_offset += copy_len;
-                }
-            }
-
-            return Ok(remaining_offset);
         }
 
         Ok(written.min(actual_len))
@@ -484,7 +380,7 @@ impl VfsCore {
                         .get(&fh)
                         .and_then(|handle| handle.layout.as_ref().map(|layout| layout.version_id));
                     if refreshed_version == version_id {
-                        // NSS still names the very layout that produced
+                        // The metadata store still names the very layout that produced
                         // the miss: the miss is a genuine sparse hole for
                         // this identity. Restarting the whole request at
                         // the (unchanged) ceiling keeps one read() from
@@ -496,9 +392,7 @@ impl VfsCore {
                         validated_sparse_blocks.clear();
                     }
                 }
-                Err(FsError::DataVg(volume_group_proxy::DataVgError::Corrupted))
-                    if !retried_corruption =>
-                {
+                Err(FsError::Corrupted) if !retried_corruption => {
                     self.refresh_handle_layout(fh, true).await?;
                     validated_sparse_blocks.clear();
                     retried_corruption = true;

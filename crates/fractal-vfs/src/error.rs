@@ -1,3 +1,4 @@
+use fs_gateway_codec::ErrorKind;
 use rpc_client_common::RpcError;
 use std::io;
 use thiserror::Error;
@@ -31,11 +32,18 @@ pub enum FsError {
     #[error("file is busy: another writer holds the inode-scoped write lock")]
     Busy,
 
+    /// Transport failure between this mount and the gateway.
     #[error("RPC error: {0}")]
     Rpc(#[from] RpcError),
 
-    #[error("DataVg error: {0}")]
-    DataVg(#[from] volume_group_proxy::DataVgError),
+    /// The addressed exact block generation exists on no replica.
+    #[error("block not found")]
+    BlockNotFound,
+
+    /// A row-committed generation is missing or the replicas disagree:
+    /// detected data loss, never served as zeros.
+    #[error("block data corrupted or lost")]
+    Corrupted,
 
     #[error("invalid object state")]
     InvalidState,
@@ -57,19 +65,18 @@ pub enum FsError {
 
     #[error("layout may have changed while reading sparse block {1} of {0}")]
     StaleLayout(data_types::DataBlobGuid, u32),
+
+    /// The gateway rejected the session even after a re-mount.
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
 }
 
 impl FsError {
     /// The addressed exact generation does not exist on enough nodes.
-    /// Which wrapper delivers it depends on the backend path (direct
-    /// BSS client vs volume-group proxy), so classification lives here
-    /// rather than at each call site.
     pub(crate) fn is_block_missing(&self) -> bool {
         matches!(
             self,
-            FsError::DataVg(volume_group_proxy::DataVgError::BlockNotFound)
-                | FsError::DataVg(volume_group_proxy::DataVgError::BssRpc(RpcError::NotFound))
-                | FsError::Rpc(RpcError::NotFound)
+            FsError::BlockNotFound | FsError::Rpc(RpcError::NotFound)
         )
     }
 }
@@ -87,9 +94,6 @@ impl From<FsError> for io::Error {
             FsError::BadFd => io::Error::from_raw_os_error(libc::EBADF),
             FsError::Busy => io::Error::from_raw_os_error(libc::EBUSY),
             FsError::Rpc(RpcError::NoSpace) => io::Error::from_raw_os_error(libc::ENOSPC),
-            FsError::DataVg(volume_group_proxy::DataVgError::BssRpc(RpcError::NoSpace)) => {
-                io::Error::from_raw_os_error(libc::ENOSPC)
-            }
             FsError::Rpc(ref e) => {
                 if e.retryable() {
                     io::Error::from_raw_os_error(libc::EAGAIN)
@@ -97,7 +101,8 @@ impl From<FsError> for io::Error {
                     io::Error::from_raw_os_error(libc::EIO)
                 }
             }
-            FsError::DataVg(_) => io::Error::from_raw_os_error(libc::EIO),
+            FsError::BlockNotFound => io::Error::from_raw_os_error(libc::EIO),
+            FsError::Corrupted => io::Error::from_raw_os_error(libc::EIO),
             FsError::InvalidState => io::Error::from_raw_os_error(libc::EINVAL),
             FsError::InvalidArg => io::Error::from_raw_os_error(libc::EINVAL),
             FsError::NoData => io::Error::from_raw_os_error(libc::ENXIO),
@@ -107,6 +112,7 @@ impl From<FsError> for io::Error {
             // this publish. ESTALE is the honest kernel result.
             FsError::CasConflict => io::Error::from_raw_os_error(libc::ESTALE),
             FsError::StaleLayout(_, _) => io::Error::from_raw_os_error(libc::ESTALE),
+            FsError::Unauthorized(_) => io::Error::from_raw_os_error(libc::EACCES),
         }
     }
 }
@@ -130,19 +136,23 @@ impl From<rkyv::rancor::Error> for FsError {
     }
 }
 
-impl From<file_ops::NssError> for FsError {
-    fn from(e: file_ops::NssError) -> Self {
-        match e {
-            file_ops::NssError::NotFound => FsError::NotFound,
-            // fs_server doesn't model "bucket gone" as a distinct case; the
-            // caller surfaces this as NotFound, same as a missing inode.
-            file_ops::NssError::NoSuchRootBlob => FsError::NotFound,
-            file_ops::NssError::AlreadyExists => FsError::AlreadyExists,
-            file_ops::NssError::Internal(msg) => FsError::Internal(msg),
-            file_ops::NssError::Deserialization(msg) => FsError::Deserialize(msg),
-            // Preserve the typed conflict so each operation can apply its
-            // own idempotence or failure policy.
-            file_ops::NssError::CasConflict(_) => FsError::CasConflict,
+/// Gateway outcomes keep their kind so retry and CAS-rebase logic works
+/// over the wire exactly as it did against the in-process backend.
+impl From<fs_gateway_codec::Error> for FsError {
+    fn from(e: fs_gateway_codec::Error) -> Self {
+        match e.error_kind() {
+            ErrorKind::NotFound => FsError::NotFound,
+            ErrorKind::AlreadyExists => FsError::AlreadyExists,
+            ErrorKind::CasConflict => FsError::CasConflict,
+            ErrorKind::NoSpace => FsError::Rpc(RpcError::NoSpace),
+            ErrorKind::Mismatch => FsError::Rpc(RpcError::Mismatch),
+            ErrorKind::BlockNotFound => FsError::BlockNotFound,
+            ErrorKind::Corrupted => FsError::Corrupted,
+            ErrorKind::InvalidState => FsError::InvalidState,
+            ErrorKind::Unauthorized => FsError::Unauthorized(e.message),
+            ErrorKind::ReadOnly => FsError::ReadOnly,
+            ErrorKind::Deserialize => FsError::Deserialize(e.message),
+            ErrorKind::Internal => FsError::Internal(e.message),
         }
     }
 }
