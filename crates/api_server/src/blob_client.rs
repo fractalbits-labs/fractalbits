@@ -37,7 +37,6 @@ pub struct BlobDeletionRequest {
     routing_key: RoutingKey,
     root_blob_name: String,
     blob_guid: DataBlobGuid,
-    num_blocks: u32,
     location: BlobLocation,
     /// Rows can only exist for a mapped blob; skip the NSS sweep
     /// otherwise.
@@ -108,16 +107,12 @@ fn new_blob_deletion_request(
     object: &ObjectLayout,
 ) -> Result<BlobDeletionRequest, ObjectLayoutError> {
     let blob_guid = object.blob_guid()?;
-    let num_blocks = object
-        .num_blocks()
-        .and_then(|count| u32::try_from(count).map_err(|_| ObjectLayoutError::InvalidState))?;
     let location = object.get_blob_location()?;
     let grace = reclamation_grace(app.config.rpc_request_timeout());
     Ok(BlobDeletionRequest {
         routing_key,
         root_blob_name,
         blob_guid,
-        num_blocks,
         location,
         mapped: object.may_have_ovr_records(),
         marker_written: !object.may_have_ovr_records(),
@@ -457,11 +452,19 @@ async fn delete_layout_blocks(
                 }
             }
         }
-        // S3-side keys are not generation-specific; the base
-        // generation stands in for the whole logical range.
-        BlobLocation::S3 => (0..request.num_blocks)
-            .map(|block_number| (block_number, 1))
-            .collect(),
+        // FUSE rewrites leave versioned keys behind, so enumerate the
+        // bucket rather than assuming generation 1 per block.
+        BlobLocation::S3 => match storage.list_s3_blob_blocks(request.blob_guid.blob_id).await {
+            Ok(identities) => identities,
+            Err(error) => {
+                tracing::warn!(
+                    blob_guid = %request.blob_guid,
+                    %error,
+                    "background S3 blob enumeration failed"
+                );
+                return false;
+            }
+        },
     };
     identities.sort_unstable();
     identities.dedup();

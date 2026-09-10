@@ -67,14 +67,14 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         cmd_service::stop_service(ServiceName::All)
     };
 
-    let test_fs_server = |disk_cache: bool| async move {
+    let test_fs_server = |disk_cache: bool, data_blob_storage: DataBlobStorage| async move {
         fs_server::build_fs_server()?;
         fs_server::ensure_fuse_uring()?;
         cmd_service::init_service(
             ServiceName::All,
             BuildMode::Debug,
             &InitConfig {
-                data_blob_storage: DataBlobStorage::AllInBssSingleAz,
+                data_blob_storage,
                 bss_count: 6,
                 ..Default::default()
             },
@@ -132,16 +132,29 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         TestType::BssNodeFailure => test_bss_node_failure().await,
         TestType::BssRepair => test_bss_repair().await,
         TestType::NssFailover => test_nss_failover(RssBackend::Etcd).await,
-        TestType::FsServer { disk_cache_only } => test_fs_server(disk_cache_only).await,
-        TestType::Pjdfstest { subdir } => {
-            cmd_service::init_service(ServiceName::All, BuildMode::Debug, &InitConfig::default())?;
+        TestType::FsServer {
+            disk_cache_only,
+            data_blob_storage,
+        } => test_fs_server(disk_cache_only, data_blob_storage).await,
+        TestType::Pjdfstest {
+            subdir,
+            data_blob_storage,
+        } => {
+            cmd_service::init_service(
+                ServiceName::All,
+                BuildMode::Debug,
+                &InitConfig {
+                    data_blob_storage,
+                    ..Default::default()
+                },
+            )?;
             cmd_service::start_service(ServiceName::All)?;
             let result = fs_server::pjdfs::run_pjdfstest(subdir.as_deref()).await;
             cmd_service::stop_service(ServiceName::All)?;
             result
         }
         TestType::All => {
-            test_fs_server(false).await?;
+            test_fs_server(false, DataBlobStorage::AllInBssSingleAz).await?;
             test_bss_node_failure().await?;
             test_bss_repair().await?;
             test_nss_failover(RssBackend::Etcd).await?;

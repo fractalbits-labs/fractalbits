@@ -1,12 +1,10 @@
-use super::{
-    BlobLocation, BlobStorageError, DataVgProxy, blob_key, chunks_to_bytestream, create_s3_client,
-};
+use super::{BlobLocation, BlobStorageError, DataVgProxy, chunks_to_bytestream, create_s3_client};
 use crate::config::S3HybridSingleAzConfig;
-use aws_sdk_s3::Client as S3Client;
 use bytes::Bytes;
 use data_types::object_layout::ObjectLayout;
 use data_types::{DataBlobGuid, DataVgInfo, TraceId, Volume};
 use metrics_wrapper::histogram;
+use s3_blob_store::{S3BlobError, S3BlobStore};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -16,8 +14,7 @@ use uuid::Uuid;
 
 pub struct S3HybridSingleAzStorage {
     data_vg_proxy: Arc<DataVgProxy>,
-    client_s3: S3Client,
-    data_blob_in_s3_bucket: String,
+    store: S3BlobStore,
 }
 
 impl S3HybridSingleAzStorage {
@@ -48,8 +45,7 @@ impl S3HybridSingleAzStorage {
 
         Ok(Self {
             data_vg_proxy,
-            client_s3,
-            data_blob_in_s3_bucket: s3_hybrid_config.s3_bucket.clone(),
+            store: S3BlobStore::new(client_s3, s3_hybrid_config.s3_bucket.clone()),
         })
     }
 
@@ -78,6 +74,13 @@ impl S3HybridSingleAzStorage {
             .collect())
     }
 
+    pub async fn list_s3_blob_blocks(
+        &self,
+        blob_id: Uuid,
+    ) -> Result<Vec<(u32, u64)>, BlobStorageError> {
+        Ok(self.store.list_blob_blocks(blob_id).await?)
+    }
+
     pub async fn put_blob(
         &self,
         blob_id: Uuid,
@@ -100,15 +103,9 @@ impl S3HybridSingleAzStorage {
                 .await?;
         } else {
             // Large blob - store in S3 (volume_id doesn't matter for S3 storage, but we'll use S3_VOLUME for metadata consistency)
-            let s3_key = blob_key(blob_id, block_number);
-            self.client_s3
-                .put_object()
-                .bucket(&self.data_blob_in_s3_bucket)
-                .key(&s3_key)
-                .body(body.into())
-                .send()
-                .await
-                .map_err(|e| BlobStorageError::S3(e.to_string()))?;
+            self.store
+                .put(blob_id, block_number, 1, body.into())
+                .await?;
 
             histogram!("rpc_duration_nanos", "type" => "s3", "name" => "put_blob_s3")
                 .record(start.elapsed().as_nanos() as f64);
@@ -137,23 +134,9 @@ impl S3HybridSingleAzStorage {
                 .put_blob_vectored(blob_guid, block_number, chunks, 1, trace_id)
                 .await?;
         } else {
-            let s3_key = blob_key(blob_id, block_number);
-            self.client_s3
-                .put_object()
-                .bucket(&self.data_blob_in_s3_bucket)
-                .key(&s3_key)
-                .body(chunks_to_bytestream(chunks))
-                .send()
-                .await
-                .map_err(|e| {
-                    tracing::error!(
-                        "S3 put_object failed: bucket={}, key={}, error={:?}",
-                        self.data_blob_in_s3_bucket,
-                        s3_key,
-                        e
-                    );
-                    BlobStorageError::S3(e.to_string())
-                })?;
+            self.store
+                .put(blob_id, block_number, 1, chunks_to_bytestream(chunks))
+                .await?;
 
             histogram!("rpc_duration_nanos", "type" => "s3", "name" => "put_blob_s3")
                 .record(start.elapsed().as_nanos() as f64);
@@ -188,33 +171,18 @@ impl S3HybridSingleAzStorage {
                     .await?;
             }
             BlobLocation::S3 => {
-                // Large blob - get from S3
-                let s3_key = blob_key(blob_guid.blob_id, block_number);
-                let result = self
-                    .client_s3
-                    .get_object()
-                    .bucket(&self.data_blob_in_s3_bucket)
-                    .key(&s3_key)
-                    .send()
+                // Exact generation; generations above 1 come from FUSE
+                // rewrites of the block.
+                *body = self
+                    .store
+                    .get(blob_guid.blob_id, block_number, version)
                     .await
-                    .map_err(|e| {
-                        tracing::error!(
-                            "S3 get_object failed: bucket={}, key={}, error={:?}",
-                            self.data_blob_in_s3_bucket,
-                            s3_key,
-                            e
-                        );
-                        BlobStorageError::S3(e.to_string())
+                    .map_err(|e| match e {
+                        S3BlobError::NotFound => {
+                            BlobStorageError::DataVg(volume_group_proxy::DataVgError::BlockNotFound)
+                        }
+                        other => other.into(),
                     })?;
-
-                let bytes = result
-                    .body
-                    .collect()
-                    .await
-                    .map_err(|e| BlobStorageError::S3(e.to_string()))?
-                    .into_bytes();
-
-                *body = bytes;
             }
         }
 
@@ -238,18 +206,9 @@ impl S3HybridSingleAzStorage {
                     .await?;
             }
             BlobLocation::S3 => {
-                // S3 keys are not generation-specific, so version is ignored here.
-                let s3_key = blob_key(blob_guid.blob_id, block_number);
-                self.client_s3
-                    .delete_object()
-                    .bucket(&self.data_blob_in_s3_bucket)
-                    .key(&s3_key)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!("delete {s3_key} failed: {e}");
-                        BlobStorageError::S3(e.to_string())
-                    })?;
+                self.store
+                    .delete(blob_guid.blob_id, block_number, version)
+                    .await?;
             }
         }
 

@@ -857,6 +857,27 @@ fn get_rss_backend_setting() -> RssBackend {
     }
 }
 
+/// fs_server env for its data volume. S3 access follows the cluster's
+/// blob backend so a mount can serve S3-resident objects; the data volume
+/// for new files follows it too unless `data_volume` overrides it.
+pub fn fs_server_data_volume_env(data_volume: &str) -> Vec<(&'static str, String)> {
+    let hybrid = get_data_blob_storage_setting() == DataBlobStorage::S3HybridSingleAz;
+    let data_volume = match data_volume {
+        "" if hybrid => "s3",
+        "" => "bss",
+        other => other,
+    };
+    let mut env = Vec::new();
+    if hybrid || data_volume == "s3" {
+        env.push(("FS_SERVER_S3_HOST", "http://127.0.0.1".to_string()));
+        env.push(("FS_SERVER_S3_PORT", "9000".to_string()));
+        env.push(("FS_SERVER_S3_REGION", "localdev".to_string()));
+        env.push(("FS_SERVER_S3_BUCKET", "fractalbits-bucket".to_string()));
+    }
+    env.push(("FS_SERVER_DATA_VOLUME", data_volume.to_string()));
+    env
+}
+
 fn get_data_blob_storage_setting() -> DataBlobStorage {
     if run_cmd!(grep -q s3_hybrid_single_az data/etc/api_server.service &>/dev/null).is_ok() {
         DataBlobStorage::S3HybridSingleAz
@@ -1292,6 +1313,9 @@ Environment="MINIO_REGION=localdev""##
             if fs.allow_other {
                 env_settings += "\nEnvironment=\"FS_SERVER_ALLOW_OTHER=true\"";
             }
+            for (key, value) in fs_server_data_volume_env(&fs.data_volume) {
+                env_settings += &format!("\nEnvironment=\"{key}={value}\"");
+            }
             resolve_binary_path("fs_server", build_mode)
         }
         _ => unreachable!(),
@@ -1320,9 +1344,14 @@ Environment="MINIO_REGION=localdev""##
                 }
             }
         }
-        ServiceName::FsServer => {
-            "After=rss.service nss_role_agent@0.service\nWants=rss.service nss_role_agent@0.service\n".to_string()
-        }
+        ServiceName::FsServer => match get_data_blob_storage_setting() {
+            DataBlobStorage::S3HybridSingleAz => {
+                "After=rss.service nss_role_agent@0.service minio.service\nWants=rss.service nss_role_agent@0.service minio.service\n".to_string()
+            }
+            DataBlobStorage::AllInBssSingleAz => {
+                "After=rss.service nss_role_agent@0.service\nWants=rss.service nss_role_agent@0.service\n".to_string()
+            }
+        },
         _ => String::new(),
     };
 
