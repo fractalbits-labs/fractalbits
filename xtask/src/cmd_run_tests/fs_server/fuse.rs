@@ -1,5 +1,6 @@
+use crate::cmd_build::BuildMode;
 use crate::cmd_service;
-use crate::{CmdResult, FsServerConfig, InitConfig, ServiceName};
+use crate::{CmdResult, FsMountConfig, InitConfig, ServiceName};
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use cmd_lib::*;
@@ -20,7 +21,10 @@ use std::process::{Child, Command};
 use std::time::Duration;
 use volume_group_proxy::DataVgProxy;
 
-use super::{MOUNT_POINT, cleanup_objects, generate_test_data, setup_test_bucket};
+use super::{
+    GATEWAY_ADDR, MOUNT_POINT, cleanup_objects, ensure_gateway, gateway_config, generate_test_data,
+    mount_fs, setup_test_bucket, unmount_fs,
+};
 
 const MOUNT_POINT_B: &str = "/tmp/fs_server_test_b";
 
@@ -62,64 +66,29 @@ fn disk_cache_path() -> String {
         .to_string()
 }
 
-fn fs_server_config(bucket: &str, read_write: bool, disk_cache: bool) -> FsServerConfig {
-    let mut cfg = FsServerConfig {
-        bucket_name: bucket.to_string(),
-        mount_point: MOUNT_POINT.to_string(),
-        read_write,
-        ..Default::default()
-    };
-    if disk_cache {
-        cfg.disk_cache_enabled = true;
-        cfg.disk_cache_path = disk_cache_path();
-        cfg.disk_cache_size_gb = 1;
-    }
-    cfg
+/// Bring up (or keep) the gateway with the requested disk-cache setting,
+/// then mount `bucket` through it in the given writeback mode.
+fn mount_with(bucket: &str, read_write: bool, disk_cache: bool, writeback_mode: &str) -> CmdResult {
+    ensure_gateway(
+        BuildMode::Debug,
+        &gateway_config(disk_cache, &disk_cache_path(), 1),
+    )?;
+    mount_fs(
+        BuildMode::Debug,
+        &FsMountConfig {
+            bucket_name: bucket.to_string(),
+            mount_point: MOUNT_POINT.to_string(),
+            read_write,
+            writeback_mode: writeback_mode.to_string(),
+            ..Default::default()
+        },
+    )
 }
 
 /// Same as `mount_fuse_with_opts` but sets `writeback_mode = "default"`
 /// so the writeback queue / worker are active for this mount.
 fn mount_fuse_writeback(bucket: &str, read_write: bool, disk_cache: bool) -> CmdResult {
-    let mount_point = MOUNT_POINT;
-
-    run_cmd! {
-        ignore fusermount3 -u $mount_point 2>/dev/null;
-        ignore fusermount -u $mount_point 2>/dev/null;
-    }?;
-    run_cmd!(mkdir -p $mount_point)?;
-    if disk_cache {
-        let dc_path = disk_cache_path();
-        run_cmd!(mkdir -p $dc_path)?;
-    }
-    let mut fs_cfg = fs_server_config(bucket, read_write, disk_cache);
-    fs_cfg.writeback_mode = "default".to_string();
-    let init_config = InitConfig {
-        fs_server: fs_cfg,
-        ..Default::default()
-    };
-    cmd_service::init_service(
-        ServiceName::FsServer,
-        crate::cmd_build::BuildMode::Debug,
-        &init_config,
-    )?;
-    cmd_service::start_service(ServiceName::FsServer)?;
-
-    for i in 0..20 {
-        std::thread::sleep(Duration::from_millis(500));
-        if run_cmd!(mountpoint -q $mount_point).is_ok() {
-            println!(
-                "    FUSE (writeback=default) mounted at {} (after {}ms)",
-                mount_point,
-                (i + 1) * 500
-            );
-            return Ok(());
-        }
-    }
-
-    Err(std::io::Error::other(format!(
-        "FUSE mount at {} not ready after 10 seconds",
-        mount_point
-    )))
+    mount_with(bucket, read_write, disk_cache, "default")
 }
 
 fn mount_fuse_ro(bucket: &str, disk_cache: bool) -> CmdResult {
@@ -130,72 +99,23 @@ fn mount_fuse_rw(bucket: &str, disk_cache: bool) -> CmdResult {
     mount_fuse_with_opts(bucket, true, disk_cache)
 }
 
+/// Explicit strict mode: the config default is writeback-on, so without
+/// this the general FUSE suite (and this helper's callers) would never
+/// exercise the strict synchronous publish path. Default-mode coverage
+/// lives in the `mount_fuse_writeback` tests and pjdfstest.
 fn mount_fuse_with_opts(bucket: &str, read_write: bool, disk_cache: bool) -> CmdResult {
-    let mount_point = MOUNT_POINT;
-
-    // Clean up any stale FUSE mount (e.g. "Transport endpoint is not connected").
-    run_cmd! {
-        ignore fusermount3 -u $mount_point 2>/dev/null;
-        ignore fusermount -u $mount_point 2>/dev/null;
-    }?;
-    run_cmd!(mkdir -p $mount_point)?;
-    if disk_cache {
-        let dc_path = disk_cache_path();
-        run_cmd!(mkdir -p $dc_path)?;
-    }
-    // Explicit strict mode: the config default is writeback-on, so without
-    // this the general FUSE suite (and this helper's callers) would never
-    // exercise the strict synchronous publish path. Default-mode coverage
-    // lives in the `mount_fuse_writeback` tests and pjdfstest.
-    let mut fs_cfg = fs_server_config(bucket, read_write, disk_cache);
-    fs_cfg.writeback_mode = "strict".to_string();
-    let init_config = InitConfig {
-        fs_server: fs_cfg,
-        ..Default::default()
-    };
-    cmd_service::init_service(
-        ServiceName::FsServer,
-        crate::cmd_build::BuildMode::Debug,
-        &init_config,
-    )?;
-    cmd_service::start_service(ServiceName::FsServer)?;
-
-    // Wait for mount to appear (poll up to 10 seconds)
-    for i in 0..20 {
-        std::thread::sleep(Duration::from_millis(500));
-        if run_cmd!(mountpoint -q $mount_point).is_ok() {
-            println!(
-                "    FUSE (writeback=strict) mounted at {} (after {}ms)",
-                mount_point,
-                (i + 1) * 500
-            );
-            return Ok(());
-        }
-    }
-
-    Err(std::io::Error::other(format!(
-        "FUSE mount at {} not ready after 10 seconds",
-        mount_point
-    )))
+    mount_with(bucket, read_write, disk_cache, "strict")
 }
 
 pub fn unmount_fuse() -> CmdResult {
-    let mount_point = MOUNT_POINT;
-    run_cmd! {
-        ignore fusermount3 -u $mount_point 2>/dev/null;
-        ignore fusermount -u $mount_point 2>/dev/null;
-    }?;
-    let _ = cmd_service::stop_service(ServiceName::FsServer);
-    run_cmd! { ignore pkill -x fs_server 2>/dev/null; }?;
-    std::thread::sleep(Duration::from_millis(500));
-    Ok(())
+    unmount_fs(MOUNT_POINT)
 }
 
-// ── Second fs_server instance helpers ──────────────────────────────
+// ── Second mount instance helpers ──────────────────────────────────
 //
-// Spawns a second fs_server process directly (not via systemd) with
-// a different mount point on the same bucket. Used for cross-instance
-// cache invalidation tests.
+// Spawns a second fractalbits-mount process directly (not via systemd)
+// with a different mount point on the same bucket, through the same
+// gateway. Used for cross-instance cache invalidation tests.
 
 fn spawn_second_fuse(bucket: &str, read_write: bool) -> std::io::Result<Child> {
     let mount_point = MOUNT_POINT_B;
@@ -212,19 +132,16 @@ fn spawn_second_fuse(bucket: &str, read_write: bool) -> std::io::Result<Child> {
     std::fs::create_dir_all(mount_point)?;
 
     let binary = format!(
-        "{}/target/debug/fs_server",
+        "{}/target/debug/fractalbits-mount",
         std::env::current_dir()?.display()
     );
     let mut cmd = Command::new(&binary);
-    cmd.env("FS_SERVER_BUCKET_NAME", bucket)
-        .env("FS_SERVER_MOUNT_POINT", mount_point)
-        .env("FS_SERVER_MODE", "fuse")
-        .env("FS_SERVER_READ_WRITE", read_write.to_string())
+    cmd.env("FS_MOUNT_GATEWAY_ADDRS", GATEWAY_ADDR)
+        .env("FS_MOUNT_BUCKET_NAME", bucket)
+        .env("FS_MOUNT_MOUNT_POINT", mount_point)
+        .env("FS_MOUNT_READ_WRITE", read_write.to_string())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    for (key, value) in cmd_service::fs_server_data_volume_env("") {
-        cmd.env(key, value);
-    }
     // Propagate LLVM_PROFILE_FILE for coverage instrumentation
     if let Ok(profile_file) = std::env::var("LLVM_PROFILE_FILE") {
         cmd.env("LLVM_PROFILE_FILE", profile_file);
@@ -279,7 +196,7 @@ pub async fn run_fuse_tests_with_disk_cache(disk_cache_only: bool) -> CmdResult 
         cmd_service::init_service(
             ServiceName::All,
             crate::cmd_build::BuildMode::Debug,
-            &crate::InitConfig::default(),
+            &InitConfig::default(),
         )?;
         cmd_service::start_service(ServiceName::All)?;
     }
@@ -311,9 +228,9 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
 
     // BSS partition tests stop replicas to force write failures; with data
     // on the S3 volume those outages are invisible to the mount.
-    let bss_data_volume = cmd_service::fs_server_data_volume_env("")
+    let bss_data_volume = cmd_service::fs_gateway_data_volume_env("")
         .iter()
-        .any(|(key, value)| *key == "FS_SERVER_DATA_VOLUME" && value == "bss");
+        .any(|(key, value)| *key == "FS_GATEWAY_DATA_VOLUME" && value == "bss");
 
     macro_rules! run_test {
         ($name:expr, $func:ident) => {
