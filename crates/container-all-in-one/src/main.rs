@@ -31,7 +31,7 @@ struct Opt {
     )]
     pub data_dir: std::path::PathBuf,
 
-    #[clap(long, default_value = "8080", help = "API server port")]
+    #[clap(long, default_value = "8080", help = "S3 gateway port")]
     pub api_port: u16,
 
     #[clap(long, default_value = "2379", help = "etcd client port")]

@@ -38,7 +38,7 @@ pub struct AppState {
     pub(crate) row_maps: Cache<(uuid::Uuid, u64), Arc<data_types::ovr_map::OvrRowMap>>,
 
     // Per-routing-key NSS clients, lazily populated as buckets are resolved.
-    // A single api_server instance can cache clients for multiple distinct
+    // A single s3_gateway instance can cache clients for multiple distinct
     // routing keys (each routing key maps to one NSS endpoint).
     nss_clients: Arc<RwLock<HashMap<RoutingKey, NssEntry>>>,
     rpc_client_rss: RpcClientRss,
@@ -357,7 +357,7 @@ impl AppState {
     /// (so subsequent reads see it) and returned to the caller.
     ///
     /// Used by the authorization gate to handle the case where another
-    /// api_server has just added or removed a bucket from this api_key's
+    /// s3_gateway has just added or removed a bucket from this api_key's
     /// `authorized_buckets`: our cached copy says deny, but the source of
     /// truth says allow (or vice versa). One refresh on the cold path of a
     /// denial closes the staleness window without re-introducing recall.
@@ -423,7 +423,7 @@ impl AppState {
         )
         .await?;
         // Drop our local cache entry. Other per-core caches and other
-        // api_server instances fall back to TTL — see the
+        // s3_gateway instances fall back to TTL — see the
         // refresh-on-auth-deny path that picks up new versions on demand.
         self.cache.invalidate(&full_key).await;
         Ok(())
@@ -543,7 +543,7 @@ impl AppState {
         )
         .await?;
 
-        // Drop our local api_key cache entry; other workers / api_servers
+        // Drop our local api_key cache entry; other workers / s3_gateways
         // pick up the new authorized_buckets via refresh-on-auth-deny or TTL.
         self.cache
             .invalidate(&format!("api_key:{api_key_id}"))
@@ -570,7 +570,7 @@ impl AppState {
         .await?;
 
         // Drop our local bucket and api_key cache entries; other workers /
-        // api_servers fall back to TTL or to NoSuchRootBlob from NSS on the
+        // s3_gateways fall back to TTL or to NoSuchRootBlob from NSS on the
         // next op against the deleted bucket.
         self.cache
             .invalidate(&format!("bucket:{bucket_name}"))

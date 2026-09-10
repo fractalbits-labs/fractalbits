@@ -334,7 +334,7 @@ pub fn create_ena_irq_affinity_service() -> CmdResult {
         r##"[Unit]
 Description=ENA IRQ Affinity Configuration
 After=network-online.target
-Before=api_server.service bss.service nss.service bench_client.service
+Before=s3_gateway.service bss.service nss.service bench_client.service
 
 [Service]
 Type=oneshot

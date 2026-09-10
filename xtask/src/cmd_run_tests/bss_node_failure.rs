@@ -417,7 +417,7 @@ async fn put_object_with_retry(
 
 /// Warm up circuit breakers for downed nodes by sending probe puts.
 ///
-/// The api_server has multiple workers, each with its own DataVgProxy and
+/// The s3_gateway has multiple workers, each with its own DataVgProxy and
 /// independent circuit breakers. Each circuit breaker needs 3 consecutive
 /// failures to open. Probes are randomly distributed across workers, so we
 /// send enough to reliably cover all workers (2 workers × 3 failures = 6

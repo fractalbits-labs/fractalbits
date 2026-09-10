@@ -20,13 +20,13 @@ import {
 export type DataBlobStorage = "all_in_bss_single_az" | "s3_hybrid_single_az";
 
 export interface FractalbitsVpcStackProps extends cdk.StackProps {
-  numApiServers: number;
+  numS3Gateways: number;
   numBenchClients: number;
   numBssNodes: number;
   benchType?: "service_endpoint" | "external" | null;
   az: string;
   bssInstanceTypes: string;
-  apiServerInstanceType: string;
+  s3GatewayInstanceType: string;
   benchClientInstanceType: string;
   nssInstanceType: string;
   browserIp?: string;
@@ -340,28 +340,28 @@ export class FractalbitsVpcStack extends cdk.Stack {
       createUserData(this, deployOS, "--role bss_server"),
     );
 
-    // Create api_server(s) in ASG
-    const apiServerAsg = createEc2Asg(
+    // Create s3_gateway(s) in ASG
+    const s3GatewayAsg = createEc2Asg(
       this,
-      "ApiServerAsg",
+      "S3GatewayAsg",
       this.vpc,
       subnet1,
       privateSg,
       ec2Role,
-      [props.apiServerInstanceType],
-      props.numApiServers,
-      props.numApiServers,
-      "api_server",
+      [props.s3GatewayInstanceType],
+      props.numS3Gateways,
+      props.numS3Gateways,
+      "s3_gateway",
       deployOS,
-      createUserData(this, deployOS, "--role api_server"),
+      createUserData(this, deployOS, "--role s3_gateway"),
     );
 
-    // Add lifecycle hook for api_server ASG
+    // Add lifecycle hook for s3_gateway ASG
     addAsgDynamoDbDeregistrationLifecycleHook(
       this,
-      "ApiServer",
-      apiServerAsg,
-      "api-server",
+      "S3Gateway",
+      s3GatewayAsg,
+      "s3-gateway",
       "fractalbits-service-discovery",
     );
 
@@ -403,7 +403,7 @@ export class FractalbitsVpcStack extends cdk.Stack {
       const listener = nlb.addListener("ApiListener", { port: 80 });
       listener.addTargets("ApiTargets", {
         port: 80,
-        targets: [apiServerAsg],
+        targets: [s3GatewayAsg],
         healthCheck: {
           enabled: true,
           healthyThresholdCount: 2,
@@ -464,9 +464,9 @@ export class FractalbitsVpcStack extends cdk.Stack {
       });
     }
 
-    new cdk.CfnOutput(this, "apiServerAsgName", {
-      value: apiServerAsg.autoScalingGroupName,
-      description: `Api Server Auto Scaling Group Name`,
+    new cdk.CfnOutput(this, "s3GatewayAsgName", {
+      value: s3GatewayAsg.autoScalingGroupName,
+      description: `S3 Gateway Auto Scaling Group Name`,
     });
 
     if (benchClientAsg) {
