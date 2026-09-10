@@ -45,13 +45,7 @@ impl RpcClient {
         operation: crate::stats::NssOperation,
     ) -> Result<rpc_codec_common::MessageFrame<nss_codec::MessageHeader>, rpc_client_common::RpcError>
     {
-        let stats = crate::stats::get_global_nss_stats();
-        stats.increment(operation);
-
-        let result = self.get_connection().send_request(frame, timeout).await;
-
-        stats.decrement(operation);
-
-        result
+        let _guard = crate::stats::NssStatsGuard::new(operation);
+        self.get_connection().send_request(frame, timeout).await
     }
 }

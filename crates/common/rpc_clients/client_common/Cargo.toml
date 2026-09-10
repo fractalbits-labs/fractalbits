@@ -30,4 +30,5 @@ libc = "0.2"
 
 [dev-dependencies]
 bytemuck.workspace = true
+futures.workspace = true
 xxhash-rust.workspace = true

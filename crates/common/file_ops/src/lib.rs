@@ -112,6 +112,32 @@ pub fn parse_list_inodes(resp: ListInodesResponse) -> Result<ListInodesResult, N
     Ok(ListInodesResult { entries, has_more })
 }
 
+/// Raw variant of `parse_list_inodes` for internal keyspaces (`@ovr/`
+/// rows and friends) whose values are not `ObjectLayout`s: returns the
+/// NUL-trimmed keys with their raw value bytes plus the has_more flag,
+/// skipping the rkyv decode that hard-errors on non-layout values.
+pub fn parse_list_inodes_raw(
+    resp: ListInodesResponse,
+) -> Result<(Vec<(String, Bytes)>, bool), NssError> {
+    let (inodes, has_more) = match resp.result.unwrap() {
+        list_inodes_response::Result::Ok(res) => (res.inodes, res.has_more),
+        list_inodes_response::Result::ErrNoSuchRootBlob(()) => {
+            return Err(NssError::NoSuchRootBlob);
+        }
+        list_inodes_response::Result::ErrOther(e) => {
+            tracing::error!("NSS list_inodes error: {e}");
+            return Err(NssError::Internal(e));
+        }
+    };
+    Ok((
+        inodes
+            .into_iter()
+            .map(|inode| (inode.key.trim_end_matches('\0').to_string(), inode.inode))
+            .collect(),
+        has_more,
+    ))
+}
+
 pub fn parse_put_inode(resp: PutInodeResponse) -> Result<Bytes, NssError> {
     match resp.result.unwrap() {
         put_inode_response::Result::Ok(res) => Ok(res),
@@ -155,9 +181,16 @@ pub fn parse_delete_inode(resp: DeleteInodeResponse) -> Result<Option<Bytes>, Ns
     }
 }
 
-pub fn mpu_get_part_prefix(mut key: String, part_number: u64) -> String {
+pub fn mpu_get_uploads_prefix(mut key: String) -> String {
     key.push('#');
-    // if part number is 0, we treat it as object key
+    key
+}
+
+pub fn mpu_get_part_prefix(mut key: String, upload_id: uuid::Uuid, part_number: u64) -> String {
+    key.push('#');
+    key.push_str(&upload_id.simple().to_string());
+    key.push('/');
+    // Part zero requests the upload-scoped listing prefix.
     if part_number != 0 {
         // part numbers range is [1, 10000], which can be encoded as 4 digits
         // See https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
@@ -198,6 +231,7 @@ pub fn create_dir_marker_layout() -> ObjectLayout {
         version_id: ObjectLayout::gen_version_id(),
         block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
         blob_version: 1,
+        fs_ext: None,
         state: ObjectState::Normal(ObjectMetaData {
             blob_guid: DataBlobGuid {
                 blob_id: uuid::Uuid::nil(),
@@ -208,7 +242,6 @@ pub fn create_dir_marker_layout() -> ObjectLayout {
                 etag: String::new(),
                 headers: vec![],
                 checksum: None,
-                ..Default::default()
             },
         }),
     }
@@ -226,4 +259,26 @@ pub fn blob_blocks_to_delete(layout: &ObjectLayout) -> Vec<(data_types::DataBlob
         Err(_) => return vec![],
     };
     (0..num_blocks).map(|i| (blob_guid, i as u32)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mpu_get_part_prefix, mpu_get_uploads_prefix};
+    use uuid::Uuid;
+
+    #[test]
+    fn mpu_part_keys_are_scoped_to_the_upload() {
+        let upload_id =
+            Uuid::parse_str("12345678-9abc-def0-1122-334455667788").expect("valid upload id");
+
+        assert_eq!(mpu_get_uploads_prefix("/object".to_string()), "/object#");
+        assert_eq!(
+            mpu_get_part_prefix("/object".to_string(), upload_id, 0),
+            "/object#123456789abcdef01122334455667788/"
+        );
+        assert_eq!(
+            mpu_get_part_prefix("/object".to_string(), upload_id, 10_000),
+            "/object#123456789abcdef01122334455667788/9999"
+        );
+    }
 }
