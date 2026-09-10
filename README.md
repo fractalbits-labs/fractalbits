@@ -123,13 +123,13 @@ just service start
 just service status
 
 # Check service with normal systemd commands
-systemctl --user status api_server
-journalctl --user -u api_server
+systemctl --user status s3_gateway
+journalctl --user -u s3_gateway
 ```
 
 Services will be available at:
 
-- **API Server**: `http://localhost:8080` (S3 API endpoint)
+- **S3 Gateway**: `http://localhost:8080` (S3 API endpoint)
 
 ### Basic Usage Example
 
@@ -177,7 +177,7 @@ just precheckin
 ## Quick Start - Docker
 
 Run FractalBits in a single Docker container for quick testing and evaluation.
-The Docker image bundles all services (API server, BSS, NSS, RSS) into a single
+The Docker image bundles all services (S3 gateway, BSS, NSS, RSS) into a single
 container orchestrated by the `container-all-in-one` binary.
 
 ### Using `just` Commands (Recommended)
@@ -249,7 +249,7 @@ just deploy build
 Make sure your [AWS CLI Configuration Settings](https://docs.aws.amazon.com/cli/v1/userguide/cli-configure-files.html) are set up correctly.
 
 ```bash
-# Deploy with perf_demo template (14 API servers, 42 bench clients, 6 BSS nodes)
+# Deploy with perf_demo template (14 S3 gateways, 42 bench clients, 6 BSS nodes)
 # Use "mini" template for a single instance of each node type.
 just deploy create-vpc --template perf_demo --with-bench
 

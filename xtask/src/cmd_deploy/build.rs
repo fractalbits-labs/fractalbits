@@ -8,7 +8,7 @@ pub fn build(
     target: DeployBuildTarget,
     release_mode: bool,
     zig_extra_build: &[String],
-    api_server_build_env: &[String],
+    s3_gateway_build_env: &[String],
 ) -> CmdResult {
     let (zig_build_opt, rust_build_opt, build_dir) = if release_mode {
         ("--release=safe", "--release", "release")
@@ -43,7 +43,7 @@ pub fn build(
 
     // Build other Rust projects with CPU-specific optimizations
     if matches!(target, DeployBuildTarget::Rust | DeployBuildTarget::All) {
-        build_rust(rust_build_opt, build_dir, api_server_build_env)?;
+        build_rust(rust_build_opt, build_dir, s3_gateway_build_env)?;
     }
 
     // Build Zig projects for all CPU targets (for both aws and on_prem)
@@ -103,13 +103,13 @@ fn get_aws_cpu_deploy_dir(target: &ArchTarget) -> String {
     format!("prebuilt/deploy/aws/{}/{}", target.arch, target.cpu_name)
 }
 
-fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[String]) -> CmdResult {
+fn build_rust(rust_build_opt: &str, build_dir: &str, s3_gateway_build_env: &[String]) -> CmdResult {
     info!("Building Rust projects for all arch targets (generic + AWS CPU-specific)");
 
     // Build for ARCH_TARGETS (generic/baseline builds)
     // container-all-in-one is included in generic builds for Docker image staging
     for target in ARCH_TARGETS {
-        build_rust_for_target(target, rust_build_opt, api_server_build_env, &[], "generic")?;
+        build_rust_for_target(target, rust_build_opt, s3_gateway_build_env, &[], "generic")?;
 
         // Copy Rust binaries to generic directory (excluding fractalbits-bootstrap)
         copy_rust_binaries_to_generic(target, target.rust_target, build_dir)?;
@@ -133,7 +133,7 @@ fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[Str
         build_rust_for_target(
             target,
             rust_build_opt,
-            api_server_build_env,
+            s3_gateway_build_env,
             &["container-all-in-one"],
             &label,
         )?;
@@ -147,7 +147,7 @@ fn build_rust(rust_build_opt: &str, build_dir: &str, api_server_build_env: &[Str
 fn build_rust_for_target(
     target: &ArchTarget,
     rust_build_opt: &str,
-    api_server_build_env: &[String],
+    s3_gateway_build_env: &[String],
     extra_excludes: &[&str],
     label: &str,
 ) -> CmdResult {
@@ -166,7 +166,7 @@ fn build_rust_for_target(
         excludes.push(pkg.to_string());
     }
 
-    if api_server_build_env.is_empty() {
+    if s3_gateway_build_env.is_empty() {
         let excludes = &excludes;
         run_cmd! {
             info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [$label]";
@@ -177,7 +177,7 @@ fn build_rust_for_target(
     } else {
         let mut excludes_with_api = excludes.clone();
         excludes_with_api.push("--exclude".to_string());
-        excludes_with_api.push("api_server".to_string());
+        excludes_with_api.push("s3_gateway".to_string());
         let excludes_with_api = &excludes_with_api;
         run_cmd! {
             info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [$label]";
@@ -185,11 +185,11 @@ fn build_rust_for_target(
             $[build_envs] cargo zigbuild
                 --target $rust_target $rust_build_opt --workspace $[excludes_with_api];
 
-            info "Building api_server ...";
+            info "Building s3_gateway ...";
             RUSTFLAGS="-C target-cpu=$rust_cpu"
-            $[api_server_build_env] $[build_envs] cargo zigbuild
+            $[s3_gateway_build_env] $[build_envs] cargo zigbuild
                 --target $rust_target $rust_build_opt
-                --package api_server;
+                --package s3_gateway;
         }?;
     }
     Ok(())

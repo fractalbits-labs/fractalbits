@@ -44,8 +44,8 @@ const bssInstanceTypes =
   app.node.tryGetContext("bssInstanceTypes") ?? "i8g.2xlarge";
 const nssInstanceType =
   app.node.tryGetContext("nssInstanceType") ?? "r7g.4xlarge";
-const apiServerInstanceType =
-  app.node.tryGetContext("apiServerInstanceType") ?? "c8g.xlarge";
+const s3GatewayInstanceType =
+  app.node.tryGetContext("s3GatewayInstanceType") ?? "c8g.xlarge";
 const benchClientInstanceType =
   app.node.tryGetContext("benchClientInstanceType") ?? "c8g.xlarge";
 const dataBlobStorage =
@@ -53,7 +53,7 @@ const dataBlobStorage =
 const rssBackend = app.node.tryGetContext("rssBackend") ?? "ddb";
 const browserIp = app.node.tryGetContext("browserIp") ?? null;
 // Note: Context values from CLI are always strings, so convert to numbers
-const numApiServers = Number(app.node.tryGetContext("numApiServers")) || 1;
+const numS3Gateways = Number(app.node.tryGetContext("numS3Gateways")) || 1;
 const numBenchClients = Number(app.node.tryGetContext("numBenchClients")) || 1;
 const numBssNodes = Number(app.node.tryGetContext("numBssNodes")) || 1;
 const rootServerHa = app.node.tryGetContext("rootServerHa") || false;
@@ -68,13 +68,13 @@ if (!az) {
 const vpcStack = new FractalbitsVpcStack(app, "FractalbitsVpcStack", {
   env: env,
   browserIp: browserIp,
-  numApiServers: numApiServers,
+  numS3Gateways: numS3Gateways,
   numBenchClients: numBenchClients,
   numBssNodes: numBssNodes,
   benchType: benchType,
   az: az,
   bssInstanceTypes: bssInstanceTypes,
-  apiServerInstanceType: apiServerInstanceType,
+  s3GatewayInstanceType: s3GatewayInstanceType,
   benchClientInstanceType: benchClientInstanceType,
   nssInstanceType: nssInstanceType,
   dataBlobStorage: dataBlobStorage,

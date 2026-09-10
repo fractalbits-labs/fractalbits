@@ -1,4 +1,4 @@
-//! Block-addressed blob storage on an S3 bucket, shared by the API server
+//! Block-addressed blob storage on an S3 bucket, shared by the S3 gateway
 //! (hybrid data volume) and the FUSE client (S3 data volume).
 //!
 //! Every block generation is one object at `{blob_id}-p{block}-v{version}`,
@@ -131,7 +131,7 @@ impl S3BlobStore {
     }
 
     /// Unconditional put. Used where the caller already guarantees a fresh
-    /// key (the API server allocates a new blob id per object) or must be
+    /// key (the S3 gateway allocates a new blob id per object) or must be
     /// able to re-send the same bytes (MPU part retries).
     pub async fn put(
         &self,

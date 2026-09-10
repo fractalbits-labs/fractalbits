@@ -133,14 +133,14 @@ fn build_cdk_context(config: &VpcConfig) -> Vec<String> {
         params.push(format!("{}={}", key, value));
     };
 
-    add("numApiServers", config.num_api_servers.to_string());
+    add("numS3Gateways", config.num_s3_gateways.to_string());
     add("numBenchClients", config.num_bench_clients.to_string());
     add("numBssNodes", config.num_bss_nodes.to_string());
     add("bssInstanceTypes", config.bss_instance_type.clone());
     add("nssInstanceType", config.nss_instance_type.clone());
     add(
-        "apiServerInstanceType",
-        config.api_server_instance_type.clone(),
+        "s3GatewayInstanceType",
+        config.s3_gateway_instance_type.clone(),
     );
     add(
         "benchClientInstanceType",
@@ -175,14 +175,14 @@ fn apply_template_defaults(config: &mut VpcConfig) {
             config.nss_instance_type = "r7g.xlarge".to_string();
             config.bss_instance_type = "i8g.xlarge".to_string();
             config.root_server_ha = false;
-            config.num_api_servers = 1;
+            config.num_s3_gateways = 1;
             config.num_bss_nodes = 1;
             config.num_bench_clients = 1;
         }
         Some(VpcTemplate::PerfDemo) => {
             config.nss_instance_type = "r7g.4xlarge".to_string();
             config.root_server_ha = true;
-            config.num_api_servers = 14;
+            config.num_s3_gateways = 14;
             config.num_bss_nodes = 6;
             config.num_bench_clients = 42;
         }
