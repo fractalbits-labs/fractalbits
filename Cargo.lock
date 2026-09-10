@@ -390,6 +390,7 @@ dependencies = [
  "rstest",
  "rustls 0.23.37",
  "rustls-pemfile",
+ "s3_blob_store",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -2562,10 +2563,12 @@ dependencies = [
  "rpc_client_rss",
  "rpc_codec_common",
  "rss_codec",
+ "s3_blob_store",
  "serde",
  "serde_json",
  "strum",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "uuid",
  "volume_group_proxy",
@@ -5284,6 +5287,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "s3_blob_store"
+version = "0.1.0"
+dependencies = [
+ "aws-config",
+ "aws-sdk-s3",
+ "bytes",
+ "thiserror 2.0.18",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7207,6 +7222,7 @@ dependencies = [
  "rpc_client_bss",
  "rpc_client_nss",
  "rpc_client_rss",
+ "s3_blob_store",
  "serde",
  "serde_json",
  "strum",

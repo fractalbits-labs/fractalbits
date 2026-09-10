@@ -26,6 +26,7 @@ exclude = [
     "crates/common/rpc_codecs/nss_codec/src",
     "crates/common/rpc_codecs/rss_codec/src",
     "crates/common/test_common/src",
+    "crates/common/s3_blob_store/src",
     "crates/common/volume_group_proxy/src",
     "crates/fs_server/src",
     "crates/fs_server/fractal-fuse/src",
@@ -51,6 +52,7 @@ data_types = { path = "crates/common/data_types" }
 volume_group_proxy = { path = "crates/common/volume_group_proxy", default-features = false }
 metrics_wrapper = { path = "crates/common/metrics_wrapper" }
 rpc_client_common = { path = "crates/common/rpc_clients/client_common", default-features = false }
+s3_blob_store = { path = "crates/common/s3_blob_store" }
 rpc_client_bss = { path = "crates/common/rpc_clients/bss", default-features = false }
 rpc_client_nss = { path = "crates/common/rpc_clients/nss", default-features = false }
 rpc_client_rss = { path = "crates/common/rpc_clients/rss", default-features = false }
