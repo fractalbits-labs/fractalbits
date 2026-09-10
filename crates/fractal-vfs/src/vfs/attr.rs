@@ -309,41 +309,40 @@ impl VfsCore {
                     let mut attr = self.make_file_attr(inode, &layout)?;
                     // Cross-instance size authority: this entry's cached layout
                     // (size + blob_version) may lag a peer instance's most
-                    // recent overwrite, so make_file_attr's size can be stale.
-                    // Re-read the authoritative geometry sentinel from BSS via a
-                    // max-version quorum read, which reflects the latest
-                    // published override regardless of our cached layout
-                    // version. Skips symlinks/special files (they report their
-                    // own size and have no data blob). getattr is gated by the
-                    // 1s FUSE attr TTL, so this BSS read happens at most about
-                    // once/sec/inode: a bounded, throttled extra read.
+                    // recent overwrite. The NSS layout is the sole size
+                    // authority (the BSS geometry sentinel is gone with the
+                    // versioned-key design), so refresh it here. getattr is
+                    // gated by the 1s FUSE attr TTL, so this NSS read happens
+                    // at most about once/sec/inode: a bounded, throttled read.
+                    // Only move forward (a racing older fetch must never
+                    // downgrade a fresher local size), and skip symlinks /
+                    // special files (they report their own size).
                     if !layout.is_symlink()
                         && layout.special().is_none()
-                        && let Ok(geom_guid) = layout.blob_guid()
+                        && !name_removed
+                        && let Some(key) = self.inodes.get_s3_key(inode)
                     {
                         let trace_id = TraceId::new();
-                        match self.backend().get_blob_info(geom_guid, &trace_id).await {
-                            // Only let the sentinel move size FORWARD: apply it
-                            // when it is at least as new as our cached layout
-                            // (vfs_lookup refreshes the cached layout from NSS,
-                            // so a stale sentinel must never downgrade a fresh
-                            // size back to an older value).
-                            Ok(Some(info)) if info.blob_version >= layout.blob_version => {
-                                attr.size = info.total_size;
-                                // make_file_attr derives st_blocks from size
-                                // (512-byte units) for regular files; keep it
-                                // consistent with the refreshed size.
-                                attr.blocks = info.total_size.div_ceil(512);
+                        match self.backend().get_inode(&key, &trace_id).await {
+                            Ok(fresh) if fresh.blob_version >= layout.blob_version => {
+                                if let Ok(sz) = fresh.size() {
+                                    attr.size = sz;
+                                    // make_file_attr derives st_blocks from
+                                    // size (512-byte units); keep consistent.
+                                    attr.blocks = sz.div_ceil(512);
+                                    if let Some(mut e) = self.inodes.get_mut(inode) {
+                                        e.layout = Some(fresh);
+                                    }
+                                }
                             }
-                            // Sentinel older than our cached layout: keep the
-                            // (fresher) cached-layout size.
-                            Ok(Some(_)) => {}
-                            // No sentinel yet: keep the cached-layout size.
-                            Ok(None) => {}
+                            // Older than (or unrelated to) our cached layout:
+                            // keep the fresher cached size. NotFound: a queued
+                            // writeback publish may not have landed yet.
+                            Ok(_) | Err(FsError::NotFound) => {}
                             Err(e) => {
                                 tracing::warn!(
                                     error = %e,
-                                    "getattr get_blob_info failed; using cached size"
+                                    "getattr layout refresh failed; using cached size"
                                 );
                             }
                         }

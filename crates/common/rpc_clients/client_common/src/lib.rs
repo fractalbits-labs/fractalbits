@@ -66,6 +66,15 @@ pub use rpc_codec_common::{MessageFrame, MessageHeaderTrait};
 
 use generic_client::RpcClient as GenericRpcClient;
 
+/// Grace granted to in-flight readers before reclaiming superseded
+/// write-once data keys. INTERIM: with no positive reader pinning, this
+/// wall-clock window (one request timeout plus slack) is the only cover
+/// an in-flight read of a doomed generation gets; both the fs_server
+/// sweep and the api_server deletion worker apply it.
+pub fn reclamation_grace(rpc_timeout: std::time::Duration) -> std::time::Duration {
+    rpc_timeout.saturating_add(std::time::Duration::from_secs(10))
+}
+
 #[derive(Error, Debug)]
 pub enum RpcError {
     #[error(transparent)]
@@ -101,6 +110,13 @@ pub enum RpcError {
     ChecksumMismatch,
     #[error("Version skipped")]
     VersionSkipped,
+    #[error("No space left on BSS volume")]
+    NoSpace,
+    /// Write-once violation: a put addressed an existing versioned data key
+    /// with different bytes. The stored content is untouched; never retry
+    /// the same identity with these bytes.
+    #[error("Write-once key mismatch")]
+    Mismatch,
 }
 
 impl<T> From<tokio::sync::mpsc::error::SendError<T>> for RpcError {

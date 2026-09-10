@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::time::Duration;
 use strum::EnumString;
+use volume_group_proxy::DEFAULT_EC_HEDGE_DELAY;
 
 /// Writeback-cache durability mode.
 ///
@@ -16,6 +17,9 @@ pub enum WritebackMode {
     Default,
 }
 
+fn default_ec_read_hedge_delay_ms() -> u64 {
+    DEFAULT_EC_HEDGE_DELAY.as_millis() as u64
+}
 fn default_writeback_mode() -> String {
     "default".to_string()
 }
@@ -46,6 +50,9 @@ pub struct Config {
     pub mount_point: String,
 
     pub rpc_request_timeout_seconds: u64,
+    /// EC read grace period before parity shards are requested.
+    #[serde(default = "default_ec_read_hedge_delay_ms")]
+    pub ec_read_hedge_delay_ms: u64,
     pub rpc_connection_timeout_seconds: u64,
     pub rss_rpc_timeout_seconds: u64,
     pub worker_threads: usize,
@@ -93,6 +100,10 @@ pub struct Config {
 impl Config {
     pub fn rpc_request_timeout(&self) -> Duration {
         Duration::from_secs(self.rpc_request_timeout_seconds)
+    }
+
+    pub fn ec_read_hedge_delay(&self) -> Duration {
+        Duration::from_millis(self.ec_read_hedge_delay_ms)
     }
 
     pub fn rpc_connection_timeout(&self) -> Duration {
@@ -153,6 +164,7 @@ impl Default for Config {
             bucket_name: "default".to_string(),
             mount_point: "/mnt/fractalbits".to_string(),
             rpc_request_timeout_seconds: 30,
+            ec_read_hedge_delay_ms: default_ec_read_hedge_delay_ms(),
             rpc_connection_timeout_seconds: 5,
             rss_rpc_timeout_seconds: 30,
             worker_threads: 2,

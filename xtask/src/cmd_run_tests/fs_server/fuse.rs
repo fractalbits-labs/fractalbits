@@ -1,15 +1,58 @@
 use crate::cmd_service;
 use crate::{CmdResult, FsServerConfig, InitConfig, ServiceName};
 use aws_sdk_s3::primitives::ByteStream;
+use bytes::Bytes;
 use cmd_lib::*;
 use colored::*;
+use data_types::object_layout::ObjectLayout;
+use data_types::ovr_map::{
+    OVR_ABORT_VALUE, OvrRow, PrevSlot, RowState, encode_ovr_gc_rows_ready, ovr_gc_key, ovr_row_key,
+    ovr_row_prefix, parse_ovr_abort_range, parse_ovr_row_block,
+};
+use data_types::{Bucket, DataBlobGuid, TraceId};
+use file_ops::{parse_get_inode, parse_list_inodes_raw, parse_put_inode, parse_put_inode_cas};
+use rpc_client_nss::RpcClientNss;
+use rpc_client_rss::RpcClientRss;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Child, Command};
 use std::time::Duration;
+use volume_group_proxy::DataVgProxy;
 
 use super::{MOUNT_POINT, cleanup_objects, generate_test_data, setup_test_bucket};
 
 const MOUNT_POINT_B: &str = "/tmp/fs_server_test_b";
+
+/// Restarts bss@0 + bss@3 on drop unless disarmed: keeps a failed
+/// EC-write-hole test from leaving the cluster degraded for the rest of
+/// the suite.
+struct BssZeroThreeRestartGuard {
+    armed: bool,
+}
+
+impl BssZeroThreeRestartGuard {
+    fn new() -> Self {
+        Self { armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BssZeroThreeRestartGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = run_cmd! {
+            ignore systemctl --user start bss@0.service;
+            ignore systemctl --user start bss@3.service;
+        } {
+            eprintln!("failed to restart BSS nodes after test failure: {error}");
+        }
+    }
+}
 
 fn disk_cache_path() -> String {
     let base = std::env::current_dir().expect("Failed to get cwd");
@@ -259,15 +302,20 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         std::fs::remove_dir_all(&dc_path).ok();
     }
 
+    // FUSE_TEST_FILTER=<substring> runs only matching tests (dev iteration).
+    let test_filter = std::env::var("FUSE_TEST_FILTER").unwrap_or_default();
+
     macro_rules! run_test {
         ($name:expr, $func:ident) => {
-            println!(
-                "\n{}",
-                format!("=== Test: {}{} ===", $name, dc_label).bold()
-            );
-            if let Err(e) = $func(disk_cache).await {
-                eprintln!("{}: {}", "Test FAILED".red().bold(), e);
-                return Err(e);
+            if test_filter.is_empty() || $name.contains(test_filter.as_str()) {
+                println!(
+                    "\n{}",
+                    format!("=== Test: {}{} ===", $name, dc_label).bold()
+                );
+                if let Err(e) = $func(disk_cache).await {
+                    eprintln!("{}: {}", "Test FAILED".red().bold(), e);
+                    return Err(e);
+                }
             }
         };
     }
@@ -437,6 +485,42 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
         run_test!(
             "Override Survives BSS Partition-Rejoin",
             test_override_survives_bss_partition_rejoin
+        );
+        run_test!(
+            "Failed EC Overwrite Keeps Committed V1",
+            test_failed_ec_overwrite_keeps_committed_v1
+        );
+        run_test!(
+            "Overwrite Retry After EC Quorum Failure",
+            test_overwrite_retry_after_quorum_failure
+        );
+        run_test!(
+            "Aborted Row Survives Row-Free Commit",
+            test_aborted_row_survives_row_free_commit
+        );
+        run_test!(
+            "Delayed Row After Recovery Commit",
+            test_delayed_row_after_recovery_commit
+        );
+        run_test!(
+            "Trim+Regrow Zeroes After Interrupted Overwrite",
+            test_trim_regrow_zeroes_after_interrupted_overwrite
+        );
+        run_test!(
+            "Pending Append Crash Recovery",
+            test_pending_append_crash_recovery
+        );
+        run_test!(
+            "Teardown Scavenger Spares Live Blob Rows",
+            test_scavenger_spares_live_blob_rows
+        );
+        run_test!(
+            "S3 Slow Stream Fails After Reclaim",
+            test_s3_slow_stream_fails_after_reclaim
+        );
+        run_test!(
+            "Fenced Bucket Teardown Sweeps Internal Keyspaces",
+            test_fenced_bucket_teardown_sweeps_internal_keys
         );
     }
 
@@ -3738,6 +3822,1260 @@ async fn test_qemu_style_fio_workload(disk_cache: bool) -> CmdResult {
     println!(
         "{}",
         "SUCCESS: qemu-style fio workload + stable-path cache invariant".green()
+    );
+    Ok(())
+}
+
+async fn test_failed_ec_overwrite_keeps_committed_v1(disk_cache: bool) -> CmdResult {
+    assert!(
+        !disk_cache,
+        "this EC failure regression requires no disk cache"
+    );
+    let (ctx, bucket) = setup_test_bucket().await;
+    let key = "failed-ec-overwrite.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let file_len = 2 * BLOCK_SIZE as usize;
+    let v1 = generate_test_data("failed-ec-overwrite-v1", file_len);
+    let v2 = generate_test_data("failed-ec-overwrite-v2", file_len);
+    assert_ne!(v1, v2, "test generations must differ");
+
+    println!("  Step 1: Commit a two-block V1 file");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&fuse_path)
+            .expect("open V1 file");
+        file.write_all(&v1).expect("write V1 file");
+        file.sync_all().expect("commit V1 file");
+    }
+    unmount_fuse()?;
+
+    println!("  Step 2: Stop two BSS nodes so EC write quorum is unavailable");
+    let mut restart_guard = BssZeroThreeRestartGuard::new();
+    // Keep two replicas available in each three-node NSS journal volume.
+    run_cmd! {
+        systemctl --user stop bss@0.service;
+        systemctl --user stop bss@3.service;
+    }?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    println!("  Step 3: Attempt a full V2 overwrite with only four shards available");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let sync_result = {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fuse_path)
+            .expect("open V2 file");
+        file.write_all(&v2).expect("write V2 file");
+        file.sync_all()
+    };
+    let unmount_result = unmount_fuse();
+
+    println!("  Step 4: Restart both BSS nodes");
+    let restart_result = run_cmd! {
+        systemctl --user start bss@0.service;
+        systemctl --user start bss@3.service;
+    };
+    if restart_result.is_ok() {
+        restart_guard.disarm();
+    }
+    restart_result?;
+    cmd_service::wait_for_port_ready(8088, 120)?;
+    cmd_service::wait_for_port_ready(8091, 120)?;
+    unmount_result?;
+
+    let sync_error = sync_result.expect_err("V2 sync must fail below EC write quorum");
+    assert_eq!(
+        sync_error.raw_os_error(),
+        Some(libc::EIO),
+        "failed EC overwrite must surface EIO"
+    );
+
+    println!("  Step 5: Remount read-only and verify committed V1 remains visible");
+    mount_fuse_ro(&bucket, disk_cache)?;
+    let actual = std::fs::read(&fuse_path).expect("read after failed V2 overwrite");
+    assert_eq!(
+        actual, v1,
+        "prepared V2 fragments became visible after failed commit"
+    );
+    unmount_fuse()?;
+
+    println!("  Step 6: Retry V2 after every placement node is available");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fuse_path)
+            .expect("open V2 retry");
+        file.write_all(&v2).expect("write V2 retry");
+        file.sync_all().expect("commit V2 retry");
+    }
+    unmount_fuse()?;
+
+    println!("  Step 7: Verify the retried generation is committed");
+    mount_fuse_ro(&bucket, disk_cache)?;
+    let actual = std::fs::read(&fuse_path).expect("read committed V2 retry");
+    assert_eq!(actual, v2, "retried V2 generation was not committed");
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: Failed EC overwrite kept committed V1 bytes".green()
+    );
+    Ok(())
+}
+
+/// NSS client plus the bucket's root blob name, for reading committed
+/// layouts and for planting the exact crash states the row-map
+/// protocol must recover from.
+async fn nss_raw_access(bucket: &str) -> std::io::Result<(RpcClientNss, String)> {
+    let timeout = Duration::from_secs(5);
+    let trace_id = TraceId::new();
+    let rss = RpcClientRss::new_from_addresses(vec!["127.0.0.1:8086".to_string()], timeout);
+    let (_version, bucket_json) = rss
+        .get(&format!("bucket:{bucket}"), Some(timeout), &trace_id, 0)
+        .await
+        .map_err(|e| std::io::Error::other(format!("rss get bucket: {e:?}")))?;
+    let bucket_info: Bucket = serde_json::from_str(&bucket_json)
+        .map_err(|e| std::io::Error::other(format!("parse bucket json: {e}")))?;
+    Ok((
+        RpcClientNss::new_from_address("127.0.0.1:8087".to_string(), timeout),
+        bucket_info.root_blob_name,
+    ))
+}
+
+async fn data_vg_raw_access() -> std::io::Result<DataVgProxy> {
+    let timeout = Duration::from_secs(5);
+    let trace_id = TraceId::new();
+    let rss = RpcClientRss::new_from_addresses(vec!["127.0.0.1:8086".to_string()], timeout);
+    let data_vg_info = rss
+        .get_data_vg_info(Some(timeout), &trace_id)
+        .await
+        .map_err(|e| std::io::Error::other(format!("rss get data vg info: {e:?}")))?;
+    DataVgProxy::new(data_vg_info, timeout, timeout)
+        .map_err(|e| std::io::Error::other(format!("build data vg proxy: {e}")))
+}
+
+/// Fetch the committed NSS layout for `key`: the bare ObjectLayout stored
+/// at the s3_key (not valid for hardlink-promoted inodes).
+async fn fetch_object_layout(bucket: &str, key: &str) -> std::io::Result<ObjectLayout> {
+    let timeout = Duration::from_secs(5);
+    let trace_id = TraceId::new();
+    let (nss, root_blob_name) = nss_raw_access(bucket).await?;
+    // NSS stores every key with a leading "/" (see InodeTable::new).
+    let nss_key = format!("/{key}");
+    let resp = nss
+        .get_inode(&root_blob_name, &nss_key, Some(timeout), &trace_id, 0)
+        .await
+        .map_err(|e| std::io::Error::other(format!("nss get_inode: {e:?}")))?;
+    parse_get_inode(resp).map_err(|e| std::io::Error::other(format!("parse layout: {e:?}")))
+}
+
+async fn install_object_layout_cas(
+    bucket: &str,
+    key: &str,
+    base: &ObjectLayout,
+    prepared: &ObjectLayout,
+) -> std::io::Result<()> {
+    let timeout = Duration::from_secs(5);
+    let trace_id = TraceId::new();
+    let (nss, root_blob_name) = nss_raw_access(bucket).await?;
+    let old_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(base)
+        .map_err(|e| std::io::Error::other(format!("serialize base: {e}")))?;
+    let new_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(prepared)
+        .map_err(|e| std::io::Error::other(format!("serialize prepared: {e}")))?;
+    let nss_key = format!("/{key}");
+    let resp = nss
+        .put_inode_cas(
+            &root_blob_name,
+            &nss_key,
+            Bytes::from(new_bytes.to_vec()),
+            Bytes::from(old_bytes.to_vec()),
+            Some(timeout),
+            &trace_id,
+            0,
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("nss put_inode_cas: {e:?}")))?;
+    parse_put_inode_cas(resp)
+        .map(|_| ())
+        .map_err(|e| std::io::Error::other(format!("prepare injection lost a CAS race: {e:?}")))
+}
+
+/// All row and aborted-generation records under one blob's `@ovr/`
+/// prefix.
+async fn list_ovr_records(
+    bucket: &str,
+    blob_id: &uuid::Uuid,
+) -> std::io::Result<(Vec<(u32, OvrRow)>, Vec<(u64, u64)>)> {
+    let timeout = Duration::from_secs(5);
+    let trace_id = TraceId::new();
+    let (nss, root_blob_name) = nss_raw_access(bucket).await?;
+    let prefix = ovr_row_prefix(blob_id);
+    let mut rows = Vec::new();
+    let mut aborted = Vec::new();
+    let mut start_after = String::new();
+    loop {
+        let resp = nss
+            .list_inodes(
+                &root_blob_name,
+                1000,
+                &prefix,
+                "",
+                &start_after,
+                true,
+                Some(timeout),
+                &trace_id,
+                0,
+            )
+            .await
+            .map_err(|e| std::io::Error::other(format!("nss list_inodes: {e:?}")))?;
+        let (page, has_more) = parse_list_inodes_raw(resp)
+            .map_err(|e| std::io::Error::other(format!("parse rows: {e:?}")))?;
+        let Some(last_key) = page.last().map(|(key, _)| key.clone()) else {
+            return Ok((rows, aborted));
+        };
+        for (record_key, value) in page {
+            if let Some(block) = parse_ovr_row_block(&record_key) {
+                let row = OvrRow::decode(&value).ok_or_else(|| {
+                    std::io::Error::other(format!("bad row value at {record_key}"))
+                })?;
+                rows.push((block, row));
+            } else if let Some(range) = parse_ovr_abort_range(&record_key) {
+                assert_eq!(
+                    value.as_ref(),
+                    OVR_ABORT_VALUE,
+                    "bad abort value at {record_key}"
+                );
+                aborted.push(range);
+            } else {
+                return Err(std::io::Error::other(format!(
+                    "bad @ovr record key {record_key}"
+                )));
+            }
+        }
+        if !has_more {
+            return Ok((rows, aborted));
+        }
+        start_after = last_key;
+    }
+}
+
+/// All decoded block rows, excluding abort records.
+async fn list_ovr_rows(bucket: &str, blob_id: &uuid::Uuid) -> std::io::Result<Vec<(u32, OvrRow)>> {
+    Ok(list_ovr_records(bucket, blob_id).await?.0)
+}
+
+/// One interrupted flush prepared against NSS but not yet committed.
+struct InterruptedRowFlush {
+    blob_id: uuid::Uuid,
+    block: u32,
+    row: OvrRow,
+}
+
+/// Plant the prepare CAS of an interrupted flush. The returned row can
+/// be installed either before recovery or afterward to model a delayed
+/// NSS CAS. O1 has already acknowledged the corresponding body before
+/// a real row CAS; omitting the body here makes accidental publication
+/// fail loudly as detected loss.
+async fn prepare_interrupted_row_flush(
+    bucket: &str,
+    key: &str,
+    block: u32,
+) -> std::io::Result<InterruptedRowFlush> {
+    let base = fetch_object_layout(bucket, key).await?;
+    let blob_id = base
+        .blob_guid()
+        .map_err(|e| std::io::Error::other(format!("blob_guid: {e:?}")))?
+        .blob_id;
+    let staged_version = base.next_burn_version();
+
+    // The prepare CAS an interrupted attempt durably landed.
+    let mut prepared = base.clone();
+    prepared.set_next_version(staged_version + 1);
+    install_object_layout_cas(bucket, key, &base, &prepared).await?;
+
+    // The row the interrupted attempt can still CAS after its prepare.
+    let prev = list_ovr_rows(bucket, &blob_id)
+        .await?
+        .into_iter()
+        .find(|(b, _)| *b == block)
+        .map(|(_, committed)| PrevSlot::Slot(committed.cur_state, committed.cur_version))
+        .unwrap_or(PrevSlot::Base);
+    let staged = OvrRow {
+        cur_state: RowState::Written,
+        cur_version: staged_version,
+        prev,
+    };
+    Ok(InterruptedRowFlush {
+        blob_id,
+        block,
+        row: staged,
+    })
+}
+
+async fn install_interrupted_row(
+    bucket: &str,
+    interrupted: &InterruptedRowFlush,
+) -> std::io::Result<()> {
+    let timeout = Duration::from_secs(5);
+    let trace_id = TraceId::new();
+    let (nss, root_blob_name) = nss_raw_access(bucket).await?;
+    let row_key = ovr_row_key(&interrupted.blob_id, interrupted.block);
+    let resp = nss
+        .put_inode(
+            &root_blob_name,
+            &row_key,
+            Bytes::copy_from_slice(&interrupted.row.encode()),
+            Some(timeout),
+            &trace_id,
+            0,
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("nss put_inode: {e:?}")))?;
+    parse_put_inode(resp)
+        .map(|_| ())
+        .map_err(|e| std::io::Error::other(format!("stage row: {e:?}")))
+}
+
+async fn inject_interrupted_row_flush(
+    bucket: &str,
+    key: &str,
+    block: u32,
+) -> std::io::Result<InterruptedRowFlush> {
+    let interrupted = prepare_interrupted_row_flush(bucket, key, block).await?;
+    install_interrupted_row(bucket, &interrupted).await?;
+    Ok(interrupted)
+}
+
+/// An append that durably prepared and wrote only part of its version-1 span.
+struct InterruptedAppendFlush {
+    blob_guid: DataBlobGuid,
+    pending_append: (u32, u32),
+    burned_version: u64,
+    base_ceiling: u64,
+}
+
+async fn inject_interrupted_append_flush(
+    bucket: &str,
+    key: &str,
+    pending_append: (u32, u32),
+    v1_bodies: &[(u32, Bytes)],
+) -> std::io::Result<InterruptedAppendFlush> {
+    let (lo, hi) = pending_append;
+    let block_count = hi
+        .checked_sub(lo)
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| std::io::Error::other("invalid pending append range"))?;
+    if v1_bodies.is_empty() || v1_bodies.len() as u64 >= u64::from(block_count) {
+        return Err(std::io::Error::other(
+            "interrupted append must write a nonempty proper subset",
+        ));
+    }
+    if v1_bodies
+        .iter()
+        .any(|(block, _)| *block < lo || *block > hi)
+    {
+        return Err(std::io::Error::other(
+            "interrupted append body lies outside pending range",
+        ));
+    }
+
+    let base = fetch_object_layout(bucket, key).await?;
+    let blob_guid = base
+        .blob_guid()
+        .map_err(|e| std::io::Error::other(format!("blob_guid: {e:?}")))?;
+    let burned_version = base.next_burn_version();
+    let base_ceiling = base.blob_version;
+    let mut prepared = base.clone();
+    prepared.set_next_version(burned_version + 1);
+    prepared.set_pending_append(Some(pending_append));
+    install_object_layout_cas(bucket, key, &base, &prepared).await?;
+
+    let trace_id = TraceId::new();
+    let data_vg = data_vg_raw_access().await?;
+    for (block, body) in v1_bodies {
+        data_vg
+            .put_blob(blob_guid, *block, body.clone(), 1, &trace_id)
+            .await
+            .map_err(|e| std::io::Error::other(format!("write partial v1 body: {e}")))?;
+    }
+
+    let entries = data_vg
+        .list_blob_blocks(blob_guid, lo, block_count, &trace_id)
+        .await
+        .map_err(|e| std::io::Error::other(format!("list partial v1 bodies: {e}")))?;
+    for block in lo..=hi {
+        let expected = v1_bodies
+            .iter()
+            .any(|(written_block, _)| *written_block == block);
+        let present = entries
+            .iter()
+            .any(|entry| entry.block_number == block && entry.version == 1);
+        if expected != present {
+            return Err(std::io::Error::other(format!(
+                "partial v1 body state mismatch for block {block}: expected={expected}, present={present}"
+            )));
+        }
+    }
+
+    Ok(InterruptedAppendFlush {
+        blob_guid,
+        pending_append,
+        burned_version,
+        base_ceiling,
+    })
+}
+
+/// Commit a two-block file and overwrite its second block, so the blob
+/// is mapped (block 1 carries a committed row) and block 0 is base
+/// territory. Returns (v1 bytes, committed block-1 bytes).
+fn commit_mapped_two_block_file(fuse_path: &str, seed: &str) -> (Vec<u8>, Vec<u8>) {
+    let file_len = 2 * BLOCK_SIZE as usize;
+    let v1 = generate_test_data(&format!("{seed}-v1"), file_len);
+    let block1_new = generate_test_data(&format!("{seed}-ow"), BLOCK_SIZE as usize);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(fuse_path)
+        .expect("open file");
+    file.write_all(&v1).expect("write V1");
+    file.sync_all().expect("commit V1");
+    file.seek(SeekFrom::Start(BLOCK_SIZE))
+        .expect("seek block 1");
+    file.write_all(&block1_new).expect("overwrite block 1");
+    file.sync_all().expect("commit block-1 overwrite");
+    (v1, block1_new)
+}
+
+/// An interrupted attempt's row must remain rejected when a later
+/// row-free commit crosses its generation. The recovery commit records
+/// the skipped generation and bumps the map epoch even though it writes
+/// no block row itself.
+async fn test_aborted_row_survives_row_free_commit(disk_cache: bool) -> CmdResult {
+    let (ctx, bucket) = setup_test_bucket().await;
+    let key = "staged-row-fence.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+
+    println!("  Step 1: Commit a two-block file with a committed block-1 overwrite");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let (v1, block1_new) = commit_mapped_two_block_file(&fuse_path, "staged-row-fence");
+    unmount_fuse()?;
+    let mapped = fetch_object_layout(&bucket, key).await?;
+    assert!(mapped.is_mapped(), "block-1 overwrite must map the blob");
+    let blob_id = mapped
+        .blob_guid()
+        .map_err(|e| std::io::Error::other(format!("blob_guid: {e:?}")))?
+        .blob_id;
+
+    println!("  Step 2: Plant an interrupted flush's staged row for block 0");
+    let interrupted = inject_interrupted_row_flush(&bucket, key, 0).await?;
+    let staged_version = interrupted.row.cur_version;
+
+    println!("  Step 3: Append (a row-free commit) and read back");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let tail = generate_test_data("staged-row-fence-tail", 4096);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&fuse_path)
+            .expect("open for append");
+        file.write_all(&tail).expect("append tail");
+        file.sync_all().expect("commit append");
+    }
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&v1[..BLOCK_SIZE as usize]);
+    expected.extend_from_slice(&block1_new);
+    expected.extend_from_slice(&tail);
+    let actual = std::fs::read(&fuse_path).expect("read after fenced append");
+    assert_eq!(
+        actual, expected,
+        "append published the interrupted attempt's staged row"
+    );
+    unmount_fuse()?;
+
+    println!("  Step 4: The skipped generation has a durable abort record");
+    let after = fetch_object_layout(&bucket, key).await?;
+    assert!(
+        after.blob_version > mapped.blob_version,
+        "append must have committed"
+    );
+    assert_ne!(
+        after.map_epoch(),
+        mapped.map_epoch(),
+        "crossing an aborted generation must invalidate row caches"
+    );
+    let (rows, aborted) = list_ovr_records(&bucket, &blob_id).await?;
+    assert!(
+        rows.iter()
+            .any(|(b, row)| *b == 0 && row.cur_version == staged_version),
+        "the test must retain the abandoned row"
+    );
+    assert!(
+        aborted
+            .iter()
+            .any(|(lo, hi)| *lo <= staged_version && staged_version <= *hi),
+        "the skipped generation must remain durably rejected"
+    );
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: Aborted row stayed hidden across a row-free commit".green()
+    );
+    Ok(())
+}
+
+/// A row CAS can outlive the recovering flush's scan and even its
+/// commit. Plant the old row only after recovery has advanced the
+/// ceiling, then force a cold reload: the immutable abort record must
+/// still reject it.
+async fn test_delayed_row_after_recovery_commit(disk_cache: bool) -> CmdResult {
+    let (ctx, bucket) = setup_test_bucket().await;
+    let key = "delayed-row-after-recovery.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+
+    println!("  Step 1: Commit a mapped two-block file");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let (v1, block1_new) = commit_mapped_two_block_file(&fuse_path, "delayed-row");
+    unmount_fuse()?;
+
+    println!("  Step 2: Plant only the interrupted attempt's prepare CAS");
+    let interrupted = prepare_interrupted_row_flush(&bucket, key, 0).await?;
+    let staged_version = interrupted.row.cur_version;
+
+    println!("  Step 3: Recover with a row-free append commit");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let tail = generate_test_data("delayed-row-tail", 4096);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&fuse_path)
+            .expect("open for append");
+        file.write_all(&tail).expect("append tail");
+        file.sync_all().expect("commit append");
+    }
+    unmount_fuse()?;
+
+    println!("  Step 4: Land the old row after the recovery commit");
+    install_interrupted_row(&bucket, &interrupted).await?;
+
+    println!("  Step 5: Cold-load the map and verify committed bytes");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&v1[..BLOCK_SIZE as usize]);
+    expected.extend_from_slice(&block1_new);
+    expected.extend_from_slice(&tail);
+    let actual = std::fs::read(&fuse_path).expect("read after delayed row CAS");
+    assert_eq!(actual, expected, "the delayed row became reader-visible");
+    unmount_fuse()?;
+
+    let (_, aborted) = list_ovr_records(&bucket, &interrupted.blob_id).await?;
+    assert!(
+        aborted
+            .iter()
+            .any(|(lo, hi)| *lo <= staged_version && staged_version <= *hi),
+        "the delayed row's generation must be durably aborted"
+    );
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: Delayed row CAS stayed hidden after recovery".green()
+    );
+    Ok(())
+}
+
+/// Truncate-then-regrow over an interrupted overwrite must read zeros.
+/// The staged row sits above the ceiling when the shrink classifies its
+/// trim range. The recovery commit must durably abort that generation,
+/// and resolution-based trim classification must replace the committed
+/// block with a Hole so the regrown range cannot resurrect old bytes.
+async fn test_trim_regrow_zeroes_after_interrupted_overwrite(disk_cache: bool) -> CmdResult {
+    let (ctx, bucket) = setup_test_bucket().await;
+    let key = "trim-regrow-fence.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+
+    println!("  Step 1: Commit a two-block file with a committed block-1 overwrite");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let (v1, _block1_new) = commit_mapped_two_block_file(&fuse_path, "trim-regrow-fence");
+    unmount_fuse()?;
+
+    println!("  Step 2: Plant an interrupted overwrite of block 1 over its committed row");
+    inject_interrupted_row_flush(&bucket, key, 1).await?;
+
+    println!("  Step 3: Truncate below block 1, regrow, and read");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fuse_path)
+            .expect("open for truncate");
+        file.set_len(BLOCK_SIZE).expect("truncate down");
+        file.sync_all().expect("commit shrink");
+        file.set_len(2 * BLOCK_SIZE).expect("truncate up");
+        file.sync_all().expect("commit regrow");
+    }
+    let actual = std::fs::read(&fuse_path).expect("read after trim+regrow");
+    assert_eq!(actual.len(), 2 * BLOCK_SIZE as usize, "regrown length");
+    assert_eq!(
+        &actual[..BLOCK_SIZE as usize],
+        &v1[..BLOCK_SIZE as usize],
+        "block 0 must keep its committed bytes"
+    );
+    assert!(
+        actual[BLOCK_SIZE as usize..].iter().all(|b| *b == 0),
+        "the regrown range must read zeros, not resurrected bytes"
+    );
+    unmount_fuse()?;
+
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: Trim+regrow read zeros over an interrupted overwrite".green()
+    );
+    Ok(())
+}
+
+/// Recover a crash after prepare and midway through version-1 append bodies.
+/// The retry must use a burned generation for contested data and Hole rows
+/// for the abandoned remainder before a later regrow can expose it.
+async fn test_pending_append_crash_recovery(disk_cache: bool) -> CmdResult {
+    assert!(!disk_cache, "this crash injection requires no disk cache");
+    let (ctx, bucket) = setup_test_bucket().await;
+    let key = "pending-append-crash.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let base_body = generate_test_data("pending-append-base", BLOCK_SIZE as usize);
+    let crashed_block1 = generate_test_data("pending-append-crash-b1", BLOCK_SIZE as usize);
+    let crashed_block2 = generate_test_data("pending-append-crash-b2", BLOCK_SIZE as usize);
+    let recovered_block1 = generate_test_data("pending-append-recovery-b1", BLOCK_SIZE as usize);
+    assert_ne!(
+        crashed_block1, recovered_block1,
+        "A1 must encounter a write-once conflict if it retries version 1"
+    );
+
+    println!("  Step 1: Commit a one-block base file and unmount");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&fuse_path)
+            .expect("open pending-append base");
+        file.write_all(&base_body)
+            .expect("write pending-append base");
+        file.sync_all().expect("commit pending-append base");
+    }
+    unmount_fuse()?;
+
+    println!("  Step 2: Inject pending range 1..=3 with only blocks 1 and 2 at version 1");
+    let interrupted = inject_interrupted_append_flush(
+        &bucket,
+        key,
+        (1, 3),
+        &[
+            (1, Bytes::copy_from_slice(&crashed_block1)),
+            (2, Bytes::copy_from_slice(&crashed_block2)),
+        ],
+    )
+    .await?;
+    let prepared = fetch_object_layout(&bucket, key).await?;
+    assert_eq!(
+        prepared.pending_append(),
+        Some(interrupted.pending_append),
+        "prepare must durably record the contested version-1 range"
+    );
+    assert_eq!(
+        prepared.blob_version, interrupted.base_ceiling,
+        "prepare must not move the reader ceiling"
+    );
+    assert!(
+        prepared.next_burn_version() > interrupted.burned_version,
+        "prepare must durably burn its generation"
+    );
+
+    println!("  Step 3: Remount and recover block 1 with different bytes");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fuse_path)
+            .expect("open pending-append recovery");
+        file.seek(SeekFrom::Start(BLOCK_SIZE))
+            .expect("seek pending-append recovery");
+        file.write_all(&recovered_block1)
+            .expect("write pending-append recovery");
+        file.sync_all().expect("commit pending-append recovery");
+    }
+    let mut expected_recovered = base_body.clone();
+    expected_recovered.extend_from_slice(&recovered_block1);
+    let actual = std::fs::read(&fuse_path).expect("read pending-append recovery");
+    assert_eq!(
+        actual, expected_recovered,
+        "recovery must not expose the crashed version-1 body"
+    );
+    unmount_fuse()?;
+
+    println!("  Step 4: Verify A1 generation, A2 Hole rows, and cleared pending state");
+    let recovered = fetch_object_layout(&bucket, key).await?;
+    assert_eq!(
+        recovered.size().expect("recovered size"),
+        2 * BLOCK_SIZE,
+        "recovery must commit only the rewritten prefix"
+    );
+    assert_eq!(
+        recovered.pending_append(),
+        None,
+        "successful recovery must clear pending_append"
+    );
+    assert!(
+        recovered.blob_version > interrupted.burned_version,
+        "recovery must advance past the interrupted generation"
+    );
+    let rows = list_ovr_rows(&bucket, &interrupted.blob_guid.blob_id).await?;
+    let recovered_row = rows
+        .iter()
+        .find(|(block, _)| *block == 1)
+        .map(|(_, row)| row)
+        .expect("A1 must publish a row for block 1");
+    assert_eq!(
+        recovered_row.cur_state,
+        RowState::Written,
+        "A1 block must resolve to written data"
+    );
+    assert_eq!(
+        recovered_row.cur_version, recovered.blob_version,
+        "A1 row must name the recovery generation"
+    );
+    assert!(
+        recovered_row.cur_version > 1,
+        "A1 must not retry the contested version 1"
+    );
+    for block in 2..=3 {
+        let remainder_row = rows
+            .iter()
+            .find(|(candidate, _)| *candidate == block)
+            .map(|(_, row)| row)
+            .expect("A2 must publish a row for every remainder block");
+        assert_eq!(
+            remainder_row.cur_state,
+            RowState::Hole,
+            "A2 remainder block {block} must resolve to a hole"
+        );
+        assert_eq!(
+            remainder_row.cur_version, recovered.blob_version,
+            "A2 remainder block {block} must commit atomically with recovery"
+        );
+    }
+
+    println!("  Step 5: Cold-remount, regrow through block 3, and verify zeroes");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fuse_path)
+            .expect("open pending-append regrow");
+        file.set_len(4 * BLOCK_SIZE)
+            .expect("regrow pending-append file");
+        file.sync_all().expect("commit pending-append regrow");
+    }
+    let actual = std::fs::read(&fuse_path).expect("read pending-append regrow");
+    assert_eq!(actual.len(), 4 * BLOCK_SIZE as usize, "regrown length");
+    assert_eq!(
+        &actual[..2 * BLOCK_SIZE as usize],
+        expected_recovered.as_slice(),
+        "regrow must preserve committed prefix"
+    );
+    assert!(
+        actual[2 * BLOCK_SIZE as usize..]
+            .iter()
+            .all(|byte| *byte == 0),
+        "regrow must not expose the abandoned version-1 fragment"
+    );
+    unmount_fuse()?;
+    let regrown = fetch_object_layout(&bucket, key).await?;
+    assert_eq!(
+        regrown.pending_append(),
+        None,
+        "regrow must not recreate pending_append"
+    );
+
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+    println!(
+        "{}",
+        "SUCCESS: Pending append crash recovered through A1 and A2".green()
+    );
+    Ok(())
+}
+
+/// A teardown marker is an intent, not proof: a failed unlink leaves a
+/// marker naming a live file, and the mount-time scavenger must retain it
+/// and never delete the live blob's rows. A committed probe marker proves
+/// that the scavenger completed its pass.
+async fn test_scavenger_spares_live_blob_rows(disk_cache: bool) -> CmdResult {
+    let (ctx, bucket) = setup_test_bucket().await;
+    let key = "scavenger-live.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+
+    println!("  Step 1: Commit a two-block file with a committed block-1 overwrite");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let (v1, block1_new) = commit_mapped_two_block_file(&fuse_path, "scavenger-live");
+    unmount_fuse()?;
+    let mapped = fetch_object_layout(&bucket, key).await?;
+    let blob_id = mapped
+        .blob_guid()
+        .map_err(|e| std::io::Error::other(format!("blob_guid: {e:?}")))?
+        .blob_id;
+    let committed_rows = list_ovr_rows(&bucket, &blob_id).await?;
+    assert!(
+        !committed_rows.is_empty(),
+        "the committed overwrite must have produced rows"
+    );
+
+    println!("  Step 2: Plant a stale death warrant (what a failed unlink leaves)");
+    let timeout = Duration::from_secs(5);
+    let trace_id = TraceId::new();
+    let (nss, root_blob_name) = nss_raw_access(&bucket).await?;
+    let marker_key = ovr_gc_key(&blob_id);
+    let marker_value = format!("/{key}");
+    let resp = nss
+        .put_inode(
+            &root_blob_name,
+            &marker_key,
+            Bytes::from(marker_value.clone()),
+            Some(timeout),
+            &trace_id,
+            0,
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("nss put marker: {e:?}")))?;
+    parse_put_inode(resp).map_err(|e| std::io::Error::other(format!("put marker: {e:?}")))?;
+
+    // The probe must be a REPLAYABLE committed phase: rows-ready for a
+    // blob that has no rows completes instantly and removes the marker,
+    // proving the scavenger pass ran. The legacy "gc" value would be
+    // retained fail-closed and never resolve.
+    let probe_marker_key = ovr_gc_key(&uuid::Uuid::new_v4());
+    let resp = nss
+        .put_inode(
+            &root_blob_name,
+            &probe_marker_key,
+            Bytes::copy_from_slice(&encode_ovr_gc_rows_ready(0)),
+            Some(timeout),
+            &trace_id,
+            0,
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("nss put probe marker: {e:?}")))?;
+    parse_put_inode(resp).map_err(|e| std::io::Error::other(format!("put probe marker: {e:?}")))?;
+
+    println!("  Step 3: Remount and wait for the scavenger probe");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let resp = nss
+            .list_inodes(
+                &root_blob_name,
+                10,
+                &probe_marker_key,
+                "",
+                "",
+                true,
+                Some(timeout),
+                &trace_id,
+                0,
+            )
+            .await
+            .map_err(|e| std::io::Error::other(format!("nss list markers: {e:?}")))?;
+        let (page, _) = parse_list_inodes_raw(resp)
+            .map_err(|e| std::io::Error::other(format!("parse markers: {e:?}")))?;
+        if page.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "scavenger never resolved the committed probe marker"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let resp = nss
+        .list_inodes(
+            &root_blob_name,
+            10,
+            &marker_key,
+            "",
+            "",
+            true,
+            Some(timeout),
+            &trace_id,
+            0,
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("nss list stale marker: {e:?}")))?;
+    let (stale_page, _) = parse_list_inodes_raw(resp)
+        .map_err(|e| std::io::Error::other(format!("parse stale marker: {e:?}")))?;
+    assert!(
+        stale_page
+            .iter()
+            .any(|(entry_key, value)| entry_key == &marker_key
+                && value.as_ref() == marker_value.as_bytes()),
+        "scavenger must retain the conditional marker"
+    );
+
+    println!("  Step 4: The live blob's rows must have survived");
+    let rows_after = list_ovr_rows(&bucket, &blob_id).await?;
+    assert_eq!(
+        rows_after, committed_rows,
+        "the scavenger deleted a live blob's rows"
+    );
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&v1[..BLOCK_SIZE as usize]);
+    expected.extend_from_slice(&block1_new);
+    let actual = std::fs::read(&fuse_path).expect("read after scavenge");
+    assert_eq!(actual, expected, "committed content must keep serving");
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: Scavenger spared live rows and retained the conditional marker".green()
+    );
+    Ok(())
+}
+
+/// A streamed S3 GET must never turn reclaimed data into zeroes. The
+/// stream captures its layout, emits early blocks, then the object is
+/// deleted and a far block's exact base-version key reclaimed before
+/// the client drains the rest. The response must terminate with an
+/// error, never a fabricated zero tail.
+async fn test_s3_slow_stream_fails_after_reclaim(disk_cache: bool) -> CmdResult {
+    let _ = disk_cache;
+    let (ctx, bucket) = setup_test_bucket().await;
+    let key = "slow-stream-reclaim.bin";
+    // Far larger than any loopback socket buffering, so the final block
+    // cannot have been prefetched while the client stalls early on.
+    const NUM_BLOCKS: u64 = 256;
+    let object_size = (NUM_BLOCKS * BLOCK_SIZE) as usize;
+    let body = generate_test_data("slow-stream-reclaim", object_size);
+
+    println!("  Step 1: PUT a {NUM_BLOCKS}-block object");
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await
+        .expect("put slow-stream object");
+    let layout = fetch_object_layout(&bucket, key).await?;
+    let blob_guid = layout
+        .blob_guid()
+        .map_err(|e| std::io::Error::other(format!("blob_guid: {e:?}")))?;
+
+    println!("  Step 2: Start a GET and consume only the first blocks");
+    let resp = ctx
+        .client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("start slow GET");
+    let mut stream = resp.body;
+    let mut received: usize = 0;
+    while received < 2 * BLOCK_SIZE as usize {
+        let chunk = stream
+            .try_next()
+            .await
+            .map_err(|e| std::io::Error::other(format!("early stream read: {e}")))?
+            .ok_or_else(|| std::io::Error::other("stream ended before two blocks"))?;
+        assert!(
+            chunk.as_ref() == &body[received..received + chunk.len()],
+            "early streamed bytes must match the committed object"
+        );
+        received += chunk.len();
+    }
+
+    println!("  Step 3: Delete the object and reclaim the final block");
+    ctx.client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("delete streamed object");
+    let trace_id = TraceId::new();
+    let data_vg = data_vg_raw_access().await?;
+    data_vg
+        .delete_blob(blob_guid, (NUM_BLOCKS - 1) as u32, 1, &trace_id)
+        .await
+        .map_err(|e| std::io::Error::other(format!("reclaim final block: {e}")))?;
+
+    println!("  Step 4: Drain the rest; the stream must fail, not zero-fill");
+    let mut tail_failed = false;
+    loop {
+        match stream.try_next().await {
+            Ok(Some(chunk)) => {
+                assert!(
+                    chunk.as_ref() == &body[received..received + chunk.len()],
+                    "stream must never substitute reclaimed data at offset {received}"
+                );
+                received += chunk.len();
+                assert!(
+                    received < object_size,
+                    "server outran the backpressure window; the reclaim raced the stream"
+                );
+            }
+            Ok(None) => break,
+            Err(_) => {
+                tail_failed = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        tail_failed,
+        "stream must terminate in an error once its snapshot is gone \
+         (received {received}/{object_size})"
+    );
+
+    println!(
+        "{}",
+        "SUCCESS: Slow GET failed closed after reclamation".green()
+    );
+    Ok(())
+}
+
+/// Bucket teardown must reach the fenced-cleanup path over the real
+/// Rust-to-Zig NSS RPC boundary: a fenced nonempty probe returns the
+/// NSS-issued generation (never the legacy not-empty error), and the
+/// generation-carrying sweep must page through more than 1000 internal
+/// keys before the retried root delete succeeds.
+async fn test_fenced_bucket_teardown_sweeps_internal_keys(disk_cache: bool) -> CmdResult {
+    let _ = disk_cache;
+    let ctx = test_common::context();
+    let bucket = ctx.create_bucket("teardown-fence-sweep").await;
+    let hold_key = "hold.bin";
+
+    println!("  Step 1: A bucket holding a real object must refuse deletion");
+    ctx.client
+        .put_object()
+        .bucket(&bucket)
+        .key(hold_key)
+        .body(ByteStream::from(generate_test_data("teardown-hold", 128)))
+        .send()
+        .await
+        .expect("put hold object");
+    ctx.client
+        .delete_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect_err("nonempty bucket deletion must fail");
+
+    println!("  Step 2: Remove the object, then plant >1000 internal keys");
+    ctx.client
+        .delete_object()
+        .bucket(&bucket)
+        .key(hold_key)
+        .send()
+        .await
+        .expect("delete hold object");
+
+    let timeout = Duration::from_secs(5);
+    let (nss, root_blob_name) = nss_raw_access(&bucket).await?;
+    let mut internal_keys = Vec::new();
+    for _ in 0..3 {
+        let blob_id = uuid::Uuid::new_v4();
+        for block in 0..350u32 {
+            internal_keys.push(ovr_row_key(&blob_id, block));
+        }
+        internal_keys.push(ovr_gc_key(&blob_id));
+        internal_keys.push(format!(
+            "{}{}",
+            data_types::object_layout::HARDLINK_PREFIX,
+            blob_id.simple()
+        ));
+    }
+    assert!(
+        internal_keys.len() > 1000,
+        "the sweep must cover more than one NSS listing page"
+    );
+    for internal_key in &internal_keys {
+        let resp = nss
+            .put_inode(
+                &root_blob_name,
+                internal_key,
+                Bytes::from_static(b"x"),
+                Some(timeout),
+                &TraceId::new(),
+                0,
+            )
+            .await
+            .map_err(|e| std::io::Error::other(format!("nss put {internal_key}: {e:?}")))?;
+        parse_put_inode(resp)
+            .map_err(|e| std::io::Error::other(format!("put {internal_key}: {e:?}")))?;
+    }
+
+    println!("  Step 3: Bucket deletion must sweep the fenced keyspaces and finish");
+    ctx.client
+        .delete_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("fenced teardown must sweep internal keys and delete the bucket");
+
+    let buckets = ctx.list_buckets().await;
+    assert!(
+        buckets
+            .buckets()
+            .iter()
+            .all(|b| b.name() != Some(bucket.as_str())),
+        "bucket must be gone after fenced teardown"
+    );
+
+    println!(
+        "{}",
+        "SUCCESS: Fenced teardown swept >1000 internal keys over the RPC boundary".green()
+    );
+    Ok(())
+}
+
+/// Interrupted overwrite then same-mount retry: the failed attempt burns
+/// a version (the allocator advances durably before data I/O) while the
+/// ceiling stays put, so committed data keeps serving; the retry burns a
+/// fresh version and commits. Companion to
+/// `test_failed_ec_overwrite_keeps_committed_v1`, which remounts between
+/// the interruption and the retry.
+async fn test_overwrite_retry_after_quorum_failure(disk_cache: bool) -> CmdResult {
+    assert!(
+        !disk_cache,
+        "this EC failure regression requires no disk cache"
+    );
+    let (ctx, bucket) = setup_test_bucket().await;
+    let key = "overwrite-retry.bin";
+    let fuse_path = format!("{}/{}", MOUNT_POINT, key);
+    let file_len = 2 * BLOCK_SIZE as usize;
+    let v1 = generate_test_data("overwrite-retry-v1", file_len);
+    let v2 = generate_test_data("overwrite-retry-v2", file_len);
+
+    println!("  Step 1: Commit a two-block V1 file");
+    mount_fuse_rw(&bucket, disk_cache)?;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&fuse_path)
+            .expect("open V1 file");
+        file.write_all(&v1).expect("write V1 file");
+        file.sync_all().expect("commit V1 file");
+    }
+    let base = fetch_object_layout(&bucket, key).await?;
+    let base_version = base.blob_version;
+    let base_burn = base.next_burn_version();
+
+    println!("  Step 2: Stop two BSS nodes so EC write quorum is unavailable");
+    let mut restart_guard = BssZeroThreeRestartGuard::new();
+    // Keep two replicas available in each three-node NSS journal volume.
+    run_cmd! {
+        systemctl --user stop bss@0.service;
+        systemctl --user stop bss@3.service;
+    }?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    println!("  Step 3: V2 overwrite fails in-process, handle stays open");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fuse_path)
+        .expect("open V2 file");
+    file.write_all(&v2).expect("write V2");
+    let sync_error = file
+        .sync_all()
+        .expect_err("V2 sync must fail below EC write quorum");
+    assert_eq!(
+        sync_error.raw_os_error(),
+        Some(libc::EIO),
+        "failed EC overwrite must surface EIO"
+    );
+    let interrupted = fetch_object_layout(&bucket, key).await?;
+    assert_eq!(
+        interrupted.blob_version, base_version,
+        "the ceiling must not move on an interrupted overwrite"
+    );
+    assert!(
+        interrupted.next_burn_version() > base_burn,
+        "the failed attempt must have durably burned its version"
+    );
+
+    println!("  Step 4: Restart both BSS nodes");
+    let restart_result = run_cmd! {
+        systemctl --user start bss@0.service;
+        systemctl --user start bss@3.service;
+    };
+    if restart_result.is_ok() {
+        restart_guard.disarm();
+    }
+    restart_result?;
+    cmd_service::wait_for_port_ready(8088, 120)?;
+    cmd_service::wait_for_port_ready(8091, 120)?;
+    // A ready TCP port only means the process is up, not that the node has
+    // rejoined the volume group and can serve EC writes again. Give the
+    // cluster a moment to converge before retrying, then keep retrying on a
+    // generous budget: under full-suite load the rejoin can take well past
+    // ten seconds, and each iteration re-dirties the buffer so the flush is
+    // genuinely re-attempted (not a consumed-fsync-error no-op).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    println!("  Step 5: Retry V2 on the same handle until the flush commits");
+    let mut committed = false;
+    for _ in 0..60 {
+        file.seek(SeekFrom::Start(0)).expect("rewind for retry");
+        file.write_all(&v2).expect("rewrite V2");
+        if file.sync_all().is_ok() {
+            committed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        committed,
+        "V2 retry did not commit after BSS nodes returned"
+    );
+    drop(file);
+
+    println!("  Step 6: Verify the retry committed a newer generation");
+    let final_layout = fetch_object_layout(&bucket, key).await?;
+    assert!(
+        final_layout.blob_version > base_version,
+        "retry must commit a newer generation"
+    );
+    assert!(
+        final_layout.next_burn_version() > final_layout.blob_version,
+        "allocator must stay ahead of the ceiling"
+    );
+    unmount_fuse()?;
+
+    println!("  Step 7: Remount and verify V2 content");
+    mount_fuse_ro(&bucket, disk_cache)?;
+    let actual = std::fs::read(&fuse_path).expect("read committed V2");
+    assert_eq!(actual, v2, "retried V2 generation was not committed");
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &[key]).await;
+
+    println!(
+        "{}",
+        "SUCCESS: Interrupted overwrite retried and committed cleanly".green()
     );
     Ok(())
 }

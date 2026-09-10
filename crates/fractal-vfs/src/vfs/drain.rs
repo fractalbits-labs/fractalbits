@@ -1,6 +1,5 @@
 //! Flush orchestration: fsync/close flushes, writeback draining, release.
 
-use data_types::TraceId;
 use data_types::object_layout::ObjectLayout;
 use fractal_fuse::{FileHandleId, InodeId};
 use std::sync::Arc;
@@ -478,13 +477,10 @@ impl VfsCore {
         {
             if !self.has_open_handles_for_inode(ino, None) {
                 // Last handle closed, clean up blobs now
-                let trace_id = TraceId::new();
                 if let Ok(old_layout) =
                     rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
                 {
-                    self.backend()
-                        .delete_blob_blocks(&old_layout, &trace_id)
-                        .await;
+                    self.teardown_blob(&old_layout).await;
                 }
             } else {
                 // Still more handles open, re-insert
