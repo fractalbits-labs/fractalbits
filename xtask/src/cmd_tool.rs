@@ -253,7 +253,7 @@ fn describe_stack(stack_name: &str) -> CmdResult {
     println!("{table}");
 
     if !nlb_endpoint.is_empty() {
-        println!("\n API Server NLB Endpoint: {nlb_endpoint}");
+        println!("\n S3 Gateway NLB Endpoint: {nlb_endpoint}");
     }
 
     Ok(())
@@ -381,7 +381,7 @@ fn describe_gcp_stack(gcp_project: Option<&str>, gcp_zone: Option<&str>) -> CmdR
     if let Ok(ip) = lb_ip
         && !ip.trim().is_empty()
     {
-        println!("\n API Server LB Endpoint: {}", ip.trim());
+        println!("\n S3 Gateway LB Endpoint: {}", ip.trim());
     }
 
     Ok(())

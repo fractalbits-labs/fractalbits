@@ -11,7 +11,7 @@ pub struct UnifiedStatsWriter {
 
 impl UnifiedStatsWriter {
     pub fn new(stats_dir: String) -> Self {
-        let stats_file_path = format!("{}/api_server.stats", stats_dir);
+        let stats_file_path = format!("{}/s3_gateway.stats", stats_dir);
         Self {
             stats_file_path,
             shutdown_tx: None,

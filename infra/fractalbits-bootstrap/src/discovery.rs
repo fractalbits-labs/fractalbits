@@ -9,7 +9,7 @@ use crate::config::{BootstrapConfig, InstanceConfig};
 pub enum ServiceType {
     RootServer { is_leader: bool },
     NssServer { journal_uuid: Option<String> },
-    ApiServer,
+    S3Gateway,
     BssServer,
     GuiServer,
     BenchServer { bench_client_num: usize },
@@ -23,7 +23,7 @@ pub struct CliArgs {
     /// Bucket URI (s3:// or gs://) — positional, always first
     pub bucket_uri: String,
 
-    /// Service role: root_server, nss_server, api_server, bss_server, gui_server,
+    /// Service role: root_server, nss_server, s3_gateway, bss_server, gui_server,
     /// bench_server, bench_client
     #[clap(long)]
     pub role: Option<String>,
@@ -53,7 +53,7 @@ pub fn discover_from_args(args: &CliArgs) -> Result<ServiceType, Error> {
                 journal_uuid: None, // read from config.global.journal_uuid at bootstrap time
             })
         }
-        "api_server" => Ok(ServiceType::ApiServer),
+        "s3_gateway" => Ok(ServiceType::S3Gateway),
         "bss_server" => Ok(ServiceType::BssServer),
         "gui_server" => Ok(ServiceType::GuiServer),
         "bench_server" => Ok(ServiceType::BenchServer {
@@ -61,7 +61,7 @@ pub fn discover_from_args(args: &CliArgs) -> Result<ServiceType, Error> {
         }),
         "bench_client" => Ok(ServiceType::BenchClient),
         _ => Err(Error::other(format!(
-            "Unknown --role value: {role:?}. Expected one of: root_server, nss_server, api_server, bss_server, gui_server, bench_server, bench_client"
+            "Unknown --role value: {role:?}. Expected one of: root_server, nss_server, s3_gateway, bss_server, gui_server, bench_server, bench_client"
         ))),
     }
 }
@@ -98,7 +98,7 @@ fn parse_instance_config(instance_config: &InstanceConfig) -> Result<ServiceType
             }
             Ok(ServiceType::NssServer { journal_uuid })
         }
-        "api_server" => Ok(ServiceType::ApiServer),
+        "s3_gateway" => Ok(ServiceType::S3Gateway),
         "bss_server" => Ok(ServiceType::BssServer),
         "gui_server" => Ok(ServiceType::GuiServer),
         "bench_server" => {

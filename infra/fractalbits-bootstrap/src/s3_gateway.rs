@@ -31,7 +31,7 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     // Complete instances-ready stage
     InstancesReadyStage::complete(&barrier)?;
 
-    let mut binaries = vec!["api_server"];
+    let mut binaries = vec!["s3_gateway"];
     if config.is_etcd_backend() {
         binaries.push("etcdctl");
     }
@@ -47,7 +47,7 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
 
     create_config(config)?;
 
-    info!("Creating directories for api_server");
+    info!("Creating directories for s3_gateway");
     run_cmd!(mkdir -p "/data/local/stats")?;
 
     if config.global.deploy_target == DeployTarget::Aws {
@@ -55,10 +55,10 @@ pub fn bootstrap(config: &BootstrapConfig) -> CmdResult {
     }
 
     // setup_cloudwatch_agent()?;
-    create_systemd_unit_file("api_server", true)?;
-    register_service(config, "api-server")?;
+    create_systemd_unit_file("s3_gateway", true)?;
+    register_service(config, "s3-gateway")?;
 
-    // Signal that API server is ready
+    // Signal that S3 gateway is ready
     ServicesReadyStage::complete(&barrier)?;
 
     Ok(())
@@ -171,7 +171,7 @@ backend = "all_in_bss_single_az"
 
     run_cmd! {
         mkdir -p $ETC_PATH;
-        echo $config_content > $ETC_PATH/$API_SERVER_CONFIG
+        echo $config_content > $ETC_PATH/$S3_GATEWAY_CONFIG
     }?;
     Ok(())
 }

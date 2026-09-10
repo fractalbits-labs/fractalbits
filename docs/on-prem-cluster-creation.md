@@ -79,14 +79,14 @@ for_bench = false
 # Number of benchmark client nodes (only used when for_bench = true)
 # num_bench_clients = 4
 
-# Optional: Number of API server nodes (auto-detected from nodes list if not set)
-# num_api_servers = 2
+# Optional: Number of S3 gateway nodes (auto-detected from nodes list if not set)
+# num_s3_gateways = 2
 
 [endpoints]
-# API server endpoint (load balancer or single API server IP)
-# If not set, auto-detected from first api_server node
+# S3 gateway endpoint (load balancer or single S3 gateway IP)
+# If not set, auto-detected from first s3_gateway node
 # Required for bench_server to connect
-# api_server_endpoint = "10.0.1.30"
+# s3_gateway_endpoint = "10.0.1.30"
 
 # Node definitions grouped by service type
 # Each node entry has:
@@ -137,8 +137,8 @@ hostname = "bss-5"
 ip = "10.0.1.25"
 hostname = "bss-6"
 
-# API Server
-[[nodes.api_server]]
+# S3 Gateway
+[[nodes.s3_gateway]]
 ip = "10.0.1.30"
 hostname = "api-1"
 ```
@@ -150,7 +150,7 @@ hostname = "api-1"
 | `root_server` | Root State Store server (leader election, metadata coordination) | 1 |
 | `nss_server` | Namespace Server (handles S3 API routing, metadata) | 2 (active + standby) |
 | `bss_server` | Blob Storage Server (stores actual data, runs etcd) | 1-12 (recommend 6) |
-| `api_server` | S3 API endpoint server | 1+ |
+| `s3_gateway` | S3 API endpoint server | 1+ |
 | `bench_server` | Benchmark coordinator (optional) | 0-1 |
 | `bench_client` | Benchmark workers (optional) | 0+ |
 
@@ -185,7 +185,7 @@ role = "standby"
 [[nodes.bss_server]]
 ip = "10.0.1.20"
 
-[[nodes.api_server]]
+[[nodes.s3_gateway]]
 ip = "10.0.1.30"
 ```
 
@@ -214,7 +214,7 @@ role = "standby"
 [[nodes.bss_server]]
 ip = "10.0.1.20"
 
-[[nodes.api_server]]
+[[nodes.s3_gateway]]
 ip = "10.0.1.30"
 
 [[nodes.bench_client]]
@@ -302,8 +302,8 @@ ssh <nss-standby-ip> "journalctl -u nss_role_agent"
 # BSS logs
 ssh <bss-ip> "journalctl -u bss"
 
-# API Server logs
-ssh <api-ip> "journalctl -u api_server"
+# S3 Gateway logs
+ssh <api-ip> "journalctl -u s3_gateway"
 
 # etcd logs
 ssh <bss-ip> "journalctl -u etcd"
@@ -326,9 +326,9 @@ Ensure these ports are open between nodes:
 | Port | Protocol | Service | Direction |
 |------|----------|---------|-----------|
 | 22 | TCP | SSH | Deployment -> All nodes |
-| 80 | TCP | S3 API | Clients -> API Server |
+| 80 | TCP | S3 API | Clients -> S3 Gateway |
 | 2379 | TCP | etcd client | All nodes -> BSS nodes |
 | 2380 | TCP | etcd peer | BSS <-> BSS |
-| 8088 | TCP | Service RPC | RSS <-> NSS <-> BSS <-> API Server |
+| 8088 | TCP | Service RPC | RSS <-> NSS <-> BSS <-> S3 Gateway |
 | 9999 | TCP | Mirrord | NSS active <-> NSS standby |
 | 18088 | TCP | Management | Internal health checks |
