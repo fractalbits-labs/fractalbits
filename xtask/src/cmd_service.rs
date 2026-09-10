@@ -341,7 +341,7 @@ pub fn init_service(
         ServiceName::NssRoleAgent => {}
         ServiceName::Etcd => init_etcd()?,
         ServiceName::FirestoreEmulator => firestore_utils::ensure_firestore_emulator()?,
-        ServiceName::FsServer => {}
+        ServiceName::FsGateway | ServiceName::FsMount => {}
         ServiceName::All => {
             if init_config.with_https {
                 generate_https_certificates()?;
@@ -860,7 +860,7 @@ fn get_rss_backend_setting() -> RssBackend {
 /// fs_server env for its data volume. S3 access follows the cluster's
 /// blob backend so a mount can serve S3-resident objects; the data volume
 /// for new files follows it too unless `data_volume` overrides it.
-pub fn fs_server_data_volume_env(data_volume: &str) -> Vec<(&'static str, String)> {
+pub fn fs_gateway_data_volume_env(data_volume: &str) -> Vec<(&'static str, String)> {
     let hybrid = get_data_blob_storage_setting() == DataBlobStorage::S3HybridSingleAz;
     let data_volume = match data_volume {
         "" if hybrid => "s3",
@@ -869,12 +869,12 @@ pub fn fs_server_data_volume_env(data_volume: &str) -> Vec<(&'static str, String
     };
     let mut env = Vec::new();
     if hybrid || data_volume == "s3" {
-        env.push(("FS_SERVER_S3_HOST", "http://127.0.0.1".to_string()));
-        env.push(("FS_SERVER_S3_PORT", "9000".to_string()));
-        env.push(("FS_SERVER_S3_REGION", "localdev".to_string()));
-        env.push(("FS_SERVER_S3_BUCKET", "fractalbits-bucket".to_string()));
+        env.push(("FS_GATEWAY_S3_HOST", "http://127.0.0.1".to_string()));
+        env.push(("FS_GATEWAY_S3_PORT", "9000".to_string()));
+        env.push(("FS_GATEWAY_S3_REGION", "localdev".to_string()));
+        env.push(("FS_GATEWAY_S3_BUCKET", "fractalbits-bucket".to_string()));
     }
-    env.push(("FS_SERVER_DATA_VOLUME", data_volume.to_string()));
+    env.push(("FS_GATEWAY_DATA_VOLUME", data_volume.to_string()));
     env
 }
 
@@ -942,17 +942,19 @@ pub fn show_service_status(service: ServiceName) -> CmdResult {
                 }
             }
 
-            // fs_server is not part of all_services (standalone), show it separately
-            let svc_name = ServiceName::FsServer.as_ref();
-            let fs_status = match run_fun!(systemctl --user is-active $svc_name.service 2>/dev/null)
-            {
-                Ok(output) => match output.trim() {
-                    "active" => "active".green().to_string(),
-                    _ => "inactive (dead)".bright_black().to_string(),
-                },
-                Err(_) => "inactive (dead)".bright_black().to_string(),
-            };
-            println!("{svc_name:<16}: {fs_status}");
+            // The fs units are not part of all_services (standalone), show them separately
+            for svc in [ServiceName::FsGateway, ServiceName::FsMount] {
+                let svc_name = svc.as_ref();
+                let fs_status = match run_fun!(systemctl --user is-active $svc_name.service 2>/dev/null)
+                {
+                    Ok(output) => match output.trim() {
+                        "active" => "active".green().to_string(),
+                        _ => "inactive (dead)".bright_black().to_string(),
+                    },
+                    Err(_) => "inactive (dead)".bright_black().to_string(),
+                };
+                println!("{svc_name:<16}: {fs_status}");
+            }
         }
         single_service => {
             if single_service == ServiceName::Bss {
@@ -1152,7 +1154,8 @@ fn create_systemd_unit_files_for_init(
         | ServiceName::Minio
         | ServiceName::Etcd
         | ServiceName::FirestoreEmulator
-        | ServiceName::FsServer => {
+        | ServiceName::FsGateway
+        | ServiceName::FsMount => {
             create_systemd_unit_file(service, build_mode, init_config)?;
             if service == ServiceName::NssRoleAgent {
                 create_nss_role_agent_service_symlinks(DEFAULT_NSS_ROLE_AGENT_COUNT)?;
@@ -1285,38 +1288,42 @@ Environment="MINIO_REGION=localdev""##
                 "{java} -Duser.language=en -cp {jar} com.google.cloud.datastore.emulator.firestore.CloudFirestore start --host=localhost --port=8282 --database-mode=firestore-native"
             )
         }
-        ServiceName::FsServer => {
-            let fs = &init_config.fs_server;
-            env_settings += &format!("\nEnvironment=\"FS_SERVER_BUCKET_NAME={}\"", fs.bucket_name);
-            env_settings += &format!("\nEnvironment=\"FS_SERVER_MOUNT_POINT={}\"", fs.mount_point);
-            if !fs.mode.is_empty() {
-                env_settings += &format!("\nEnvironment=\"FS_SERVER_MODE={}\"", fs.mode);
-            }
-            env_settings += &format!("\nEnvironment=\"FS_SERVER_READ_WRITE={}\"", fs.read_write);
-            if fs.disk_cache_enabled {
-                env_settings += "\nEnvironment=\"FS_SERVER_DISK_CACHE_ENABLED=true\"";
+        ServiceName::FsGateway => {
+            let gw = &init_config.fs_gateway;
+            // Local development: no API key signature on Mount.
+            env_settings += "\nEnvironment=\"FS_GATEWAY_AUTH_REQUIRED=false\"";
+            if gw.disk_cache_enabled {
+                env_settings += "\nEnvironment=\"FS_GATEWAY_DISK_CACHE_ENABLED=true\"";
                 env_settings += &format!(
-                    "\nEnvironment=\"FS_SERVER_DISK_CACHE_PATH={}\"",
-                    fs.disk_cache_path
+                    "\nEnvironment=\"FS_GATEWAY_DISK_CACHE_PATH={}\"",
+                    gw.disk_cache_path
                 );
                 env_settings += &format!(
-                    "\nEnvironment=\"FS_SERVER_DISK_CACHE_SIZE_GB={}\"",
-                    fs.disk_cache_size_gb
+                    "\nEnvironment=\"FS_GATEWAY_DISK_CACHE_SIZE_GB={}\"",
+                    gw.disk_cache_size_gb
                 );
             }
+            for (key, value) in fs_gateway_data_volume_env(&gw.data_volume) {
+                env_settings += &format!("\nEnvironment=\"{key}={value}\"");
+            }
+            resolve_binary_path("fs_gateway", build_mode)
+        }
+        ServiceName::FsMount => {
+            let fs = &init_config.fs_mount;
+            env_settings += "\nEnvironment=\"FS_MOUNT_GATEWAY_ADDRS=127.0.0.1:8180\"";
+            env_settings += &format!("\nEnvironment=\"FS_MOUNT_BUCKET_NAME={}\"", fs.bucket_name);
+            env_settings += &format!("\nEnvironment=\"FS_MOUNT_MOUNT_POINT={}\"", fs.mount_point);
+            env_settings += &format!("\nEnvironment=\"FS_MOUNT_READ_WRITE={}\"", fs.read_write);
             if !fs.writeback_mode.is_empty() {
                 env_settings += &format!(
-                    "\nEnvironment=\"FS_SERVER_WRITEBACK_MODE={}\"",
+                    "\nEnvironment=\"FS_MOUNT_WRITEBACK_MODE={}\"",
                     fs.writeback_mode
                 );
             }
             if fs.allow_other {
-                env_settings += "\nEnvironment=\"FS_SERVER_ALLOW_OTHER=true\"";
+                env_settings += "\nEnvironment=\"FS_MOUNT_ALLOW_OTHER=true\"";
             }
-            for (key, value) in fs_server_data_volume_env(&fs.data_volume) {
-                env_settings += &format!("\nEnvironment=\"{key}={value}\"");
-            }
-            resolve_binary_path("fs_server", build_mode)
+            resolve_binary_path("fractalbits-mount", build_mode)
         }
         _ => unreachable!(),
     };
@@ -1344,7 +1351,7 @@ Environment="MINIO_REGION=localdev""##
                 }
             }
         }
-        ServiceName::FsServer => match get_data_blob_storage_setting() {
+        ServiceName::FsGateway => match get_data_blob_storage_setting() {
             DataBlobStorage::S3HybridSingleAz => {
                 "After=rss.service nss_role_agent@0.service minio.service\nWants=rss.service nss_role_agent@0.service minio.service\n".to_string()
             }
@@ -1352,6 +1359,7 @@ Environment="MINIO_REGION=localdev""##
                 "After=rss.service nss_role_agent@0.service\nWants=rss.service nss_role_agent@0.service\n".to_string()
             }
         },
+        ServiceName::FsMount => "After=fs_gateway.service\nWants=fs_gateway.service\n".to_string(),
         _ => String::new(),
     };
 
@@ -1395,7 +1403,7 @@ StartLimitBurst=100
         _ => service_name.to_string(),
     };
     let timeout_stop_sec = match service {
-        ServiceName::S3Gateway | ServiceName::FsServer => 60,
+        ServiceName::S3Gateway | ServiceName::FsGateway | ServiceName::FsMount => 60,
         _ => 5,
     };
 
@@ -1496,7 +1504,8 @@ pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdRes
         }
         ServiceName::Etcd => ("port 2379", vec![2379]),
         ServiceName::FirestoreEmulator => ("port 8282", vec![8282]),
-        ServiceName::FsServer => ("mountpoint check", vec![]),
+        ServiceName::FsGateway => ("port 8180", vec![8180]),
+        ServiceName::FsMount => ("mountpoint check", vec![]),
         ServiceName::All => unreachable!("Should not check readiness for All"),
     };
 

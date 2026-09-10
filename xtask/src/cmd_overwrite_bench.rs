@@ -1,7 +1,7 @@
 use crate::cmd_build::BuildMode;
 use crate::cmd_run_tests::fs_server::{self, MOUNT_POINT};
 use crate::cmd_service;
-use crate::{DataBlobStorage, FsServerConfig, InitConfig, ServiceName};
+use crate::{DataBlobStorage, FsMountConfig, InitConfig, ServiceName};
 use cmd_lib::*;
 
 /// Overwrite-heavy fio benchmark (VM-image / database profile) on a
@@ -16,7 +16,8 @@ pub async fn run(disk_cache: bool, file_mb: u32, write_secs: u32, read_secs: u32
     let mode = BuildMode::Release;
 
     // Clean slate.
-    let _ = cmd_service::stop_service(ServiceName::FsServer);
+    let _ = fs_server::unmount_fs(MOUNT_POINT);
+    let _ = fs_server::stop_gateway();
     cmd_service::stop_service(ServiceName::All)?;
     fs_server::ensure_fuse_uring()?;
 
@@ -34,36 +35,18 @@ pub async fn run(disk_cache: bool, file_mb: u32, write_secs: u32, read_secs: u32
     let (_ctx, bucket) = fs_server::setup_test_bucket().await;
 
     let mount_point = MOUNT_POINT;
-    run_cmd! {
-        ignore fusermount3 -u $mount_point 2>/dev/null;
-        ignore fusermount -u $mount_point 2>/dev/null;
-    }?;
-    run_cmd!(mkdir -p $mount_point)?;
-
     let dc_path = format!("{}/data/owbench_disk_cache", run_fun!(pwd)?);
-    let mut fs_cfg = FsServerConfig {
+    if disk_cache {
+        run_cmd!(rm -rf $dc_path)?;
+    }
+    fs_server::ensure_gateway(mode, &fs_server::gateway_config(disk_cache, &dc_path, 20))?;
+    let fs_cfg = FsMountConfig {
         bucket_name: bucket.clone(),
         mount_point: mount_point.to_string(),
         read_write: true,
         ..Default::default()
     };
-    if disk_cache {
-        run_cmd!(rm -rf $dc_path)?;
-        run_cmd!(mkdir -p $dc_path)?;
-        fs_cfg.disk_cache_enabled = true;
-        fs_cfg.disk_cache_path = dc_path.clone();
-        fs_cfg.disk_cache_size_gb = 20;
-    }
-    cmd_service::init_service(
-        ServiceName::FsServer,
-        mode,
-        &InitConfig {
-            fs_server: fs_cfg,
-            ..Default::default()
-        },
-    )?;
-    cmd_service::start_service(ServiceName::FsServer)?;
-    cmd_service::wait_for_service_ready(ServiceName::FsServer, 15)?;
+    fs_server::mount_fs(mode, &fs_cfg)?;
 
     let bench_file = format!("{mount_point}/owbench.bin");
     let size = format!("{file_mb}M");
@@ -95,13 +78,8 @@ pub async fn run(disk_cache: bool, file_mb: u32, write_secs: u32, read_secs: u32
         ("randread-128k", "randread", "128k", true),
         ("seqread-1m", "read", "1M", false),
     ] {
-        cmd_service::stop_service(ServiceName::FsServer)?;
-        run_cmd! {
-            ignore fusermount3 -u $mount_point 2>/dev/null;
-            ignore fusermount -u $mount_point 2>/dev/null;
-        }?;
-        cmd_service::start_service(ServiceName::FsServer)?;
-        cmd_service::wait_for_service_ready(ServiceName::FsServer, 15)?;
+        fs_server::unmount_fs(mount_point)?;
+        fs_server::mount_fs(mode, &fs_cfg)?;
 
         println!("--- PHASE {name}: {rw} bs={bs} (cold mount) ---");
         if time_based {
@@ -120,11 +98,8 @@ pub async fn run(disk_cache: bool, file_mb: u32, write_secs: u32, read_secs: u32
     }
 
     // Teardown.
-    run_cmd! {
-        ignore fusermount3 -u $mount_point 2>/dev/null;
-        ignore fusermount -u $mount_point 2>/dev/null;
-    }?;
-    let _ = cmd_service::stop_service(ServiceName::FsServer);
+    let _ = fs_server::unmount_fs(mount_point);
+    let _ = fs_server::stop_gateway();
     cmd_service::stop_service(ServiceName::All)?;
     Ok(())
 }
