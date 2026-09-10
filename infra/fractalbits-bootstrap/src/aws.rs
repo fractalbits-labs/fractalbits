@@ -24,9 +24,6 @@ pub fn get_cpu_target_from_instance_type(instance_type: &str) -> &'static str {
     let family = instance_type.split('.').next().unwrap_or("");
 
     match family {
-        // x86_64 instance families
-        "i3" => "broadwell",
-        "i3en" => "skylake",
         // aarch64 - Graviton3 (7th gen)
         "c7g" | "m7g" | "r7g" | "c7gn" | "c7gd" | "m7gd" | "r7gd" => "neoverse-n1",
         // aarch64 - Graviton4 (8th gen)
