@@ -5,7 +5,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use cmd_lib::*;
 use colored::*;
-use data_types::object_layout::ObjectLayout;
+use data_types::object_layout::{ObjectLayout, orphan_key};
 use data_types::ovr_map::{
     OVR_ABORT_VALUE, OvrRow, PrevSlot, RowState, encode_ovr_gc_rows_ready, ovr_gc_key, ovr_row_key,
     ovr_row_prefix, parse_ovr_abort_range, parse_ovr_row_block,
@@ -4924,6 +4924,7 @@ async fn test_fenced_bucket_teardown_sweeps_internal_keys(disk_cache: bool) -> C
             data_types::object_layout::HARDLINK_PREFIX,
             blob_id.simple()
         ));
+        internal_keys.push(orphan_key(blob_id));
     }
     assert!(
         internal_keys.len() > 1000,
