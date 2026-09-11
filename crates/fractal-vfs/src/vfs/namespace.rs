@@ -298,7 +298,10 @@ impl VfsCore {
                         // Another linker won; the source points elsewhere, so
                         // our CAS never landed; drop our orphan and join theirs.
                         if record_created {
-                            let _ = self.backend().delete_inode_record(new_id, &trace_id).await;
+                            let _ = self
+                                .backend()
+                                .delete_inode_record(new_id, false, &trace_id)
+                                .await;
                         }
                         let record = self
                             .cas_mutate_inode_record(id, &trace_id, bump_link)
@@ -308,7 +311,10 @@ impl VfsCore {
                     ObjectState::Directory(_) | ObjectState::Mpu(MpuState::Uploading) => {
                         // Source is not Indirect -> our CAS never landed.
                         if record_created {
-                            let _ = self.backend().delete_inode_record(new_id, &trace_id).await;
+                            let _ = self
+                                .backend()
+                                .delete_inode_record(new_id, false, &trace_id)
+                                .await;
                         }
                         return Err(FsError::IsDir);
                     }
@@ -320,7 +326,10 @@ impl VfsCore {
                             // Still normal after all retries -> our CAS never
                             // landed -> new_id is a true orphan.
                             if record_created {
-                                let _ = self.backend().delete_inode_record(new_id, &trace_id).await;
+                                let _ = self
+                                    .backend()
+                                    .delete_inode_record(new_id, false, &trace_id)
+                                    .await;
                             }
                             return Err(FsError::CasConflict);
                         }
@@ -345,7 +354,7 @@ impl VfsCore {
                                 .map_err(FsError::from)?
                                 .into();
                         self.backend()
-                            .put_inode_record(new_id, &record, &trace_id)
+                            .put_inode_record(new_id, &record, &src_key, &trace_id)
                             .await?;
                         record_created = true;
                         if self
@@ -855,7 +864,7 @@ impl VfsCore {
                 write_buf: Some({
                     // Fresh empty file; dirty so the close-time flush
                     // publishes the 0-byte inode.
-                    let mut wb = WriteBuffer::new(None, 0, DEFAULT_BLOCK_SIZE);
+                    let mut wb = WriteBuffer::new(false, 0, DEFAULT_BLOCK_SIZE);
                     wb.dirty = true;
                     wb.size_changed = true;
                     wb
@@ -1012,38 +1021,26 @@ impl VfsCore {
         }
     }
 
-    /// Clean up the value that previously lived at `key` after it was
-    /// unlinked or replaced by a rename. Handles every layout shape:
-    ///   - `Normal`: GC the blob blocks (deferred when a handle is still
-    ///     open so reads against the open fd keep working).
-    ///   - `Mpu(Completed)`: GC each part blob and delete the part inodes.
+    /// Reconcile the value that previously lived at `key` after it was
+    /// unlinked or replaced by a rename. The gateway already reclaimed a
+    /// data-bearing value, or moved it to `orphan_key` because this mount
+    /// still holds handles on it. What is left here is the mount's own
+    /// state and the hardlink record:
+    ///   - `Normal` / `Mpu(Completed)` with an orphan key: point the
+    ///     open handles at it.
     ///   - `Indirect`: decrement the shared `InodeRecord`'s nlink, bumping
     ///     the surviving file's ctime; when nlink reaches 0 delete the
-    ///     record and GC the real blob (or stamp `orphan_since` if a
-    ///     handle is still open). A redirect shares its blob with other
-    ///     names, so it is never deferred as a whole-blob cleanup.
+    ///     record with teardown (or stamp `orphan_since` if a handle is
+    ///     still open). A redirect shares its data with other names, so
+    ///     it is never orphaned as a whole.
     pub(crate) async fn cleanup_orphaned_value(
         &self,
-        key: &str,
         ino_hint: Option<InodeId>,
         old_bytes: Bytes,
+        orphan_key: Option<String>,
         trace_id: &TraceId,
     ) {
         if old_bytes.is_empty() {
-            return;
-        }
-        if let Some(ino) = ino_hint
-            && self.has_open_handles_for_inode(ino, None)
-            && !matches!(
-                rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
-                    .ok()
-                    .as_ref()
-                    .map(|l| &l.state),
-                Some(ObjectState::Indirect(_))
-            )
-        {
-            self.deferred_blob_cleanup
-                .insert(ino, (key.to_string(), old_bytes));
             return;
         }
         let Ok(old_layout) = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
@@ -1051,19 +1048,9 @@ impl VfsCore {
             return;
         };
         match &old_layout.state {
-            ObjectState::Normal(_) => {
-                self.teardown_blob(key, &old_layout).await;
-            }
-            ObjectState::Mpu(MpuState::Completed(_)) => {
-                if let Ok(parts) = self
-                    .backend()
-                    .list_mpu_parts(key, old_layout.version_id, trace_id)
-                    .await
-                {
-                    for (part_key, part_layout) in &parts {
-                        self.teardown_blob(part_key, part_layout).await;
-                        let _ = self.backend().delete_inode(part_key, trace_id).await;
-                    }
+            ObjectState::Normal(_) | ObjectState::Mpu(MpuState::Completed(_)) => {
+                if let (Some(ino), Some(orphan_key)) = (ino_hint, orphan_key) {
+                    self.adopt_orphan(ino, &orphan_key);
                 }
             }
             ObjectState::Indirect(redirect) => {
@@ -1093,7 +1080,7 @@ impl VfsCore {
                     .await;
                 match committed {
                     Ok(record) if record.nlink == 0 && !still_open => {
-                        // Reclaim the shared blob + record. This is safe
+                        // Reclaim the shared data + record. This is safe
                         // against a racing link: `bump_link` refuses to
                         // revive an nlink==0 record, so a link can only have
                         // committed *before* our decrement (then we observe
@@ -1102,9 +1089,10 @@ impl VfsCore {
                         if let Ok(fresh) = self.backend().get_inode_record(inode_id, trace_id).await
                             && fresh.nlink == 0
                         {
-                            self.teardown_blob(&InodeRecord::key_for(inode_id), &fresh.layout)
+                            let _ = self
+                                .backend()
+                                .delete_inode_record(inode_id, true, trace_id)
                                 .await;
-                            let _ = self.backend().delete_inode_record(inode_id, trace_id).await;
                         }
                     }
                     Ok(_) => {}
@@ -1113,7 +1101,7 @@ impl VfsCore {
                         // count could not be decremented (e.g. CAS retries
                         // exhausted under sustained contention). Surface it
                         // rather than silently leaving st_nlink too high /
-                        // leaking the blob; a record repair/GC sweep would
+                        // leaking the data; a record repair/GC sweep would
                         // reconcile.
                         tracing::warn!(
                             %inode_id, error = %e,
@@ -1163,26 +1151,16 @@ impl VfsCore {
             }
         }
 
-        // Pre-read the doomed layout: reject unsupported data layouts,
-        // and record the teardown intent (`@ovr-gc/`) BEFORE the inode
-        // delete. Once the inode is gone the blob_id is unrecoverable
-        // from any surviving key, so a crash between the delete and the
-        // row sweep would otherwise leak the rows permanently.
-        match self.backend().get_inode(&key, &trace_id).await {
-            Ok(doomed) => {
-                self.ensure_data_layout_supported(&doomed, &trace_id)
-                    .await?;
-                self.write_teardown_marker(&doomed, Some(&key), &trace_id)
-                    .await?;
-            }
-            Err(FsError::NotFound) => {}
-            Err(error) => return Err(error),
-        }
+        // Delete the inode. The gateway reclaims the data it named, or,
+        // while this mount still holds handles on it, moves the value to
+        // a hidden orphan key those handles keep addressing.
+        let still_open = ino.is_some_and(|ino| self.has_open_handles_for_inode(ino, None));
+        let deleted = self
+            .backend()
+            .delete_inode(&key, !still_open, still_open, &trace_id)
+            .await?;
 
-        // Delete the inode from the metadata store
-        let old_bytes = self.backend().delete_inode(&key, &trace_id).await?;
-
-        let old_bytes = match old_bytes {
+        let old_bytes = match deleted.previous {
             Some(bytes) => bytes,
             // A tainted target's create publish failed: the metadata store has nothing,
             // but the name is still locally visible (lookup keeps a tainted
@@ -1213,8 +1191,8 @@ impl VfsCore {
             self.inodes.remove_name_mapping(ino);
         }
 
-        // GC the value (blob blocks, or a hardlink nlink decrement).
-        self.cleanup_orphaned_value(&key, ino, old_bytes, &trace_id)
+        // Reconcile local state with what the gateway did to the value.
+        self.cleanup_orphaned_value(ino, old_bytes, deleted.orphan_key, &trace_id)
             .await;
 
         // Invalidate dir cache for parent
@@ -1376,7 +1354,9 @@ impl VfsCore {
         }
 
         // Delete the directory marker
-        self.backend().delete_inode(&key, &trace_id).await?;
+        self.backend()
+            .delete_inode(&key, false, false, &trace_id)
+            .await?;
 
         // Remove from inode table (marks name_removed, no refcount leak)
         if let Some(ino) = ino {
@@ -1445,21 +1425,6 @@ impl VfsCore {
             self.drain_inode_to_barrier(ino).await?;
         }
 
-        // A rename over an existing dst destroys it: reject unsupported
-        // data layouts up front and record the teardown intent for the
-        // displaced blob's rows before the swap makes its blob_id
-        // unrecoverable.
-        match self.backend().get_inode(&dst_key, &trace_id).await {
-            Ok(dst_layout) => {
-                self.ensure_data_layout_supported(&dst_layout, &trace_id)
-                    .await?;
-                self.write_teardown_marker(&dst_layout, Some(&dst_key), &trace_id)
-                    .await?;
-            }
-            Err(FsError::NotFound) => {}
-            Err(error) => return Err(error),
-        }
-
         // Determine type by probing metadata-store backend directly (no inode side effects)
         let is_dir = match self.backend().get_inode(&src_key, &trace_id).await {
             Ok(_) => false,
@@ -1520,13 +1485,24 @@ impl VfsCore {
             // close-time publish lands in the metadata store; rename/09.t / 10.t fire
             // the rename immediately after).
             // POSIX rename(2) atomically replaces an existing
-            // regular-file dst. The metadata store does the swap via
-            // `force_overwrite=true` and hands back the prior dst value
-            // so we can GC the orphaned blob.
-            let old_bytes = self
+            // regular-file dst. The gateway does the swap via
+            // `force_overwrite=true`, reclaims the displaced value (or
+            // moves it to an orphan key while this mount still holds
+            // handles on it) and hands back its bytes.
+            let dst_still_open =
+                dst_ino_before.is_some_and(|ino| self.has_open_handles_for_inode(ino, None));
+            let displaced = self
                 .backend()
-                .rename_file(&src_key, &dst_key, true, &trace_id)
+                .rename_file(
+                    &src_key,
+                    &dst_key,
+                    true,
+                    !dst_still_open,
+                    dst_still_open,
+                    &trace_id,
+                )
                 .await?;
+            let old_bytes = displaced.previous;
 
             // Drop the replaced dst's name from the inode table. A
             // hardlink redirect keeps its inode (other names) live; a
@@ -1542,11 +1518,11 @@ impl VfsCore {
                 self.inodes.remove_name_mapping(dst_ino);
             }
 
-            // GC the value the rename displaced: a blob for a Normal/Mpu
-            // file, or an nlink decrement for a hardlink redirect (so a
-            // rename over a multiply-linked file leaves the survivors at
-            // the right count, rename/23.t).
-            self.cleanup_orphaned_value(&dst_key, dst_ino_before, old_bytes, &trace_id)
+            // Reconcile the displaced value: point still-open dst handles
+            // at its orphan key, or decrement a hardlink redirect's nlink
+            // (so a rename over a multiply-linked file leaves the
+            // survivors at the right count, rename/23.t).
+            self.cleanup_orphaned_value(dst_ino_before, old_bytes, displaced.orphan_key, &trace_id)
                 .await;
 
             // Update inode s3_key if cached (read-only lookup, no refcount leak)

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::config::WritebackMode;
 use crate::error::FsError;
 use crate::inode::EntryType;
-use crate::prefetch::{prefetch_plan, should_prefetch};
+use crate::prefetch::should_prefetch;
 use crate::vfs::write_buffer::WriteBuffer;
 use crate::vfs::{DEFAULT_BLOCK_SIZE, FileHandle, VfsCore};
 
@@ -227,35 +227,33 @@ impl VfsCore {
                 // Existing file, no O_TRUNC: seed a sparse buffer from the
                 // committed geometry. No whole-file preload; partial-block
                 // edits lazy-load only the blocks they touch.
-                let blob_guid = l.blob_guid().ok();
                 let committed_size = l.size().unwrap_or(0);
-                Some(WriteBuffer::new(blob_guid, committed_size, l.block_size))
+                Some(WriteBuffer::new(true, committed_size, l.block_size))
             } else if let Some(ref l) = layout {
-                // O_TRUNC on an existing file: file_size 0, keep blob_guid so
-                // the override flush trims the old blocks; size_changed/dirty
-                // so flush sees the truncate. The committed layout size still
-                // bounds the flush trim range.
-                let blob_guid = l.blob_guid().ok();
-                let mut wb = WriteBuffer::new(blob_guid, 0, l.block_size);
+                // O_TRUNC on an existing file: file_size 0 with size_changed
+                // and dirty set so the flush sees the truncate; the
+                // committed layout size bounds the flush trim range.
+                let mut wb = WriteBuffer::new(true, 0, l.block_size);
                 wb.size_changed = true;
                 wb.dirty = true;
                 Some(wb)
             } else {
                 // Brand-new file (the metadata store lookup returned NotFound).
-                Some(WriteBuffer::new(None, 0, DEFAULT_BLOCK_SIZE))
+                Some(WriteBuffer::new(false, 0, DEFAULT_BLOCK_SIZE))
             }
         } else {
             None
         };
 
-        // Ask the gateway to warm its disk cache with the whole blob when
+        // Ask the gateway to warm its disk cache with the whole file when
         // the open-time policy says yes. Read-only opens only; writers own
-        // the blob's bytes via `WriteBuffer` and have no need for it. The
-        // gateway applies its own cache-pressure and completeness checks.
+        // the bytes via `WriteBuffer` and have no need for it. The gateway
+        // resolves the blocks and applies its own cache-pressure and
+        // completeness checks.
         if !is_write
             && let Some(ref l) = layout
+            && matches!(l.state, ObjectState::Normal(_))
             && let Ok(file_size) = l.size()
-            && let Ok(blob_guid) = l.blob_guid()
         {
             // FOPEN_KEEP_CACHE is the kernel's sequential-read hint; the
             // open(2) flag itself does not directly map, so the
@@ -263,18 +261,12 @@ impl VfsCore {
             // workload_bulk_read branches fire.
             let keep_cache_hint = false;
             if should_prefetch(file_size, keep_cache_hint, &self.prefetch_policy) {
-                let rows = self.row_map_for_prefetch(l).await;
-                let plan = prefetch_plan(l, rows.as_deref());
-                if !plan.is_empty() {
-                    let backend = self.backend();
-                    let key = s3_key.clone();
-                    compio_runtime::spawn(async move {
-                        backend
-                            .prefetch_blob(&key, blob_guid, file_size, plan)
-                            .await;
-                    })
-                    .detach();
-                }
+                let backend = self.backend();
+                let key = s3_key.clone();
+                compio_runtime::spawn(async move {
+                    backend.prefetch_inode(&key).await;
+                })
+                .detach();
             }
         }
 

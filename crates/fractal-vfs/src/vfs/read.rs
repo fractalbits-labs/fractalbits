@@ -1,14 +1,12 @@
-//! Data read paths: row-resolved exact block reads, MPU stitching,
-//! vfs_read, and the TTL-bounded clean-handle layout refresh.
+//! Data read paths: key-addressed block reads, MPU stitching, vfs_read,
+//! and the TTL-bounded clean-handle layout refresh.
 
-use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 use data_types::TraceId;
 use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
-use data_types::ovr_map::{BlockFetchPlan, OvrRowMap, block_fetch_plan, zeros};
+use data_types::ovr_map::zeros;
 use fractal_fuse::FileHandleId;
 use futures::{StreamExt, TryStreamExt, stream};
 
@@ -17,80 +15,31 @@ use crate::vfs::{TTL, VfsCore};
 
 /// Blocks fetched in parallel for one multi-block read.
 const READ_CONCURRENCY: usize = 8;
+/// Bound on stale-layout refreshes within one read.
+const MAX_STALE_REFRESHES: u32 = 64;
 
 impl VfsCore {
-    /// Read a block by resolving its exact committed identity from the
-    /// row snapshot (base version 1 when unmapped/absent), then fetching
-    /// it from the gateway (which serves its disk cache first). A `Hole`
-    /// resolution returns zeros with no gateway access.
-    ///
-    /// Miss semantics carry the row's durability contract: a
-    /// row-committed generation missing on every replica is detected
-    /// data loss (fail loudly), while a base-version miss is a sparse
-    /// hole only after the layout is revalidated against the metadata store (the
-    /// `validated_sparse_blocks` / `StaleLayout` protocol).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn read_block_cached(
+    /// Read one committed block of the file at `key` against `layout`.
+    /// The gateway resolves the exact generation and serves its disk
+    /// cache first; a hole comes back as zeros with no data on the wire.
+    /// A `StaleLayout` error means the key moved past `layout`.
+    pub(crate) async fn read_block_committed(
         &self,
         key: &str,
-        blob_guid: data_types::DataBlobGuid,
-        rows: Option<&OvrRowMap>,
-        ceiling: u64,
+        layout: &ObjectLayout,
         block_num: u32,
         block_content_len: usize,
-        block_size: usize,
-        validated_sparse_blocks: &HashSet<(data_types::DataBlobGuid, u32)>,
         trace_id: &TraceId,
     ) -> Result<Bytes, FsError> {
-        let (version, read_len, miss_is_loss) =
-            match block_fetch_plan(rows, block_num, ceiling, block_size, block_content_len) {
-                BlockFetchPlan::Zeros => return Ok(zeros(block_content_len)),
-                // Both row slots sit above this reader's ceiling: the
-                // layout snapshot is older than the row. Refresh both
-                // and retry via the stale-layout protocol.
-                BlockFetchPlan::Stale => {
-                    return Err(FsError::StaleLayout(blob_guid, block_num));
-                }
-                BlockFetchPlan::Fetch {
-                    version,
-                    read_len,
-                    miss_is_loss,
-                } => (version, read_len, miss_is_loss),
-            };
-
-        let mut data = match self
+        match self
             .backend()
-            .read_block(key, blob_guid, version, block_num, read_len, trace_id)
-            .await
+            .read_block(key, block_num, Some(layout.version_id), trace_id)
+            .await?
         {
-            Ok(r) => r,
-            Err(e) if e.is_block_missing() => {
-                if miss_is_loss {
-                    // The row committed this exact generation; nobody
-                    // holding it is data loss, never a hole. Fail loudly
-                    // instead of serving zeros or older bytes.
-                    tracing::error!(
-                        %blob_guid,
-                        block_num,
-                        version,
-                        "DATA LOSS: row-committed generation missing on every replica"
-                    );
-                    return Err(FsError::Corrupted);
-                }
-                // A base-version miss is zeros only after the metadata store confirms
-                // this handle still names the layout that issued it.
-                if validated_sparse_blocks.contains(&(blob_guid, block_num)) {
-                    return Ok(zeros(block_content_len));
-                }
-                return Err(FsError::StaleLayout(blob_guid, block_num));
-            }
-            Err(e) => return Err(e),
-        };
-        if data.len() > block_content_len {
-            data = data.slice(0..block_content_len);
+            Some(data) if data.len() > block_content_len => Ok(data.slice(0..block_content_len)),
+            Some(data) => Ok(data),
+            None => Ok(zeros(block_content_len)),
         }
-
-        Ok(data)
     }
 
     pub(crate) async fn read_mpu(
@@ -99,7 +48,6 @@ impl VfsCore {
         layout: &ObjectLayout,
         offset: u64,
         size: u32,
-        validated_sparse_blocks: &HashSet<(data_types::DataBlobGuid, u32)>,
     ) -> Result<Bytes, FsError> {
         let file_size = layout.size()?;
         if size == 0 || offset >= file_size {
@@ -127,9 +75,6 @@ impl VfsCore {
             }
 
             if part_end > offset {
-                let blob_guid = part_obj.blob_guid()?;
-                let part_rows = self.layout_row_map(part_obj).await?;
-                let part_ceiling = part_obj.blob_version;
                 let block_size = part_obj.block_size as u64;
 
                 let part_read_start = offset.saturating_sub(obj_offset);
@@ -144,21 +89,16 @@ impl VfsCore {
 
                 let fetched = stream::iter(first_block..=last_block)
                     .map(|block_num| {
-                        let rows = part_rows.as_deref();
                         let trace_id = &trace_id;
                         async move {
                             let block_start = block_num as u64 * block_size;
                             let block_content_len =
                                 std::cmp::min(block_size, part_size - block_start) as usize;
-                            self.read_block_cached(
+                            self.read_block_committed(
                                 part_key,
-                                blob_guid,
-                                rows,
-                                part_ceiling,
+                                part_obj,
                                 block_num,
                                 block_content_len,
-                                block_size as usize,
-                                validated_sparse_blocks,
                                 trace_id,
                             )
                             .await
@@ -203,20 +143,15 @@ impl VfsCore {
         layout: &ObjectLayout,
         offset: u64,
         buf: &mut [u8],
-        validated_sparse_blocks: &HashSet<(data_types::DataBlobGuid, u32)>,
     ) -> Result<usize, FsError> {
-        // The metadata-store layout is the sole size authority (the block-store geometry
-        // sentinel is gone with the versioned-key design); freshness
-        // comes from the attr-TTL-bounded layout refresh.
+        // The committed layout is the sole size authority; freshness comes
+        // from the attr-TTL-bounded layout refresh.
         let file_size = layout.size()?;
         let size = buf.len() as u32;
         if size == 0 || offset >= file_size {
             return Ok(0);
         }
 
-        let blob_guid = layout.blob_guid()?;
-        let rows = self.layout_row_map(layout).await?;
-        let ceiling = layout.blob_version;
         let block_size = layout.block_size as u64;
         let read_end = std::cmp::min(offset.saturating_add(size as u64), file_size);
         let actual_len = (read_end - offset) as usize;
@@ -230,24 +165,13 @@ impl VfsCore {
         let fetched = stream::iter(first_block..=last_block)
             .map(|block_num| {
                 let trace_id = &trace_id;
-                let rows = rows.as_deref();
                 async move {
                     let block_start = block_num as u64 * block_size;
                     let block_content_len =
                         std::cmp::min(block_size, file_size - block_start) as usize;
-                    self.read_block_cached(
-                        key,
-                        blob_guid,
-                        rows,
-                        ceiling,
-                        block_num,
-                        block_content_len,
-                        block_size as usize,
-                        validated_sparse_blocks,
-                        trace_id,
-                    )
-                    .await
-                    .map(|data| (block_num, data))
+                    self.read_block_committed(key, layout, block_num, block_content_len, trace_id)
+                        .await
+                        .map(|data| (block_num, data))
                 }
             })
             .buffered(READ_CONCURRENCY)
@@ -283,7 +207,6 @@ impl VfsCore {
         fh: FileHandleId,
         offset: u64,
         buf: &mut [u8],
-        validated_sparse_blocks: &HashSet<(data_types::DataBlobGuid, u32)>,
     ) -> Result<usize, FsError> {
         let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
         let layout = match &handle.layout {
@@ -294,19 +217,10 @@ impl VfsCore {
         drop(handle);
 
         match &layout.state {
-            ObjectState::Normal(_) => {
-                self.read_normal_buf(&s3_key, &layout, offset, buf, validated_sparse_blocks)
-                    .await
-            }
+            ObjectState::Normal(_) => self.read_normal_buf(&s3_key, &layout, offset, buf).await,
             ObjectState::Mpu(MpuState::Completed(_)) => {
                 let data = self
-                    .read_mpu(
-                        &s3_key,
-                        &layout,
-                        offset,
-                        buf.len() as u32,
-                        validated_sparse_blocks,
-                    )
+                    .read_mpu(&s3_key, &layout, offset, buf.len() as u32)
                     .await?;
                 let n = data.len().min(buf.len());
                 buf[..n].copy_from_slice(&data[..n]);
@@ -316,10 +230,7 @@ impl VfsCore {
         }
     }
 
-    /// Read data directly into a caller-provided buffer (zero-copy path).
-    ///
-    /// Tries to read from disk cache directly into `buf`. For cache misses
-    /// or unsupported object states, falls back to the Bytes path internally.
+    /// Read data directly into a caller-provided buffer.
     pub async fn vfs_read(
         &self,
         fh: FileHandleId,
@@ -342,22 +253,19 @@ impl VfsCore {
         {
             let file_size = wb.file_size;
             let block_size = wb.block_size;
-            let existing_blob_guid = wb.existing_blob_guid;
+            let has_committed_data = wb.has_committed_data;
             let eof_low_watermark = wb.eof_low_watermark;
             let blocks = wb.blocks.clone();
             let committed_layout = handle.layout.clone();
             let s3_key = handle.s3_key.clone();
             drop(handle);
-            let (committed_rows, committed_ceiling) =
-                self.rows_and_ceiling(committed_layout.as_ref()).await?;
             return self
                 .read_dirty_handle(
                     &s3_key,
                     file_size,
                     block_size,
-                    existing_blob_guid,
-                    committed_rows.as_deref(),
-                    committed_ceiling,
+                    has_committed_data,
+                    committed_layout.as_ref(),
                     &blocks,
                     eof_low_watermark,
                     offset,
@@ -368,54 +276,29 @@ impl VfsCore {
         drop(handle);
 
         self.refresh_handle_layout(fh, false).await?;
-        let mut validated_sparse_blocks = HashSet::new();
         let mut retried_corruption = false;
         let mut refresh_attempts = 0u32;
         loop {
-            let version_id = self
-                .file_handles
-                .get(&fh)
-                .and_then(|handle| handle.layout.as_ref().map(|layout| layout.version_id));
-            let result = self
-                .read_clean_handle(fh, offset, buf, &validated_sparse_blocks)
-                .await;
-            match result {
-                Err(FsError::StaleLayout(blob_guid, block_number)) => {
+            match self.read_clean_handle(fh, offset, buf).await {
+                // The gateway resolved against a newer committed layout
+                // than this handle holds. Refresh and restart the whole
+                // request so one read() never straddles two commits.
+                Err(FsError::StaleLayout) => {
                     refresh_attempts += 1;
-                    if refresh_attempts > 64 {
+                    if refresh_attempts > MAX_STALE_REFRESHES {
                         tracing::error!(
-                            %blob_guid,
-                            block_number,
-                            "stale-layout retry budget exhausted; ceiling never advanced"
+                            fh = fh.0,
+                            "stale-layout retry budget exhausted; layout never settled"
                         );
-                        return Err(FsError::StaleLayout(blob_guid, block_number));
+                        return Err(FsError::StaleLayout);
                     }
                     self.refresh_handle_layout(fh, true).await?;
-                    let refreshed_version = self
-                        .file_handles
-                        .get(&fh)
-                        .and_then(|handle| handle.layout.as_ref().map(|layout| layout.version_id));
-                    if refreshed_version == version_id {
-                        // The metadata store still names the very layout that produced
-                        // the miss: the miss is a genuine sparse hole for
-                        // this identity. Restarting the whole request at
-                        // the (unchanged) ceiling keeps one read() from
-                        // straddling two snapshots.
-                        if !validated_sparse_blocks.insert((blob_guid, block_number)) {
-                            return Err(FsError::StaleLayout(blob_guid, block_number));
-                        }
-                    } else {
-                        validated_sparse_blocks.clear();
-                    }
                 }
                 Err(FsError::Corrupted) if !retried_corruption => {
                     self.refresh_handle_layout(fh, true).await?;
-                    validated_sparse_blocks.clear();
                     retried_corruption = true;
                 }
-                other => {
-                    return other;
-                }
+                other => return other,
             }
         }
     }
@@ -444,17 +327,7 @@ impl VfsCore {
             (handle.ino, handle.s3_key.clone(), layout.version_id)
         };
 
-        let (inode_id, name_removed) = self
-            .inodes
-            .get(ino)
-            .map(|entry| (entry.inode_id, entry.name_removed))
-            .unwrap_or((None, false));
-        if name_removed && inode_id.is_none() {
-            if let Some(mut handle) = self.file_handles.get_mut(&fh) {
-                handle.layout_refreshed_at = Instant::now();
-            }
-            return Ok(());
-        }
+        let inode_id = self.inodes.get(ino).and_then(|entry| entry.inode_id);
 
         let trace_id = TraceId::new();
         let (fresh, resolved_id) = if let Some(id) = inode_id {
@@ -466,8 +339,8 @@ impl VfsCore {
             let layout = match self.backend().get_inode(&s3_key, &trace_id).await {
                 Ok(layout) => layout,
                 // A rename can remove the original name while an open fd
-                // legitimately keeps the old blob alive. Retain that handle
-                // snapshot; rename does not enqueue a data sweep.
+                // legitimately keeps the old data alive. Retain that handle
+                // snapshot; rename does not tear the data down.
                 Err(FsError::NotFound) => {
                     if let Some(mut handle) = self.file_handles.get_mut(&fh)
                         && handle.layout.as_ref().map(|l| l.version_id) == Some(version_id)
@@ -482,24 +355,10 @@ impl VfsCore {
             (layout, id)
         };
 
-        // An S3 PUT that replaced the object installs a fresh blob_guid;
-        // the open fd keeps its snapshot of the old blob (Unix unlink
-        // semantics) and takes its chances against that blob's deletion.
-        let retain_open_identity = self
-            .file_handles
-            .get(&fh)
-            .and_then(|handle| handle.layout.clone())
-            .is_some_and(|current| match &current.state {
-                ObjectState::Normal(_) => current.blob_guid().ok() != fresh.blob_guid().ok(),
-                _ => false,
-            });
-        if retain_open_identity {
-            if let Some(mut handle) = self.file_handles.get_mut(&fh) {
-                handle.layout_refreshed_at = Instant::now();
-            }
-            return Ok(());
-        }
-
+        // An S3 PUT that replaced the object installs a fresh blob. Data is
+        // addressed by key, so the open fd adopts the replacement rather
+        // than keeping a snapshot it could no longer read (a deliberate
+        // departure from unlink semantics for out-of-band replacement).
         let mut updated = false;
         if let Some(mut handle) = self.file_handles.get_mut(&fh)
             && handle.layout.as_ref().map(|l| l.version_id) == Some(version_id)
@@ -510,7 +369,7 @@ impl VfsCore {
                 && !wb.dirty
             {
                 wb.file_size = fresh.size()?;
-                wb.existing_blob_guid = fresh.blob_guid().ok();
+                wb.has_committed_data = true;
                 wb.block_size = fresh.block_size;
                 wb.size_changed = false;
                 wb.eof_low_watermark = None;
@@ -525,14 +384,5 @@ impl VfsCore {
             }
         }
         Ok(())
-    }
-
-    /// Prefetch helper: hand the row snapshot to the whole-blob
-    /// prefetcher so every insert lands at the exact committed identity.
-    pub(crate) async fn row_map_for_prefetch(
-        &self,
-        layout: &ObjectLayout,
-    ) -> Option<Arc<OvrRowMap>> {
-        self.layout_row_map(layout).await.ok().flatten()
     }
 }

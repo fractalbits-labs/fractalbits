@@ -13,6 +13,7 @@ use hmac::{Hmac, Mac};
 use rpc_client_rss::RpcClientRss;
 use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::FsError;
@@ -27,6 +28,8 @@ const MOUNT_SKEW: Duration = Duration::from_secs(300);
 pub struct Session {
     pub bucket: String,
     pub read_write: bool,
+    /// The mounting process, stable across its re-mounts.
+    pub instance: Uuid,
 }
 
 pub struct Auth {
@@ -109,12 +112,14 @@ impl Auth {
         Ok(())
     }
 
-    /// Token layout: `[u8 read_write][u64 expiry_ms][bucket][32-byte tag]`.
+    /// Token layout: `[u8 read_write][u64 expiry_ms][16-byte instance]
+    /// [bucket][32-byte tag]`.
     pub fn issue_token(&self, session: &Session) -> Bytes {
         let expiry = unix_ms().saturating_add(self.token_ttl.as_millis() as u64);
-        let mut payload = BytesMut::with_capacity(9 + session.bucket.len() + TAG_LEN);
+        let mut payload = BytesMut::with_capacity(25 + session.bucket.len() + TAG_LEN);
         payload.put_u8(session.read_write as u8);
         payload.put_u64_le(expiry);
+        payload.put_slice(session.instance.as_bytes());
         payload.put_slice(session.bucket.as_bytes());
         let tag = hmac_tag(&self.secret, &payload);
         payload.put_slice(&tag);
@@ -122,7 +127,7 @@ impl Auth {
     }
 
     pub fn verify_token(&self, token: &[u8]) -> Result<Session, FsError> {
-        if token.len() < 9 + TAG_LEN {
+        if token.len() < 25 + TAG_LEN {
             return Err(FsError::Unauthorized("malformed session token".into()));
         }
         let (payload, tag) = token.split_at(token.len() - TAG_LEN);
@@ -134,10 +139,37 @@ impl Auth {
         if unix_ms() > expiry {
             return Err(FsError::Unauthorized("session token expired".into()));
         }
-        let bucket = std::str::from_utf8(&payload[9..])
+        let instance = Uuid::from_slice(&payload[9..25]).expect("16 bytes");
+        let bucket = std::str::from_utf8(&payload[25..])
             .map_err(|_| FsError::Unauthorized("malformed session token".into()))?
             .to_string();
-        Ok(Session { bucket, read_write })
+        Ok(Session {
+            bucket,
+            read_write,
+            instance,
+        })
+    }
+}
+
+impl Auth {
+    /// Sign an opaque payload under the process secret: `payload || tag`.
+    pub fn sign(&self, payload: &[u8]) -> Bytes {
+        let mut out = BytesMut::with_capacity(payload.len() + TAG_LEN);
+        out.put_slice(payload);
+        out.put_slice(&hmac_tag(&self.secret, payload));
+        out.freeze()
+    }
+
+    /// The payload of a value produced by `sign`, if the tag verifies.
+    pub fn verify_signed<'a>(&self, signed: &'a [u8], what: &str) -> Result<&'a [u8], FsError> {
+        if signed.len() < TAG_LEN {
+            return Err(FsError::Unauthorized(format!("malformed {what}")));
+        }
+        let (payload, tag) = signed.split_at(signed.len() - TAG_LEN);
+        if !constant_time_eq(&hmac_tag(&self.secret, payload), tag) {
+            return Err(FsError::Unauthorized(format!("unknown {what}")));
+        }
+        Ok(payload)
     }
 }
 

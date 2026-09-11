@@ -112,29 +112,40 @@ rpc_method!(
     ListMpuPartsRequest,
     ListMpuPartsResponse
 );
-rpc_method!(
-    allocate_blob_guid,
-    AllocateBlobGuid,
-    AllocateBlobGuidRequest,
-    AllocateBlobGuidResponse
-);
 rpc_method!(read_block, ReadBlock, ReadBlockRequest, ReadBlockResponse);
 rpc_method!(
-    write_block,
-    WriteBlock,
-    WriteBlockRequest,
-    WriteBlockResponse
+    probe_data_blocks,
+    ProbeDataBlocks,
+    ProbeDataBlocksRequest,
+    ProbeDataBlocksResponse
 );
 rpc_method!(
-    list_blob_blocks,
-    ListBlobBlocks,
-    ListBlobBlocksRequest,
-    ListBlobBlocksResponse
+    begin_flush,
+    BeginFlush,
+    BeginFlushRequest,
+    BeginFlushResponse
 );
 rpc_method!(
-    prefetch_blob,
-    PrefetchBlob,
-    PrefetchBlobRequest,
-    PrefetchBlobResponse
+    write_flush_block,
+    WriteFlushBlock,
+    WriteFlushBlockRequest,
+    WriteFlushBlockResponse
 );
-rpc_method!(sweep_blob, SweepBlob, SweepBlobRequest, SweepBlobResponse);
+rpc_method!(
+    commit_flush,
+    CommitFlush,
+    CommitFlushRequest,
+    CommitFlushResponse
+);
+rpc_method!(
+    abort_flush,
+    AbortFlush,
+    AbortFlushRequest,
+    AbortFlushResponse
+);
+rpc_method!(
+    prefetch_inode,
+    PrefetchInode,
+    PrefetchInodeRequest,
+    PrefetchInodeResponse
+);

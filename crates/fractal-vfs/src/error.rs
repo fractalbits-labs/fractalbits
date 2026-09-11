@@ -63,22 +63,14 @@ pub enum FsError {
     #[error("cas conflict: stored value changed under the put_inode_cas guard")]
     CasConflict,
 
-    #[error("layout may have changed while reading sparse block {1} of {0}")]
-    StaleLayout(data_types::DataBlobGuid, u32),
+    /// The gateway resolved the read against a newer committed layout
+    /// than the one this handle holds; refresh and retry.
+    #[error("layout changed under the read")]
+    StaleLayout,
 
     /// The gateway rejected the session even after a re-mount.
     #[error("unauthorized: {0}")]
     Unauthorized(String),
-}
-
-impl FsError {
-    /// The addressed exact generation does not exist on enough nodes.
-    pub(crate) fn is_block_missing(&self) -> bool {
-        matches!(
-            self,
-            FsError::BlockNotFound | FsError::Rpc(RpcError::NotFound)
-        )
-    }
 }
 
 impl From<FsError> for io::Error {
@@ -111,7 +103,7 @@ impl From<FsError> for io::Error {
             // A CAS conflict means the guarded inode bytes changed before
             // this publish. ESTALE is the honest kernel result.
             FsError::CasConflict => io::Error::from_raw_os_error(libc::ESTALE),
-            FsError::StaleLayout(_, _) => io::Error::from_raw_os_error(libc::ESTALE),
+            FsError::StaleLayout => io::Error::from_raw_os_error(libc::ESTALE),
             FsError::Unauthorized(_) => io::Error::from_raw_os_error(libc::EACCES),
         }
     }
@@ -152,6 +144,7 @@ impl From<fs_gateway_codec::Error> for FsError {
             ErrorKind::Unauthorized => FsError::Unauthorized(e.message),
             ErrorKind::ReadOnly => FsError::ReadOnly,
             ErrorKind::Deserialize => FsError::Deserialize(e.message),
+            ErrorKind::StaleLayout => FsError::StaleLayout,
             ErrorKind::Internal => FsError::Internal(e.message),
         }
     }

@@ -4,6 +4,11 @@
 //! by its session token, resolved to a bucket backend, executed, and
 //! answered. Requests on one connection run concurrently; replies are
 //! matched by request id on the client.
+//!
+//! Authorization is the namespace: a session may only name keys in its
+//! bucket, and data is addressed by key and logical block. The client
+//! never names a blob or a generation, so nothing it sends can reach
+//! another bucket's storage.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -17,23 +22,32 @@ use compio_buf::BufResult;
 use compio_io::{AsyncReadExt, AsyncWriteExt};
 use compio_net::{TcpListener, TcpSocket, TcpStream};
 use data_types::TraceId;
-use data_types::object_layout::{HARDLINK_PREFIX, InodeRecord, ObjectLayout, ObjectState};
-use data_types::ovr_map::{OvrRow, parse_ovr_row_block};
+use data_types::object_layout::{
+    HARDLINK_PREFIX, InodeRecord, MpuState, ORPHAN_PREFIX, ObjectLayout, ObjectState, orphan_key,
+    posix_only_moved,
+};
+use data_types::ovr_map::{OVR_GC_PREFIX, OVR_ROW_PREFIX};
 use fs_gateway_codec::*;
 use futures::channel::mpsc;
 use futures::{SinkExt, StreamExt};
 use prost::Message;
 use rpc_client_rss::RpcClientRss;
 use rpc_codec_common::MessageHeaderTrait;
+use uuid::Uuid;
 
 use crate::auth::{Auth, Session};
-use crate::backend::{BLOB_OWNER_PREFIX, BackendConfig, StorageBackend};
+use crate::backend::{BackendConfig, StorageBackend};
 use crate::config::Config;
 use crate::disk_cache::{DiskCache, MIRROR_BYTE_BUDGET, MirrorHandle, MirrorJob};
 use crate::error::FsError;
+use crate::flush;
 use crate::prefetch;
+use crate::resolve::BlockRead;
 use crate::s3_volume::S3DataVolume;
-use crate::sweep::{SweepCoordinator, enqueue_sweep_request, scavenge_teardown_markers};
+use crate::sweep::{
+    SweepCoordinator, delete_with_teardown, scavenge_orphans, scavenge_teardown_markers,
+    teardown_value, write_conditional_marker,
+};
 
 const HEADER_SIZE: usize = size_of::<MessageHeader>();
 /// Largest encoded request accepted. Data commands apply the tighter block
@@ -50,7 +64,11 @@ const REPLY_QUEUE: usize = 4096;
 const CONNECTION_INFLIGHT_LIMIT: usize = 256;
 const GLOBAL_INFLIGHT_LIMIT: usize = 2048;
 const PREFETCH_INFLIGHT_LIMIT: usize = 8;
-const MAX_PREFETCH_BLOCKS: usize = 8192;
+
+/// Internal keyspaces the client may not address at all. `@hardlink/`
+/// records and `@orphan/` keys are namespace state the client
+/// legitimately reads and publishes to.
+const RESERVED_PREFIXES: [&str; 2] = [OVR_ROW_PREFIX, OVR_GC_PREFIX];
 
 pub struct Gateway {
     pub config: Arc<Config>,
@@ -128,9 +146,40 @@ macro_rules! respond {
     }};
 }
 
-fn decode_guid(guid: Option<&BlobGuid>) -> Result<data_types::DataBlobGuid, FsError> {
-    let guid = guid.ok_or_else(|| FsError::Internal("missing blob guid".into()))?;
-    data_types::DataBlobGuid::try_from(guid).map_err(FsError::Internal)
+fn reject_reserved_key(key: &str) -> Result<(), FsError> {
+    if RESERVED_PREFIXES
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
+    {
+        return Err(FsError::Unauthorized("reserved gateway key".into()));
+    }
+    Ok(())
+}
+
+/// Optional 16-byte layout version id on a read request.
+fn expected_version(bytes: &[u8]) -> Result<Option<Uuid>, FsError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    Uuid::from_slice(bytes)
+        .map(Some)
+        .map_err(|_| FsError::InvalidState)
+}
+
+/// A value that names data on shared storage: the data binding the
+/// client may carry forward but never author.
+fn names_data(layout: &ObjectLayout) -> bool {
+    match &layout.state {
+        ObjectState::Normal(data) => !data.blob_guid.blob_id.is_nil(),
+        ObjectState::Mpu(MpuState::Completed(_)) => true,
+        _ => false,
+    }
+}
+
+/// A client-supplied inode value, decoded by key shape.
+#[derive(Debug)]
+struct ClientValue {
+    layout: ObjectLayout,
 }
 
 impl Gateway {
@@ -198,7 +247,7 @@ impl Gateway {
         if let Some(previous) = self.buckets.lock().get(bucket)
             && previous.root_blob_name == discovered.root_blob_name
         {
-            discovered.owned_blobs = previous.owned_blobs.clone();
+            discovered.caches = previous.caches.clone();
         }
         let cfg = Arc::new(discovered);
         self.buckets.lock().insert(bucket.to_string(), cfg.clone());
@@ -223,7 +272,7 @@ impl Gateway {
     }
 
     /// Best-effort disk-cache population off the request path.
-    fn mirror_insert(
+    pub(crate) fn mirror_insert(
         &self,
         blob_guid: data_types::DataBlobGuid,
         block: u32,
@@ -275,11 +324,18 @@ impl Gateway {
         );
         // One scavenge pass per mount, as the old per-process fs_server
         // did at startup: markers a crashed teardown left behind become
-        // row-teardown work again.
+        // row-teardown work again, and a writer reclaims the orphans of
+        // any writer before it.
+        let instance = Uuid::from_slice(&req.instance).unwrap_or_else(|_| Uuid::new_v4());
         compio_runtime::spawn(scavenge_teardown_markers(cfg.clone(), self.sweep.clone())).detach();
+        if req.read_write {
+            compio_runtime::spawn(scavenge_orphans(cfg.clone(), self.sweep.clone(), instance))
+                .detach();
+        }
         let session = Session {
             bucket: req.bucket,
             read_write: req.read_write,
+            instance,
         };
         Ok(mount_response::Session {
             token: self.auth.issue_token(&session),
@@ -293,100 +349,74 @@ impl Gateway {
         trace_id: &TraceId,
     ) -> Result<read_block_response::Block, FsError> {
         let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
-        let blob_guid = decode_guid(req.blob.as_ref())?;
-        let content_len = req.content_len as usize;
-        if content_len > ObjectLayout::DEFAULT_BLOCK_SIZE as usize || req.version == 0 {
-            return Err(FsError::InvalidState);
-        }
-        backend
-            .verify_blob_owner(blob_guid, &req.key, trace_id)
-            .await?;
-        if let Some(dc) = &self.disk_cache
-            && let Some(cached) = dc
-                .get_block_exact(blob_guid, req.block_number, req.version, content_len)
-                .await
+        reject_reserved_key(&req.key)?;
+        let expected = expected_version(&req.expected_version_id)?;
+        match backend
+            .read_block_at_key(
+                &req.key,
+                req.block_number,
+                expected,
+                self.disk_cache.as_ref(),
+                trace_id,
+            )
+            .await?
         {
-            return Ok(read_block_response::Block { data: cached });
+            BlockRead::Data(data) => Ok(read_block_response::Block { data, hole: false }),
+            BlockRead::Hole => Ok(read_block_response::Block {
+                data: Bytes::new(),
+                hole: true,
+            }),
         }
-        let (mut data, _checksum) = backend
-            .read_block(
-                blob_guid,
-                req.version,
-                req.block_number,
-                content_len,
-                trace_id,
-            )
-            .await?;
-        if data.len() > content_len {
-            data = data.slice(0..content_len);
-        }
-        // Cold fill inline (as the in-process cache did) so a re-read
-        // right after this one is already a disk hit.
-        if let Some(dc) = &self.disk_cache {
-            let _ = dc
-                .insert_block(blob_guid, req.block_number, req.version, &data)
-                .await;
-        }
-        Ok(read_block_response::Block { data })
     }
 
-    async fn write_block(&self, req: WriteBlockRequest, trace_id: &TraceId) -> Result<(), FsError> {
-        let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-        let blob_guid = decode_guid(req.blob.as_ref())?;
-        // BSS rejects anything above one shard; enforce it here so a bad
-        // client cannot reach that check on a shared node.
-        if req.data.len() > ObjectLayout::DEFAULT_BLOCK_SIZE as usize || req.version == 0 {
-            return Err(FsError::InvalidState);
-        }
-        backend
-            .verify_blob_owner(blob_guid, &req.key, trace_id)
-            .await?;
-        let stored = backend
-            .write_block(
-                blob_guid,
-                req.block_number,
-                req.data.clone(),
-                req.version,
-                trace_id,
-            )
-            .await?;
-        // A write-once key that already existed kept its original bytes;
-        // mirroring the caller's copy would poison the disk cache.
-        if stored {
-            self.mirror_insert(blob_guid, req.block_number, req.version, req.data);
-        }
-        Ok(())
-    }
-
-    async fn prefetch_blob(
+    async fn probe_data_blocks(
         &self,
-        req: PrefetchBlobRequest,
+        req: ProbeDataBlocksRequest,
+        trace_id: &TraceId,
+    ) -> Result<probe_data_blocks_response::Blocks, FsError> {
+        let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
+        reject_reserved_key(&req.key)?;
+        let expected = expected_version(&req.expected_version_id)?;
+        let data_blocks = backend
+            .probe_data_blocks(
+                &req.key,
+                req.first_block,
+                req.block_count,
+                expected,
+                trace_id,
+            )
+            .await?;
+        Ok(probe_data_blocks_response::Blocks { data_blocks })
+    }
+
+    async fn prefetch_inode(
+        &self,
+        req: PrefetchInodeRequest,
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
         let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
+        reject_reserved_key(&req.key)?;
         let Some(dc) = &self.disk_cache else {
             return Ok(());
         };
-        let blob_guid = decode_guid(req.blob.as_ref())?;
-        backend
-            .verify_blob_owner(blob_guid, &req.key, trace_id)
+        let layout = backend
+            .resolve_layout(&req.key, None, false, trace_id)
             .await?;
-        if req.blocks.len() > MAX_PREFETCH_BLOCKS
-            || req.blocks.iter().any(|plan| {
-                plan.version == 0
-                    || plan.content_len > ObjectLayout::DEFAULT_BLOCK_SIZE
-                    || plan.read_len > ObjectLayout::DEFAULT_BLOCK_SIZE
-                    || plan.content_len > plan.read_len
-            })
-        {
-            return Err(FsError::InvalidState);
-        }
+        let Ok(blob_guid) = layout.blob_guid() else {
+            return Ok(());
+        };
+        let file_size = layout.size()?;
         if prefetch::cache_pressure_high(
             dc.current_usage(),
             dc.capacity_bytes(),
             self.config.prefetch_pressure_decline,
-        ) || dc.is_complete(blob_guid, req.file_size)
+        ) || dc.is_complete(blob_guid, file_size)
         {
+            return Ok(());
+        }
+        let rows = backend.row_map_for(&layout, trace_id).await?;
+        let plan = prefetch::prefetch_plan(&layout, rows.as_deref());
+        if plan.is_empty() {
             return Ok(());
         }
         let Ok(permit) = self.prefetch_limit.clone().try_acquire_owned() else {
@@ -395,33 +425,23 @@ impl Gateway {
         let dc = Arc::clone(dc);
         compio_runtime::spawn(async move {
             let _permit = permit;
-            prefetch::prefetch_blob(backend, dc, blob_guid, req.blocks).await;
+            prefetch::prefetch_blob(backend, dc, blob_guid, plan).await;
         })
         .detach();
         Ok(())
     }
 
-    fn reject_owner_key(key: &str) -> Result<(), FsError> {
-        if key.starts_with(BLOB_OWNER_PREFIX) {
-            return Err(FsError::Unauthorized("reserved gateway key".into()));
-        }
-        Ok(())
-    }
-
-    /// Semantic checks on a layout a client wants stored. Returns the
-    /// data blob it names, if any, for the ownership check.
-    fn validate_object_layout(
-        layout: &ObjectLayout,
-    ) -> Result<Option<data_types::DataBlobGuid>, FsError> {
+    /// Semantic checks on a layout a client wants stored.
+    fn validate_object_layout(layout: &ObjectLayout) -> Result<(), FsError> {
         if layout.block_size != ObjectLayout::DEFAULT_BLOCK_SIZE {
             return Err(FsError::InvalidState);
         }
         let ObjectState::Normal(data) = &layout.state else {
-            return Ok(None);
+            return Ok(());
         };
         if data.blob_guid.blob_id.is_nil() {
             return if data.core_meta_data.size == 0 {
-                Ok(None)
+                Ok(())
             } else {
                 Err(FsError::InvalidState)
             };
@@ -433,74 +453,203 @@ impl Gateway {
         {
             return Err(FsError::InvalidState);
         }
-        Ok(Some(data.blob_guid))
+        Ok(())
     }
 
-    /// Validate a client-supplied inode value before it lands where the
-    /// S3 gateway and other mounts will parse it. Returns the data blob
-    /// the value names, if any.
-    fn validate_layout(
-        key: &str,
-        value: &[u8],
-    ) -> Result<Option<data_types::DataBlobGuid>, FsError> {
-        Self::reject_owner_key(key)?;
-        if key.starts_with(HARDLINK_PREFIX) {
+    /// Decode a client-supplied inode value by key shape and check its
+    /// invariants before it lands where the S3 gateway and other mounts
+    /// will parse it.
+    fn decode_client_value(key: &str, value: &[u8]) -> Result<ClientValue, FsError> {
+        reject_reserved_key(key)?;
+        let layout = if key.starts_with(HARDLINK_PREFIX) {
             let record = rkyv::from_bytes::<InodeRecord, rkyv::rancor::Error>(value)
                 .map_err(|e| FsError::Deserialize(format!("inode record rejected: {e}")))?;
             if matches!(record.layout.state, ObjectState::Indirect(_)) {
                 return Err(FsError::InvalidState);
             }
-            return Self::validate_object_layout(&record.layout);
-        }
-        if parse_ovr_row_block(key).is_some() {
-            return OvrRow::decode(value)
-                .map(|_| None)
-                .ok_or_else(|| FsError::Deserialize("row rejected".into()));
-        }
-        // Remaining internal keyspaces (`@ovr/` abort records, `@ovr-gc/`
-        // markers) hold opaque values the gateway never interprets.
-        if key.starts_with('@') {
-            return Ok(None);
-        }
-        let layout = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(value)
-            .map_err(|e| FsError::Deserialize(format!("layout rejected: {e}")))?;
-        Self::validate_object_layout(&layout)
-    }
-
-    /// Serving a layout out of this bucket's namespace proves the blob it
-    /// names belongs here; remember that so the data requests that follow
-    /// skip the marker lookup.
-    fn note_served_layout(backend: &StorageBackend, key: &str, value: &[u8]) {
-        if key.starts_with('@') && !key.starts_with(HARDLINK_PREFIX) {
-            return;
-        }
-        let layout = if key.starts_with(HARDLINK_PREFIX) {
-            rkyv::from_bytes::<InodeRecord, rkyv::rancor::Error>(value)
-                .ok()
-                .map(|record| record.layout)
+            record.layout
         } else {
-            rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(value).ok()
+            if key.starts_with('@') && !key.starts_with(ORPHAN_PREFIX) {
+                return Err(FsError::Unauthorized("reserved gateway key".into()));
+            }
+            rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(value)
+                .map_err(|e| FsError::Deserialize(format!("layout rejected: {e}")))?
         };
-        if let Some(blob_guid) = layout.and_then(|l| l.blob_guid().ok()) {
-            backend.note_owned_blob(blob_guid);
+        Self::validate_object_layout(&layout)?;
+        Ok(ClientValue { layout })
+    }
+
+    /// A stored value the client may copy its data binding from: the one
+    /// its CAS replaces, or the one at a proof key.
+    fn binding_carried(proof: Option<&ObjectLayout>, new: &ObjectLayout) -> Result<(), FsError> {
+        match proof {
+            Some(proof) if posix_only_moved(proof, new) => Ok(()),
+            _ => Err(FsError::Unauthorized(
+                "a data binding may only be carried forward, never authored".into(),
+            )),
         }
     }
 
-    /// Store an inode value the client supplied: validate it, and prove
-    /// any blob it names belongs to this bucket (the value already stored
-    /// at the same key is one acceptable proof, so republishing a
-    /// layout the S3 API created works without a marker).
-    async fn store_inode(
-        &self,
+    /// Validate a CAS publish: a value that names data must carry the
+    /// binding of the value it replaces, differing at most in posix.
+    fn validate_cas(key: &str, value: &[u8], expected_old: &[u8]) -> Result<(), FsError> {
+        let new = Self::decode_client_value(key, value)?;
+        if !names_data(&new.layout) {
+            return Ok(());
+        }
+        let proof = if expected_old.is_empty() {
+            None
+        } else {
+            Some(Self::decode_client_value(key, expected_old)?.layout)
+        };
+        Self::binding_carried(proof.as_ref(), &new.layout)
+    }
+
+    /// Validate a blind put: a value that names data must carry the
+    /// binding stored at `proof_key` in this bucket (hardlink promotion
+    /// copies the source layout into its shared record).
+    async fn validate_put(
         backend: &StorageBackend,
         key: &str,
         value: &[u8],
+        proof_key: &str,
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
-        if let Some(blob_guid) = Self::validate_layout(key, value)? {
-            backend.verify_blob_owner(blob_guid, key, trace_id).await?;
+        let new = Self::decode_client_value(key, value)?;
+        if !names_data(&new.layout) {
+            return Ok(());
         }
-        Ok(())
+        if proof_key.is_empty() {
+            return Self::binding_carried(None, &new.layout);
+        }
+        reject_reserved_key(proof_key)?;
+        let proof = backend.layout_at(proof_key, trace_id).await?;
+        Self::binding_carried(proof.as_ref(), &new.layout)
+    }
+
+    /// `true` for a value whose data an unlinked-but-open handle still
+    /// needs a key for.
+    fn is_data_value(value: &[u8]) -> bool {
+        rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(value)
+            .map(|layout| names_data(&layout))
+            .unwrap_or(false)
+    }
+
+    async fn delete_inode(
+        &self,
+        req: DeleteInodeRequest,
+        trace_id: &TraceId,
+    ) -> Result<delete_inode_response::Deleted, FsError> {
+        let (session, cfg, backend) = self.authorize(req.caller.as_ref(), true)?;
+        reject_reserved_key(&req.key)?;
+        let current = if req.orphan {
+            match backend.get_inode_raw(&req.key, trace_id).await {
+                Ok(bytes) => Some(bytes),
+                Err(FsError::NotFound) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        // Unlinked while open: keep the value reachable under a hidden
+        // key so the open handles can still address its data; the last
+        // close deletes that key with teardown.
+        if req.orphan
+            && let Some(previous) = current.as_ref().filter(|v| Self::is_data_value(v))
+        {
+            let orphan = orphan_key(session.instance, Uuid::new_v4());
+            match backend
+                .rename_file(&req.key, &orphan, false, trace_id)
+                .await
+            {
+                Ok(_) => {
+                    backend.forget_layout(&req.key);
+                    return Ok(delete_inode_response::Deleted {
+                        existed: true,
+                        previous: previous.clone(),
+                        orphan_key: orphan,
+                    });
+                }
+                Err(FsError::NotFound) => {
+                    return Ok(delete_inode_response::Deleted::default());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let previous = if req.teardown {
+            delete_with_teardown(&self.sweep, &cfg, &backend, &req.key, trace_id).await?
+        } else {
+            let previous = backend.delete_inode(&req.key, trace_id).await?;
+            backend.forget_layout(&req.key);
+            previous
+        };
+        Ok(delete_inode_response::Deleted {
+            existed: previous.is_some(),
+            previous: previous.unwrap_or_default(),
+            orphan_key: String::new(),
+        })
+    }
+
+    async fn rename_file(
+        &self,
+        req: RenameFileRequest,
+        trace_id: &TraceId,
+    ) -> Result<rename_file_response::Displaced, FsError> {
+        let (session, cfg, backend) = self.authorize(req.caller.as_ref(), true)?;
+        reject_reserved_key(&req.src_key)?;
+        reject_reserved_key(&req.dst_key)?;
+        // Record the teardown intent for the displaced blob's rows before
+        // the swap makes its blob_id unrecoverable.
+        if req.teardown_displaced && !req.orphan_displaced {
+            match backend.get_inode_raw(&req.dst_key, trace_id).await {
+                Ok(current) => {
+                    if let Ok(layout) =
+                        rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&current)
+                    {
+                        write_conditional_marker(&backend, &layout, &req.dst_key, trace_id).await?;
+                    }
+                }
+                Err(FsError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let displaced = backend
+            .rename_file(&req.src_key, &req.dst_key, req.force_overwrite, trace_id)
+            .await?;
+        backend.forget_layout(&req.src_key);
+        backend.forget_layout(&req.dst_key);
+        if displaced.is_empty() {
+            return Ok(rename_file_response::Displaced::default());
+        }
+        // The replaced destination is still open somewhere: republish it
+        // under a hidden key so those handles keep a name to address it
+        // by. The blob has no key for the few milliseconds in between,
+        // and nothing tears down a blob without an explicit request.
+        if req.orphan_displaced && Self::is_data_value(&displaced) {
+            let orphan = orphan_key(session.instance, Uuid::new_v4());
+            backend
+                .put_inode(&orphan, displaced.clone(), trace_id)
+                .await?;
+            return Ok(rename_file_response::Displaced {
+                previous: displaced,
+                orphan_key: orphan,
+            });
+        }
+        if req.teardown_displaced {
+            teardown_value(
+                &self.sweep,
+                &cfg,
+                &backend,
+                &req.dst_key,
+                &displaced,
+                trace_id,
+            )
+            .await;
+        }
+        Ok(rename_file_response::Displaced {
+            previous: displaced,
+            orphan_key: String::new(),
+        })
     }
 
     /// Decode, authorize, execute, encode. Returns `None` for a request
@@ -530,10 +679,8 @@ impl Gateway {
                 let req = decode!(GetInodeRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
-                    Self::reject_owner_key(&req.key)?;
-                    let value = backend.get_inode_raw(&req.key, trace_id).await?;
-                    Self::note_served_layout(&backend, &req.key, &value);
-                    Ok::<_, FsError>(value)
+                    reject_reserved_key(&req.key)?;
+                    backend.get_inode_raw(&req.key, trace_id).await
                 };
                 respond!(GetInodeResponse, get_inode_response, run.await)
             }
@@ -541,6 +688,7 @@ impl Gateway {
                 let req = decode!(ListInodesRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
+                    reject_reserved_key(&req.prefix)?;
                     let (entries, has_more) = backend
                         .list_inodes_page(
                             &req.prefix,
@@ -553,7 +701,7 @@ impl Gateway {
                     Ok::<_, FsError>(list_inodes_response::Page {
                         entries: entries
                             .into_iter()
-                            .filter(|(key, _)| !key.starts_with(BLOB_OWNER_PREFIX))
+                            .filter(|(key, _)| reject_reserved_key(key).is_ok())
                             .map(|(key, value)| list_inodes_response::Entry { key, value })
                             .collect(),
                         has_more,
@@ -565,9 +713,11 @@ impl Gateway {
                 let req = decode!(PutInodeRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    self.store_inode(&backend, &req.key, &req.value, trace_id)
+                    Self::validate_put(&backend, &req.key, &req.value, &req.proof_key, trace_id)
                         .await?;
-                    backend.put_inode(&req.key, req.value, trace_id).await
+                    let previous = backend.put_inode(&req.key, req.value, trace_id).await?;
+                    backend.forget_layout(&req.key);
+                    Ok::<_, FsError>(previous)
                 };
                 respond!(PutInodeResponse, put_inode_response, run.await)
             }
@@ -575,54 +725,37 @@ impl Gateway {
                 let req = decode!(PutInodeCasRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    self.store_inode(&backend, &req.key, &req.value, trace_id)
-                        .await?;
-                    backend
+                    Self::validate_cas(&req.key, &req.value, &req.expected_old_value)?;
+                    let previous = backend
                         .put_inode_cas(&req.key, req.value, req.expected_old_value, trace_id)
-                        .await
+                        .await?;
+                    backend.forget_layout(&req.key);
+                    Ok::<_, FsError>(previous)
                 };
                 respond!(PutInodeCasResponse, put_inode_cas_response, run.await)
             }
             Command::DeleteInode => {
                 let req = decode!(DeleteInodeRequest);
-                let run = async {
-                    let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    Self::reject_owner_key(&req.key)?;
-                    let previous = backend.delete_inode(&req.key, trace_id).await?;
-                    // The teardown hint for the displaced blob follows; its
-                    // only proof of ownership was the value just removed.
-                    if let Some(previous) = &previous {
-                        Self::note_served_layout(&backend, &req.key, previous);
-                    }
-                    Ok::<_, FsError>(delete_inode_response::Deleted {
-                        existed: previous.is_some(),
-                        previous: previous.unwrap_or_default(),
-                    })
-                };
-                respond!(DeleteInodeResponse, delete_inode_response, run.await)
+                respond!(
+                    DeleteInodeResponse,
+                    delete_inode_response,
+                    self.delete_inode(req, trace_id).await
+                )
             }
             Command::RenameFile => {
                 let req = decode!(RenameFileRequest);
-                let run = async {
-                    let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    Self::reject_owner_key(&req.src_key)?;
-                    Self::reject_owner_key(&req.dst_key)?;
-                    let displaced = backend
-                        .rename_file(&req.src_key, &req.dst_key, req.force_overwrite, trace_id)
-                        .await?;
-                    if !displaced.is_empty() {
-                        Self::note_served_layout(&backend, &req.dst_key, &displaced);
-                    }
-                    Ok::<_, FsError>(displaced)
-                };
-                respond!(RenameFileResponse, rename_file_response, run.await)
+                respond!(
+                    RenameFileResponse,
+                    rename_file_response,
+                    self.rename_file(req, trace_id).await
+                )
             }
             Command::RenameFolder => {
                 let req = decode!(RenameFolderRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    Self::reject_owner_key(&req.src_key)?;
-                    Self::reject_owner_key(&req.dst_key)?;
+                    reject_reserved_key(&req.src_key)?;
+                    reject_reserved_key(&req.dst_key)?;
                     backend
                         .rename_folder(&req.src_key, &req.dst_key, trace_id)
                         .await
@@ -633,7 +766,7 @@ impl Gateway {
                 let req = decode!(PutDirMarkerRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    Self::reject_owner_key(&req.key)?;
+                    reject_reserved_key(&req.key)?;
                     backend.put_dir_marker(&req.key, trace_id).await
                 };
                 respond!(PutDirMarkerResponse, put_dir_marker_response, run.await)
@@ -642,16 +775,12 @@ impl Gateway {
                 let req = decode!(ListMpuPartsRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
+                    reject_reserved_key(&req.key)?;
                     let upload_id = uuid::Uuid::from_slice(&req.upload_id)
                         .map_err(|e| FsError::Internal(format!("invalid upload id: {e}")))?;
                     let parts = backend
                         .list_mpu_parts(&req.key, upload_id, trace_id)
                         .await?;
-                    for (_, layout) in &parts {
-                        if let Ok(blob_guid) = layout.blob_guid() {
-                            backend.note_owned_blob(blob_guid);
-                        }
-                    }
                     let mut out = Vec::with_capacity(parts.len());
                     for (key, layout) in parts {
                         let bytes: Vec<u8> = rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(
@@ -667,20 +796,6 @@ impl Gateway {
                 };
                 respond!(ListMpuPartsResponse, list_mpu_parts_response, run.await)
             }
-            Command::AllocateBlobGuid => {
-                let req = decode!(AllocateBlobGuidRequest);
-                let run = async {
-                    let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    let blob_guid = backend.create_blob_guid();
-                    backend.claim_blob(blob_guid, trace_id).await?;
-                    Ok::<_, FsError>(BlobGuid::from(blob_guid))
-                };
-                respond!(
-                    AllocateBlobGuidResponse,
-                    allocate_blob_guid_response,
-                    run.await
-                )
-            }
             Command::ReadBlock => {
                 let req = decode!(ReadBlockRequest);
                 respond!(
@@ -689,69 +804,58 @@ impl Gateway {
                     self.read_block(req, trace_id).await
                 )
             }
-            Command::WriteBlock => {
-                let req = decode!(WriteBlockRequest);
+            Command::ProbeDataBlocks => {
+                let req = decode!(ProbeDataBlocksRequest);
                 respond!(
-                    WriteBlockResponse,
-                    write_block_response,
-                    self.write_block(req, trace_id).await
+                    ProbeDataBlocksResponse,
+                    probe_data_blocks_response,
+                    self.probe_data_blocks(req, trace_id).await
                 )
             }
-            Command::ListBlobBlocks => {
-                let req = decode!(ListBlobBlocksRequest);
+            Command::BeginFlush => {
+                let req = decode!(BeginFlushRequest);
                 let run = async {
-                    let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
-                    let blob_guid = decode_guid(req.blob.as_ref())?;
-                    backend
-                        .verify_blob_owner(blob_guid, &req.key, trace_id)
-                        .await?;
-                    let entries = if req.all_nodes {
-                        backend.list_all_blob_blocks(blob_guid, trace_id).await?
-                    } else {
-                        backend
-                            .list_blob_blocks(blob_guid, req.first_block, req.block_count, trace_id)
-                            .await?
-                    };
-                    Ok::<_, FsError>(list_blob_blocks_response::Entries {
-                        entries: entries
-                            .into_iter()
-                            .map(|e| BlockIdentity {
-                                block_number: e.block_number,
-                                version: e.version,
-                            })
-                            .collect(),
-                    })
+                    let (session, _, backend) = self.authorize(req.caller.as_ref(), true)?;
+                    reject_reserved_key(&req.key)?;
+                    flush::begin(self, &backend, &session, req, trace_id).await
                 };
-                respond!(ListBlobBlocksResponse, list_blob_blocks_response, run.await)
+                respond!(BeginFlushResponse, begin_flush_response, run.await)
             }
-            Command::PrefetchBlob => {
-                let req = decode!(PrefetchBlobRequest);
+            Command::WriteFlushBlock => {
+                let req = decode!(WriteFlushBlockRequest);
+                let run = async {
+                    let (session, _, backend) = self.authorize(req.caller.as_ref(), true)?;
+                    flush::write_block(self, &backend, &session, req, trace_id).await
+                };
                 respond!(
-                    PrefetchBlobResponse,
-                    prefetch_blob_response,
-                    self.prefetch_blob(req, trace_id).await
+                    WriteFlushBlockResponse,
+                    write_flush_block_response,
+                    run.await
                 )
             }
-            Command::SweepBlob => {
-                let req = decode!(SweepBlobRequest);
+            Command::CommitFlush => {
+                let req = decode!(CommitFlushRequest);
                 let run = async {
-                    let (_, cfg, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    let blob_guid = decode_guid(req.blob.as_ref())?;
-                    if req.victims.iter().any(|victim| victim.version == 0)
-                        || req.below.iter().any(|floor| floor.keep_from == 0)
-                        || (req.delete_rows && !req.delete_all_blocks)
-                    {
-                        return Err(FsError::InvalidState);
-                    }
-                    backend
-                        .verify_blob_owner(blob_guid, &req.key, trace_id)
-                        .await?;
-                    // What is reclaimable is re-derived by the sweep worker
-                    // from this bucket's rows and layouts, off the request path.
-                    enqueue_sweep_request(&self.sweep, cfg, blob_guid, &req);
-                    Ok::<_, FsError>(())
+                    let (session, cfg, backend) = self.authorize(req.caller.as_ref(), true)?;
+                    flush::commit(self, &cfg, &backend, &session, req, trace_id).await
                 };
-                respond!(SweepBlobResponse, sweep_blob_response, run.await)
+                respond!(CommitFlushResponse, commit_flush_response, run.await)
+            }
+            Command::AbortFlush => {
+                let req = decode!(AbortFlushRequest);
+                let run = async {
+                    let (session, cfg, _) = self.authorize(req.caller.as_ref(), true)?;
+                    flush::abort(self, &cfg, &session, req).await
+                };
+                respond!(AbortFlushResponse, abort_flush_response, run.await)
+            }
+            Command::PrefetchInode => {
+                let req = decode!(PrefetchInodeRequest);
+                respond!(
+                    PrefetchInodeResponse,
+                    prefetch_inode_response,
+                    self.prefetch_inode(req, trace_id).await
+                )
             }
             Command::Invalid | Command::Handshake => {
                 tracing::warn!(?command, "unsupported command");
@@ -897,8 +1001,7 @@ pub async fn run_worker(gw: Arc<Gateway>, worker_id: usize) -> std::io::Result<(
 mod validate_tests {
     use super::*;
     use data_types::DataBlobGuid;
-    use data_types::object_layout::{ObjectCoreMetaData, ObjectMetaData};
-    use data_types::ovr_map::{OVR_ROW_LEN, ovr_row_key};
+    use data_types::object_layout::{ObjectCoreMetaData, ObjectMetaData, PosixAttrs};
 
     fn normal_layout(blob_id: uuid::Uuid, size: u64, blob_version: u64) -> ObjectLayout {
         ObjectLayout {
@@ -926,42 +1029,52 @@ mod validate_tests {
     }
 
     #[test]
-    fn valid_layout_yields_its_blob() {
-        let blob_id = uuid::Uuid::new_v4();
-        let layout = normal_layout(blob_id, 4096, 1);
-        let blob = Gateway::validate_layout("/a", &encode(&layout)).expect("valid layout");
-        assert_eq!(blob.map(|g| g.blob_id), Some(blob_id));
-    }
-
-    #[test]
     fn layout_invariants_are_enforced() {
         let blob_id = uuid::Uuid::new_v4();
         let mut odd_block_size = normal_layout(blob_id, 4096, 1);
         odd_block_size.block_size = 0;
-        Gateway::validate_layout("/a", &encode(&odd_block_size)).expect_err("block_size 0");
+        Gateway::decode_client_value("/a", &encode(&odd_block_size)).expect_err("block_size 0");
 
         let zero_ceiling = normal_layout(blob_id, 4096, 0);
-        Gateway::validate_layout("/a", &encode(&zero_ceiling)).expect_err("blob_version 0");
+        Gateway::decode_client_value("/a", &encode(&zero_ceiling)).expect_err("blob_version 0");
 
         let nil_blob_with_data = normal_layout(uuid::Uuid::nil(), 4096, 1);
-        Gateway::validate_layout("/a", &encode(&nil_blob_with_data))
+        Gateway::decode_client_value("/a", &encode(&nil_blob_with_data))
             .expect_err("nil blob with bytes");
 
         let empty = normal_layout(uuid::Uuid::nil(), 0, 1);
-        assert!(
-            Gateway::validate_layout("/a", &encode(&empty))
-                .expect("empty file")
-                .is_none()
-        );
+        Gateway::decode_client_value("/a", &encode(&empty)).expect("empty file");
 
-        Gateway::validate_layout("/a", b"not a layout").expect_err("garbage");
-        Gateway::validate_layout(&format!("{BLOB_OWNER_PREFIX}00001/x"), &encode(&empty))
+        Gateway::decode_client_value("/a", b"not a layout").expect_err("garbage");
+        Gateway::decode_client_value(&format!("{OVR_ROW_PREFIX}x/00000001"), &encode(&empty))
             .expect_err("reserved keyspace");
     }
 
     #[test]
-    fn rows_must_decode() {
-        let key = ovr_row_key(&uuid::Uuid::new_v4(), 3);
-        Gateway::validate_layout(&key, &[0u8; OVR_ROW_LEN - 1]).expect_err("short row");
+    fn data_binding_is_carried_never_authored() {
+        let blob_id = uuid::Uuid::new_v4();
+        let stored = normal_layout(blob_id, 4096, 3);
+        let mut chmodded = stored.clone();
+        chmodded.set_fs_posix(Some(PosixAttrs {
+            mode: 0o100600,
+            ..PosixAttrs::default()
+        }));
+        Gateway::validate_cas("/a", &encode(&chmodded), &encode(&stored))
+            .expect("posix-only change carries the binding");
+
+        let mut grown = stored.clone();
+        if let ObjectState::Normal(data) = &mut grown.state {
+            data.core_meta_data.size = 8192;
+        }
+        Gateway::validate_cas("/a", &encode(&grown), &encode(&stored)).expect_err("size change");
+
+        let foreign = normal_layout(uuid::Uuid::new_v4(), 4096, 3);
+        Gateway::validate_cas("/a", &encode(&foreign), &encode(&stored)).expect_err("other blob");
+        Gateway::validate_cas("/a", &encode(&stored), b"").expect_err("binding on create");
+
+        let empty = normal_layout(uuid::Uuid::nil(), 0, 1);
+        Gateway::validate_cas("/a", &encode(&empty), b"").expect("empty create");
+        Gateway::validate_cas("/a", &encode(&empty), &encode(&stored))
+            .expect("dropping a binding is allowed");
     }
 }

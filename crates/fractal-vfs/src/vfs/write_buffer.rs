@@ -5,24 +5,22 @@ use bytes::Bytes;
 
 /// Per-block content intent for the sparse WriteBuffer.
 ///
-/// Blocks NOT in the map are implicitly "Keep": no buffered work, the block store is
-/// authoritative. The override flush uploads only `Rewrite` blocks (in
-/// place at the bumped blob_version), replays `Delete` intents as
-/// versioned block deletes, and never touches "Keep"/absent blocks. The
-/// sparse buffer keeps in-memory ops O(1), avoids whole-file preload on
-/// open, and serves dirty-handle reads per block.
+/// Blocks NOT in the map are implicitly "Keep": no buffered work, the
+/// committed data is authoritative. The flush ships only `Rewrite`
+/// blocks and `Delete` intents to the gateway and never touches
+/// "Keep"/absent blocks. The sparse buffer keeps in-memory ops O(1),
+/// avoids whole-file preload on open, and serves dirty-handle reads per
+/// block.
 #[derive(Debug, Clone)]
 pub(crate) enum BlockState {
     /// Definitive new bytes for this block. Origin: `vfs_write`, a shrink
-    /// tail-zero, or a punch-hole partial edge. The override flush uploads
-    /// these (zero-padded to block_size) at the new blob_version.
+    /// tail-zero, or a punch-hole partial edge. The flush ships these to
+    /// the gateway, which assigns their generation.
     Rewrite(Bytes),
-    /// PUNCH_HOLE intent: the override flush schedules a versioned
-    /// `delete_block` so the block-store entry is dropped at the new blob_version.
-    /// Reads (dirty-handle merge and post-flush via `BlockNotFound`) treat
-    /// the block as zeros. Distinguished from a plain hole because a
-    /// punched block sits inside the file's logical range and the deletion
-    /// must be replayed on flush even with no `Rewrite` content.
+    /// PUNCH_HOLE intent: the flush publishes a `Hole` row so the block
+    /// reads as zeros. Distinguished from a plain hole because a punched
+    /// block sits inside the file's logical range and the intent must be
+    /// replayed on flush even with no `Rewrite` content.
     Delete,
 }
 
@@ -33,10 +31,9 @@ pub(crate) struct WriteBuffer {
     /// True if `file_size` differs from the committed layout size at open
     /// time, or any block intent was buffered. Flush-eligibility predicate.
     pub(crate) size_changed: bool,
-    /// Blob guid of the file at open time; used to lazy-load committed
-    /// bytes for partial-block edits and dirty reads, and reused by the
-    /// override flush. `None` for brand-new files.
-    pub(crate) existing_blob_guid: Option<data_types::DataBlobGuid>,
+    /// Whether the file had committed data at open time; a brand-new
+    /// file lazy-loads nothing (every unbuffered block is zeros).
+    pub(crate) has_committed_data: bool,
     /// Block size copied from the committed layout (or DEFAULT for new
     /// files).
     pub(crate) block_size: u32,
@@ -61,15 +58,11 @@ pub(crate) struct WriteBuffer {
 }
 
 impl WriteBuffer {
-    pub(crate) fn new(
-        existing_blob_guid: Option<data_types::DataBlobGuid>,
-        file_size: u64,
-        block_size: u32,
-    ) -> Self {
+    pub(crate) fn new(has_committed_data: bool, file_size: u64, block_size: u32) -> Self {
         Self {
             file_size,
             size_changed: false,
-            existing_blob_guid,
+            has_committed_data,
             block_size,
             blocks: std::collections::BTreeMap::new(),
             dirty: false,
