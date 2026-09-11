@@ -6,6 +6,16 @@ use xxhash_rust::xxh3::xxh3_64;
 pub mod protobuf_header;
 pub use protobuf_header::{EMPTY_BODY_CHECKSUM, ProtobufMessageHeader};
 
+/// Request-side fields the shared protobuf `call` path fills in. The protobuf header newtypes
+/// get it from `impl_protobuf_message_header!`; the bss header implements it next to its raw
+/// addressing fields.
+pub trait ProtobufRequestHeader: MessageHeaderTrait + Default {
+    fn set_request(&mut self, id: u32, command: i32, retry_count: u8, trace_id: &TraceId);
+
+    /// Sets the total frame size and the body checksum for `body`.
+    fn set_body(&mut self, body: &[u8]);
+}
+
 pub trait MessageHeaderTrait: Sized + Clone + Copy + Send + Sync + 'static {
     fn encode(&self) -> &[u8];
 
@@ -120,6 +130,22 @@ macro_rules! impl_protobuf_message_header {
 
             fn verify_body_checksum(&self, body: &[u8]) -> bool {
                 self.0.verify_body_checksum(body)
+            }
+        }
+
+        impl $crate::ProtobufRequestHeader for $header_type {
+            fn set_request(
+                &mut self,
+                id: u32,
+                command: i32,
+                retry_count: u8,
+                trace_id: &data_types::TraceId,
+            ) {
+                self.0.set_request(id, command, retry_count, trace_id)
+            }
+
+            fn set_body(&mut self, body: &[u8]) {
+                self.0.set_body(body)
             }
         }
     };

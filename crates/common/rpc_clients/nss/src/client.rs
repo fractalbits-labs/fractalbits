@@ -1,4 +1,6 @@
-use rpc_client_common::AutoReconnectRpcClient;
+use bytes::Bytes;
+use nss_codec::MessageHeader;
+use rpc_client_common::{AutoReconnectRpcClient, MessageFrame, ProtobufRpc, RpcError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -6,8 +8,7 @@ use std::time::Duration;
 const CONNS_PER_CORE: usize = 8;
 
 pub struct RpcClient {
-    connections:
-        Vec<Arc<AutoReconnectRpcClient<nss_codec::MessageCodec, nss_codec::MessageHeader>>>,
+    connections: Vec<Arc<AutoReconnectRpcClient<nss_codec::MessageCodec, MessageHeader>>>,
     next_conn: AtomicUsize,
 }
 
@@ -29,23 +30,25 @@ impl RpcClient {
 
     fn get_connection(
         &self,
-    ) -> &Arc<AutoReconnectRpcClient<nss_codec::MessageCodec, nss_codec::MessageHeader>> {
+    ) -> &Arc<AutoReconnectRpcClient<nss_codec::MessageCodec, MessageHeader>> {
         let idx = self.next_conn.fetch_add(1, Ordering::Relaxed) % self.connections.len();
         &self.connections[idx]
     }
+}
 
-    pub fn gen_request_id(&self) -> u32 {
+impl ProtobufRpc for RpcClient {
+    type Header = MessageHeader;
+    const RPC_TYPE: &'static str = "nss";
+
+    fn gen_request_id(&self) -> u32 {
         self.get_connection().gen_request_id()
     }
 
-    pub async fn send_request(
+    async fn send_request(
         &self,
-        frame: rpc_codec_common::MessageFrame<nss_codec::MessageHeader, bytes::Bytes>,
-        timeout: Option<std::time::Duration>,
-        operation: crate::stats::NssOperation,
-    ) -> Result<rpc_codec_common::MessageFrame<nss_codec::MessageHeader>, rpc_client_common::RpcError>
-    {
-        let _guard = crate::stats::NssStatsGuard::new(operation);
+        frame: MessageFrame<MessageHeader, Bytes>,
+        timeout: Option<Duration>,
+    ) -> Result<MessageFrame<MessageHeader>, RpcError> {
         self.get_connection().send_request(frame, timeout).await
     }
 }

@@ -1,8 +1,10 @@
-use rpc_client_common::AutoReconnectRpcClient;
+use bytes::Bytes;
+use rpc_client_common::{AutoReconnectRpcClient, MessageFrame, ProtobufRpc, RpcError};
+use rss_codec::MessageHeader;
 use std::time::Duration;
 
 pub struct RpcClient {
-    inner: AutoReconnectRpcClient<rss_codec::MessageCodec, rss_codec::MessageHeader>,
+    inner: AutoReconnectRpcClient<rss_codec::MessageCodec, MessageHeader>,
 }
 
 impl RpcClient {
@@ -10,17 +12,21 @@ impl RpcClient {
         let inner = AutoReconnectRpcClient::new_from_addresses(addresses, connection_timeout);
         Self { inner }
     }
+}
 
-    pub fn gen_request_id(&self) -> u32 {
+impl ProtobufRpc for RpcClient {
+    type Header = MessageHeader;
+    const RPC_TYPE: &'static str = "rss";
+
+    fn gen_request_id(&self) -> u32 {
         self.inner.gen_request_id()
     }
 
-    pub async fn send_request(
+    async fn send_request(
         &self,
-        frame: rpc_codec_common::MessageFrame<rss_codec::MessageHeader, bytes::Bytes>,
-        timeout: Option<std::time::Duration>,
-    ) -> Result<rpc_codec_common::MessageFrame<rss_codec::MessageHeader>, rpc_client_common::RpcError>
-    {
+        frame: MessageFrame<MessageHeader, Bytes>,
+        timeout: Option<Duration>,
+    ) -> Result<MessageFrame<MessageHeader>, RpcError> {
         self.inner.send_request(frame, timeout).await
     }
 }

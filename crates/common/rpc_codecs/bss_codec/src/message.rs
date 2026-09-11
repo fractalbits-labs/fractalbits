@@ -2,7 +2,7 @@
 //! Note if this file is updated, the corresponding message.zig file also needs to be updated!
 use bytemuck::{Pod, Zeroable};
 use data_types::TraceId;
-use rpc_codec_common::MessageHeaderTrait;
+use rpc_codec_common::{MessageHeaderTrait, ProtobufRequestHeader};
 use std::mem::size_of;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
@@ -177,6 +177,20 @@ impl MessageHeader {
     pub fn set_data_cohort_tag(&mut self, cohort_tag: u64) {
         self.reserve1[Self::DATA_COHORT_TAG_OFFSET..Self::DATA_COHORT_TAG_OFFSET + 8]
             .copy_from_slice(&cohort_tag.to_le_bytes());
+    }
+}
+
+impl ProtobufRequestHeader for MessageHeader {
+    fn set_request(&mut self, id: u32, command: i32, retry_count: u8, trace_id: &TraceId) {
+        self.id = id;
+        self.command = command;
+        self.retry_count = retry_count;
+        self.trace_id = trace_id.0;
+    }
+
+    fn set_body(&mut self, body: &[u8]) {
+        self.size = (size_of::<Self>() + body.len()) as u32;
+        self.set_body_checksum(body);
     }
 }
 

@@ -62,7 +62,7 @@ use metrics_wrapper::{Gauge, counter, gauge, histogram};
 
 pub mod generic_client;
 pub use generic_client::RpcCodec;
-pub use rpc_codec_common::{MessageFrame, MessageHeaderTrait};
+pub use rpc_codec_common::{MessageFrame, MessageHeaderTrait, ProtobufRequestHeader};
 
 use generic_client::RpcClient as GenericRpcClient;
 
@@ -287,6 +287,99 @@ impl Drop for InflightRpcGuard {
             .record(self.start.elapsed().as_nanos() as f64);
         self.gauge.decrement(1.0);
     }
+}
+
+/// Framing shared by the protobuf-bodied RPCs (fs_gateway, nss, rss, and the bss list calls).
+/// Implementors supply the transport; `call` is one request / response round trip. Transport
+/// failures surface as `RpcError`; application outcomes stay inside the decoded response so the
+/// caller can map them without losing the error kind.
+#[allow(async_fn_in_trait)]
+pub trait ProtobufRpc {
+    type Header: ProtobufRequestHeader;
+    const RPC_TYPE: &'static str;
+
+    fn gen_request_id(&self) -> u32;
+
+    async fn send_request(
+        &self,
+        frame: MessageFrame<Self::Header, Bytes>,
+        timeout: Option<Duration>,
+    ) -> Result<MessageFrame<Self::Header>, RpcError>;
+
+    /// Protocol-level failure carried in the response header (bss errno); the protobuf newtype
+    /// headers have none.
+    fn check_response(_header: &Self::Header) -> Result<(), RpcError> {
+        Ok(())
+    }
+
+    /// `ctx` renders caller-side context (key, prefix, bucket) and is only invoked when a
+    /// non-retryable failure is logged.
+    #[allow(clippy::too_many_arguments)]
+    async fn call<Req: PbMessage, Resp: PbMessage + Default>(
+        &self,
+        command: i32,
+        name: &'static str,
+        body: Req,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+        ctx: impl FnOnce() -> String,
+    ) -> Result<Resp, RpcError> {
+        let header = Self::Header::default();
+        self.call_with_header(
+            header,
+            command,
+            name,
+            body,
+            timeout,
+            trace_id,
+            retry_count,
+            ctx,
+        )
+        .await
+    }
+
+    /// `call` with a caller-populated header, for protocols whose header carries addressing
+    /// fields (bss volume and blob ids) beyond the shared request fields.
+    #[allow(clippy::too_many_arguments)]
+    async fn call_with_header<Req: PbMessage, Resp: PbMessage + Default>(
+        &self,
+        mut header: Self::Header,
+        command: i32,
+        name: &'static str,
+        body: Req,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+        ctx: impl FnOnce() -> String,
+    ) -> Result<Resp, RpcError> {
+        let _guard = InflightRpcGuard::new(Self::RPC_TYPE, name);
+        let request_id = self.gen_request_id();
+        header.set_request(request_id, command, retry_count as u8, trace_id);
+        let body_bytes = encode_protobuf(body, trace_id)?;
+        header.set_body(&body_bytes);
+        let frame = MessageFrame::new(header, body_bytes);
+        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
+            if !e.retryable() {
+                error!(
+                    rpc = %name, %request_id, ctx = %ctx(), error = ?e,
+                    "{} rpc failed", Self::RPC_TYPE
+                );
+            }
+            e
+        })?;
+        Self::check_response(&resp_frame.header)?;
+        PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))
+    }
+}
+
+/// Lazy `name=value` context for the rpc failure log: `rpc_ctx!(volume_id, prefix)` renders
+/// `volume_id=3 prefix=/d3/`, and only when the closure is invoked.
+#[macro_export]
+macro_rules! rpc_ctx {
+    ($($field:ident),+ $(,)?) => {
+        || [$(format!(concat!(stringify!($field), "={}"), $field)),+].join(" ")
+    };
 }
 
 #[macro_export]

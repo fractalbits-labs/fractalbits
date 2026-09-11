@@ -56,6 +56,22 @@ pub enum NssOperation {
     RenameObject,
 }
 
+impl NssOperation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NssOperation::PutInode => "put_inode",
+            NssOperation::PutInodeCas => "put_inode_cas",
+            NssOperation::GetInode => "get_inode",
+            NssOperation::ListInodes => "list_inodes",
+            NssOperation::DeleteInode => "delete_inode",
+            NssOperation::CreateRootInode => "create_root_inode",
+            NssOperation::DeleteRootInode => "delete_root_inode",
+            NssOperation::RenameFolder => "rename_folder",
+            NssOperation::RenameObject => "rename_object",
+        }
+    }
+}
+
 pub struct NssStats {
     get_inode: AtomicU64,
     put_inode: AtomicU64,
