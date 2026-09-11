@@ -2,7 +2,7 @@ use bytemuck::{Pod, Zeroable};
 use data_types::TraceId;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::MessageHeaderTrait;
+use crate::{MessageHeaderTrait, ProtobufRequestHeader};
 
 /// XXH3-64 hash of an empty buffer (seed=0)
 /// This is the correct checksum value for empty message bodies
@@ -79,6 +79,20 @@ impl ProtobufMessageHeader {
 
     pub fn set_trace_id(&mut self, trace_id: &TraceId) {
         self.trace_id = trace_id.0;
+    }
+}
+
+impl ProtobufRequestHeader for ProtobufMessageHeader {
+    fn set_request(&mut self, id: u32, command: i32, retry_count: u8, trace_id: &TraceId) {
+        self.id = id;
+        self.command = command;
+        self.retry_count = retry_count;
+        self.set_trace_id(trace_id);
+    }
+
+    fn set_body(&mut self, body: &[u8]) {
+        self.size = (size_of::<Self>() + body.len()) as u32;
+        self.set_body_checksum(body);
     }
 }
 
