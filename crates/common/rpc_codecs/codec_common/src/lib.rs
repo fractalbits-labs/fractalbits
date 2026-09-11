@@ -78,15 +78,9 @@ pub struct MessageCodec<H: MessageHeaderTrait> {
 
 #[macro_export]
 macro_rules! impl_protobuf_message_header {
-    ($header_type:ident, $command_type:ty) => {
-        // Safety: Command is defined as protobuf enum type (i32), and 0 as Invalid. There is also no padding
-        // as verified from the zig side. With header checksum validation, we can also be sure no invalid
-        // enum value being interpreted.
-        unsafe impl bytemuck::Pod for $command_type {}
-        unsafe impl bytemuck::Zeroable for $command_type {}
-
+    ($header_type:ident) => {
         impl std::ops::Deref for $header_type {
-            type Target = $crate::ProtobufMessageHeader<$command_type>;
+            type Target = $crate::ProtobufMessageHeader;
 
             fn deref(&self) -> &Self::Target {
                 &self.0
