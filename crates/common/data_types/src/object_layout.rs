@@ -453,6 +453,99 @@ pub struct IndirectEntry {
     pub inode_id: Uuid,
 }
 
+/// Prefix of the hidden keys an unlinked-but-open file is moved to. The
+/// gateway renames the inode there on an unlink or rename-over whose
+/// client still holds handles, so those handles keep a key to address
+/// data by; the client deletes the key (with teardown) on the last close.
+pub const ORPHAN_PREFIX: &str = "@orphan/";
+
+pub fn orphan_key(instance: Uuid, id: Uuid) -> String {
+    format!("{ORPHAN_PREFIX}{}/{}", instance.as_simple(), id.as_simple())
+}
+
+/// Mount instance an orphan key was created under.
+pub fn parse_orphan_instance(key: &str) -> Option<Uuid> {
+    let rest = key.trim_end_matches('\0').strip_prefix(ORPHAN_PREFIX)?;
+    let (instance, _) = rest.split_once('/')?;
+    Uuid::try_parse(instance).ok()
+}
+
+/// The embedded `PosixAttrs` of a layout, or the zero value for shapes
+/// that carry none (Indirect, Mpu(Uploading)), which callers treat as
+/// "uninitialised, fall back to defaults".
+pub fn layout_posix(layout: &ObjectLayout) -> PosixAttrs {
+    match &layout.state {
+        ObjectState::Directory(data) => data.posix,
+        ObjectState::Normal(_)
+        | ObjectState::Mpu(MpuState::Completed(_))
+        | ObjectState::Symlink(_)
+        | ObjectState::Special(_) => layout.fs_posix().unwrap_or_default(),
+        _ => PosixAttrs::default(),
+    }
+}
+
+/// `layout` with its embedded `PosixAttrs` replaced. No-op for shapes
+/// that carry none.
+pub fn layout_with_posix(mut layout: ObjectLayout, new_posix: PosixAttrs) -> ObjectLayout {
+    if let ObjectState::Directory(data) = &mut layout.state {
+        data.posix = new_posix;
+        return layout;
+    }
+    if matches!(
+        &layout.state,
+        ObjectState::Normal(_)
+            | ObjectState::Mpu(MpuState::Completed(_))
+            | ObjectState::Symlink(_)
+            | ObjectState::Special(_)
+    ) {
+        layout.set_fs_posix(Some(new_posix));
+    }
+    layout
+}
+
+fn layout_bytes(layout: &ObjectLayout) -> Option<Vec<u8>> {
+    rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(layout, Vec::new()).ok()
+}
+
+/// True when `current` differs from `expected` only in posix attributes,
+/// whatever the layout shape. rkyv encoding is deterministic for these
+/// types, so byte equality after re-normalizing the posix is exact
+/// structural equality. This is the rebase rule of the flush CAS (a
+/// chmod or utimensat may land between prepare and commit) and the
+/// gateway's rule for a client-authored value: it may change attributes,
+/// never the data binding.
+pub fn posix_only_moved(expected: &ObjectLayout, current: &ObjectLayout) -> bool {
+    // Copy the exact optional posix, not its default-filled reading: an
+    // absent posix and an all-zero one serialize differently.
+    let mut normalized = current.clone();
+    match (&expected.state, &mut normalized.state) {
+        (ObjectState::Directory(expected_dir), ObjectState::Directory(current_dir)) => {
+            current_dir.posix = expected_dir.posix;
+        }
+        (ObjectState::Directory(_), _) | (_, ObjectState::Directory(_)) => return false,
+        _ => normalized.set_fs_posix(expected.fs_posix()),
+    }
+    match (layout_bytes(expected), layout_bytes(&normalized)) {
+        (Some(expected_bytes), Some(normalized_bytes)) => expected_bytes == normalized_bytes,
+        _ => false,
+    }
+}
+
+/// True when both layouts publish the same committed data: same blob,
+/// ceiling, size, geometry and map epoch. The allocator, append record,
+/// posix and version id may differ: a prepared (uncommitted) flush moves
+/// exactly those, and buffered edits against `expected` stay valid.
+pub fn same_committed_data(expected: &ObjectLayout, current: &ObjectLayout) -> bool {
+    let (ObjectState::Normal(a), ObjectState::Normal(b)) = (&expected.state, &current.state) else {
+        return false;
+    };
+    a.blob_guid == b.blob_guid
+        && a.core_meta_data.size == b.core_meta_data.size
+        && expected.blob_version == current.blob_version
+        && expected.block_size == current.block_size
+        && expected.map_epoch() == current.map_epoch()
+}
+
 /// The `@hardlink/<inode_id>` keyspace entry that backs every
 /// `ObjectState::Indirect` redirect. Holds the real `ObjectLayout`
 /// Prefix of the shared hardlink records' internal keyspace. Exported
@@ -643,6 +736,60 @@ mod tests {
         multi.set_fs_posix(Some(p));
         assert_eq!(multi.next_burn_version(), 4);
         assert_eq!(multi.fs_posix(), Some(p));
+    }
+
+    #[test]
+    fn posix_only_moved_ignores_attributes_and_nothing_else() {
+        let base = normal_layout(core_meta(2));
+        let mut chmodded = base.clone();
+        chmodded.set_fs_posix(Some(PosixAttrs {
+            mode: 0o100600,
+            uid: 7,
+            gid: 8,
+            mtime_ns: 9,
+            ctime_ns: 10,
+        }));
+        assert!(
+            posix_only_moved(&base, &chmodded),
+            "posix from none to some"
+        );
+        assert!(
+            posix_only_moved(&chmodded, &base),
+            "posix from some to none"
+        );
+        assert!(posix_only_moved(&base, &base), "identical rows");
+
+        let mut advanced = base.clone();
+        advanced.blob_version = 2;
+        assert!(
+            !posix_only_moved(&base, &advanced),
+            "ceiling move is a writer"
+        );
+        let mut mapped = base.clone();
+        mapped.set_map_epoch(4);
+        assert!(!posix_only_moved(&base, &mapped), "row commit is a writer");
+        let mut pending = base.clone();
+        pending.set_pending_append(Some((3, 5)));
+        assert!(
+            !posix_only_moved(&base, &pending),
+            "append record is a writer"
+        );
+        assert!(
+            same_committed_data(&base, &pending),
+            "prepare keeps the data"
+        );
+        assert!(!same_committed_data(&base, &advanced));
+    }
+
+    #[test]
+    fn orphan_keys_carry_their_mount_instance() {
+        let instance = Uuid::from_u128(7);
+        let key = orphan_key(instance, Uuid::from_u128(9));
+        assert!(key.starts_with(ORPHAN_PREFIX));
+        assert_eq!(parse_orphan_instance(&key), Some(instance));
+        assert_eq!(parse_orphan_instance(&format!("{key}\0")), Some(instance));
+        assert_eq!(parse_orphan_instance("@orphan/legacy"), None);
+        assert_eq!(parse_orphan_instance("/user/key"), None);
     }
 
     #[test]
