@@ -45,7 +45,8 @@ use crate::prefetch;
 use crate::resolve::BlockRead;
 use crate::s3_volume::S3DataVolume;
 use crate::sweep::{
-    SweepCoordinator, scavenge_teardown_markers, teardown_value, write_conditional_marker,
+    SweepCoordinator, delete_with_teardown, scavenge_orphans, scavenge_teardown_markers,
+    teardown_value, write_conditional_marker,
 };
 
 const HEADER_SIZE: usize = size_of::<MessageHeader>();
@@ -323,11 +324,18 @@ impl Gateway {
         );
         // One scavenge pass per mount, as the old per-process fs_server
         // did at startup: markers a crashed teardown left behind become
-        // row-teardown work again.
+        // row-teardown work again, and a writer reclaims the orphans of
+        // any writer before it.
+        let instance = Uuid::from_slice(&req.instance).unwrap_or_else(|_| Uuid::new_v4());
         compio_runtime::spawn(scavenge_teardown_markers(cfg.clone(), self.sweep.clone())).detach();
+        if req.read_write {
+            compio_runtime::spawn(scavenge_orphans(cfg.clone(), self.sweep.clone(), instance))
+                .detach();
+        }
         let session = Session {
             bucket: req.bucket,
             read_write: req.read_write,
+            instance,
         };
         Ok(mount_response::Session {
             token: self.auth.issue_token(&session),
@@ -532,9 +540,9 @@ impl Gateway {
         req: DeleteInodeRequest,
         trace_id: &TraceId,
     ) -> Result<delete_inode_response::Deleted, FsError> {
-        let (_, cfg, backend) = self.authorize(req.caller.as_ref(), true)?;
+        let (session, cfg, backend) = self.authorize(req.caller.as_ref(), true)?;
         reject_reserved_key(&req.key)?;
-        let current = if req.orphan || req.teardown {
+        let current = if req.orphan {
             match backend.get_inode_raw(&req.key, trace_id).await {
                 Ok(bytes) => Some(bytes),
                 Err(FsError::NotFound) => None,
@@ -549,7 +557,7 @@ impl Gateway {
         if req.orphan
             && let Some(previous) = current.as_ref().filter(|v| Self::is_data_value(v))
         {
-            let orphan = orphan_key(Uuid::new_v4());
+            let orphan = orphan_key(session.instance, Uuid::new_v4());
             match backend
                 .rename_file(&req.key, &orphan, false, trace_id)
                 .await
@@ -568,19 +576,13 @@ impl Gateway {
                 Err(error) => return Err(error),
             }
         }
-        if req.teardown
-            && let Some(current) = current.as_ref()
-            && let Ok(layout) = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(current)
-        {
-            write_conditional_marker(&backend, &layout, &req.key, trace_id).await?;
-        }
-        let previous = backend.delete_inode(&req.key, trace_id).await?;
-        backend.forget_layout(&req.key);
-        if req.teardown
-            && let Some(previous) = &previous
-        {
-            teardown_value(&self.sweep, &cfg, &backend, &req.key, previous, trace_id).await;
-        }
+        let previous = if req.teardown {
+            delete_with_teardown(&self.sweep, &cfg, &backend, &req.key, trace_id).await?
+        } else {
+            let previous = backend.delete_inode(&req.key, trace_id).await?;
+            backend.forget_layout(&req.key);
+            previous
+        };
         Ok(delete_inode_response::Deleted {
             existed: previous.is_some(),
             previous: previous.unwrap_or_default(),
@@ -593,7 +595,7 @@ impl Gateway {
         req: RenameFileRequest,
         trace_id: &TraceId,
     ) -> Result<rename_file_response::Displaced, FsError> {
-        let (_, cfg, backend) = self.authorize(req.caller.as_ref(), true)?;
+        let (session, cfg, backend) = self.authorize(req.caller.as_ref(), true)?;
         reject_reserved_key(&req.src_key)?;
         reject_reserved_key(&req.dst_key)?;
         // Record the teardown intent for the displaced blob's rows before
@@ -624,7 +626,7 @@ impl Gateway {
         // by. The blob has no key for the few milliseconds in between,
         // and nothing tears down a blob without an explicit request.
         if req.orphan_displaced && Self::is_data_value(&displaced) {
-            let orphan = orphan_key(Uuid::new_v4());
+            let orphan = orphan_key(session.instance, Uuid::new_v4());
             backend
                 .put_inode(&orphan, displaced.clone(), trace_id)
                 .await?;

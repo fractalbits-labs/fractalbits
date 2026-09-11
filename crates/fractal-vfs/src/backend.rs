@@ -52,6 +52,9 @@ pub struct Displaced {
 pub struct Session {
     initial_token: Bytes,
     pub supports_s3_volume: bool,
+    /// This process's mount instance, sent on every (re-)mount so the
+    /// gateway can tell this mount's orphans from a departed one's.
+    instance: Uuid,
 }
 
 /// Mount-time configuration shared across threads.
@@ -86,7 +89,11 @@ fn version_bytes(version_id: Option<Uuid>) -> Bytes {
         .unwrap_or_default()
 }
 
-async fn mount(client: &RpcClientFs, config: &Config) -> Result<mount_response::Session, FsError> {
+async fn mount(
+    client: &RpcClientFs,
+    config: &Config,
+    instance: Uuid,
+) -> Result<mount_response::Session, FsError> {
     let trace_id = TraceId::new();
     let timestamp_ms = unix_ms();
     let nonce: [u8; 16] = rand::random();
@@ -108,6 +115,7 @@ async fn mount(client: &RpcClientFs, config: &Config) -> Result<mount_response::
         timestamp_ms,
         nonce: Bytes::copy_from_slice(&nonce),
         signature: Bytes::from(signature),
+        instance: Bytes::copy_from_slice(instance.as_bytes()),
     };
     let resp = rpc_retry!(
         "fs_gateway",
@@ -130,7 +138,8 @@ impl BackendConfig {
             config.gateway_addrs.clone(),
             config.rpc_connection_timeout(),
         );
-        let session = mount(&client, config)
+        let instance = Uuid::new_v4();
+        let session = mount(&client, config, instance)
             .await
             .map_err(|e| format!("mount '{}' via gateway failed: {e}", config.bucket_name))?;
         tracing::info!(
@@ -145,6 +154,7 @@ impl BackendConfig {
             session: Arc::new(Session {
                 initial_token: session.token,
                 supports_s3_volume: session.supports_s3_volume,
+                instance,
             }),
         })
     }
@@ -258,7 +268,7 @@ impl StorageBackend {
     }
 
     async fn remount(&self) -> Result<(), FsError> {
-        let session = mount(&self.client, &self.config).await?;
+        let session = mount(&self.client, &self.config, self.session.instance).await?;
         *self.token.write() = session.token;
         Ok(())
     }

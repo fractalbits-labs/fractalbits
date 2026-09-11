@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
+use data_types::object_layout::{
+    MpuState, ORPHAN_PREFIX, ObjectLayout, ObjectState, parse_orphan_instance,
+};
 use data_types::ovr_map::{
     BlockResolution, OVR_GC_PREFIX, OvrGcMarker, OvrRow, encode_ovr_gc_data_pending,
     encode_ovr_gc_rows_ready, ovr_gc_key, ovr_row_key, ovr_row_prefix, parse_ovr_gc_blob_id,
@@ -350,6 +352,41 @@ async fn teardown_blob(
         }
     }
     enqueue_sweep(coordinator, backend_config.clone(), blob_guid, hint);
+}
+
+/// Delete `key` and reclaim the data its value named. The teardown
+/// intent is recorded before the delete so a crash in between cannot
+/// leak the rows. Returns the removed bytes.
+pub async fn delete_with_teardown(
+    coordinator: &SweepCoordinator,
+    backend_config: &Arc<BackendConfig>,
+    backend: &StorageBackend,
+    key: &str,
+    trace_id: &TraceId,
+) -> Result<Option<Bytes>, FsError> {
+    match backend.get_inode_raw(key, trace_id).await {
+        Ok(current) => {
+            if let Ok(layout) = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&current) {
+                write_conditional_marker(backend, &layout, key, trace_id).await?;
+            }
+        }
+        Err(FsError::NotFound) => {}
+        Err(error) => return Err(error),
+    }
+    let previous = backend.delete_inode(key, trace_id).await?;
+    backend.forget_layout(key);
+    if let Some(previous) = &previous {
+        teardown_value(
+            coordinator,
+            backend_config,
+            backend,
+            key,
+            previous,
+            trace_id,
+        )
+        .await;
+    }
+    Ok(previous)
 }
 
 /// Reclaim the data a value that just left the namespace named: the blob
@@ -1036,6 +1073,59 @@ pub async fn scavenge_teardown_markers(
                 ScavengedMarker::Work(blob_guid, work) => (blob_guid, work),
             };
             coordinator.queue.lock().enqueue(blob_guid, *work);
+        }
+        if !has_more {
+            return;
+        }
+        start_after = last_key;
+    }
+}
+
+/// One pass over `@orphan/` on a read-write mount: tear down every
+/// orphan another mounting process left behind. Only one writer holds a
+/// bucket at a time, so a foreign instance id proves its owner is gone;
+/// the mounting process's own orphans (a re-mount after token expiry or
+/// failover) are still open and are kept.
+pub async fn scavenge_orphans(
+    backend_config: Arc<BackendConfig>,
+    coordinator: Arc<SweepCoordinator>,
+    own_instance: Uuid,
+) {
+    let backend = match StorageBackend::new(&backend_config) {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::warn!(%error, "orphan scavenger backend initialization failed");
+            return;
+        }
+    };
+    let trace_id = TraceId::new();
+    let mut start_after = String::new();
+    loop {
+        let (page, has_more) = match backend
+            .list_inodes_raw_page(ORPHAN_PREFIX, &start_after, ROW_TEARDOWN_PAGE, &trace_id)
+            .await
+        {
+            Ok(page) => page,
+            Err(FsError::NotFound) => return,
+            Err(error) => {
+                tracing::warn!(%error, "orphan scavenger listing failed");
+                return;
+            }
+        };
+        let Some(last_key) = page.last().map(|(key, _)| key.clone()) else {
+            return;
+        };
+        for (key, _) in &page {
+            let key = key.trim_end_matches('\0');
+            if parse_orphan_instance(key) == Some(own_instance) {
+                continue;
+            }
+            match delete_with_teardown(&coordinator, &backend_config, &backend, key, &trace_id)
+                .await
+            {
+                Ok(_) => tracing::info!(%key, "reclaimed orphan of a departed mount"),
+                Err(error) => tracing::warn!(%key, %error, "orphan reclamation failed"),
+            }
         }
         if !has_more {
             return;
