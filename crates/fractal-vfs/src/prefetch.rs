@@ -1,16 +1,11 @@
-//! Open-time whole-blob prefetch hint.
+//! Open-time whole-file prefetch hint.
 //!
 //! The mount has no cache of its own; the disk cache lives on the
 //! gateway. What stays here is the decision: on a read `vfs_open`, a few
 //! cheap comparisons against the file size and the kernel's
-//! `FOPEN_KEEP_CACHE` hint decide whether the file is worth warming, and
-//! `prefetch_plan` resolves each block's exact committed identity from
-//! the row map so the gateway can fetch without interpreting layouts.
-//! The fetch loop and the cache-pressure check run on the gateway.
-
-use data_types::object_layout::ObjectLayout;
-use data_types::ovr_map::{BlockFetchPlan, OvrRowMap, block_fetch_plan};
-use fs_gateway_codec::prefetch_blob_request::PrefetchBlock;
+//! `FOPEN_KEEP_CACHE` hint decide whether the file is worth warming. The
+//! gateway resolves the blocks, runs the fetch loop and applies its own
+//! cache-pressure check.
 
 use crate::config::Config;
 
@@ -56,44 +51,6 @@ pub fn should_prefetch(file_size: u64, fopen_keep_cache: bool, policy: &Prefetch
         return true;
     }
     policy.workload_bulk_read
-}
-
-/// Resolve every block of `layout` to the exact committed identity the
-/// gateway should fetch. Holes and stale resolutions are skipped: the
-/// former need no fetch, the latter mean the layout snapshot is older
-/// than the row and the read path will refresh it.
-pub fn prefetch_plan(layout: &ObjectLayout, rows: Option<&OvrRowMap>) -> Vec<PrefetchBlock> {
-    let Ok(file_size) = layout.size() else {
-        return Vec::new();
-    };
-    let block_size = layout.block_size as u64;
-    if file_size == 0 || block_size == 0 {
-        return Vec::new();
-    }
-    let ceiling = layout.blob_version;
-    let last_block = ((file_size - 1) / block_size) as u32;
-    let mut plan = Vec::with_capacity(last_block as usize + 1);
-    for block_number in 0..=last_block {
-        let block_start = block_number as u64 * block_size;
-        let content_len = std::cmp::min(block_size, file_size - block_start) as usize;
-        if let BlockFetchPlan::Fetch {
-            version, read_len, ..
-        } = block_fetch_plan(
-            rows,
-            block_number,
-            ceiling,
-            layout.block_size as usize,
-            content_len,
-        ) {
-            plan.push(PrefetchBlock {
-                block_number,
-                version,
-                read_len: read_len as u32,
-                content_len: content_len as u32,
-            });
-        }
-    }
-    plan
 }
 
 #[cfg(test)]

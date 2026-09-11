@@ -1,23 +1,23 @@
 //! Storage backend over the `fs_gateway` protocol.
 //!
-//! The method set is the one `VfsCore` consumed from the in-cluster
-//! backend; each call is one round trip to the gateway, which owns the
-//! cluster clients, the disk cache, prefetch and reclamation. Every
-//! request carries a session token issued by `Mount`; a gateway that no
-//! longer recognises it (restart, expiry, or load-balancer routing) answers
-//! `Unauthorized` and that worker's connection re-mounts once and retries.
+//! Inode primitives are one round trip each. Data is addressed by inode
+//! key and logical block: the gateway owns blob identity, generations,
+//! the row map and reclamation, and this side never names any of them.
+//! Every request carries a session token issued by `Mount`; a gateway
+//! that no longer recognises it (restart, expiry, or load-balancer
+//! routing) answers `Unauthorized` and that worker's connection re-mounts
+//! once and retries.
 
 use bytes::Bytes;
-use data_types::object_layout::{InodeRecord, ObjectLayout};
-use data_types::{DataBlobGuid, TraceId};
-use fs_gateway_codec::prefetch_blob_request::PrefetchBlock;
-use fs_gateway_codec::sweep_blob_request::BlockFloor;
+use data_types::TraceId;
+use data_types::object_layout::{InodeRecord, ObjectLayout, PosixAttrs};
 use fs_gateway_codec::*;
 use parking_lot::RwLock;
 use rpc_client_common::rpc_retry;
 use rpc_client_fs::RpcClientFs;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::FsError;
@@ -28,11 +28,24 @@ pub struct ListEntry {
     pub layout: Option<ObjectLayout>,
 }
 
-/// One stored generation of a block, as enumerated by the gateway.
-#[derive(Debug, Clone, Copy)]
-pub struct BlobBlockEntry {
-    pub block_number: u32,
-    pub version: u64,
+/// Outcome of `BeginFlush`: the opaque ticket the later steps carry and,
+/// for an overwrite, the prepared layout now stored at the key.
+pub struct Prepared {
+    pub ticket: Bytes,
+    pub layout: Option<ObjectLayout>,
+}
+
+/// Outcome of a delete: the removed bytes, and the hidden key the value
+/// was moved to instead when the caller asked to orphan it.
+pub struct Deleted {
+    pub previous: Option<Bytes>,
+    pub orphan_key: Option<String>,
+}
+
+/// The value a rename displaced at its destination, if any.
+pub struct Displaced {
+    pub previous: Bytes,
+    pub orphan_key: Option<String>,
 }
 
 /// Mount capabilities shared by every worker thread.
@@ -57,6 +70,20 @@ fn unix_ms() -> u64 {
 fn decode_layout(bytes: &[u8]) -> Result<ObjectLayout, FsError> {
     rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(bytes)
         .map_err(|e| FsError::Deserialize(e.to_string()))
+}
+
+fn encode_layout(layout: &ObjectLayout) -> Result<Bytes, FsError> {
+    Ok(
+        rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(layout, Vec::new())
+            .map_err(FsError::from)?
+            .into(),
+    )
+}
+
+fn version_bytes(version_id: Option<Uuid>) -> Bytes {
+    version_id
+        .map(|id| Bytes::copy_from_slice(id.as_bytes()))
+        .unwrap_or_default()
 }
 
 async fn mount(client: &RpcClientFs, config: &Config) -> Result<mount_response::Session, FsError> {
@@ -248,7 +275,7 @@ impl StorageBackend {
     }
 
     /// Raw value fetch: the stored bytes without the `ObjectLayout`
-    /// decode (the `@ovr/` row path stores non-layout values).
+    /// decode (`@hardlink/` records are a different shape).
     pub async fn get_inode_raw(&self, key: &str, trace_id: &TraceId) -> Result<Bytes, FsError> {
         gateway_call!(self, get_inode, get_inode_response, trace_id, |token| {
             GetInodeRequest {
@@ -257,44 +284,6 @@ impl StorageBackend {
             }
         })
         .await
-    }
-
-    async fn list_page(
-        &self,
-        prefix: &str,
-        delimiter: &str,
-        start_after: &str,
-        max_keys: u32,
-        trace_id: &TraceId,
-    ) -> Result<(Vec<(String, Bytes)>, bool), FsError> {
-        let page = gateway_call!(self, list_inodes, list_inodes_response, trace_id, |token| {
-            ListInodesRequest {
-                caller: self.caller(token.clone()),
-                prefix: prefix.to_string(),
-                delimiter: delimiter.to_string(),
-                start_after: start_after.to_string(),
-                max_keys,
-            }
-        })
-        .await?;
-        Ok((
-            page.entries.into_iter().map(|e| (e.key, e.value)).collect(),
-            page.has_more,
-        ))
-    }
-
-    /// One raw listing page: `(key, value)` pairs plus the has_more flag.
-    /// Callers own pagination via `start_after`; the server page clamp makes
-    /// ignoring `has_more` a silent-truncation bug.
-    pub async fn list_inodes_raw_page(
-        &self,
-        prefix: &str,
-        start_after: &str,
-        max_keys: u32,
-        trace_id: &TraceId,
-    ) -> Result<(Vec<(String, Bytes)>, bool), FsError> {
-        self.list_page(prefix, "", start_after, max_keys, trace_id)
-            .await
     }
 
     /// List inodes under a prefix. An empty value is a common prefix (directory).
@@ -306,20 +295,30 @@ impl StorageBackend {
         max_keys: u32,
         trace_id: &TraceId,
     ) -> Result<Vec<ListEntry>, FsError> {
-        let (page, _has_more) = self
-            .list_page(prefix, delimiter, start_after, max_keys, trace_id)
-            .await?;
-        let mut entries = Vec::with_capacity(page.len());
-        for (key, value) in page {
-            let layout = if value.is_empty() {
+        let page = gateway_call!(self, list_inodes, list_inodes_response, trace_id, |token| {
+            ListInodesRequest {
+                caller: self.caller(token.clone()),
+                prefix: prefix.to_string(),
+                delimiter: delimiter.to_string(),
+                start_after: start_after.to_string(),
+                max_keys,
+            }
+        })
+        .await?;
+        let mut entries = Vec::with_capacity(page.entries.len());
+        for entry in page.entries {
+            let layout = if entry.value.is_empty() {
                 None
             } else {
-                Some(decode_layout(&value).inspect_err(|e| {
-                    tracing::error!(%key, value_len = value.len(), error = %e,
+                Some(decode_layout(&entry.value).inspect_err(|e| {
+                    tracing::error!(key = %entry.key, value_len = entry.value.len(), error = %e,
                         "list entry: rkyv deserialization failed");
                 })?)
             };
-            entries.push(ListEntry { key, layout });
+            entries.push(ListEntry {
+                key: entry.key,
+                layout,
+            });
         }
         Ok(entries)
     }
@@ -328,7 +327,7 @@ impl StorageBackend {
     pub async fn list_mpu_parts(
         &self,
         key: &str,
-        upload_id: uuid::Uuid,
+        upload_id: Uuid,
         trace_id: &TraceId,
     ) -> Result<Vec<(String, ObjectLayout)>, FsError> {
         let parts = gateway_call!(
@@ -352,114 +351,177 @@ impl StorageBackend {
             .collect()
     }
 
-    /// Read one block at its exact committed generation. The gateway
-    /// serves it from its disk cache when present. `key` is the inode
-    /// whose layout references the blob (see the proto `Caller` note).
-    #[allow(clippy::too_many_arguments)]
+    /// Read logical block `block_number` of the file at `key` at its
+    /// committed content, or `None` for a block that reads as zeros.
+    /// `expected_version_id` is the layout the caller read against; the
+    /// gateway answers `StaleLayout` if the key has moved past it.
     pub async fn read_block(
         &self,
         key: &str,
-        blob_guid: DataBlobGuid,
-        version: u64,
         block_number: u32,
-        content_len: usize,
+        expected_version_id: Option<Uuid>,
         trace_id: &TraceId,
-    ) -> Result<Bytes, FsError> {
+    ) -> Result<Option<Bytes>, FsError> {
         let block = gateway_call!(self, read_block, read_block_response, trace_id, |token| {
             ReadBlockRequest {
                 caller: self.caller(token.clone()),
-                blob: Some(BlobGuid::from(blob_guid)),
-                block_number,
-                version,
-                content_len: content_len as u32,
                 key: key.to_string(),
+                block_number,
+                expected_version_id: version_bytes(expected_version_id),
             }
         })
         .await?;
-        Ok(block.data)
+        Ok((!block.hole).then_some(block.data))
     }
 
-    /// Mint a fresh data blob GUID on the gateway's data volume.
-    pub async fn create_blob_guid(&self, trace_id: &TraceId) -> Result<DataBlobGuid, FsError> {
-        let guid = gateway_call!(
+    /// Blocks of `[first_block, first_block + block_count)` holding data.
+    pub async fn probe_data_blocks(
+        &self,
+        key: &str,
+        first_block: u32,
+        block_count: u32,
+        expected_version_id: Option<Uuid>,
+        trace_id: &TraceId,
+    ) -> Result<Vec<u32>, FsError> {
+        let blocks = gateway_call!(
             self,
-            allocate_blob_guid,
-            allocate_blob_guid_response,
+            probe_data_blocks,
+            probe_data_blocks_response,
             trace_id,
-            |token| AllocateBlobGuidRequest {
+            |token| ProbeDataBlocksRequest {
                 caller: self.caller(token.clone()),
+                key: key.to_string(),
+                first_block,
+                block_count,
+                expected_version_id: version_bytes(expected_version_id),
             }
         )
         .await?;
-        DataBlobGuid::try_from(&guid).map_err(FsError::Internal)
+        Ok(blocks.data_blocks)
     }
 
-    /// Write a single block at a specific version. Override-style flush
-    /// passes the bumped `blob_version`; initial-create passes `1`.
+    /// Prepare a flush of `key`. `expected` is the committed layout the
+    /// dirty buffer was built against (`None` for a create).
     #[allow(clippy::too_many_arguments)]
-    pub async fn write_block(
+    pub async fn begin_flush(
         &self,
         key: &str,
-        blob_guid: DataBlobGuid,
-        block_number: u32,
-        body: Bytes,
-        version: u64,
+        expected: Option<&ObjectLayout>,
+        file_size: u64,
+        rewrites: &[u32],
+        punched: &[u32],
+        eof_low_watermark: Option<u32>,
+        trim_upper: Option<u32>,
         trace_id: &TraceId,
-    ) -> Result<(), FsError> {
-        gateway_call!(self, write_block, write_block_response, trace_id, |token| {
-            WriteBlockRequest {
+    ) -> Result<Prepared, FsError> {
+        let expected_layout = match expected {
+            Some(layout) => encode_layout(layout)?,
+            None => Bytes::new(),
+        };
+        let prepared = gateway_call!(self, begin_flush, begin_flush_response, trace_id, |token| {
+            BeginFlushRequest {
                 caller: self.caller(token.clone()),
-                blob: Some(BlobGuid::from(blob_guid)),
-                block_number,
-                version,
-                data: body.clone(),
                 key: key.to_string(),
+                expected_layout: expected_layout.clone(),
+                file_size,
+                rewrites: rewrites.to_vec(),
+                punched: punched.to_vec(),
+                eof_low_watermark,
+                trim_upper,
             }
         })
+        .await?;
+        let layout = if prepared.layout.is_empty() {
+            None
+        } else {
+            Some(decode_layout(&prepared.layout)?)
+        };
+        Ok(Prepared {
+            ticket: prepared.ticket,
+            layout,
+        })
+    }
+
+    /// Ship one dirty block of a prepared flush.
+    pub async fn write_flush_block(
+        &self,
+        ticket: &Bytes,
+        block_number: u32,
+        data: Bytes,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        gateway_call!(
+            self,
+            write_flush_block,
+            write_flush_block_response,
+            trace_id,
+            |token| WriteFlushBlockRequest {
+                caller: self.caller(token.clone()),
+                ticket: ticket.clone(),
+                block_number,
+                data: data.clone(),
+            }
+        )
         .await
     }
 
-    /// Enumerate the committed block entries for one blob over
-    /// `[first_block, first_block + block_count)`. Absent blocks are holes.
-    pub async fn list_blob_blocks(
+    /// Commit a prepared flush once every block is acknowledged. Returns
+    /// the committed layout.
+    pub async fn commit_flush(
         &self,
-        key: &str,
-        blob_guid: DataBlobGuid,
-        first_block: u32,
-        block_count: u32,
+        ticket: &Bytes,
+        rewrites: &[u32],
+        punched: &[u32],
+        posix: PosixAttrs,
         trace_id: &TraceId,
-    ) -> Result<Vec<BlobBlockEntry>, FsError> {
-        let entries = gateway_call!(
+    ) -> Result<ObjectLayout, FsError> {
+        let layout = gateway_call!(
             self,
-            list_blob_blocks,
-            list_blob_blocks_response,
+            commit_flush,
+            commit_flush_response,
             trace_id,
-            |token| ListBlobBlocksRequest {
+            |token| CommitFlushRequest {
                 caller: self.caller(token.clone()),
-                blob: Some(BlobGuid::from(blob_guid)),
-                first_block,
-                block_count,
-                all_nodes: false,
-                key: key.to_string(),
+                ticket: ticket.clone(),
+                rewrites: rewrites.to_vec(),
+                punched: punched.to_vec(),
+                posix: Some(posix.into()),
             }
         )
         .await?;
-        Ok(entries
-            .entries
-            .into_iter()
-            .map(|e| BlobBlockEntry {
-                block_number: e.block_number,
-                version: e.version,
-            })
-            .collect())
+        decode_layout(&layout)
+    }
+
+    /// Give up a prepared flush. Best effort: the gateway reclaims a
+    /// create's fresh blob after the grace; an overwrite needs nothing.
+    pub async fn abort_flush(&self, ticket: &Bytes) {
+        let trace_id = TraceId::new();
+        let result = gateway_call!(
+            self,
+            abort_flush,
+            abort_flush_response,
+            &trace_id,
+            |token| {
+                AbortFlushRequest {
+                    caller: self.caller(token.clone()),
+                    ticket: ticket.clone(),
+                }
+            }
+        )
+        .await;
+        if let Err(e) = result {
+            tracing::debug!(error = %e, "flush abort hint failed");
+        }
     }
 
     /// Put (create/update) an inode. Returns the previous object bytes
-    /// (empty if this is a new object).
+    /// (empty if this is a new object). A value that names data must
+    /// copy the binding stored at `proof_key`.
     pub async fn put_inode(
         &self,
         key: &str,
         value: Bytes,
+        proof_key: Option<&str>,
         trace_id: &TraceId,
     ) -> Result<Bytes, FsError> {
         gateway_call!(self, put_inode, put_inode_response, trace_id, |token| {
@@ -467,6 +529,7 @@ impl StorageBackend {
                 caller: self.caller(token.clone()),
                 key: key.to_string(),
                 value: value.clone(),
+                proof_key: proof_key.unwrap_or_default().to_string(),
             }
         })
         .await
@@ -504,7 +567,7 @@ impl StorageBackend {
     /// `@hardlink/<inode_id>` key.
     pub async fn get_inode_record(
         &self,
-        inode_id: uuid::Uuid,
+        inode_id: Uuid,
         trace_id: &TraceId,
     ) -> Result<InodeRecord, FsError> {
         let key = InodeRecord::key_for(inode_id);
@@ -513,11 +576,14 @@ impl StorageBackend {
             .map_err(|e| FsError::Internal(format!("InodeRecord deserialization: {e}")))
     }
 
-    /// Persist the `InodeRecord` for a hardlink-promoted inode.
+    /// Persist the `InodeRecord` for a hardlink-promoted inode. The
+    /// record copies the layout published at `source_key`, which the
+    /// gateway checks before accepting the data binding.
     pub async fn put_inode_record(
         &self,
-        inode_id: uuid::Uuid,
+        inode_id: Uuid,
         record: &InodeRecord,
+        source_key: &str,
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
         let key = InodeRecord::key_for(inode_id);
@@ -525,29 +591,34 @@ impl StorageBackend {
             rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(record, Vec::new())
                 .map_err(FsError::from)?
                 .into();
-        self.put_inode(&key, bytes, trace_id).await?;
+        self.put_inode(&key, bytes, Some(source_key), trace_id)
+            .await?;
         Ok(())
     }
 
     /// Delete the `InodeRecord` for a hardlink inode whose last name was
-    /// removed (nlink reached 0).
+    /// removed (nlink reached 0), reclaiming the shared blob.
     pub async fn delete_inode_record(
         &self,
-        inode_id: uuid::Uuid,
+        inode_id: Uuid,
+        teardown: bool,
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
         let key = InodeRecord::key_for(inode_id);
-        self.delete_inode(&key, trace_id).await?;
+        self.delete_inode(&key, teardown, false, trace_id).await?;
         Ok(())
     }
 
-    /// Delete an inode. Returns the previous object bytes, or None
-    /// if the object was not found / already deleted.
+    /// Delete an inode. `teardown` reclaims the data the value named;
+    /// `orphan` moves a data-bearing value to a hidden key instead, for a
+    /// file that is still open.
     pub async fn delete_inode(
         &self,
         key: &str,
+        teardown: bool,
+        orphan: bool,
         trace_id: &TraceId,
-    ) -> Result<Option<Bytes>, FsError> {
+    ) -> Result<Deleted, FsError> {
         let deleted = gateway_call_once!(
             self,
             delete_inode,
@@ -557,32 +628,46 @@ impl StorageBackend {
                 DeleteInodeRequest {
                     caller: self.caller(token.clone()),
                     key: key.to_string(),
+                    teardown,
+                    orphan,
                 }
             }
         )
         .await?;
-        Ok(deleted.existed.then_some(deleted.previous))
+        Ok(Deleted {
+            previous: deleted.existed.then_some(deleted.previous),
+            orphan_key: (!deleted.orphan_key.is_empty()).then_some(deleted.orphan_key),
+        })
     }
 
-    /// Rename a file (object). When `force_overwrite` is set and
-    /// the destination already exists, the gateway atomically replaces it and
-    /// returns the prior dst value (otherwise empty).
+    /// Rename a file (object). When `force_overwrite` is set and the
+    /// destination exists, the gateway atomically replaces it and hands
+    /// back the displaced value, reclaimed or orphaned as requested.
     pub async fn rename_file(
         &self,
         src_key: &str,
         dst_key: &str,
         force_overwrite: bool,
+        teardown_displaced: bool,
+        orphan_displaced: bool,
         trace_id: &TraceId,
-    ) -> Result<Bytes, FsError> {
-        gateway_call_once!(self, rename_file, rename_file_response, trace_id, |token| {
-            RenameFileRequest {
-                caller: self.caller(token.clone()),
-                src_key: src_key.to_string(),
-                dst_key: dst_key.to_string(),
-                force_overwrite,
-            }
+    ) -> Result<Displaced, FsError> {
+        let displaced =
+            gateway_call_once!(self, rename_file, rename_file_response, trace_id, |token| {
+                RenameFileRequest {
+                    caller: self.caller(token.clone()),
+                    src_key: src_key.to_string(),
+                    dst_key: dst_key.to_string(),
+                    force_overwrite,
+                    teardown_displaced,
+                    orphan_displaced,
+                }
+            })
+            .await?;
+        Ok(Displaced {
+            previous: displaced.previous,
+            orphan_key: (!displaced.orphan_key.is_empty()).then_some(displaced.orphan_key),
         })
-        .await
     }
 
     /// Rename a folder (directory prefix).
@@ -625,83 +710,23 @@ impl StorageBackend {
         .await
     }
 
-    /// Best-effort hint: warm the gateway disk cache with these exact
-    /// block identities. Errors are logged, never surfaced.
-    pub async fn prefetch_blob(
-        &self,
-        key: &str,
-        blob_guid: DataBlobGuid,
-        file_size: u64,
-        blocks: Vec<PrefetchBlock>,
-    ) {
+    /// Best-effort hint: warm the gateway disk cache with the file at
+    /// `key`. Errors are logged, never surfaced.
+    pub async fn prefetch_inode(&self, key: &str) {
         let trace_id = TraceId::new();
         let result = gateway_call!(
             self,
-            prefetch_blob,
-            prefetch_blob_response,
+            prefetch_inode,
+            prefetch_inode_response,
             &trace_id,
-            |token| PrefetchBlobRequest {
+            |token| PrefetchInodeRequest {
                 caller: self.caller(token.clone()),
-                blob: Some(BlobGuid::from(blob_guid)),
-                file_size,
-                blocks: blocks.clone(),
                 key: key.to_string(),
             }
         )
         .await;
         if let Err(e) = result {
-            tracing::debug!(%blob_guid, error = %e, "prefetch hint failed");
-        }
-    }
-
-    /// Hand reclamation work to the gateway. Best effort: the durable
-    /// `@ovr-gc/` markers cover a lost teardown; a lost superseded-block
-    /// sweep leaks invisible garbage until the block is rewritten. `key`
-    /// is the inode the blob was published under, or empty when the
-    /// client has none (a create whose publish never landed).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn sweep_blob(
-        &self,
-        key: &str,
-        blob_guid: DataBlobGuid,
-        victims: Vec<(u32, u64)>,
-        below: Vec<(u32, u64)>,
-        delete_all_blocks: bool,
-        delete_rows: bool,
-        with_grace: bool,
-        marker_data_pending_unix_ms: Option<u64>,
-    ) {
-        let trace_id = TraceId::new();
-        let victims: Vec<BlockIdentity> = victims
-            .into_iter()
-            .map(|(block_number, version)| BlockIdentity {
-                block_number,
-                version,
-            })
-            .collect();
-        let below: Vec<BlockFloor> = below
-            .into_iter()
-            .map(|(block_number, keep_from)| BlockFloor {
-                block_number,
-                keep_from,
-            })
-            .collect();
-        let result = gateway_call!(self, sweep_blob, sweep_blob_response, &trace_id, |token| {
-            SweepBlobRequest {
-                caller: self.caller(token.clone()),
-                blob: Some(BlobGuid::from(blob_guid)),
-                victims: victims.clone(),
-                below: below.clone(),
-                delete_all_blocks,
-                delete_rows,
-                with_grace,
-                marker_data_pending_unix_ms,
-                key: key.to_string(),
-            }
-        })
-        .await;
-        if let Err(e) = result {
-            tracing::warn!(%blob_guid, error = %e, "sweep hint failed; garbage may remain");
+            tracing::debug!(%key, error = %e, "prefetch hint failed");
         }
     }
 }

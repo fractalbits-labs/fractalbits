@@ -1,6 +1,5 @@
 //! Flush orchestration: fsync/close flushes, writeback draining, release.
 
-use data_types::object_layout::ObjectLayout;
 use fractal_fuse::{FileHandleId, InodeId};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -471,21 +470,9 @@ impl VfsCore {
 
         flush_res?;
 
-        // Handle deferred blob cleanup for unlinked files
-        if let Some(ino) = ino
-            && let Some((_, (key, old_bytes))) = self.deferred_blob_cleanup.remove(&ino)
-        {
-            if !self.has_open_handles_for_inode(ino, None) {
-                // Last handle closed, clean up blobs now
-                if let Ok(old_layout) =
-                    rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
-                {
-                    self.teardown_blob(&key, &old_layout).await;
-                }
-            } else {
-                // Still more handles open, re-insert
-                self.deferred_blob_cleanup.insert(ino, (key, old_bytes));
-            }
+        // The last close of an unlinked file reclaims its orphan key.
+        if let Some(ino) = ino {
+            self.release_orphan_if_last(ino);
         }
 
         Ok(())

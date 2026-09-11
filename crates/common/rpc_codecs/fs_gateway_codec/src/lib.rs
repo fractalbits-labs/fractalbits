@@ -1,8 +1,8 @@
 //! Wire protocol between `fractalbits-mount` (client) and `fs_gateway`.
 //!
-//! The command set is the storage-backend surface `VfsCore` consumes:
-//! inode primitives, block primitives, and two best-effort hints
-//! (prefetch, sweep) for the gateway-side caches and reclamation.
+//! The command set is the storage surface `VfsCore` consumes: inode
+//! primitives, data primitives addressed by inode key and logical block
+//! (reads, probes, the three-step flush), and a prefetch hint.
 
 pub mod message;
 
@@ -20,26 +20,29 @@ impl RpcCodec<MessageHeader> for MessageCodec {
     const RPC_TYPE: &'static str = "fs_gateway";
 }
 
-use data_types::DataBlobGuid;
+use data_types::object_layout;
 
-impl From<DataBlobGuid> for BlobGuid {
-    fn from(guid: DataBlobGuid) -> Self {
+impl From<object_layout::PosixAttrs> for PosixAttrs {
+    fn from(posix: object_layout::PosixAttrs) -> Self {
         Self {
-            blob_id: bytes::Bytes::copy_from_slice(guid.blob_id.as_bytes()),
-            volume_id: guid.volume_id as u32,
+            mode: posix.mode,
+            uid: posix.uid,
+            gid: posix.gid,
+            mtime_ns: posix.mtime_ns,
+            ctime_ns: posix.ctime_ns,
         }
     }
 }
 
-impl TryFrom<&BlobGuid> for DataBlobGuid {
-    type Error = String;
-
-    fn try_from(guid: &BlobGuid) -> Result<Self, Self::Error> {
-        let blob_id =
-            uuid::Uuid::from_slice(&guid.blob_id).map_err(|e| format!("invalid blob id: {e}"))?;
-        let volume_id =
-            u16::try_from(guid.volume_id).map_err(|_| "volume id out of range".to_string())?;
-        Ok(Self { blob_id, volume_id })
+impl From<&PosixAttrs> for object_layout::PosixAttrs {
+    fn from(posix: &PosixAttrs) -> Self {
+        Self {
+            mode: posix.mode,
+            uid: posix.uid,
+            gid: posix.gid,
+            mtime_ns: posix.mtime_ns,
+            ctime_ns: posix.ctime_ns,
+        }
     }
 }
 

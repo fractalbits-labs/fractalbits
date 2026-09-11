@@ -141,6 +141,28 @@ impl Auth {
     }
 }
 
+impl Auth {
+    /// Sign an opaque payload under the process secret: `payload || tag`.
+    pub fn sign(&self, payload: &[u8]) -> Bytes {
+        let mut out = BytesMut::with_capacity(payload.len() + TAG_LEN);
+        out.put_slice(payload);
+        out.put_slice(&hmac_tag(&self.secret, payload));
+        out.freeze()
+    }
+
+    /// The payload of a value produced by `sign`, if the tag verifies.
+    pub fn verify_signed<'a>(&self, signed: &'a [u8], what: &str) -> Result<&'a [u8], FsError> {
+        if signed.len() < TAG_LEN {
+            return Err(FsError::Unauthorized(format!("malformed {what}")));
+        }
+        let (payload, tag) = signed.split_at(signed.len() - TAG_LEN);
+        if !constant_time_eq(&hmac_tag(&self.secret, payload), tag) {
+            return Err(FsError::Unauthorized(format!("unknown {what}")));
+        }
+        Ok(payload)
+    }
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

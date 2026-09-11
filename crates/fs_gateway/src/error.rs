@@ -37,6 +37,15 @@ pub enum FsError {
 
     #[error("read-only session")]
     ReadOnly,
+
+    /// The layout at the key no longer matches the version the client
+    /// read against, or a row pair sits above every ceiling observed.
+    #[error("layout changed under the read")]
+    StaleLayout,
+
+    /// A row-committed generation is missing on every replica.
+    #[error("block data corrupted or lost")]
+    Corrupted,
 }
 
 impl FsError {
@@ -59,6 +68,8 @@ impl FsError {
             FsError::Deserialize(_) => ErrorKind::Deserialize,
             FsError::Unauthorized(_) => ErrorKind::Unauthorized,
             FsError::ReadOnly => ErrorKind::ReadOnly,
+            FsError::StaleLayout => ErrorKind::StaleLayout,
+            FsError::Corrupted => ErrorKind::Corrupted,
             FsError::Rpc(RpcError::NotFound) => ErrorKind::NotFound,
             FsError::Rpc(RpcError::AlreadyExists) => ErrorKind::AlreadyExists,
             FsError::Rpc(RpcError::NoSpace) => ErrorKind::NoSpace,

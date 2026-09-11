@@ -6,23 +6,18 @@ mod namespace;
 mod open;
 mod publish;
 mod read;
-mod row_map;
 mod sweep;
 mod write;
 mod write_buffer;
 
-use bytes::Bytes;
 use dashmap::DashMap;
 use data_types::object_layout::{ObjectLayout, ObjectState, SpecialKind};
-use data_types::ovr_map::OvrRowMap;
 use fractal_fuse::{FileHandleId, InodeId};
-use rkyv::api::high::to_bytes_in;
 use std::cell::Cell;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
 
 use crate::backend::{BackendConfig, StorageBackend};
 use crate::cache::{DirCache, DirEntry, DirEntryKind};
@@ -33,8 +28,6 @@ use crate::vfs::publish::spawn_writeback_worker;
 use crate::vfs::write_buffer::WriteBuffer;
 use crate::writeback::WritebackQueue;
 pub const TTL: Duration = Duration::from_secs(1);
-/// Bound on cached per-blob row snapshots.
-const ROW_MAP_CACHE_CAP: usize = 4096;
 pub const DEFAULT_BLOCK_SIZE: u32 = 128 * 1024;
 /// Upper bound on a single file's in-memory write buffer. The buffer is
 /// a flat `BytesMut`, so a truncate/extend allocates the whole size; a
@@ -141,39 +134,6 @@ struct FileHandle {
     write_buf: Option<WriteBuffer>,
 }
 
-/// True when `current` differs from `expected` only in posix attributes:
-/// the async SetPosix worker (or a chmod/utimensat) republished the row
-/// between this flush's base snapshot and its CAS. Metadata updates clone
-/// the fetched layout and carry the versioning fields (blob_version,
-/// next_version, pending_append, map_epoch) forward unchanged, so a data
-/// flush can rebase over them; any other divergence is a foreign writer
-/// and stays a hard conflict. The row-CAS promotion rule depends on
-/// exactly this narrowness: it promotes a stored `cur` into `prev` only
-/// when that `cur` is at or below the ceiling observed at prepare time,
-/// which is sound only because the ceiling cannot move between a flush's
-/// prepare and commit. Widening the rebase to accept a moved
-/// blob_version would silently unsound the rows' prev slots.
-fn posix_only_moved(expected: &ObjectLayout, current: &ObjectLayout) -> bool {
-    if !matches!(expected.state, ObjectState::Normal(_))
-        || !matches!(current.state, ObjectState::Normal(_))
-    {
-        return false;
-    }
-    // `set_fs_posix` re-normalizes the fs_ext box, so a republish that
-    // only touched posix collapses back to the expected shape (including
-    // the ext disappearing entirely when nothing else is in it).
-    let mut normalized = current.clone();
-    normalized.set_fs_posix(expected.fs_posix());
-    // rkyv encoding is deterministic for these types (the CAS guard itself
-    // relies on this), so byte equality is exact structural equality.
-    let expected_bytes = to_bytes_in::<_, rkyv::rancor::Error>(expected, Vec::new());
-    let normalized_bytes = to_bytes_in::<_, rkyv::rancor::Error>(&normalized, Vec::new());
-    match (expected_bytes, normalized_bytes) {
-        (Ok(expected_bytes), Ok(normalized_bytes)) => expected_bytes == normalized_bytes,
-        _ => false,
-    }
-}
-
 pub struct VfsCore {
     backend_config: Arc<BackendConfig>,
     inodes: Arc<InodeTable>,
@@ -195,23 +155,16 @@ pub struct VfsCore {
     /// One-shot guard for the writeback worker. Flipped by
     /// `ensure_writeback_worker_started`.
     writeback_worker_started: AtomicBool,
-    // Tracks blob data for unlinked files that still have open handles.
-    // Cleanup is deferred until the last handle is released.
-    /// `(unlinked key, displaced layout bytes)` awaiting the last close.
-    deferred_blob_cleanup: DashMap<InodeId, (String, Bytes)>,
+    /// Unlinked inodes whose value the gateway moved to a hidden
+    /// `@orphan/` key for the still-open handles; the last close deletes
+    /// the key with teardown.
+    orphans: DashMap<InodeId, String>,
     // InodeId-scoped write lock. At most one write-mode handle per inode is
     // allowed. Map value is the owning fh so a stale lock for a closed fh
     // can be reclaimed by the next opener. Reads do not touch
     // this lock.
     inode_write_owner: DashMap<InodeId, FileHandleId>,
-    /// Per-blob `@ovr/` row snapshots keyed by blob_id, each tagged with
-    /// the `map_epoch` it was loaded under. A snapshot at epoch M serves
-    /// any read whose layout still carries M (every resolution change is
-    /// published by a commit CAS that bumps the epoch), so invalidation
-    /// is a cheap epoch compare, never a TTL. LRU-bounded: eviction
-    /// reloads one blob's prefix, one listing page per 1000 records.
-    row_maps: parking_lot::Mutex<lru::LruCache<Uuid, Arc<OvrRowMap>>>,
-    /// Sweep hand-offs to the gateway not yet acknowledged; `destroy`
+    /// Orphan hand-offs to the gateway not yet acknowledged; `destroy`
     /// waits for these before exiting.
     sweep_inflight: Arc<AtomicUsize>,
 }
@@ -257,11 +210,8 @@ impl VfsCore {
             writeback_mode,
             writeback_poll_ms,
             writeback_worker_started: AtomicBool::new(false),
-            deferred_blob_cleanup: DashMap::new(),
+            orphans: DashMap::new(),
             inode_write_owner: DashMap::new(),
-            row_maps: parking_lot::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(ROW_MAP_CACHE_CAP).expect("row map cap is nonzero"),
-            )),
             sweep_inflight: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -287,8 +237,8 @@ impl VfsCore {
         })
     }
 
-    /// The inode key an open handle publishes under; data requests carry
-    /// it so the gateway can prove the blob belongs to this bucket.
+    /// The inode key an open handle reads and publishes through: its
+    /// name, or the hidden orphan key of an unlinked-but-open file.
     pub(crate) fn handle_key(&self, fh: FileHandleId) -> Result<String, FsError> {
         Ok(self
             .file_handles
@@ -463,77 +413,4 @@ fn dir_mode(perm: u16) -> u32 {
 
 fn symlink_mode(perm: u16) -> u32 {
     libc::S_IFLNK | perm as u32
-}
-
-#[cfg(test)]
-mod posix_only_moved_tests {
-    use super::*;
-    use data_types::DataBlobGuid;
-    use data_types::object_layout::{ObjectCoreMetaData, ObjectMetaData, PosixAttrs};
-
-    fn layout_with(mtime_ns: u64, blob_version: u64) -> ObjectLayout {
-        ObjectLayout {
-            timestamp: 1,
-            version_id: uuid::Uuid::nil(),
-            block_size: DEFAULT_BLOCK_SIZE,
-            blob_version,
-            fs_ext: ObjectLayout::fs_ext_from(Some(PosixAttrs {
-                mode: 0o100644,
-                uid: 1000,
-                gid: 1000,
-                mtime_ns,
-                ctime_ns: mtime_ns,
-            })),
-            state: ObjectState::Normal(ObjectMetaData {
-                blob_guid: DataBlobGuid {
-                    blob_id: uuid::Uuid::nil(),
-                    volume_id: 1,
-                },
-                core_meta_data: ObjectCoreMetaData {
-                    size: 2,
-                    etag: "etag".to_string(),
-                    headers: vec![],
-                    checksum: None,
-                },
-            }),
-        }
-    }
-
-    #[test]
-    fn posix_republish_is_benign() {
-        let base = layout_with(100, 1);
-        let moved = layout_with(200, 1);
-        assert!(posix_only_moved(&base, &moved), "mtime-only move rebases");
-        assert!(posix_only_moved(&base, &base), "identical rows rebase");
-    }
-
-    #[test]
-    fn structural_divergence_stays_a_conflict() {
-        let base = layout_with(100, 1);
-        let mut advanced = layout_with(100, 2);
-        assert!(
-            !posix_only_moved(&base, &advanced),
-            "blob_version change is a real writer"
-        );
-        advanced = layout_with(100, 1);
-        if let ObjectState::Normal(meta) = &mut advanced.state {
-            meta.core_meta_data.size = 3;
-        }
-        assert!(
-            !posix_only_moved(&base, &advanced),
-            "size change is a real writer"
-        );
-        let mut mapped = layout_with(100, 1);
-        mapped.set_map_epoch(4);
-        assert!(
-            !posix_only_moved(&base, &mapped),
-            "a row-writing commit is a real writer"
-        );
-        let mut pending = layout_with(100, 1);
-        pending.set_pending_append(Some((3, 5)));
-        assert!(
-            !posix_only_moved(&base, &pending),
-            "an in-flight append record is a real writer"
-        );
-    }
 }

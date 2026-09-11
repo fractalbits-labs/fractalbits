@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use data_types::object_layout::{MpuState, ObjectLayout, ObjectState, PosixAttrs};
+use data_types::object_layout::{ObjectLayout, PosixAttrs};
 use fractal_fuse::InodeId;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -13,43 +13,7 @@ pub enum EntryType {
     Directory,
 }
 
-/// Pull the embedded `PosixAttrs` out of an `ObjectLayout`. Returns the
-/// zero value for layout shapes that don't carry one (Indirect, or
-/// Mpu(Uploading)) so callers can treat that as the
-/// "uninitialised, fall back to defaults" sentinel.
-pub fn layout_posix(layout: &ObjectLayout) -> PosixAttrs {
-    match &layout.state {
-        ObjectState::Directory(data) => data.posix,
-        ObjectState::Normal(_)
-        | ObjectState::Mpu(MpuState::Completed(_))
-        | ObjectState::Symlink(_)
-        | ObjectState::Special(_) => layout.fs_posix().unwrap_or_default(),
-        _ => PosixAttrs::default(),
-    }
-}
-
-/// Set the embedded `PosixAttrs` of an `ObjectLayout`, returning the
-/// updated layout. No-op for shapes that don't carry posix
-/// (Indirect, Mpu(Uploading)); used by `vfs_setattr_posix`'s
-/// queue-side persistence path so a standalone chmod / chown / utime
-/// against a file with no pending flush still survives a
-/// forget+relookup.
-pub fn layout_with_posix(mut layout: ObjectLayout, new_posix: PosixAttrs) -> ObjectLayout {
-    if let ObjectState::Directory(data) = &mut layout.state {
-        data.posix = new_posix;
-        return layout;
-    }
-    if matches!(
-        &layout.state,
-        ObjectState::Normal(_)
-            | ObjectState::Mpu(MpuState::Completed(_))
-            | ObjectState::Symlink(_)
-            | ObjectState::Special(_)
-    ) {
-        layout.set_fs_posix(Some(new_posix));
-    }
-    layout
-}
+pub use data_types::object_layout::{layout_posix, layout_with_posix};
 
 pub struct InodeEntry {
     pub s3_key: String,
@@ -395,7 +359,7 @@ impl InodeTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use data_types::object_layout::DirectoryData;
+    use data_types::object_layout::{DirectoryData, ObjectState};
 
     fn dir_layout(uid: u32, gid: u32, mode: u32) -> ObjectLayout {
         ObjectLayout {

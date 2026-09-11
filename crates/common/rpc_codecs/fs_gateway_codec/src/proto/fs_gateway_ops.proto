@@ -4,33 +4,38 @@ package fs_gateway_ops;
 
 import "google/protobuf/empty.proto";
 
+// The client addresses data by inode key and logical block number only.
+// Blob identity, block generations, the `@ovr/` row map and reclamation
+// are owned by the gateway; the client never names a blob or a version.
+
 enum Command {
   Invalid = 0;
   Handshake = 1;
 
   // Session
-  Mount = 16;
+  Mount = 2;
 
   // Inode primitives
-  GetInode = 17;
-  ListInodes = 18;
-  PutInode = 19;
-  PutInodeCas = 20;
-  DeleteInode = 21;
-  RenameFile = 22;
-  RenameFolder = 23;
-  PutDirMarker = 24;
-  ListMpuParts = 25;
+  GetInode = 3;
+  ListInodes = 4;
+  PutInode = 5;
+  PutInodeCas = 6;
+  DeleteInode = 7;
+  RenameFile = 8;
+  RenameFolder = 9;
+  PutDirMarker = 10;
+  ListMpuParts = 11;
 
-  // Block primitives
-  AllocateBlobGuid = 26;
-  ReadBlock = 27;
-  WriteBlock = 28;
-  ListBlobBlocks = 29;
+  // Data primitives, addressed by (key, logical block)
+  ReadBlock = 12;
+  ProbeDataBlocks = 13;
+  BeginFlush = 14;
+  WriteFlushBlock = 15;
+  CommitFlush = 16;
+  AbortFlush = 17;
 
-  // Gateway-side cache / reclamation hints
-  PrefetchBlob = 32;
-  SweepBlob = 33;
+  // Gateway-side cache hint
+  PrefetchInode = 18;
 }
 
 // Backend outcomes VfsCore distinguishes. Kept as an enum (not errno) so
@@ -49,6 +54,9 @@ enum ErrorKind {
   Unauthorized = 9;
   ReadOnly = 10;
   Deserialize = 11;
+  // The layout at the key no longer matches the version the client
+  // read against; refresh the layout and retry.
+  StaleLayout = 12;
 }
 
 message Error {
@@ -59,21 +67,6 @@ message Error {
 // Session token issued by Mount, carried by every other request.
 message Caller {
   bytes token = 1;
-}
-
-// Data requests name the inode whose layout references the blob. The
-// gateway proves the blob belongs to the token's bucket from its own
-// ownership marker (gateway-allocated blobs) or, for blobs the S3 path
-// created, from that inode in the bucket's own namespace.
-
-message BlobGuid {
-  bytes blob_id = 1;
-  uint32 volume_id = 2;
-}
-
-message BlockIdentity {
-  uint32 block_number = 1;
-  uint64 version = 2;
 }
 
 // ---------- Mount ----------
@@ -140,10 +133,16 @@ message ListInodesResponse {
   }
 }
 
+// A client-supplied inode value may carry a data binding (blob, ceiling,
+// size, map epoch) only when it copies one the bucket already stores:
+// the value it replaces under CAS, or, for a blind put, the value at
+// `proof_key` (hardlink promotion copies the source layout into its
+// shared record). Only the gateway's flush commit changes a binding.
 message PutInodeRequest {
   Caller caller = 1;
   string key = 2;
   bytes value = 3;
+  string proof_key = 4;
 }
 
 message PutInodeResponse {
@@ -168,9 +167,15 @@ message PutInodeCasResponse {
   }
 }
 
+// `teardown` reclaims the data the removed value named, after the reader
+// grace. `orphan` instead moves a data-bearing value to a hidden
+// `@orphan/` key so still-open handles keep a name to address it by; the
+// client deletes that key with `teardown` on the last close.
 message DeleteInodeRequest {
   Caller caller = 1;
   string key = 2;
+  bool teardown = 3;
+  bool orphan = 4;
 }
 
 message DeleteInodeResponse {
@@ -182,6 +187,8 @@ message DeleteInodeResponse {
   message Deleted {
     bool existed = 1;
     bytes previous = 2;
+    // Set when the value was moved instead of deleted.
+    string orphan_key = 3;
   }
 }
 
@@ -190,13 +197,21 @@ message RenameFileRequest {
   string src_key = 2;
   string dst_key = 3;
   bool force_overwrite = 4;
+  // As for DeleteInode, applied to the value the rename displaced.
+  bool teardown_displaced = 5;
+  bool orphan_displaced = 6;
 }
 
 message RenameFileResponse {
   oneof result {
-    // Prior destination bytes (empty if none).
-    bytes ok = 1;
+    Displaced ok = 1;
     Error err = 2;
+  }
+
+  message Displaced {
+    // Prior destination bytes (empty if none).
+    bytes previous = 1;
+    string orphan_key = 2;
   }
 }
 
@@ -247,26 +262,17 @@ message ListMpuPartsResponse {
   }
 }
 
-// ---------- Block primitives ----------
+// ---------- Data primitives ----------
 
-message AllocateBlobGuidRequest {
-  Caller caller = 1;
-}
-
-message AllocateBlobGuidResponse {
-  oneof result {
-    BlobGuid ok = 1;
-    Error err = 2;
-  }
-}
-
+// One logical block of the file published at `key`, at its committed
+// content. `expected_version_id` (16 bytes, optional) is the layout the
+// client read against: a different committed layout answers StaleLayout
+// so one read never straddles two commits.
 message ReadBlockRequest {
   Caller caller = 1;
-  BlobGuid blob = 2;
+  string key = 2;
   uint32 block_number = 3;
-  uint64 version = 4;
-  uint32 content_len = 5;
-  string key = 6;
+  bytes expected_version_id = 4;
 }
 
 message ReadBlockResponse {
@@ -276,96 +282,149 @@ message ReadBlockResponse {
   }
 
   message Block {
+    // Empty with `hole == true` for a block that reads as zeros.
     bytes data = 1;
+    bool hole = 2;
   }
 }
 
-message WriteBlockRequest {
+// Which blocks of `[first_block, first_block + block_count)` hold data
+// (lseek SEEK_DATA / SEEK_HOLE). Absent blocks are holes.
+message ProbeDataBlocksRequest {
   Caller caller = 1;
-  BlobGuid blob = 2;
-  uint32 block_number = 3;
-  uint64 version = 4;
-  bytes data = 5;
-  string key = 6;
+  string key = 2;
+  uint32 first_block = 3;
+  uint32 block_count = 4;
+  bytes expected_version_id = 5;
 }
 
-message WriteBlockResponse {
+message ProbeDataBlocksResponse {
+  oneof result {
+    Blocks ok = 1;
+    Error err = 2;
+  }
+
+  message Blocks {
+    repeated uint32 data_blocks = 1;
+  }
+}
+
+// A flush publishes one handle's dirty blocks and size to `key` in three
+// steps: BeginFlush prepares (mints the blob for a create, or burns the
+// next generation and records append territory), WriteFlushBlock ships
+// bodies concurrently, CommitFlush stages rows and advances the ceiling.
+// The ticket is signed gateway state: every step is self-contained.
+message BeginFlushRequest {
+  Caller caller = 1;
+  // Publish key: the name, or its `@hardlink/` record for a promoted
+  // inode, or the `@orphan/` key of an unlinked open file.
+  string key = 2;
+  // The committed layout this flush was buffered against (empty for a
+  // create). A stored layout whose committed data differs is a conflict.
+  bytes expected_layout = 3;
+  uint64 file_size = 4;
+  // Blocks the flush will rewrite and blocks it punches to zeros.
+  repeated uint32 rewrites = 5;
+  repeated uint32 punched = 6;
+  optional uint32 eof_low_watermark = 7;
+  optional uint32 trim_upper = 8;
+}
+
+message BeginFlushResponse {
+  oneof result {
+    Prepared ok = 1;
+    Error err = 2;
+  }
+
+  message Prepared {
+    bytes ticket = 1;
+    // The prepared layout now stored at the key (empty for a create),
+    // so a retry after a mid-flush failure buffers against it.
+    bytes layout = 2;
+  }
+}
+
+message WriteFlushBlockRequest {
+  Caller caller = 1;
+  bytes ticket = 2;
+  uint32 block_number = 3;
+  bytes data = 4;
+}
+
+message WriteFlushBlockResponse {
   oneof result {
     google.protobuf.Empty ok = 1;
     Error err = 2;
   }
 }
 
-message ListBlobBlocksRequest {
-  Caller caller = 1;
-  BlobGuid blob = 2;
-  uint32 first_block = 3;
-  uint32 block_count = 4;
-  // Enumerate every stored generation (reclamation) instead of the committed view.
-  bool all_nodes = 5;
-  string key = 6;
+message PosixAttrs {
+  uint32 mode = 1;
+  uint32 uid = 2;
+  uint32 gid = 3;
+  uint64 mtime_ns = 4;
+  uint64 ctime_ns = 5;
 }
 
-message ListBlobBlocksResponse {
+message CommitFlushRequest {
+  Caller caller = 1;
+  bytes ticket = 2;
+  // Same sets BeginFlush saw; every rewrite has been acknowledged.
+  repeated uint32 rewrites = 3;
+  repeated uint32 punched = 4;
+  // Attributes for a create; an overwrite carries the stored ones forward.
+  PosixAttrs posix = 5;
+}
+
+message CommitFlushResponse {
   oneof result {
-    Entries ok = 1;
+    // The committed layout (bare, even when stored inside a record).
+    bytes ok = 1;
     Error err = 2;
   }
+}
 
-  message Entries {
-    repeated BlockIdentity entries = 1;
+message AbortFlushRequest {
+  Caller caller = 1;
+  bytes ticket = 2;
+}
+
+message AbortFlushResponse {
+  oneof result {
+    google.protobuf.Empty ok = 1;
+    Error err = 2;
   }
+}
+
+// Signed by the gateway, opaque to the client.
+message FlushTicket {
+  string bucket = 1;
+  string key = 2;
+  bytes blob_id = 3;
+  uint32 volume_id = 4;
+  bool create = 5;
+  uint64 version = 6;
+  uint64 base_ceiling = 7;
+  uint64 base_epoch = 8;
+  uint64 committed_size = 9;
+  uint64 file_size = 10;
+  uint32 block_size = 11;
+  optional uint32 abandoned_lo = 12;
+  optional uint32 abandoned_hi = 13;
+  optional uint32 eof_low_watermark = 14;
+  optional uint32 trim_upper = 15;
+  uint64 issued_ms = 16;
 }
 
 // ---------- Hints ----------
 
-// Best-effort whole-blob warm of the gateway disk cache. The client
-// resolves each block's exact committed identity from its row map.
-message PrefetchBlobRequest {
+// Best-effort whole-file warm of the gateway disk cache.
+message PrefetchInodeRequest {
   Caller caller = 1;
-  BlobGuid blob = 2;
-  uint64 file_size = 3;
-  repeated PrefetchBlock blocks = 4;
-  string key = 5;
-
-  message PrefetchBlock {
-    uint32 block_number = 1;
-    uint64 version = 2;
-    uint32 read_len = 3;
-    uint32 content_len = 4;
-  }
+  string key = 2;
 }
 
-message PrefetchBlobResponse {
-  oneof result {
-    google.protobuf.Empty ok = 1;
-    Error err = 2;
-  }
-}
-
-// Reclamation work the client derived from a commit or teardown. The
-// gateway coalesces per blob, applies the reader grace and retries, and
-// re-derives reclaimability from the bucket's own metadata before it
-// deletes anything: `key` names the inode the blob was published under
-// (empty when the client has none, e.g. a failed unpublished create).
-message SweepBlobRequest {
-  Caller caller = 1;
-  BlobGuid blob = 2;
-  repeated BlockIdentity victims = 3;
-  repeated BlockFloor below = 4;
-  bool delete_all_blocks = 5;
-  bool delete_rows = 6;
-  bool with_grace = 7;
-  optional uint64 marker_data_pending_unix_ms = 8;
-  string key = 9;
-
-  message BlockFloor {
-    uint32 block_number = 1;
-    uint64 keep_from = 2;
-  }
-}
-
-message SweepBlobResponse {
+message PrefetchInodeResponse {
   oneof result {
     google.protobuf.Empty ok = 1;
     Error err = 2;

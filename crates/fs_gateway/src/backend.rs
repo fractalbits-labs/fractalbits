@@ -7,47 +7,21 @@ use file_ops::{
     parse_list_inodes_raw, parse_mpu_parts, parse_put_inode, parse_put_inode_cas,
 };
 use futures::{StreamExt, stream};
-use lru::LruCache;
 use rpc_client_common::RpcError;
 use rpc_client_common::nss_rpc_retry;
 use rpc_client_nss::RpcClientNss;
 use rpc_client_rss::RpcClientRss;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashSet};
-use std::num::NonZeroUsize;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use uuid::Uuid;
 use volume_group_proxy::{DataVgProxy, PutBlobOutcome};
 
 use crate::config::Config;
 use crate::error::FsError;
+use crate::resolve::ResolveCaches;
 use crate::s3_volume::S3DataVolume;
 use data_types::object_layout::{HARDLINK_PREFIX, InodeRecord, ObjectLayout, ObjectState};
-
-/// Keyspace of the per-blob ownership markers. A marker at
-/// `@fs-owner/<volume>/<blob_id>` in a bucket's own NSS root proves the
-/// gateway allocated that blob for this bucket; the value is a fixed tag.
-pub const BLOB_OWNER_PREFIX: &str = "@fs-owner/";
-const BLOB_OWNER_VALUE: &[u8] = b"fso1";
-/// Proofs remembered per bucket (about 40 bytes each).
-const OWNED_BLOBS_CAP: usize = 1 << 18;
-
-fn blob_owner_key(blob_guid: DataBlobGuid) -> String {
-    format!(
-        "{BLOB_OWNER_PREFIX}{:05}/{}",
-        blob_guid.volume_id, blob_guid.blob_id
-    )
-}
-
-/// Blobs already proven to belong to a bucket, shared by every thread
-/// serving it so one proof covers the whole process.
-pub type OwnedBlobs = Arc<parking_lot::Mutex<LruCache<DataBlobGuid, ()>>>;
-
-pub fn new_owned_blobs() -> OwnedBlobs {
-    Arc::new(parking_lot::Mutex::new(LruCache::new(
-        NonZeroUsize::new(OWNED_BLOBS_CAP).expect("non-zero cap"),
-    )))
-}
 
 fn exact_blob_identities(
     entries: Vec<bss_codec::list_blob_blocks_response::BlobBlockEntry>,
@@ -72,8 +46,9 @@ pub struct BackendConfig {
     pub config: Config,
     /// Present when an S3 bucket is configured; shared by every thread.
     pub s3: Option<Arc<S3DataVolume>>,
-    /// Blob ownership proofs, carried across re-mounts of the same root blob.
-    pub owned_blobs: OwnedBlobs,
+    /// Layout and row-map caches, carried across re-mounts of the same
+    /// root blob.
+    pub caches: Arc<ResolveCaches>,
 }
 
 impl BackendConfig {
@@ -138,7 +113,7 @@ impl BackendConfig {
             routing_key: bucket.routing_key,
             config: config.clone(),
             s3,
-            owned_blobs: new_owned_blobs(),
+            caches: Arc::new(ResolveCaches::default()),
         })
     }
 }
@@ -155,9 +130,7 @@ pub struct StorageBackend {
     root_blob_name: String,
     routing_key: RoutingKey,
     config: Config,
-    owned_blobs: OwnedBlobs,
-    /// Data volumes this bucket may address (plus the S3 volume).
-    volume_ids: HashSet<u16>,
+    pub(crate) caches: Arc<ResolveCaches>,
 }
 
 impl StorageBackend {
@@ -185,85 +158,8 @@ impl StorageBackend {
             root_blob_name: backend_config.root_blob_name.clone(),
             routing_key: backend_config.routing_key,
             config: backend_config.config.clone(),
-            owned_blobs: backend_config.owned_blobs.clone(),
-            volume_ids: backend_config
-                .data_vg_info
-                .volumes
-                .iter()
-                .map(|v| v.volume_id)
-                .collect(),
+            caches: backend_config.caches.clone(),
         })
-    }
-
-    /// Remember a proof that `blob_guid` belongs to this bucket.
-    pub fn note_owned_blob(&self, blob_guid: DataBlobGuid) {
-        self.owned_blobs.lock().put(blob_guid, ());
-    }
-
-    fn is_owned_cached(&self, blob_guid: DataBlobGuid) -> bool {
-        self.owned_blobs.lock().get(&blob_guid).is_some()
-    }
-
-    fn known_volume(&self, volume_id: u16) -> bool {
-        volume_id == DataBlobGuid::S3_VOLUME || self.volume_ids.contains(&volume_id)
-    }
-
-    /// Durably record that a freshly allocated blob belongs to this
-    /// bucket. The marker lives in the bucket's own NSS root, so no other
-    /// bucket can create or observe it through the gateway.
-    pub async fn claim_blob(
-        &self,
-        blob_guid: DataBlobGuid,
-        trace_id: &TraceId,
-    ) -> Result<(), FsError> {
-        self.put_inode(
-            &blob_owner_key(blob_guid),
-            Bytes::from_static(BLOB_OWNER_VALUE),
-            trace_id,
-        )
-        .await?;
-        self.note_owned_blob(blob_guid);
-        Ok(())
-    }
-
-    /// Prove that a client-named blob belongs to this bucket before the
-    /// shared data volumes are addressed with it. Proof, in order: a
-    /// remembered proof, the durable `@fs-owner/` marker, or the layout
-    /// stored at `key` in this bucket's namespace naming the blob (the
-    /// only proof for blobs the S3 API created, which have no marker).
-    pub async fn verify_blob_owner(
-        &self,
-        blob_guid: DataBlobGuid,
-        key: &str,
-        trace_id: &TraceId,
-    ) -> Result<(), FsError> {
-        if blob_guid.blob_id.is_nil() || !self.known_volume(blob_guid.volume_id) {
-            return Err(FsError::InvalidState);
-        }
-        if self.is_owned_cached(blob_guid) {
-            return Ok(());
-        }
-        match self
-            .get_inode_raw(&blob_owner_key(blob_guid), trace_id)
-            .await
-        {
-            Ok(_) => {
-                self.note_owned_blob(blob_guid);
-                return Ok(());
-            }
-            Err(FsError::NotFound) => {}
-            Err(error) => return Err(error),
-        }
-        if !key.is_empty()
-            && let Some(layout) = self.layout_at(key, trace_id).await?
-            && layout.blob_guid().ok() == Some(blob_guid)
-        {
-            self.note_owned_blob(blob_guid);
-            return Ok(());
-        }
-        Err(FsError::Unauthorized(
-            "blob does not belong to the mounted bucket".into(),
-        ))
     }
 
     /// The layout published at `key`, following one hardlink redirect.
@@ -296,24 +192,6 @@ impl StorageBackend {
             Err(FsError::NotFound) => Ok(None),
             Err(error) => Err(error),
         }
-    }
-
-    /// Drop the ownership marker once whole-blob teardown has removed the
-    /// blob's data and rows.
-    pub async fn release_blob(
-        &self,
-        blob_guid: DataBlobGuid,
-        trace_id: &TraceId,
-    ) -> Result<(), FsError> {
-        match self
-            .delete_inode(&blob_owner_key(blob_guid), trace_id)
-            .await
-        {
-            Ok(_) | Err(FsError::NotFound) => {}
-            Err(error) => return Err(error),
-        }
-        self.owned_blobs.lock().pop(&blob_guid);
-        Ok(())
     }
 
     /// `Some` when the blob lives on the S3 volume; `Err` inside when this
