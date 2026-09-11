@@ -4924,7 +4924,7 @@ async fn test_fenced_bucket_teardown_sweeps_internal_keys(disk_cache: bool) -> C
             data_types::object_layout::HARDLINK_PREFIX,
             blob_id.simple()
         ));
-        internal_keys.push(orphan_key(blob_id));
+        internal_keys.push(orphan_key(uuid::Uuid::new_v4(), blob_id));
     }
     assert!(
         internal_keys.len() > 1000,

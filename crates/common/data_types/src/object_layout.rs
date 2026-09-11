@@ -459,8 +459,15 @@ pub struct IndirectEntry {
 /// data by; the client deletes the key (with teardown) on the last close.
 pub const ORPHAN_PREFIX: &str = "@orphan/";
 
-pub fn orphan_key(id: Uuid) -> String {
-    format!("{ORPHAN_PREFIX}{}", id.as_simple())
+pub fn orphan_key(instance: Uuid, id: Uuid) -> String {
+    format!("{ORPHAN_PREFIX}{}/{}", instance.as_simple(), id.as_simple())
+}
+
+/// Mount instance an orphan key was created under.
+pub fn parse_orphan_instance(key: &str) -> Option<Uuid> {
+    let rest = key.trim_end_matches('\0').strip_prefix(ORPHAN_PREFIX)?;
+    let (instance, _) = rest.split_once('/')?;
+    Uuid::try_parse(instance).ok()
 }
 
 /// The embedded `PosixAttrs` of a layout, or the zero value for shapes
@@ -772,6 +779,17 @@ mod tests {
             "prepare keeps the data"
         );
         assert!(!same_committed_data(&base, &advanced));
+    }
+
+    #[test]
+    fn orphan_keys_carry_their_mount_instance() {
+        let instance = Uuid::from_u128(7);
+        let key = orphan_key(instance, Uuid::from_u128(9));
+        assert!(key.starts_with(ORPHAN_PREFIX));
+        assert_eq!(parse_orphan_instance(&key), Some(instance));
+        assert_eq!(parse_orphan_instance(&format!("{key}\0")), Some(instance));
+        assert_eq!(parse_orphan_instance("@orphan/legacy"), None);
+        assert_eq!(parse_orphan_instance("/user/key"), None);
     }
 
     #[test]
