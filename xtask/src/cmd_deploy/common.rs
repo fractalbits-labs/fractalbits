@@ -82,6 +82,8 @@ pub(super) const RUST_BINS: &[&str] = &[
     "fractalbits-bootstrap",
     "root_server",
     "s3_gateway",
+    "fs_gateway",
+    "fractalbits-mount",
     "nss_role_agent",
     "rss_admin",
 ];

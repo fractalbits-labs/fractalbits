@@ -8,16 +8,16 @@ use crate::MessageHeaderTrait;
 /// This is the correct checksum value for empty message bodies
 pub const EMPTY_BODY_CHECKSUM: u64 = 0x2d06800538d394c2;
 
-/// Generic protobuf-based message header implementation
+/// Wire header shared by the protobuf-based RPC protocols.
 ///
-/// This provides a common implementation for protobuf-based RPC protocols.
-/// The Command type must be a protobuf enum (i32) that implements Pod and Zeroable.
+/// The command is stored as its raw protobuf `i32` value so every bit
+/// pattern read off the wire is a valid header; servers validate it with
+/// the protocol enum's `TryFrom<i32>` before dispatch. `Pod` is derived,
+/// which has the compiler check the `repr(C)`, no-padding and all-fields-
+/// `Pod` requirements the raw decode relies on.
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ProtobufMessageHeader<Command>
-where
-    Command: Pod + Zeroable + Default + Clone + Copy + Send + Sync + 'static,
-{
+#[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
+pub struct ProtobufMessageHeader {
     /// A checksum covering only the remainder of this header.
     /// This allows the header to be trusted without having to recv() or read() the associated body.
     pub checksum: u64,
@@ -35,34 +35,16 @@ where
     pub checksum_body: u64,
     /// Every request would be sent with a unique id, so the client can get the right response
     pub id: u32,
-    /// The protocol command (method) for this message.
-    /// i32 size, defined as protobuf enum type
-    pub command: Command,
+    /// Raw protobuf command value. Keeping this as `i32` makes every wire bit
+    /// pattern valid until the protocol-specific server validates it.
+    pub command: i32,
 
     /// Trace ID for distributed tracing
     pub trace_id: u64,
     pub _reserved1: u64,
 }
 
-// Safety: ProtobufMessageHeader has the same layout requirements as its fields.
-// When Command implements Pod (meaning it's valid for any bit pattern), and all other fields
-// are primitive types that implement Pod, the whole struct is Pod.
-unsafe impl<Command> Pod for ProtobufMessageHeader<Command> where
-    Command: Pod + Zeroable + Default + Clone + Copy + Send + Sync + 'static
-{
-}
-
-// Safety: When Command implements Zeroable (meaning all zeros is a valid value),
-// and all other fields are primitive types that implement Zeroable, the whole struct is Zeroable.
-unsafe impl<Command> Zeroable for ProtobufMessageHeader<Command> where
-    Command: Pod + Zeroable + Default + Clone + Copy + Send + Sync + 'static
-{
-}
-
-impl<Command> ProtobufMessageHeader<Command>
-where
-    Command: Pod + Zeroable + Default + Clone + Copy + Send + Sync + 'static,
-{
+impl ProtobufMessageHeader {
     const _SIZE_OK: () = assert!(size_of::<Self>() == 48);
 
     /// Calculate and set the checksum field for this header.
@@ -100,10 +82,7 @@ where
     }
 }
 
-impl<Command> MessageHeaderTrait for ProtobufMessageHeader<Command>
-where
-    Command: Pod + Zeroable + Default + Clone + Copy + Send + Sync + 'static,
-{
+impl MessageHeaderTrait for ProtobufMessageHeader {
     fn encode(&self) -> &[u8] {
         bytemuck::bytes_of(self)
     }
@@ -134,5 +113,25 @@ where
 
     fn verify_body_checksum(&self, body: &[u8]) -> bool {
         self.verify_body_checksum(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arbitrary_wire_command_decodes_as_raw_integer() {
+        let mut header = ProtobufMessageHeader {
+            command: i32::MIN,
+            size: size_of::<ProtobufMessageHeader>() as u32,
+            ..Default::default()
+        };
+        header.set_checksum();
+        let wire = header.encode().to_vec();
+
+        assert!(ProtobufMessageHeader::verify_header_checksum_raw(&wire));
+        let decoded = ProtobufMessageHeader::decode(&wire);
+        assert_eq!(decoded.command, i32::MIN);
     }
 }

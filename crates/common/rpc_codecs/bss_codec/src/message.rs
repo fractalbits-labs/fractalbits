@@ -28,8 +28,10 @@ pub struct MessageHeader {
 
     /// A checksum covering only the associated body after this header.
     pub checksum_body: u64,
-    /// The protocol command (method) for this message. i32 size, defined as enum type
-    pub command: Command,
+    /// The protocol command (method) for this message: a `Command` as its
+    /// raw `i32`, so any wire bit pattern is a valid header until decoded
+    /// with `Command::try_from`.
+    pub command: i32,
     /// Every request would be sent with a unique id, so the client can get the right response
     pub id: u32,
 
@@ -90,11 +92,26 @@ impl Default for Command {
     }
 }
 
-// Safety: Command is defined as enum type (i32), and 0 as Invalid. There is also no padding
-// as verified from the zig side. With header checksum validation, we can also be sure no invalid
-// enum value being interpreted.
-unsafe impl Pod for Command {}
-unsafe impl Zeroable for Command {}
+impl TryFrom<i32> for Command {
+    type Error = i32;
+
+    fn try_from(raw: i32) -> Result<Self, Self::Error> {
+        use Command::*;
+        Ok(match raw {
+            0 => Invalid,
+            1 => Handshake,
+            16 => PutDataBlob,
+            17 => GetDataBlob,
+            18 => DeleteDataBlob,
+            19 => PutMetadataBlob,
+            20 => GetMetadataBlob,
+            21 => DeleteMetadataBlob,
+            22 => ListBlobs,
+            33 => ListBlobBlocks,
+            _ => return Err(raw),
+        })
+    }
+}
 
 impl Default for MessageHeader {
     fn default() -> Self {
@@ -103,7 +120,7 @@ impl Default for MessageHeader {
             checksum: 0,
             size: 0,
             checksum_body: EMPTY_BODY_CHECKSUM,
-            command: Command::Invalid,
+            command: Command::Invalid as i32,
             id: 0,
             bucket_id: [0u8; 16],
             blob_id: [0u8; 16],
