@@ -2,15 +2,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client::RpcClient;
+use crate::stats::OperationType;
 use bss_codec::{
     Command, ListBlobBlocksRequest, ListBlobBlocksResponse, ListBlobsRequest, ListBlobsResponse,
     MessageHeader, list_blob_blocks_response, list_blobs_response,
 };
 use bytes::Bytes;
 use data_types::{DataBlobGuid, TraceId};
-use prost::Message as PbMessage;
-use rpc_client_common::{InflightRpcGuard, RpcError, encode_protobuf};
-use rpc_codec_common::MessageFrame;
+use rpc_client_common::MessageFrame;
+use rpc_client_common::{InflightRpcGuard, ProtobufRequestHeader, ProtobufRpc, RpcError, rpc_ctx};
 use tracing::error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +21,7 @@ pub struct DataBlobMetadata {
 }
 
 /// Check the errno field in the response header and return appropriate error
-fn check_response_errno(header: &MessageHeader) -> Result<(), RpcError> {
+pub(crate) fn check_response_errno(header: &MessageHeader) -> Result<(), RpcError> {
     // errno codes from core/common/rpc/rpc_error.zig
     match header.errno {
         0 => Ok(()), // OK
@@ -137,41 +137,31 @@ impl RpcClient {
         retry_count: u32,
         include_deleted: bool,
     ) -> Result<list_blobs_response::Blobs, RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "list_data_blobs");
         let body = ListBlobsRequest {
             max_keys,
             prefix: prefix.to_string(),
             start_after: start_after.to_string(),
             include_deleted,
         };
-
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::ListBlobs as i32;
-        header.volume_id = volume_id;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.trace_id = trace_id.0;
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-
-        let msg_frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(msg_frame, timeout, None).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc=%"list_data_blobs", %request_id, %volume_id, %prefix, error=?e, "bss rpc failed");
-            }
-            e
-        })?;
-        check_response_errno(&resp_frame.header)?;
-
-        let resp: ListBlobsResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        let header = MessageHeader {
+            volume_id,
+            ..Default::default()
+        };
+        let resp: ListBlobsResponse = self
+            .call_with_header(
+                header,
+                Command::ListBlobs as i32,
+                "list_data_blobs",
+                body,
+                timeout,
+                trace_id,
+                retry_count,
+                rpc_ctx!(volume_id, prefix),
+            )
+            .await?;
         parse_list_blobs_response(resp)
     }
 
-    /// Reserve a single block (single-op; no batch) at `expected_version`.
     /// Enumerate the BSS-visible block entries for one blob over
     /// `[first_block, first_block + block_count)`. Absent blocks are holes.
     pub async fn list_blob_blocks(
@@ -183,7 +173,11 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<Vec<list_blob_blocks_response::BlobBlockEntry>, RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "list_blob_blocks");
+        let header = MessageHeader {
+            blob_id: blob_guid.blob_id.into_bytes(),
+            volume_id: blob_guid.volume_id,
+            ..Default::default()
+        };
         let mut marker = String::new();
         let mut entries = Vec::new();
         loop {
@@ -192,33 +186,18 @@ impl RpcClient {
                 block_count,
                 marker: marker.clone(),
             };
-            let body_bytes = encode_protobuf(body, trace_id)?;
-
-            let mut header = MessageHeader::default();
-            let request_id = self.gen_request_id();
-            header.id = request_id;
-            header.blob_id = blob_guid.blob_id.into_bytes();
-            header.volume_id = blob_guid.volume_id;
-            header.command = Command::ListBlobBlocks as i32;
-            header.size = (size_of::<MessageHeader>() + body_bytes.len()) as u32;
-            header.retry_count = retry_count as u8;
-            header.trace_id = trace_id.0;
-            header.set_body_checksum(&body_bytes);
-
-            let msg_frame = MessageFrame::new(header, body_bytes);
-            let resp_frame = self
-                .send_request(msg_frame, timeout, None)
-                .await
-                .map_err(|e| {
-                    if !e.retryable() {
-                        error!(rpc=%"list_blob_blocks", %request_id, %blob_guid, %first_block, %block_count, error=?e, "bss rpc failed");
-                    }
-                    e
-                })?;
-            check_response_errno(&resp_frame.header)?;
-
-            let resp: ListBlobBlocksResponse = PbMessage::decode(resp_frame.body)
-                .map_err(|e| RpcError::DecodeError(e.to_string()))?;
+            let resp: ListBlobBlocksResponse = self
+                .call_with_header(
+                    header,
+                    Command::ListBlobBlocks as i32,
+                    "list_blob_blocks",
+                    body,
+                    timeout,
+                    trace_id,
+                    retry_count,
+                    rpc_ctx!(blob_guid, first_block, block_count),
+                )
+                .await?;
             let blocks = match resp.result {
                 Some(list_blob_blocks_response::Result::Ok(blocks)) => blocks,
                 Some(list_blob_blocks_response::Result::Err(err)) => {
@@ -241,6 +220,41 @@ impl RpcClient {
             }
             marker = blocks.next_marker;
         }
+    }
+
+    /// Raw-header round trip shared by the data and metadata blob RPCs. The caller fills the
+    /// addressing and body fields; this fills the shared request fields, sends, and checks the
+    /// response errno. `ctx` is only invoked when a non-retryable failure is logged.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_raw(
+        &self,
+        mut header: MessageHeader,
+        command: Command,
+        name: &'static str,
+        body: Vec<Bytes>,
+        op: Option<OperationType>,
+        timeout: Option<Duration>,
+        trace_id: &TraceId,
+        retry_count: u32,
+        ctx: impl FnOnce() -> String,
+    ) -> Result<MessageFrame<MessageHeader>, RpcError> {
+        let _guard = InflightRpcGuard::new(Self::RPC_TYPE, name);
+        let request_id = self.gen_request_id();
+        header.set_request(request_id, command as i32, retry_count as u8, trace_id);
+        let body_len: usize = body.iter().map(|c| c.len()).sum();
+        header.size = (size_of::<MessageHeader>() + body_len) as u32;
+        let frame = MessageFrame::new(header, body);
+        let resp_frame = self
+            .send_request_vectored(frame, timeout, op)
+            .await
+            .map_err(|e| {
+                if !e.retryable() {
+                    error!(rpc = %name, %request_id, ctx = %ctx(), error = ?e, "bss rpc failed");
+                }
+                e
+            })?;
+        check_response_errno(&resp_frame.header)?;
+        Ok(resp_frame)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -310,33 +324,28 @@ impl RpcClient {
         retry_count: u32,
         cohort_tag: u64,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "put_data_blob");
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.blob_id = blob_guid.blob_id.into_bytes();
-        header.volume_id = blob_guid.volume_id;
-        header.block_number = block_number;
-        header.command = Command::PutDataBlob as i32;
-        header.body_len = body.len() as u32;
-        header.size = size_of::<MessageHeader>() as u32 + header.body_len;
-        header.retry_count = retry_count as u8;
-        header.trace_id = trace_id.0;
-        header.checksum_body = body_checksum;
-        header.version = version;
+        let mut header = MessageHeader {
+            blob_id: blob_guid.blob_id.into_bytes(),
+            volume_id: blob_guid.volume_id,
+            block_number,
+            body_len: body.len() as u32,
+            checksum_body: body_checksum,
+            version,
+            ..Default::default()
+        };
         header.set_data_cohort_tag(cohort_tag);
-
-        let msg_frame = MessageFrame::new(header, body);
-        let resp_frame = self
-            .send_request(msg_frame, timeout, Some(crate::OperationType::PutData))
-            .await
-            .map_err(|e| {
-                if !e.retryable() {
-                    error!(rpc=%"put_data_blob", %request_id, %blob_guid, %block_number, error=?e, "bss rpc failed");
-                }
-                e
-            })?;
-        check_response_errno(&resp_frame.header)?;
+        self.send_raw(
+            header,
+            Command::PutDataBlob,
+            "put_data_blob",
+            vec![body],
+            Some(OperationType::PutData),
+            timeout,
+            trace_id,
+            retry_count,
+            rpc_ctx!(blob_guid, block_number),
+        )
+        .await?;
         Ok(())
     }
 
@@ -352,37 +361,30 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "put_data_blob_vectored");
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.blob_id = blob_guid.blob_id.into_bytes();
-        header.volume_id = blob_guid.volume_id;
-        header.block_number = block_number;
-        header.command = Command::PutDataBlob as i32;
-        let total_size: usize = chunks.iter().map(|c| c.len()).sum();
-        header.body_len = total_size as u32;
-        header.size = size_of::<MessageHeader>() as u32 + header.body_len;
-        header.retry_count = retry_count as u8;
-        header.trace_id = trace_id.0;
-        header.checksum_body = body_checksum;
-        header.version = version;
-
-        let msg_frame = MessageFrame::new(header, chunks);
-        let resp_frame = self
-            .send_request_vectored(msg_frame, timeout, Some(crate::OperationType::PutData))
-            .await
-            .map_err(|e| {
-                if !e.retryable() {
-                    error!(rpc=%"put_data_blob_vectored", %request_id, %blob_guid, %block_number, error=?e, "bss rpc failed");
-                }
-                e
-            })?;
-        check_response_errno(&resp_frame.header)?;
+        let header = MessageHeader {
+            blob_id: blob_guid.blob_id.into_bytes(),
+            volume_id: blob_guid.volume_id,
+            block_number,
+            body_len: chunks.iter().map(|c| c.len()).sum::<usize>() as u32,
+            checksum_body: body_checksum,
+            version,
+            ..Default::default()
+        };
+        self.send_raw(
+            header,
+            Command::PutDataBlob,
+            "put_data_blob_vectored",
+            chunks,
+            Some(OperationType::PutData),
+            timeout,
+            trace_id,
+            retry_count,
+            rpc_ctx!(blob_guid, block_number),
+        )
+        .await?;
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// Issue a GetDataBlob RPC and return the BSS-reported `version` of the
     /// returned block alongside the body. Callers that need read-side
     /// version arbitration (see `DataVgProxy::get_blob`) compare this
@@ -402,31 +404,27 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<DataBlobMetadata, RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "get_data_blob");
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.blob_id = blob_guid.blob_id.into_bytes();
-        header.volume_id = blob_guid.volume_id;
-        header.block_number = block_number;
-        header.command = Command::GetDataBlob as i32;
-        header.retry_count = retry_count as u8;
-        header.trace_id = trace_id.0;
-        header.body_len = content_len as u32;
-        header.version = version;
-        header.size = size_of::<MessageHeader>() as u32;
-
-        let msg_frame = MessageFrame::new(header, Bytes::new());
+        let header = MessageHeader {
+            blob_id: blob_guid.blob_id.into_bytes(),
+            volume_id: blob_guid.volume_id,
+            block_number,
+            body_len: content_len as u32,
+            version,
+            ..Default::default()
+        };
         let resp_frame = self
-            .send_request( msg_frame, timeout, Some(crate::OperationType::GetData))
-            .await
-            .map_err(|e| {
-                if !e.retryable() {
-                    error!(rpc=%"get_data_blob", %request_id, %blob_guid, %block_number, error=?e, "bss rpc failed");
-                }
-                e
-            })?;
-        check_response_errno(&resp_frame.header)?;
+            .send_raw(
+                header,
+                Command::GetDataBlob,
+                "get_data_blob",
+                Vec::new(),
+                Some(OperationType::GetData),
+                timeout,
+                trace_id,
+                retry_count,
+                rpc_ctx!(blob_guid, block_number),
+            )
+            .await?;
         let metadata = DataBlobMetadata {
             version: resp_frame.header.version,
             cohort_tag: resp_frame.header.data_cohort_tag(),
@@ -448,7 +446,6 @@ impl RpcClient {
         Ok(metadata)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn delete_data_blob(
         &self,
         blob_guid: DataBlobGuid,
@@ -458,30 +455,25 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "delete_data_blob");
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.blob_id = blob_guid.blob_id.into_bytes();
-        header.volume_id = blob_guid.volume_id;
-        header.block_number = block_number;
-        header.command = Command::DeleteDataBlob as i32;
-        header.size = size_of::<MessageHeader>() as u32;
-        header.retry_count = retry_count as u8;
-        header.trace_id = trace_id.0;
-        header.version = version;
-
-        let msg_frame = MessageFrame::new(header, Bytes::new());
-        let resp_frame = self
-            .send_request( msg_frame, timeout, Some(crate::OperationType::DeleteData))
-            .await
-            .map_err(|e| {
-                if !e.retryable() {
-                    error!(rpc=%"delete_data_blob", %request_id, %blob_guid, %block_number, error=?e, "bss rpc failed");
-                }
-                e
-            })?;
-        check_response_errno(&resp_frame.header)?;
+        let header = MessageHeader {
+            blob_id: blob_guid.blob_id.into_bytes(),
+            volume_id: blob_guid.volume_id,
+            block_number,
+            version,
+            ..Default::default()
+        };
+        self.send_raw(
+            header,
+            Command::DeleteDataBlob,
+            "delete_data_blob",
+            Vec::new(),
+            Some(OperationType::DeleteData),
+            timeout,
+            trace_id,
+            retry_count,
+            rpc_ctx!(blob_guid, block_number),
+        )
+        .await?;
         Ok(())
     }
 
@@ -494,30 +486,26 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<Bytes, RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "get_metadata_blob");
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.blob_id = blob_id;
-        header.volume_id = volume_id;
-        header.command = Command::GetMetadataBlob as i32;
-        header.skip_fence_token = 1;
-        header.body_len = content_len as u32;
-        header.size = size_of::<MessageHeader>() as u32;
-        header.retry_count = retry_count as u8;
-        header.trace_id = trace_id.0;
-
-        let msg_frame = MessageFrame::new(header, Bytes::new());
+        let header = MessageHeader {
+            blob_id,
+            volume_id,
+            skip_fence_token: 1,
+            body_len: content_len as u32,
+            ..Default::default()
+        };
         let resp_frame = self
-            .send_request(msg_frame, timeout, None)
-            .await
-            .map_err(|e| {
-                if !e.retryable() {
-                    error!(rpc=%"get_metadata_blob", %request_id, %volume_id, error=?e, "bss rpc failed");
-                }
-                e
-            })?;
-        check_response_errno(&resp_frame.header)?;
+            .send_raw(
+                header,
+                Command::GetMetadataBlob,
+                "get_metadata_blob",
+                Vec::new(),
+                None,
+                timeout,
+                trace_id,
+                retry_count,
+                rpc_ctx!(volume_id),
+            )
+            .await?;
         let body = resp_frame.body;
         if content_len != body.len() {
             return Err(RpcError::InternalResponseError(format!(
@@ -542,33 +530,28 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "put_metadata_blob");
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.blob_id = blob_id;
-        header.volume_id = volume_id;
-        header.command = Command::PutMetadataBlob as i32;
-        header.body_len = body.len() as u32;
-        header.size = size_of::<MessageHeader>() as u32 + header.body_len;
-        header.version = version;
-        header.is_new = if is_new { 1 } else { 0 };
-        header.skip_fence_token = 1;
-        header.checksum_body = body_checksum;
-        header.retry_count = retry_count as u8;
-        header.trace_id = trace_id.0;
-
-        let msg_frame = MessageFrame::new(header, body);
-        let resp_frame = self
-            .send_request(msg_frame, timeout, None)
-            .await
-            .map_err(|e| {
-                if !e.retryable() {
-                    error!(rpc=%"put_metadata_blob", %request_id, %volume_id, error=?e, "bss rpc failed");
-                }
-                e
-            })?;
-        check_response_errno(&resp_frame.header)?;
+        let header = MessageHeader {
+            blob_id,
+            volume_id,
+            body_len: body.len() as u32,
+            version,
+            is_new: if is_new { 1 } else { 0 },
+            skip_fence_token: 1,
+            checksum_body: body_checksum,
+            ..Default::default()
+        };
+        self.send_raw(
+            header,
+            Command::PutMetadataBlob,
+            "put_metadata_blob",
+            vec![body],
+            None,
+            timeout,
+            trace_id,
+            retry_count,
+            rpc_ctx!(volume_id),
+        )
+        .await?;
         Ok(())
     }
 
@@ -581,31 +564,26 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("bss", "delete_metadata_blob");
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.blob_id = blob_id;
-        header.volume_id = volume_id;
-        header.command = Command::DeleteMetadataBlob as i32;
-        header.is_deleted = 1;
-        header.version = version;
-        header.skip_fence_token = 1;
-        header.size = size_of::<MessageHeader>() as u32;
-        header.retry_count = retry_count as u8;
-        header.trace_id = trace_id.0;
-
-        let msg_frame = MessageFrame::new(header, Bytes::new());
-        let resp_frame = self
-            .send_request(msg_frame, timeout, None)
-            .await
-            .map_err(|e| {
-                if !e.retryable() {
-                    error!(rpc=%"delete_metadata_blob", %request_id, %volume_id, error=?e, "bss rpc failed");
-                }
-                e
-            })?;
-        check_response_errno(&resp_frame.header)?;
+        let header = MessageHeader {
+            blob_id,
+            volume_id,
+            is_deleted: 1,
+            version,
+            skip_fence_token: 1,
+            ..Default::default()
+        };
+        self.send_raw(
+            header,
+            Command::DeleteMetadataBlob,
+            "delete_metadata_blob",
+            Vec::new(),
+            None,
+            timeout,
+            trace_id,
+            retry_count,
+            rpc_ctx!(volume_id),
+        )
+        .await?;
         Ok(())
     }
 }

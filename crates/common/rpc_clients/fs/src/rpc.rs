@@ -3,45 +3,7 @@ use std::time::Duration;
 use crate::client::RpcClient;
 use data_types::TraceId;
 use fs_gateway_codec::*;
-use prost::Message as PbMessage;
-use rpc_client_common::{InflightRpcGuard, RpcError, encode_protobuf};
-use rpc_codec_common::MessageFrame;
-use tracing::error;
-
-impl RpcClient {
-    /// One request / response round trip. Transport failures surface as
-    /// `RpcError`; application outcomes stay inside the decoded response
-    /// so the caller can map them without losing the error kind.
-    async fn call<Req: PbMessage, Resp: PbMessage + Default>(
-        &self,
-        command: Command,
-        name: &'static str,
-        body: Req,
-        timeout: Option<Duration>,
-        trace_id: &TraceId,
-        retry_count: u32,
-    ) -> Result<Resp, RpcError> {
-        let _guard = InflightRpcGuard::new("fs_gateway", name);
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = command as i32;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc = %name, %request_id, error = ?e, "fs_gateway rpc failed");
-            }
-            e
-        })?;
-        PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))
-    }
-}
+use rpc_client_common::{ProtobufRpc, RpcError};
 
 macro_rules! rpc_method {
     ($name:ident, $command:ident, $req:ty, $resp:ty) => {
@@ -54,12 +16,13 @@ macro_rules! rpc_method {
                 retry_count: u32,
             ) -> Result<$resp, RpcError> {
                 self.call(
-                    Command::$command,
+                    Command::$command as i32,
                     stringify!($name),
                     req,
                     timeout,
                     trace_id,
                     retry_count,
+                    String::new,
                 )
                 .await
             }

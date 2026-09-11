@@ -3,9 +3,7 @@ use std::time::{Duration, Instant};
 use crate::client::RpcClient;
 use data_types::{DataVgInfo, TraceId};
 use metrics_wrapper::histogram;
-use prost::Message as PbMessage;
-use rpc_client_common::{InflightRpcGuard, RpcError, encode_protobuf};
-use rpc_codec_common::MessageFrame;
+use rpc_client_common::{ProtobufRpc, RpcError, rpc_ctx};
 use rss_codec::*;
 use tracing::{error, warn};
 
@@ -19,33 +17,23 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "put");
         let start = Instant::now();
         let body = PutRequest {
             version,
             key: key.to_string(),
             value: value.to_string(),
         };
-
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::Put as i32;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc=%"put", %request_id, %key, error=?e, "rss rpc failed");
-            }
-            e
-        })?;
-        let resp: PutResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        let resp: PutResponse = self
+            .call(
+                Command::Put as i32,
+                "put",
+                body,
+                timeout,
+                trace_id,
+                retry_count,
+                rpc_ctx!(key),
+            )
+            .await?;
         let duration = start.elapsed();
         match resp.result.unwrap() {
             rss_codec::put_response::Result::Ok(()) => {
@@ -75,31 +63,21 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(i64, String), RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "get");
         let start = Instant::now();
         let body = GetRequest {
             key: key.to_string(),
         };
-
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::Get as i32;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc=%"get", %request_id, %key, error=?e, "rss rpc failed");
-            }
-            e
-        })?;
-        let resp: GetResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        let resp: GetResponse = self
+            .call(
+                Command::Get as i32,
+                "get",
+                body,
+                timeout,
+                trace_id,
+                retry_count,
+                rpc_ctx!(key),
+            )
+            .await?;
         let duration = start.elapsed();
         match resp.result.unwrap() {
             rss_codec::get_response::Result::Ok(resp) => {
@@ -129,29 +107,21 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "delete");
         let start = Instant::now();
         let body = DeleteRequest {
             key: key.to_string(),
         };
-
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::Delete as i32;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            error!(rpc=%"delete", %request_id, %key, error=?e, "rss rpc failed");
-            e
-        })?;
-        let resp: DeleteResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        let resp: DeleteResponse = self
+            .call(
+                Command::Delete as i32,
+                "delete",
+                body,
+                timeout,
+                trace_id,
+                retry_count,
+                rpc_ctx!(key),
+            )
+            .await?;
         let duration = start.elapsed();
         match resp.result.unwrap() {
             rss_codec::delete_response::Result::Ok(()) => {
@@ -177,32 +147,22 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(String, Option<String>), RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "get_nss_role");
         let start = Instant::now();
         let body = GetNssRoleRequest {
             instance_id: instance_id.to_string(),
             health_report,
         };
-
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::GetNssRole as i32;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc=%"get_nss_role", %request_id, %instance_id, error=?e, "rss rpc failed");
-            }
-            e
-        })?;
-        let resp: GetNssRoleResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        let resp: GetNssRoleResponse = self
+            .call(
+                Command::GetNssRole as i32,
+                "get_nss_role",
+                body,
+                timeout,
+                trace_id,
+                retry_count,
+                rpc_ctx!(instance_id),
+            )
+            .await?;
         let duration = start.elapsed();
         let journal_config_json = resp.journal_config_json;
         match resp.result.unwrap() {
@@ -227,31 +187,21 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<Vec<String>, RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "list");
         let start = Instant::now();
         let body = ListRequest {
             prefix: prefix.to_string(),
         };
-
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::List as i32;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc=%"list", %request_id, %prefix, error=?e, "rss rpc failed");
-            }
-            e
-        })?;
-        let resp: ListResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        let resp: ListResponse = self
+            .call(
+                Command::List as i32,
+                "list",
+                body,
+                timeout,
+                trace_id,
+                retry_count,
+                rpc_ctx!(prefix),
+            )
+            .await?;
         let duration = start.elapsed();
         match resp.result.unwrap() {
             rss_codec::list_response::Result::Ok(resp) => {
@@ -276,33 +226,23 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "create_bucket");
         let start = Instant::now();
         let body = CreateBucketRequest {
             bucket_name: bucket_name.to_string(),
             enable_versioning: false,
             api_key_id: api_key_id.to_string(),
         };
-
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::CreateBucket as i32;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc=%"create_bucket", %request_id, %bucket_name, error=?e, "rss rpc failed");
-            }
-            e
-        })?;
-        let resp: CreateBucketResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        let resp: CreateBucketResponse = self
+            .call(
+                Command::CreateBucket as i32,
+                "create_bucket",
+                body,
+                timeout,
+                trace_id,
+                retry_count,
+                rpc_ctx!(bucket_name),
+            )
+            .await?;
         let duration = start.elapsed();
         match resp.result.unwrap() {
             rss_codec::create_bucket_response::Result::Ok(()) => {
@@ -339,32 +279,22 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<(), RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "delete_bucket");
         let start = Instant::now();
         let body = DeleteBucketRequest {
             bucket_name: bucket_name.to_string(),
             api_key_id: api_key_id.to_string(),
         };
-
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::DeleteBucket as i32;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc=%"delete_bucket", %request_id, %bucket_name, error=?e, "rss rpc failed");
-            }
-            e
-        })?;
-        let resp: DeleteBucketResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        let resp: DeleteBucketResponse = self
+            .call(
+                Command::DeleteBucket as i32,
+                "delete_bucket",
+                body,
+                timeout,
+                trace_id,
+                retry_count,
+                rpc_ctx!(bucket_name),
+            )
+            .await?;
         let duration = start.elapsed();
         match resp.result.unwrap() {
             rss_codec::delete_bucket_response::Result::Ok(()) => {
@@ -386,28 +316,18 @@ impl RpcClient {
         timeout: Option<Duration>,
         trace_id: &TraceId,
     ) -> Result<DataVgInfo, RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "get_data_vg_info");
         let start = Instant::now();
-        let body = GetDataVgInfoRequest {};
-
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::GetDataVgInfo as i32;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc=%"get_data_vg_info", %request_id, error=?e, "rss rpc failed");
-            }
-            e
-        })?;
-        let resp: GetDataVgInfoResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        let resp: GetDataVgInfoResponse = self
+            .call(
+                Command::GetDataVgInfo as i32,
+                "get_data_vg_info",
+                GetDataVgInfoRequest {},
+                timeout,
+                trace_id,
+                0,
+                String::new,
+            )
+            .await?;
         let duration = start.elapsed();
         match resp.result.unwrap() {
             rss_codec::get_data_vg_info_response::Result::InfoJson(info_json) => {
@@ -456,28 +376,18 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<String, RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "get_metadata_vg_info_json");
         let start = Instant::now();
-        let body = GetMetadataVgInfoRequest {};
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::GetMetadataVgInfo as i32;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc=%"get_metadata_vg_info_json", %request_id, error=?e, "rss rpc failed");
-            }
-            e
-        })?;
-        let resp: GetMetadataVgInfoResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        let resp: GetMetadataVgInfoResponse = self
+            .call(
+                Command::GetMetadataVgInfo as i32,
+                "get_metadata_vg_info_json",
+                GetMetadataVgInfoRequest {},
+                timeout,
+                trace_id,
+                retry_count,
+                String::new,
+            )
+            .await?;
         let duration = start.elapsed();
         match resp.result.unwrap() {
             rss_codec::get_metadata_vg_info_response::Result::InfoJson(info_json) => {
@@ -501,28 +411,18 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<String, RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "get_journal_vg_info_json");
         let start = Instant::now();
-        let body = GetJournalVgInfoRequest {};
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::GetJournalVgInfo as i32;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc=%"get_journal_vg_info_json", %request_id, error=?e, "rss rpc failed");
-            }
-            e
-        })?;
-        let resp: GetJournalVgInfoResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        let resp: GetJournalVgInfoResponse = self
+            .call(
+                Command::GetJournalVgInfo as i32,
+                "get_journal_vg_info_json",
+                GetJournalVgInfoRequest {},
+                timeout,
+                trace_id,
+                retry_count,
+                String::new,
+            )
+            .await?;
         let duration = start.elapsed();
         match resp.result.unwrap() {
             rss_codec::get_journal_vg_info_response::Result::InfoJson(info_json) => {
@@ -546,28 +446,18 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<String, RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "get_journal_config_json");
         let start = Instant::now();
-        let body = GetJournalConfigRequest {};
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::GetJournalConfig as i32;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc=%"get_journal_config_json", %request_id, error=?e, "rss rpc failed");
-            }
-            e
-        })?;
-        let resp: GetJournalConfigResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        let resp: GetJournalConfigResponse = self
+            .call(
+                Command::GetJournalConfig as i32,
+                "get_journal_config_json",
+                GetJournalConfigRequest {},
+                timeout,
+                trace_id,
+                retry_count,
+                String::new,
+            )
+            .await?;
         let duration = start.elapsed();
         match resp.result.unwrap() {
             rss_codec::get_journal_config_response::Result::ConfigJson(config_json) => {
@@ -591,31 +481,21 @@ impl RpcClient {
         trace_id: &TraceId,
         retry_count: u32,
     ) -> Result<String, RpcError> {
-        let _guard = InflightRpcGuard::new("rss", "get_active_nss_address");
         let start = Instant::now();
         let body = GetActiveNssAddressRequest {
             routing_key: bytes::Bytes::copy_from_slice(routing_key),
         };
-
-        let mut header = MessageHeader::default();
-        let request_id = self.gen_request_id();
-        header.id = request_id;
-        header.command = Command::GetActiveNssAddress as i32;
-        header.size = (size_of::<MessageHeader>() + body.encoded_len()) as u32;
-        header.retry_count = retry_count as u8;
-        header.set_trace_id(trace_id);
-
-        let body_bytes = encode_protobuf(body, trace_id)?;
-        header.set_body_checksum(&body_bytes);
-        let frame = MessageFrame::new(header, body_bytes);
-        let resp_frame = self.send_request(frame, timeout).await.map_err(|e| {
-            if !e.retryable() {
-                error!(rpc=%"get_active_nss_address", %request_id, error=?e, "rss rpc failed");
-            }
-            e
-        })?;
-        let resp: GetActiveNssAddressResponse =
-            PbMessage::decode(resp_frame.body).map_err(|e| RpcError::DecodeError(e.to_string()))?;
+        let resp: GetActiveNssAddressResponse = self
+            .call(
+                Command::GetActiveNssAddress as i32,
+                "get_active_nss_address",
+                body,
+                timeout,
+                trace_id,
+                retry_count,
+                String::new,
+            )
+            .await?;
         let duration = start.elapsed();
         match resp.result.unwrap() {
             rss_codec::get_active_nss_address_response::Result::Address(addr) => {
