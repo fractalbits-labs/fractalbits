@@ -1042,7 +1042,8 @@ impl VfsCore {
                 Some(ObjectState::Indirect(_))
             )
         {
-            self.deferred_blob_cleanup.insert(ino, old_bytes);
+            self.deferred_blob_cleanup
+                .insert(ino, (key.to_string(), old_bytes));
             return;
         }
         let Ok(old_layout) = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
@@ -1051,7 +1052,7 @@ impl VfsCore {
         };
         match &old_layout.state {
             ObjectState::Normal(_) => {
-                self.teardown_blob(&old_layout).await;
+                self.teardown_blob(key, &old_layout).await;
             }
             ObjectState::Mpu(MpuState::Completed(_)) => {
                 if let Ok(parts) = self
@@ -1060,7 +1061,7 @@ impl VfsCore {
                     .await
                 {
                     for (part_key, part_layout) in &parts {
-                        self.teardown_blob(part_layout).await;
+                        self.teardown_blob(part_key, part_layout).await;
                         let _ = self.backend().delete_inode(part_key, trace_id).await;
                     }
                 }
@@ -1101,7 +1102,8 @@ impl VfsCore {
                         if let Ok(fresh) = self.backend().get_inode_record(inode_id, trace_id).await
                             && fresh.nlink == 0
                         {
-                            self.teardown_blob(&fresh.layout).await;
+                            self.teardown_blob(&InodeRecord::key_for(inode_id), &fresh.layout)
+                                .await;
                             let _ = self.backend().delete_inode_record(inode_id, trace_id).await;
                         }
                     }

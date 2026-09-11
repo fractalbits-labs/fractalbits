@@ -77,9 +77,11 @@ fn unix_deadline_after(duration: Duration) -> u64 {
 }
 
 /// Reclamation work derived by one commit or teardown, in the shape the
-/// gateway consumes.
+/// gateway consumes. `key` is the inode the blob was published under;
+/// the gateway re-derives reclaimability from it.
 #[derive(Debug, Default)]
 struct SweepWork {
+    key: String,
     victims: Vec<(u32, u64)>,
     below: Vec<(u32, u64)>,
     delete_all_blocks: bool,
@@ -144,6 +146,7 @@ impl VfsCore {
         compio_runtime::spawn(async move {
             backend
                 .sweep_blob(
+                    &work.key,
                     blob_guid,
                     work.victims,
                     work.below,
@@ -164,6 +167,7 @@ impl VfsCore {
     /// whose stale claims have no row record and need one listing.
     pub(crate) fn enqueue_superseded_sweep(
         &self,
+        key: &str,
         blob_guid: DataBlobGuid,
         victims: Vec<(u32, u64)>,
         below: Vec<(u32, u64)>,
@@ -174,6 +178,7 @@ impl VfsCore {
         self.spawn_sweep(
             blob_guid,
             SweepWork {
+                key: key.to_string(),
                 victims,
                 below,
                 ..Default::default()
@@ -183,15 +188,18 @@ impl VfsCore {
 
     /// Reclaim the fragments of a create attempt whose publish never
     /// landed. The blob_guid was freshly minted and is unreachable, so
-    /// tear everything down after the grace.
+    /// tear everything down after the grace. `key` is where the publish
+    /// would have landed; nothing there can name this blob.
     pub(crate) async fn cleanup_unpublished_blob(
         &self,
+        key: &str,
         blob_guid: DataBlobGuid,
         identities: Vec<(u32, u64)>,
     ) {
         self.spawn_sweep(
             blob_guid,
             SweepWork {
+                key: key.to_string(),
                 victims: identities,
                 delete_all_blocks: true,
                 ..Default::default()
@@ -200,16 +208,19 @@ impl VfsCore {
     }
 
     /// Tear down every exact data/reservation key and every `@ovr/` row
-    /// belonging to a blob, after the reclamation grace. This promotes
-    /// any pre-mutation `@ovr-gc/` intent to a committed marker; the
-    /// gateway removes it when the rows are gone, and its init-time
-    /// scavenger replays committed markers a crash left behind.
-    pub(crate) async fn teardown_blob(&self, layout: &ObjectLayout) {
+    /// belonging to a blob, after the reclamation grace. `key` is the
+    /// name the blob was published under, already unlinked or renamed
+    /// over. This promotes any pre-mutation `@ovr-gc/` intent to a
+    /// committed marker; the gateway removes it when the rows are gone,
+    /// and its init-time scavenger replays committed markers a crash
+    /// left behind.
+    pub(crate) async fn teardown_blob(&self, key: &str, layout: &ObjectLayout) {
         let Ok(blob_guid) = layout.blob_guid() else {
             return;
         };
         let marker_required = layout.may_have_ovr_records();
         let mut work = SweepWork {
+            key: key.to_string(),
             delete_all_blocks: true,
             delete_rows: marker_required,
             ..Default::default()
@@ -297,8 +308,8 @@ impl VfsCore {
             .map(|entry| *entry.key())
             .collect::<Vec<_>>();
         for ino in deferred_inodes {
-            if let Some((_, old_bytes)) = self.deferred_blob_cleanup.remove(&ino) {
-                self.cleanup_orphaned_value("", Some(ino), old_bytes, &trace_id)
+            if let Some((_, (key, old_bytes))) = self.deferred_blob_cleanup.remove(&ino) {
+                self.cleanup_orphaned_value(&key, Some(ino), old_bytes, &trace_id)
                     .await;
             }
         }

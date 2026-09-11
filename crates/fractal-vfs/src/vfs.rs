@@ -197,7 +197,8 @@ pub struct VfsCore {
     writeback_worker_started: AtomicBool,
     // Tracks blob data for unlinked files that still have open handles.
     // Cleanup is deferred until the last handle is released.
-    deferred_blob_cleanup: DashMap<InodeId, Bytes>,
+    /// `(unlinked key, displaced layout bytes)` awaiting the last close.
+    deferred_blob_cleanup: DashMap<InodeId, (String, Bytes)>,
     // InodeId-scoped write lock. At most one write-mode handle per inode is
     // allowed. Map value is the owning fh so a stale lock for a closed fh
     // can be reclaimed by the next opener. Reads do not touch
@@ -284,6 +285,17 @@ impl VfsCore {
                 leaked
             }
         })
+    }
+
+    /// The inode key an open handle publishes under; data requests carry
+    /// it so the gateway can prove the blob belongs to this bucket.
+    pub(crate) fn handle_key(&self, fh: FileHandleId) -> Result<String, FsError> {
+        Ok(self
+            .file_handles
+            .get(&fh)
+            .ok_or(FsError::BadFd)?
+            .s3_key
+            .clone())
     }
 
     fn alloc_fh(&self) -> FileHandleId {

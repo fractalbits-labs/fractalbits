@@ -32,6 +32,7 @@ impl VfsCore {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn read_block_cached(
         &self,
+        key: &str,
         blob_guid: data_types::DataBlobGuid,
         rows: Option<&OvrRowMap>,
         ceiling: u64,
@@ -59,7 +60,7 @@ impl VfsCore {
 
         let mut data = match self
             .backend()
-            .read_block(blob_guid, version, block_num, read_len, trace_id)
+            .read_block(key, blob_guid, version, block_num, read_len, trace_id)
             .await
         {
             Ok(r) => r,
@@ -117,7 +118,7 @@ impl VfsCore {
         let mut result = BytesMut::with_capacity(actual_len);
         let mut obj_offset: u64 = 0;
 
-        for (_part_key, part_obj) in &parts {
+        for (part_key, part_obj) in &parts {
             let part_size = part_obj.size()?;
             let part_end = obj_offset + part_size;
 
@@ -141,24 +142,35 @@ impl VfsCore {
                 let first_block = (part_read_start / block_size) as u32;
                 let last_block = ((part_read_end - 1) / block_size) as u32;
 
-                for block_num in first_block..=last_block {
+                let fetched = stream::iter(first_block..=last_block)
+                    .map(|block_num| {
+                        let rows = part_rows.as_deref();
+                        let trace_id = &trace_id;
+                        async move {
+                            let block_start = block_num as u64 * block_size;
+                            let block_content_len =
+                                std::cmp::min(block_size, part_size - block_start) as usize;
+                            self.read_block_cached(
+                                part_key,
+                                blob_guid,
+                                rows,
+                                part_ceiling,
+                                block_num,
+                                block_content_len,
+                                block_size as usize,
+                                validated_sparse_blocks,
+                                trace_id,
+                            )
+                            .await
+                            .map(|data| (block_num, data))
+                        }
+                    })
+                    .buffered(READ_CONCURRENCY)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+
+                for (block_num, block_data) in fetched {
                     let block_start = block_num as u64 * block_size;
-                    let block_content_len =
-                        std::cmp::min(block_size, part_size - block_start) as usize;
-
-                    let block_data = self
-                        .read_block_cached(
-                            blob_guid,
-                            part_rows.as_deref(),
-                            part_ceiling,
-                            block_num,
-                            block_content_len,
-                            block_size as usize,
-                            validated_sparse_blocks,
-                            &trace_id,
-                        )
-                        .await?;
-
                     let slice_start = if block_num == first_block {
                         (part_read_start - block_start) as usize
                     } else {
@@ -187,6 +199,7 @@ impl VfsCore {
     /// number of bytes written.
     pub(crate) async fn read_normal_buf(
         &self,
+        key: &str,
         layout: &ObjectLayout,
         offset: u64,
         buf: &mut [u8],
@@ -223,6 +236,7 @@ impl VfsCore {
                     let block_content_len =
                         std::cmp::min(block_size, file_size - block_start) as usize;
                     self.read_block_cached(
+                        key,
                         blob_guid,
                         rows,
                         ceiling,
@@ -281,7 +295,7 @@ impl VfsCore {
 
         match &layout.state {
             ObjectState::Normal(_) => {
-                self.read_normal_buf(&layout, offset, buf, validated_sparse_blocks)
+                self.read_normal_buf(&s3_key, &layout, offset, buf, validated_sparse_blocks)
                     .await
             }
             ObjectState::Mpu(MpuState::Completed(_)) => {
@@ -332,11 +346,13 @@ impl VfsCore {
             let eof_low_watermark = wb.eof_low_watermark;
             let blocks = wb.blocks.clone();
             let committed_layout = handle.layout.clone();
+            let s3_key = handle.s3_key.clone();
             drop(handle);
             let (committed_rows, committed_ceiling) =
                 self.rows_and_ceiling(committed_layout.as_ref()).await?;
             return self
                 .read_dirty_handle(
+                    &s3_key,
                     file_size,
                     block_size,
                     existing_blob_guid,

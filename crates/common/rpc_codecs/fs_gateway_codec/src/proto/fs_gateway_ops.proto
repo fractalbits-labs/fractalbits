@@ -27,8 +27,6 @@ enum Command {
   ReadBlock = 27;
   WriteBlock = 28;
   ListBlobBlocks = 29;
-  DeleteBlock = 30;
-  DeleteBlobBlocks = 31;
 
   // Gateway-side cache / reclamation hints
   PrefetchBlob = 32;
@@ -62,6 +60,11 @@ message Error {
 message Caller {
   bytes token = 1;
 }
+
+// Data requests name the inode whose layout references the blob. The
+// gateway proves the blob belongs to the token's bucket from its own
+// ownership marker (gateway-allocated blobs) or, for blobs the S3 path
+// created, from that inode in the bucket's own namespace.
 
 message BlobGuid {
   bytes blob_id = 1;
@@ -263,6 +266,7 @@ message ReadBlockRequest {
   uint32 block_number = 3;
   uint64 version = 4;
   uint32 content_len = 5;
+  string key = 6;
 }
 
 message ReadBlockResponse {
@@ -282,6 +286,7 @@ message WriteBlockRequest {
   uint32 block_number = 3;
   uint64 version = 4;
   bytes data = 5;
+  string key = 6;
 }
 
 message WriteBlockResponse {
@@ -298,6 +303,7 @@ message ListBlobBlocksRequest {
   uint32 block_count = 4;
   // Enumerate every stored generation (reclamation) instead of the committed view.
   bool all_nodes = 5;
+  string key = 6;
 }
 
 message ListBlobBlocksResponse {
@@ -311,32 +317,6 @@ message ListBlobBlocksResponse {
   }
 }
 
-message DeleteBlockRequest {
-  Caller caller = 1;
-  BlobGuid blob = 2;
-  uint32 block_number = 3;
-  uint64 version = 4;
-}
-
-message DeleteBlockResponse {
-  oneof result {
-    google.protobuf.Empty ok = 1;
-    Error err = 2;
-  }
-}
-
-message DeleteBlobBlocksRequest {
-  Caller caller = 1;
-  BlobGuid blob = 2;
-}
-
-message DeleteBlobBlocksResponse {
-  oneof result {
-    google.protobuf.Empty ok = 1;
-    Error err = 2;
-  }
-}
-
 // ---------- Hints ----------
 
 // Best-effort whole-blob warm of the gateway disk cache. The client
@@ -346,6 +326,7 @@ message PrefetchBlobRequest {
   BlobGuid blob = 2;
   uint64 file_size = 3;
   repeated PrefetchBlock blocks = 4;
+  string key = 5;
 
   message PrefetchBlock {
     uint32 block_number = 1;
@@ -363,7 +344,10 @@ message PrefetchBlobResponse {
 }
 
 // Reclamation work the client derived from a commit or teardown. The
-// gateway coalesces per blob, applies the reader grace and retries.
+// gateway coalesces per blob, applies the reader grace and retries, and
+// re-derives reclaimability from the bucket's own metadata before it
+// deletes anything: `key` names the inode the blob was published under
+// (empty when the client has none, e.g. a failed unpublished create).
 message SweepBlobRequest {
   Caller caller = 1;
   BlobGuid blob = 2;
@@ -373,6 +357,7 @@ message SweepBlobRequest {
   bool delete_rows = 6;
   bool with_grace = 7;
   optional uint64 marker_data_pending_unix_ms = 8;
+  string key = 9;
 
   message BlockFloor {
     uint32 block_number = 1;

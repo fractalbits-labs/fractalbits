@@ -140,6 +140,7 @@ impl VfsCore {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn lazy_load_block_for_flush(
         &self,
+        key: &str,
         existing_blob_guid: Option<data_types::DataBlobGuid>,
         committed_rows: Option<&OvrRowMap>,
         committed_ceiling: u64,
@@ -180,7 +181,7 @@ impl VfsCore {
         };
         match self
             .backend()
-            .read_block(guid, version, block_num, read_len, trace_id)
+            .read_block(key, guid, version, block_num, read_len, trace_id)
             .await
         {
             Ok(data) => Ok(if data.len() > committed_content_len {
@@ -210,6 +211,7 @@ impl VfsCore {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn read_dirty_handle(
         &self,
+        key: &str,
         file_size: u64,
         block_size: u32,
         existing_blob_guid: Option<data_types::DataBlobGuid>,
@@ -254,6 +256,7 @@ impl VfsCore {
                         zeros(block_content_len)
                     } else {
                         self.lazy_load_block_for_flush(
+                            key,
                             existing_blob_guid,
                             committed_rows,
                             committed_ceiling,
@@ -540,9 +543,10 @@ impl VfsCore {
                     })
                     .map(|(b, bytes)| {
                         let trace_id = &trace_id;
+                        let key = s3_key.as_str();
                         async move {
                             self.backend()
-                                .write_block(blob_guid, b, bytes, 1, trace_id)
+                                .write_block(key, blob_guid, b, bytes, 1, trace_id)
                                 .await
                         }
                     })
@@ -550,7 +554,7 @@ impl VfsCore {
                     .try_collect::<Vec<_>>()
                     .await;
                 if let Err(e) = body_writes {
-                    self.cleanup_unpublished_blob(blob_guid, unpublished_identities)
+                    self.cleanup_unpublished_blob(&s3_key, blob_guid, unpublished_identities)
                         .await;
                     return Err(e);
                 }
@@ -559,7 +563,7 @@ impl VfsCore {
                 let publish_bytes = match wrap_for_publish(promoted_record.as_ref(), &layout) {
                     Ok(bytes) => bytes,
                     Err(error) => {
-                        self.cleanup_unpublished_blob(blob_guid, unpublished_identities)
+                        self.cleanup_unpublished_blob(&s3_key, blob_guid, unpublished_identities)
                             .await;
                         return Err(error);
                     }
@@ -717,7 +721,7 @@ impl VfsCore {
                 let count = trim_hi - trim_lo;
                 let entries = self
                     .backend()
-                    .list_blob_blocks(blob_guid, trim_lo, count, &trace_id)
+                    .list_blob_blocks(&s3_key, blob_guid, trim_lo, count, &trace_id)
                     .await?;
                 for entry in entries {
                     let b = entry.block_number;
@@ -844,6 +848,7 @@ impl VfsCore {
                 })
                 .map(|(b, bytes)| {
                     let trace_id = &trace_id;
+                    let key = s3_key.as_str();
                     async move {
                         let write_version = if v1_append_blocks_ref.contains(&b) {
                             1
@@ -860,7 +865,7 @@ impl VfsCore {
                             bytes.clone()
                         };
                         self.backend()
-                            .write_block(blob_guid, b, body, write_version, trace_id)
+                            .write_block(key, blob_guid, b, body, write_version, trace_id)
                             .await
                     }
                 })
@@ -1097,6 +1102,7 @@ impl VfsCore {
         // until the block is rewritten or the file unlinked.
         if let Ok(final_blob_guid) = final_layout.blob_guid() {
             self.enqueue_superseded_sweep(
+                &s3_key,
                 final_blob_guid,
                 std::mem::take(&mut sweep_victims),
                 std::mem::take(&mut sweep_below),
@@ -1233,6 +1239,7 @@ impl VfsCore {
         } else {
             self.rows_and_ceiling(committed_layout.as_ref()).await?
         };
+        let key = self.handle_key(fh)?;
         let bsz_u64 = block_size as u64;
         for b in blocks_to_load {
             let block_start = b as u64 * bsz_u64;
@@ -1243,6 +1250,7 @@ impl VfsCore {
             };
             let bytes = self
                 .lazy_load_block_for_flush(
+                    &key,
                     existing_blob_guid,
                     committed_rows.as_deref(),
                     committed_ceiling,
@@ -1429,6 +1437,7 @@ impl VfsCore {
         if punch_hole && !edge_loads.is_empty() {
             let (committed_rows, committed_ceiling) =
                 self.rows_and_ceiling(committed_layout.as_ref()).await?;
+            let key = self.handle_key(fh)?;
             let bsz_u64 = block_size as u64;
             for b in edge_loads {
                 let block_start = b as u64 * bsz_u64;
@@ -1439,6 +1448,7 @@ impl VfsCore {
                 };
                 let bytes = self
                     .lazy_load_block_for_flush(
+                        &key,
                         existing_blob_guid,
                         committed_rows.as_deref(),
                         committed_ceiling,
@@ -1652,9 +1662,10 @@ impl VfsCore {
                 if count == 0 {
                     BTreeSet::new()
                 } else {
+                    let key = self.handle_key(fh)?;
                     let entries = self
                         .backend()
-                        .list_blob_blocks(guid, first_block, count, &trace_id)
+                        .list_blob_blocks(&key, guid, first_block, count, &trace_id)
                         .await?;
                     entries
                         .into_iter()
@@ -1793,6 +1804,7 @@ impl VfsCore {
                     let trace_id = TraceId::new();
                     let (committed_rows, committed_ceiling) =
                         self.rows_and_ceiling(committed_layout.as_ref()).await?;
+                    let key = self.handle_key(fh)?;
                     let block_start = (last as u64) * (block_size as u64);
                     let committed_content_len = if block_start < committed_size {
                         std::cmp::min(block_size as u64, committed_size - block_start) as usize
@@ -1800,6 +1812,7 @@ impl VfsCore {
                         0
                     };
                     self.lazy_load_block_for_flush(
+                        &key,
                         existing_blob_guid,
                         committed_rows.as_deref(),
                         committed_ceiling,

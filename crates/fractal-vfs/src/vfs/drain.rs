@@ -473,18 +473,18 @@ impl VfsCore {
 
         // Handle deferred blob cleanup for unlinked files
         if let Some(ino) = ino
-            && let Some((_, old_bytes)) = self.deferred_blob_cleanup.remove(&ino)
+            && let Some((_, (key, old_bytes))) = self.deferred_blob_cleanup.remove(&ino)
         {
             if !self.has_open_handles_for_inode(ino, None) {
                 // Last handle closed, clean up blobs now
                 if let Ok(old_layout) =
                     rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(&old_bytes)
                 {
-                    self.teardown_blob(&old_layout).await;
+                    self.teardown_blob(&key, &old_layout).await;
                 }
             } else {
                 // Still more handles open, re-insert
-                self.deferred_blob_cleanup.insert(ino, old_bytes);
+                self.deferred_blob_cleanup.insert(ino, (key, old_bytes));
             }
         }
 

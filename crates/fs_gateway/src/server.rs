@@ -17,7 +17,8 @@ use compio_buf::BufResult;
 use compio_io::{AsyncReadExt, AsyncWriteExt};
 use compio_net::{TcpListener, TcpSocket, TcpStream};
 use data_types::TraceId;
-use data_types::object_layout::ObjectLayout;
+use data_types::object_layout::{HARDLINK_PREFIX, InodeRecord, ObjectLayout, ObjectState};
+use data_types::ovr_map::{OvrRow, parse_ovr_row_block};
 use fs_gateway_codec::*;
 use futures::channel::mpsc;
 use futures::{SinkExt, StreamExt};
@@ -26,7 +27,7 @@ use rpc_client_rss::RpcClientRss;
 use rpc_codec_common::MessageHeaderTrait;
 
 use crate::auth::{Auth, Session};
-use crate::backend::{BackendConfig, StorageBackend};
+use crate::backend::{BLOB_OWNER_PREFIX, BackendConfig, StorageBackend};
 use crate::config::Config;
 use crate::disk_cache::{DiskCache, MIRROR_BYTE_BUDGET, MirrorHandle, MirrorJob};
 use crate::error::FsError;
@@ -35,10 +36,21 @@ use crate::s3_volume::S3DataVolume;
 use crate::sweep::{SweepCoordinator, enqueue_sweep_request, scavenge_teardown_markers};
 
 const HEADER_SIZE: usize = size_of::<MessageHeader>();
-/// Largest request body accepted: one block plus framing, with margin.
-const MAX_BODY: usize = 16 * 1024 * 1024;
+/// Largest encoded request accepted. Data commands apply the tighter block
+/// limit after protobuf decoding.
+const MAX_BODY: usize = 1024 * 1024;
 const LISTEN_BACKLOG: i32 = 1024;
 const REPLY_QUEUE: usize = 4096;
+/// In-flight request bounds. The reader stops pulling frames off a
+/// connection while it is at its limit, so a slow backend backpressures
+/// the client instead of growing detached tasks without bound. A mount
+/// runs one connection per worker thread with up to sixteen concurrent
+/// block writes per flush plus readahead, so the per-connection bound
+/// stays well above what one thread issues.
+const CONNECTION_INFLIGHT_LIMIT: usize = 256;
+const GLOBAL_INFLIGHT_LIMIT: usize = 2048;
+const PREFETCH_INFLIGHT_LIMIT: usize = 8;
+const MAX_PREFETCH_BLOCKS: usize = 8192;
 
 pub struct Gateway {
     pub config: Arc<Config>,
@@ -53,6 +65,8 @@ pub struct Gateway {
     /// never served through a stale backend.
     buckets: parking_lot::Mutex<HashMap<String, Arc<BackendConfig>>>,
     mount_generation: AtomicU64,
+    request_limit: Arc<tokio::sync::Semaphore>,
+    prefetch_limit: Arc<tokio::sync::Semaphore>,
 }
 
 thread_local! {
@@ -162,6 +176,8 @@ impl Gateway {
             sweep: Arc::new(SweepCoordinator::default()),
             buckets: parking_lot::Mutex::new(HashMap::new()),
             mount_generation: AtomicU64::new(1),
+            request_limit: Arc::new(tokio::sync::Semaphore::new(GLOBAL_INFLIGHT_LIMIT)),
+            prefetch_limit: Arc::new(tokio::sync::Semaphore::new(PREFETCH_INFLIGHT_LIMIT)),
         }
     }
 
@@ -175,9 +191,15 @@ impl Gateway {
 
     async fn resolve_bucket(&self, bucket: &str) -> Result<Arc<BackendConfig>, FsError> {
         let generation = self.mount_generation.fetch_add(1, Ordering::Relaxed);
-        let discovered = BackendConfig::discover(&self.config, bucket, self.s3.clone(), generation)
-            .await
-            .map_err(FsError::Internal)?;
+        let mut discovered =
+            BackendConfig::discover(&self.config, bucket, self.s3.clone(), generation)
+                .await
+                .map_err(FsError::Internal)?;
+        if let Some(previous) = self.buckets.lock().get(bucket)
+            && previous.root_blob_name == discovered.root_blob_name
+        {
+            discovered.owned_blobs = previous.owned_blobs.clone();
+        }
         let cfg = Arc::new(discovered);
         self.buckets.lock().insert(bucket.to_string(), cfg.clone());
         Ok(cfg)
@@ -273,6 +295,12 @@ impl Gateway {
         let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
         let blob_guid = decode_guid(req.blob.as_ref())?;
         let content_len = req.content_len as usize;
+        if content_len > ObjectLayout::DEFAULT_BLOCK_SIZE as usize || req.version == 0 {
+            return Err(FsError::InvalidState);
+        }
+        backend
+            .verify_blob_owner(blob_guid, &req.key, trace_id)
+            .await?;
         if let Some(dc) = &self.disk_cache
             && let Some(cached) = dc
                 .get_block_exact(blob_guid, req.block_number, req.version, content_len)
@@ -305,7 +333,15 @@ impl Gateway {
     async fn write_block(&self, req: WriteBlockRequest, trace_id: &TraceId) -> Result<(), FsError> {
         let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
         let blob_guid = decode_guid(req.blob.as_ref())?;
+        // BSS rejects anything above one shard; enforce it here so a bad
+        // client cannot reach that check on a shared node.
+        if req.data.len() > ObjectLayout::DEFAULT_BLOCK_SIZE as usize || req.version == 0 {
+            return Err(FsError::InvalidState);
+        }
         backend
+            .verify_blob_owner(blob_guid, &req.key, trace_id)
+            .await?;
+        let stored = backend
             .write_block(
                 blob_guid,
                 req.block_number,
@@ -314,16 +350,37 @@ impl Gateway {
                 trace_id,
             )
             .await?;
-        self.mirror_insert(blob_guid, req.block_number, req.version, req.data);
+        // A write-once key that already existed kept its original bytes;
+        // mirroring the caller's copy would poison the disk cache.
+        if stored {
+            self.mirror_insert(blob_guid, req.block_number, req.version, req.data);
+        }
         Ok(())
     }
 
-    fn prefetch_blob(&self, req: PrefetchBlobRequest) -> Result<(), FsError> {
+    async fn prefetch_blob(
+        &self,
+        req: PrefetchBlobRequest,
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
         let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
         let Some(dc) = &self.disk_cache else {
             return Ok(());
         };
         let blob_guid = decode_guid(req.blob.as_ref())?;
+        backend
+            .verify_blob_owner(blob_guid, &req.key, trace_id)
+            .await?;
+        if req.blocks.len() > MAX_PREFETCH_BLOCKS
+            || req.blocks.iter().any(|plan| {
+                plan.version == 0
+                    || plan.content_len > ObjectLayout::DEFAULT_BLOCK_SIZE
+                    || plan.read_len > ObjectLayout::DEFAULT_BLOCK_SIZE
+                    || plan.content_len > plan.read_len
+            })
+        {
+            return Err(FsError::InvalidState);
+        }
         if prefetch::cache_pressure_high(
             dc.current_usage(),
             dc.capacity_bytes(),
@@ -332,24 +389,118 @@ impl Gateway {
         {
             return Ok(());
         }
+        let Ok(permit) = self.prefetch_limit.clone().try_acquire_owned() else {
+            return Ok(());
+        };
         let dc = Arc::clone(dc);
         compio_runtime::spawn(async move {
+            let _permit = permit;
             prefetch::prefetch_blob(backend, dc, blob_guid, req.blocks).await;
         })
         .detach();
         Ok(())
     }
 
-    fn validate_layout(key: &str, value: &[u8]) -> Result<(), FsError> {
-        // Internal keyspaces (`@ovr/`, `@ovr-gc/`, `@hardlink/`) hold
-        // non-layout values; user keys must decode so a malformed layout
-        // never lands where the S3 gateway would later parse it.
-        if key.starts_with('@') || value.is_empty() {
-            return Ok(());
+    fn reject_owner_key(key: &str) -> Result<(), FsError> {
+        if key.starts_with(BLOB_OWNER_PREFIX) {
+            return Err(FsError::Unauthorized("reserved gateway key".into()));
         }
-        rkyv::access::<rkyv::Archived<ObjectLayout>, rkyv::rancor::Error>(value)
-            .map(|_| ())
-            .map_err(|e| FsError::Deserialize(format!("layout rejected: {e}")))
+        Ok(())
+    }
+
+    /// Semantic checks on a layout a client wants stored. Returns the
+    /// data blob it names, if any, for the ownership check.
+    fn validate_object_layout(
+        layout: &ObjectLayout,
+    ) -> Result<Option<data_types::DataBlobGuid>, FsError> {
+        if layout.block_size != ObjectLayout::DEFAULT_BLOCK_SIZE {
+            return Err(FsError::InvalidState);
+        }
+        let ObjectState::Normal(data) = &layout.state else {
+            return Ok(None);
+        };
+        if data.blob_guid.blob_id.is_nil() {
+            return if data.core_meta_data.size == 0 {
+                Ok(None)
+            } else {
+                Err(FsError::InvalidState)
+            };
+        }
+        // Readers select generations `<= blob_version`; 0 would hide every
+        // block. Block numbers are u32 on the wire.
+        if layout.blob_version == 0
+            || data.core_meta_data.size.div_ceil(layout.block_size as u64) > u32::MAX as u64
+        {
+            return Err(FsError::InvalidState);
+        }
+        Ok(Some(data.blob_guid))
+    }
+
+    /// Validate a client-supplied inode value before it lands where the
+    /// S3 gateway and other mounts will parse it. Returns the data blob
+    /// the value names, if any.
+    fn validate_layout(
+        key: &str,
+        value: &[u8],
+    ) -> Result<Option<data_types::DataBlobGuid>, FsError> {
+        Self::reject_owner_key(key)?;
+        if key.starts_with(HARDLINK_PREFIX) {
+            let record = rkyv::from_bytes::<InodeRecord, rkyv::rancor::Error>(value)
+                .map_err(|e| FsError::Deserialize(format!("inode record rejected: {e}")))?;
+            if matches!(record.layout.state, ObjectState::Indirect(_)) {
+                return Err(FsError::InvalidState);
+            }
+            return Self::validate_object_layout(&record.layout);
+        }
+        if parse_ovr_row_block(key).is_some() {
+            return OvrRow::decode(value)
+                .map(|_| None)
+                .ok_or_else(|| FsError::Deserialize("row rejected".into()));
+        }
+        // Remaining internal keyspaces (`@ovr/` abort records, `@ovr-gc/`
+        // markers) hold opaque values the gateway never interprets.
+        if key.starts_with('@') {
+            return Ok(None);
+        }
+        let layout = rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(value)
+            .map_err(|e| FsError::Deserialize(format!("layout rejected: {e}")))?;
+        Self::validate_object_layout(&layout)
+    }
+
+    /// Serving a layout out of this bucket's namespace proves the blob it
+    /// names belongs here; remember that so the data requests that follow
+    /// skip the marker lookup.
+    fn note_served_layout(backend: &StorageBackend, key: &str, value: &[u8]) {
+        if key.starts_with('@') && !key.starts_with(HARDLINK_PREFIX) {
+            return;
+        }
+        let layout = if key.starts_with(HARDLINK_PREFIX) {
+            rkyv::from_bytes::<InodeRecord, rkyv::rancor::Error>(value)
+                .ok()
+                .map(|record| record.layout)
+        } else {
+            rkyv::from_bytes::<ObjectLayout, rkyv::rancor::Error>(value).ok()
+        };
+        if let Some(blob_guid) = layout.and_then(|l| l.blob_guid().ok()) {
+            backend.note_owned_blob(blob_guid);
+        }
+    }
+
+    /// Store an inode value the client supplied: validate it, and prove
+    /// any blob it names belongs to this bucket (the value already stored
+    /// at the same key is one acceptable proof, so republishing a
+    /// layout the S3 API created works without a marker).
+    async fn store_inode(
+        &self,
+        backend: &StorageBackend,
+        key: &str,
+        value: &[u8],
+        trace_id: &TraceId,
+    ) -> Result<(), FsError> {
+        if let Some(blob_guid) = Self::validate_layout(key, value)? {
+            backend.verify_blob_owner(blob_guid, key, trace_id).await?;
+        }
+        Ok(())
     }
 
     /// Decode, authorize, execute, encode. Returns `None` for a request
@@ -379,7 +530,10 @@ impl Gateway {
                 let req = decode!(GetInodeRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
-                    backend.get_inode_raw(&req.key, trace_id).await
+                    Self::reject_owner_key(&req.key)?;
+                    let value = backend.get_inode_raw(&req.key, trace_id).await?;
+                    Self::note_served_layout(&backend, &req.key, &value);
+                    Ok::<_, FsError>(value)
                 };
                 respond!(GetInodeResponse, get_inode_response, run.await)
             }
@@ -399,6 +553,7 @@ impl Gateway {
                     Ok::<_, FsError>(list_inodes_response::Page {
                         entries: entries
                             .into_iter()
+                            .filter(|(key, _)| !key.starts_with(BLOB_OWNER_PREFIX))
                             .map(|(key, value)| list_inodes_response::Entry { key, value })
                             .collect(),
                         has_more,
@@ -410,7 +565,8 @@ impl Gateway {
                 let req = decode!(PutInodeRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    Self::validate_layout(&req.key, &req.value)?;
+                    self.store_inode(&backend, &req.key, &req.value, trace_id)
+                        .await?;
                     backend.put_inode(&req.key, req.value, trace_id).await
                 };
                 respond!(PutInodeResponse, put_inode_response, run.await)
@@ -419,7 +575,8 @@ impl Gateway {
                 let req = decode!(PutInodeCasRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    Self::validate_layout(&req.key, &req.value)?;
+                    self.store_inode(&backend, &req.key, &req.value, trace_id)
+                        .await?;
                     backend
                         .put_inode_cas(&req.key, req.value, req.expected_old_value, trace_id)
                         .await
@@ -430,7 +587,13 @@ impl Gateway {
                 let req = decode!(DeleteInodeRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
+                    Self::reject_owner_key(&req.key)?;
                     let previous = backend.delete_inode(&req.key, trace_id).await?;
+                    // The teardown hint for the displaced blob follows; its
+                    // only proof of ownership was the value just removed.
+                    if let Some(previous) = &previous {
+                        Self::note_served_layout(&backend, &req.key, previous);
+                    }
                     Ok::<_, FsError>(delete_inode_response::Deleted {
                         existed: previous.is_some(),
                         previous: previous.unwrap_or_default(),
@@ -442,9 +605,15 @@ impl Gateway {
                 let req = decode!(RenameFileRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    backend
+                    Self::reject_owner_key(&req.src_key)?;
+                    Self::reject_owner_key(&req.dst_key)?;
+                    let displaced = backend
                         .rename_file(&req.src_key, &req.dst_key, req.force_overwrite, trace_id)
-                        .await
+                        .await?;
+                    if !displaced.is_empty() {
+                        Self::note_served_layout(&backend, &req.dst_key, &displaced);
+                    }
+                    Ok::<_, FsError>(displaced)
                 };
                 respond!(RenameFileResponse, rename_file_response, run.await)
             }
@@ -452,6 +621,8 @@ impl Gateway {
                 let req = decode!(RenameFolderRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
+                    Self::reject_owner_key(&req.src_key)?;
+                    Self::reject_owner_key(&req.dst_key)?;
                     backend
                         .rename_folder(&req.src_key, &req.dst_key, trace_id)
                         .await
@@ -462,6 +633,7 @@ impl Gateway {
                 let req = decode!(PutDirMarkerRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
+                    Self::reject_owner_key(&req.key)?;
                     backend.put_dir_marker(&req.key, trace_id).await
                 };
                 respond!(PutDirMarkerResponse, put_dir_marker_response, run.await)
@@ -475,6 +647,11 @@ impl Gateway {
                     let parts = backend
                         .list_mpu_parts(&req.key, upload_id, trace_id)
                         .await?;
+                    for (_, layout) in &parts {
+                        if let Ok(blob_guid) = layout.blob_guid() {
+                            backend.note_owned_blob(blob_guid);
+                        }
+                    }
                     let mut out = Vec::with_capacity(parts.len());
                     for (key, layout) in parts {
                         let bytes: Vec<u8> = rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(
@@ -494,7 +671,9 @@ impl Gateway {
                 let req = decode!(AllocateBlobGuidRequest);
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    Ok::<_, FsError>(BlobGuid::from(backend.create_blob_guid()))
+                    let blob_guid = backend.create_blob_guid();
+                    backend.claim_blob(blob_guid, trace_id).await?;
+                    Ok::<_, FsError>(BlobGuid::from(blob_guid))
                 };
                 respond!(
                     AllocateBlobGuidResponse,
@@ -523,6 +702,9 @@ impl Gateway {
                 let run = async {
                     let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
                     let blob_guid = decode_guid(req.blob.as_ref())?;
+                    backend
+                        .verify_blob_owner(blob_guid, &req.key, trace_id)
+                        .await?;
                     let entries = if req.all_nodes {
                         backend.list_all_blob_blocks(blob_guid, trace_id).await?
                     } else {
@@ -542,47 +724,34 @@ impl Gateway {
                 };
                 respond!(ListBlobBlocksResponse, list_blob_blocks_response, run.await)
             }
-            Command::DeleteBlock => {
-                let req = decode!(DeleteBlockRequest);
-                let run = async {
-                    let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    let blob_guid = decode_guid(req.blob.as_ref())?;
-                    backend
-                        .delete_block(blob_guid, req.block_number, req.version, trace_id)
-                        .await
-                };
-                respond!(DeleteBlockResponse, delete_block_response, run.await)
-            }
-            Command::DeleteBlobBlocks => {
-                let req = decode!(DeleteBlobBlocksRequest);
-                let run = async {
-                    let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    let blob_guid = decode_guid(req.blob.as_ref())?;
-                    backend.delete_blob_blocks(blob_guid, trace_id).await
-                };
-                respond!(
-                    DeleteBlobBlocksResponse,
-                    delete_blob_blocks_response,
-                    run.await
-                )
-            }
             Command::PrefetchBlob => {
                 let req = decode!(PrefetchBlobRequest);
                 respond!(
                     PrefetchBlobResponse,
                     prefetch_blob_response,
-                    self.prefetch_blob(req)
+                    self.prefetch_blob(req, trace_id).await
                 )
             }
             Command::SweepBlob => {
                 let req = decode!(SweepBlobRequest);
-                let run = || {
-                    let (_, cfg, _) = self.authorize(req.caller.as_ref(), true)?;
+                let run = async {
+                    let (_, cfg, backend) = self.authorize(req.caller.as_ref(), true)?;
                     let blob_guid = decode_guid(req.blob.as_ref())?;
+                    if req.victims.iter().any(|victim| victim.version == 0)
+                        || req.below.iter().any(|floor| floor.keep_from == 0)
+                        || (req.delete_rows && !req.delete_all_blocks)
+                    {
+                        return Err(FsError::InvalidState);
+                    }
+                    backend
+                        .verify_blob_owner(blob_guid, &req.key, trace_id)
+                        .await?;
+                    // What is reclaimable is re-derived by the sweep worker
+                    // from this bucket's rows and layouts, off the request path.
                     enqueue_sweep_request(&self.sweep, cfg, blob_guid, &req);
                     Ok::<_, FsError>(())
                 };
-                respond!(SweepBlobResponse, sweep_blob_response, run())
+                respond!(SweepBlobResponse, sweep_blob_response, run.await)
             }
             Command::Invalid | Command::Handshake => {
                 tracing::warn!(?command, "unsupported command");
@@ -596,7 +765,7 @@ impl Gateway {
 fn reply_header(id: u32, command: Command, trace_id: &TraceId, body: &[u8]) -> MessageHeader {
     let mut resp = MessageHeader(rpc_codec_common::ProtobufMessageHeader {
         id,
-        command,
+        command: command as i32,
         size: (HEADER_SIZE + body.len()) as u32,
         ..Default::default()
     });
@@ -611,6 +780,7 @@ fn reply_header(id: u32, command: Command, trace_id: &TraceId, body: &[u8]) -> M
 async fn serve_connection(gw: Arc<Gateway>, stream: TcpStream, peer: SocketAddr) {
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<(MessageHeader, Bytes)>(REPLY_QUEUE);
+    let connection_limit = Arc::new(tokio::sync::Semaphore::new(CONNECTION_INFLIGHT_LIMIT));
 
     let writer_task = compio_runtime::spawn(async move {
         while let Some((header, body)) = rx.next().await {
@@ -642,6 +812,17 @@ async fn serve_connection(gw: Arc<Gateway>, stream: TcpStream, peer: SocketAddr)
             break;
         }
         let header = MessageHeader::decode(&header_buf);
+        if header.get_size() < HEADER_SIZE {
+            tracing::warn!(%peer, size = header.get_size(), "invalid frame size; closing connection");
+            break;
+        }
+        let command = match Command::try_from(header.command) {
+            Ok(command) => command,
+            Err(_) => {
+                tracing::warn!(%peer, command = header.command, "invalid command; closing connection");
+                break;
+            }
+        };
         let body_size = header.get_body_size();
         if body_size > MAX_BODY {
             tracing::warn!(%peer, body_size, "oversized request; closing connection");
@@ -662,11 +843,20 @@ async fn serve_connection(gw: Arc<Gateway>, stream: TcpStream, peer: SocketAddr)
             break;
         }
 
+        let connection_permit = match connection_limit.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
+        let global_permit = match gw.request_limit.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
         let gw = gw.clone();
         let mut tx = tx.clone();
         compio_runtime::spawn(async move {
+            let _connection_permit = connection_permit;
+            let _global_permit = global_permit;
             let trace_id = header.get_trace_id();
-            let command = header.command;
             let Some(resp_body) = gw.dispatch(command, body, &trace_id).await else {
                 return;
             };
@@ -700,5 +890,78 @@ pub async fn run_worker(gw: Arc<Gateway>, worker_id: usize) -> std::io::Result<(
         let _ = stream.set_nodelay(true);
         tracing::debug!(worker_id, %peer, "connection accepted");
         compio_runtime::spawn(serve_connection(gw.clone(), stream, peer)).detach();
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+    use data_types::DataBlobGuid;
+    use data_types::object_layout::{ObjectCoreMetaData, ObjectMetaData};
+    use data_types::ovr_map::{OVR_ROW_LEN, ovr_row_key};
+
+    fn normal_layout(blob_id: uuid::Uuid, size: u64, blob_version: u64) -> ObjectLayout {
+        ObjectLayout {
+            timestamp: 0,
+            version_id: ObjectLayout::gen_version_id(),
+            block_size: ObjectLayout::DEFAULT_BLOCK_SIZE,
+            blob_version,
+            fs_ext: None,
+            state: ObjectState::Normal(ObjectMetaData {
+                blob_guid: DataBlobGuid {
+                    blob_id,
+                    volume_id: 1,
+                },
+                core_meta_data: ObjectCoreMetaData {
+                    size,
+                    ..Default::default()
+                },
+            }),
+        }
+    }
+
+    fn encode(layout: &ObjectLayout) -> Vec<u8> {
+        rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(layout, Vec::new())
+            .expect("layout encodes")
+    }
+
+    #[test]
+    fn valid_layout_yields_its_blob() {
+        let blob_id = uuid::Uuid::new_v4();
+        let layout = normal_layout(blob_id, 4096, 1);
+        let blob = Gateway::validate_layout("/a", &encode(&layout)).expect("valid layout");
+        assert_eq!(blob.map(|g| g.blob_id), Some(blob_id));
+    }
+
+    #[test]
+    fn layout_invariants_are_enforced() {
+        let blob_id = uuid::Uuid::new_v4();
+        let mut odd_block_size = normal_layout(blob_id, 4096, 1);
+        odd_block_size.block_size = 0;
+        Gateway::validate_layout("/a", &encode(&odd_block_size)).expect_err("block_size 0");
+
+        let zero_ceiling = normal_layout(blob_id, 4096, 0);
+        Gateway::validate_layout("/a", &encode(&zero_ceiling)).expect_err("blob_version 0");
+
+        let nil_blob_with_data = normal_layout(uuid::Uuid::nil(), 4096, 1);
+        Gateway::validate_layout("/a", &encode(&nil_blob_with_data))
+            .expect_err("nil blob with bytes");
+
+        let empty = normal_layout(uuid::Uuid::nil(), 0, 1);
+        assert!(
+            Gateway::validate_layout("/a", &encode(&empty))
+                .expect("empty file")
+                .is_none()
+        );
+
+        Gateway::validate_layout("/a", b"not a layout").expect_err("garbage");
+        Gateway::validate_layout(&format!("{BLOB_OWNER_PREFIX}00001/x"), &encode(&empty))
+            .expect_err("reserved keyspace");
+    }
+
+    #[test]
+    fn rows_must_decode() {
+        let key = ovr_row_key(&uuid::Uuid::new_v4(), 3);
+        Gateway::validate_layout(&key, &[0u8; OVR_ROW_LEN - 1]).expect_err("short row");
     }
 }
