@@ -2,6 +2,8 @@ pub mod api_key_routes;
 pub mod blob_client;
 mod blob_storage;
 mod config;
+pub mod drive_routes;
+pub mod drive_sweep;
 pub mod handler;
 pub mod http_stats;
 pub mod mgmt_auth;
@@ -10,7 +12,7 @@ pub mod unified_stats;
 pub use blob_client::BlobClient;
 use blob_client::BlobDeletionRequest;
 pub use config::{BlobStorageBackend, BlobStorageConfig, Config, S3HybridSingleAzConfig};
-use data_types::{ApiKey, Bucket, RoutingKey, TraceId, Versioned};
+use data_types::{ApiKey, Bucket, Drive, RoutingKey, TraceId, Versioned, drive::DRIVE_PREFIX};
 use handler::common::s3_error::S3Error;
 use metrics_wrapper::counter;
 use moka::future::Cache;
@@ -391,15 +393,14 @@ impl AppState {
     ) -> Result<(), RpcError> {
         let full_key = format!("api_key:{}", api_key.data.key_id);
         let data: String = serde_json::to_string(&api_key.data).unwrap();
-        let versioned_data: Versioned<String> = (api_key.version, data).into();
 
         let rss_client = self.get_rss_rpc_client();
-        rss_rpc_retry!(
+        let version = rss_rpc_retry!(
             rss_client,
             put(
-                versioned_data.version,
+                api_key.version,
                 &full_key,
-                &versioned_data.data,
+                &data,
                 Some(self.config.rss_rpc_timeout()),
                 trace_id
             )
@@ -407,7 +408,9 @@ impl AppState {
         .await?;
 
         tracing::debug!("caching data with full_key: {full_key}");
-        self.cache.insert(full_key, versioned_data).await;
+        self.cache
+            .insert(full_key, Versioned::new(version, data))
+            .await;
         Ok(())
     }
 
@@ -420,7 +423,7 @@ impl AppState {
         let rss_client = self.get_rss_rpc_client();
         rss_rpc_retry!(
             rss_client,
-            delete(&full_key, Some(self.config.rss_rpc_timeout()), trace_id)
+            delete(&full_key, 0, Some(self.config.rss_rpc_timeout()), trace_id)
         )
         .await?;
         // Drop our local cache entry. Other per-core caches and other
@@ -552,10 +555,13 @@ impl AppState {
         Ok(())
     }
 
+    /// `expected_root_blob_name` fences the delete on one bucket incarnation;
+    /// empty means any, which is what the S3 `DeleteBucket` handler passes.
     pub async fn delete_bucket(
         &self,
         bucket_name: &str,
         api_key_id: &str,
+        expected_root_blob_name: &str,
         trace_id: TraceId,
     ) -> Result<(), RpcError> {
         let rss_client = self.get_rss_rpc_client();
@@ -564,6 +570,7 @@ impl AppState {
             delete_bucket(
                 bucket_name,
                 api_key_id,
+                expected_root_blob_name,
                 Some(self.config.rss_rpc_timeout()),
                 &trace_id
             )
@@ -593,6 +600,103 @@ impl AppState {
         Ok(kvs
             .iter()
             .map(|x| serde_json::from_slice(x.as_bytes()).unwrap())
+            .collect())
+    }
+}
+
+// Drive operations: the `drive:` record is control-plane metadata beside
+// the bucket record and is never cached, since no data path reads it.
+impl AppState {
+    pub async fn get_drive(
+        &self,
+        name: &str,
+        trace_id: &TraceId,
+    ) -> Result<Option<Versioned<Drive>>, RpcError> {
+        let full_key = Drive::kv_key(name);
+        let rss_client = self.get_rss_rpc_client();
+        match rss_rpc_retry!(
+            rss_client,
+            get(&full_key, Some(self.config.rss_rpc_timeout()), trace_id)
+        )
+        .await
+        {
+            Ok((version, data)) => {
+                let drive = serde_json::from_str(&data)
+                    .map_err(|e| RpcError::DecodeError(format!("{full_key}: {e}")))?;
+                Ok(Some(Versioned::new(version, drive)))
+            }
+            Err(RpcError::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Compare-and-set on `version`: 0 creates only if absent. On success
+    /// `drive.version` becomes the version now stored, so the caller holds
+    /// the exact incarnation it wrote without reading it back. A lost race
+    /// surfaces as `RpcError::Retry` after the macro's own retries.
+    pub async fn put_drive(
+        &self,
+        drive: &mut Versioned<Drive>,
+        trace_id: &TraceId,
+    ) -> Result<(), RpcError> {
+        let full_key = Drive::kv_key(&drive.data.name);
+        let data = serde_json::to_string(&drive.data).unwrap();
+        let rss_client = self.get_rss_rpc_client();
+        let version = rss_rpc_retry!(
+            rss_client,
+            put(
+                drive.version,
+                &full_key,
+                &data,
+                Some(self.config.rss_rpc_timeout()),
+                trace_id
+            )
+        )
+        .await?;
+        drive.version = version;
+        Ok(())
+    }
+
+    /// Remove exactly the record version the caller read; a replacement
+    /// written since surfaces as `RpcError::Retry` and stays untouched.
+    /// There is deliberately no unconditional variant.
+    pub async fn delete_drive_record_if_version(
+        &self,
+        drive: &Versioned<Drive>,
+        trace_id: &TraceId,
+    ) -> Result<(), RpcError> {
+        let full_key = Drive::kv_key(&drive.data.name);
+        let rss_client = self.get_rss_rpc_client();
+        rss_rpc_retry!(
+            rss_client,
+            delete(
+                &full_key,
+                drive.version,
+                Some(self.config.rss_rpc_timeout()),
+                trace_id
+            )
+        )
+        .await
+    }
+
+    pub async fn list_drives(&self, trace_id: &TraceId) -> Result<Vec<Drive>, RpcError> {
+        let rss_client = self.get_rss_rpc_client();
+        let kvs = rss_rpc_retry!(
+            rss_client,
+            list(DRIVE_PREFIX, Some(self.config.rss_rpc_timeout()), trace_id)
+        )
+        .await?;
+        // One malformed record must not take the listing down for everyone;
+        // it is logged and skipped.
+        Ok(kvs
+            .iter()
+            .filter_map(|x| match serde_json::from_str::<Drive>(x) {
+                Ok(drive) => Some(drive),
+                Err(e) => {
+                    tracing::warn!("skipping undecodable drive record: {e}");
+                    None
+                }
+            })
             .collect())
     }
 }

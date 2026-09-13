@@ -3,10 +3,12 @@ use aws_sdk_s3::operation::list_buckets::ListBucketsOutput;
 use aws_sdk_s3::{Client, Config};
 use cmd_lib::*;
 
+pub mod mgmt;
+
 const DEFAULT_HTTP_PORT: u16 = 8080;
 const DEFAULT_HTTPS_PORT: u16 = 8443;
-const TEST_KEY: &str = "test_api_key";
-const TEST_SECRET: &str = "test_api_secret";
+pub const TEST_KEY: &str = "test_api_key";
+pub const TEST_SECRET: &str = "test_api_secret";
 
 #[allow(dead_code)]
 pub struct Service;

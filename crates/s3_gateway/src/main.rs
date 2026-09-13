@@ -9,7 +9,7 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
 };
 use rustls_pemfile::{certs, private_key};
-use s3_gateway::{AppState, Config, api_key_routes, handler};
+use s3_gateway::{AppState, Config, api_key_routes, drive_routes, handler, mgmt_auth};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::IsTerminal;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
@@ -368,6 +368,24 @@ fn main() -> std::io::Result<()> {
                                     .route(
                                         "/{key_id}",
                                         web::delete().to(api_key_routes::delete_api_key),
+                                    ),
+                            )
+                            .service(
+                                web::scope("/v1")
+                                    .wrap(actix_web::middleware::from_fn(mgmt_auth::fbsig1_auth))
+                                    .app_data(web::PayloadConfig::new(mgmt_auth::MAX_BODY))
+                                    .service(
+                                        web::scope("/drives")
+                                            .route("", web::post().to(drive_routes::create_drive))
+                                            .route("", web::get().to(drive_routes::list_drives))
+                                            .route(
+                                                "/{name}",
+                                                web::get().to(drive_routes::get_drive),
+                                            )
+                                            .route(
+                                                "/{name}",
+                                                web::delete().to(drive_routes::delete_drive),
+                                            ),
                                     ),
                             )
                     })
