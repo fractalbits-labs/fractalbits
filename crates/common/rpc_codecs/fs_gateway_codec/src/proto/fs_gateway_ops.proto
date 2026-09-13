@@ -77,12 +77,15 @@ message MountRequest {
   string api_key_id = 3;
   uint64 timestamp_ms = 4;
   bytes nonce = 5;
-  // HMAC-SHA256(secret_key, key_id | bucket | timestamp_ms | nonce)
+  // HMAC-SHA256(secret_key, key_id | bucket | prefix | holder | timestamp_ms | nonce)
   bytes signature = 6;
   // Random per mounting process, stable across its re-mounts. Orphan
   // keys are tagged with it so a later writer mount can reclaim those
   // of a process that is gone without touching its own.
   bytes instance = 7;
+  // Directory key the session is confined to; "/" or empty for the
+  // whole bucket. Must start and end with "/".
+  string prefix = 8;
 }
 
 message MountResponse {

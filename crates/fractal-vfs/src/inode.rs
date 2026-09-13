@@ -112,23 +112,26 @@ pub struct InodeTable {
 
 impl Default for InodeTable {
     fn default() -> Self {
-        Self::new()
+        Self::new("/")
     }
 }
 
 impl InodeTable {
-    pub fn new() -> Self {
+    /// `root_key` is the mount scope: "/" for the whole bucket, or the
+    /// directory key of a subtree mount. Children are keyed under it, so
+    /// the rest of the client never sees the scope.
+    pub fn new(root_key: &str) -> Self {
         let table = Self {
             map: DashMap::new(),
             next_ino: AtomicU64::new(2), // 1 is root
             key_to_ino: DashMap::new(),
         };
-        // Insert root inode. Root key is "/" matching metadata-store key convention
-        // where all keys are stored with a leading "/".
+        // Insert root inode. Root key is "/" (or the scope) matching the
+        // metadata-store key convention where all keys have a leading "/".
         table.map.insert(
             ROOT_INODE,
             InodeEntry {
-                s3_key: "/".to_string(),
+                s3_key: root_key.to_string(),
                 entry_type: EntryType::Directory,
                 layout: None,
                 cache_expiry: Instant::now(),
@@ -145,7 +148,7 @@ impl InodeTable {
         );
         table
             .key_to_ino
-            .insert(("/".to_string(), EntryType::Directory), ROOT_INODE);
+            .insert((root_key.to_string(), EntryType::Directory), ROOT_INODE);
         table
     }
 
@@ -382,7 +385,7 @@ mod tests {
 
     #[test]
     fn none_seed_dir_is_posix_unknown_then_refreshes_from_marker() {
-        let table = InodeTable::new();
+        let table = InodeTable::new("/");
         let key = "d/";
 
         // readdir common-prefix / lookup prefix-fallback: no layout, so the
@@ -415,7 +418,7 @@ mod tests {
         // A dir seeded from its marker (known), then locally chmod'd but not
         // yet flushed, must not be reverted by a subsequent marker-bearing
         // lookup carrying the stale mode.
-        let table = InodeTable::new();
+        let table = InodeTable::new("/");
         let key = "d/";
         let (ino, _) = table.lookup_or_insert(
             key,
