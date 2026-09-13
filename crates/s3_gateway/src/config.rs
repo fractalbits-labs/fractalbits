@@ -80,8 +80,16 @@ pub struct Config {
     pub enable_stats_writer: bool,
     pub blob_storage: BlobStorageConfig,
     pub allow_missing_or_bad_signature: bool,
+    /// Require the `FBSIG1` signature on the management `/v1` routes. Off
+    /// only for local development; see `mgmt_auth`.
+    #[serde(default = "default_true")]
+    pub mgmt_auth_required: bool,
     pub worker_threads: usize,
     pub set_thread_affinity: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_ec_read_hedge_delay_ms() -> u64 {
@@ -162,6 +170,7 @@ impl Config {
                 }),
             },
             allow_missing_or_bad_signature: false,
+            mgmt_auth_required: true,
             worker_threads: 2,
             set_thread_affinity: false,
         }
@@ -189,6 +198,7 @@ impl Config {
                 s3_hybrid_single_az: None,
             },
             allow_missing_or_bad_signature: false,
+            mgmt_auth_required: true,
             worker_threads: 2,
             set_thread_affinity: false,
         }

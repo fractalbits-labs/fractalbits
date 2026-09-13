@@ -4,6 +4,7 @@ mod blob_storage;
 mod config;
 pub mod handler;
 pub mod http_stats;
+pub mod mgmt_auth;
 pub mod unified_stats;
 
 pub use blob_client::BlobClient;
