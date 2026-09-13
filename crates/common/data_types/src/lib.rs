@@ -5,6 +5,7 @@ mod bucket;
 pub mod drive;
 pub mod ec_utils;
 pub mod hash;
+pub mod mgmt_sig;
 pub mod object_layout;
 pub mod observer_types;
 pub mod ovr_map;

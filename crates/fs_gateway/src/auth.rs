@@ -7,7 +7,7 @@
 //! another gateway process fails verification and the client re-mounts.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use data_types::{ApiKey, TraceId};
+use data_types::{ApiKey, TraceId, mgmt_sig::constant_time_eq};
 use fs_gateway_codec::MountRequest;
 use hmac::{Hmac, Mac};
 use rpc_client_rss::RpcClientRss;
@@ -171,11 +171,4 @@ impl Auth {
         }
         Ok(payload)
     }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
