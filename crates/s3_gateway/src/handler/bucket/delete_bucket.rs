@@ -22,7 +22,7 @@ pub async fn delete_bucket_handler(ctx: BucketRequestContext) -> Result<HttpResp
 
     let result = ctx
         .app
-        .delete_bucket(&bucket.bucket_name, &api_key_id, ctx.trace_id)
+        .delete_bucket(&bucket.bucket_name, &api_key_id, "", ctx.trace_id)
         .await;
     match result {
         Ok(_) => {

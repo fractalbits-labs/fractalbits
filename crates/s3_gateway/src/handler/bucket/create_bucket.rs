@@ -42,13 +42,23 @@ pub async fn create_bucket_handler(ctx: BucketRequestContext) -> Result<HttpResp
 
     // Validate permissions and bucket name
     let api_key_id = {
+        // The cached key may still list a bucket that another gateway or the
+        // management API deleted since; confirm against RSS before answering
+        // "already owned", or the create would be skipped for a bucket that
+        // no longer exists.
         if ctx
             .api_key
             .data
             .authorized_buckets
             .contains_key(&ctx.bucket_name)
         {
-            return Err(S3Error::BucketAlreadyOwnedByYou);
+            let fresh = ctx
+                .app
+                .refresh_api_key(ctx.api_key.data.key_id.clone(), &ctx.trace_id)
+                .await?;
+            if fresh.data.authorized_buckets.contains_key(&ctx.bucket_name) {
+                return Err(S3Error::BucketAlreadyOwnedByYou);
+            }
         }
         if !ctx.api_key.data.allow_create_bucket {
             return Err(S3Error::AccessDenied);
