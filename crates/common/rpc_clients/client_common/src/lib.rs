@@ -96,6 +96,10 @@ pub enum RpcError {
     NoSuchRootBlob,
     #[error("Bucket already owned by you")]
     BucketAlreadyOwnedByYou,
+    /// The bucket named in a fenced `DeleteBucket` is a different incarnation
+    /// (deleted and recreated) than the caller expected; nothing was deleted.
+    #[error("Bucket incarnation mismatch")]
+    IncarnationMismatch,
     #[error("Send error: {0}")]
     SendError(String),
     #[error("Encode error: {0}")]

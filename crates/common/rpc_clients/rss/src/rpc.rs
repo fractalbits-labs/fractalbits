@@ -8,6 +8,7 @@ use rss_codec::*;
 use tracing::{error, warn};
 
 impl RpcClient {
+    /// Returns the version now stored, the handle for the next compare-and-set.
     pub async fn put(
         &self,
         version: i64,
@@ -16,7 +17,7 @@ impl RpcClient {
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
-    ) -> Result<(), RpcError> {
+    ) -> Result<i64, RpcError> {
         let start = Instant::now();
         let body = PutRequest {
             version,
@@ -36,10 +37,10 @@ impl RpcClient {
             .await?;
         let duration = start.elapsed();
         match resp.result.unwrap() {
-            rss_codec::put_response::Result::Ok(()) => {
+            rss_codec::put_response::Result::Ok(version) => {
                 histogram!("rss_rpc_nanos", "status" => "Put_Ok")
                     .record(duration.as_nanos() as f64);
-                Ok(())
+                Ok(version)
             }
             rss_codec::put_response::Result::ErrOther(resp) => {
                 histogram!("rss_rpc_nanos", "status" => "Put_ErrOther")
@@ -100,9 +101,12 @@ impl RpcClient {
         }
     }
 
+    /// `version` 0 deletes unconditionally; otherwise the stored version
+    /// must still match and a lost race is `RpcError::Retry`.
     pub async fn delete(
         &self,
         key: &str,
+        version: i64,
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
@@ -110,6 +114,7 @@ impl RpcClient {
         let start = Instant::now();
         let body = DeleteRequest {
             key: key.to_string(),
+            version,
         };
         let resp: DeleteResponse = self
             .call(
@@ -134,6 +139,11 @@ impl RpcClient {
                     .record(duration.as_nanos() as f64);
                 error!(rpc=%"delete", %key, "rss rpc failed: {resp}");
                 Err(RpcError::InternalResponseError(resp))
+            }
+            rss_codec::delete_response::Result::ErrRetry(()) => {
+                histogram!("rss_rpc_nanos", "status" => "Delete_ErrRetry")
+                    .record(duration.as_nanos() as f64);
+                Err(RpcError::Retry)
             }
         }
     }
@@ -271,10 +281,13 @@ impl RpcClient {
         }
     }
 
+    /// `expected_root_blob_name` fences the delete on one bucket incarnation;
+    /// empty means any. A mismatch is `RpcError::IncarnationMismatch`.
     pub async fn delete_bucket(
         &self,
         bucket_name: &str,
         api_key_id: &str,
+        expected_root_blob_name: &str,
         timeout: Option<Duration>,
         trace_id: &TraceId,
         retry_count: u32,
@@ -283,6 +296,7 @@ impl RpcClient {
         let body = DeleteBucketRequest {
             bucket_name: bucket_name.to_string(),
             api_key_id: api_key_id.to_string(),
+            expected_root_blob_name: expected_root_blob_name.to_string(),
         };
         let resp: DeleteBucketResponse = self
             .call(
@@ -307,6 +321,11 @@ impl RpcClient {
                     .record(duration.as_nanos() as f64);
                 error!(rpc=%"delete_bucket", %bucket_name, "rss rpc failed: {err}");
                 Err(RpcError::InternalResponseError(err))
+            }
+            rss_codec::delete_bucket_response::Result::ErrIncarnationMismatch(()) => {
+                histogram!("rss_rpc_nanos", "status" => "DeleteBucket_IncarnationMismatch")
+                    .record(duration.as_nanos() as f64);
+                Err(RpcError::IncarnationMismatch)
             }
         }
     }
