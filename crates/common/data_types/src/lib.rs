@@ -2,6 +2,7 @@ mod api_key;
 mod blob_guid;
 mod bss_repair_report;
 mod bucket;
+pub mod drive;
 pub mod ec_utils;
 pub mod hash;
 pub mod object_layout;
@@ -16,6 +17,7 @@ mod volume;
 pub use api_key::ApiKey;
 pub use blob_guid::{DataBlobGuid, MetaBlobGuid};
 pub use bucket::Bucket;
+pub use drive::{Drive, DriveStatus};
 pub use permission::BucketKeyPerm;
 pub use trace_id::TraceId;
 pub use volume::{
