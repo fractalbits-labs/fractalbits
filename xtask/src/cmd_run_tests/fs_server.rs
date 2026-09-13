@@ -1,3 +1,4 @@
+pub mod drives;
 pub mod fuse;
 pub mod pjdfs;
 
@@ -15,7 +16,8 @@ const BUCKET_NAME: &str = "test-file-server";
 
 pub async fn run_fs_server_tests(disk_cache: bool) -> CmdResult {
     info!("Running fs_server integration tests...");
-    fuse::run_fuse_tests_with_disk_cache(disk_cache).await
+    fuse::run_fuse_tests_with_disk_cache(disk_cache).await?;
+    drives::run_drive_e2e(disk_cache).await
 }
 
 /// Build `fs_gateway` and `fractalbits-mount` using the isolated
