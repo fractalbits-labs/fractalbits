@@ -1314,6 +1314,14 @@ Environment="MINIO_REGION=localdev""##
             env_settings += &format!("\nEnvironment=\"FS_MOUNT_BUCKET_NAME={}\"", fs.bucket_name);
             env_settings += &format!("\nEnvironment=\"FS_MOUNT_MOUNT_POINT={}\"", fs.mount_point);
             env_settings += &format!("\nEnvironment=\"FS_MOUNT_READ_WRITE={}\"", fs.read_write);
+            let prefix = if fs.prefix.is_empty() {
+                std::env::var("FS_MOUNT_PREFIX").unwrap_or_default()
+            } else {
+                fs.prefix.clone()
+            };
+            if !prefix.is_empty() {
+                env_settings += &format!("\nEnvironment=\"FS_MOUNT_PREFIX={prefix}\"");
+            }
             if !fs.writeback_mode.is_empty() {
                 env_settings += &format!(
                     "\nEnvironment=\"FS_MOUNT_WRITEBACK_MODE={}\"",

@@ -11,6 +11,7 @@ pub mod observer_types;
 pub mod ovr_map;
 mod permission;
 mod routing_key;
+pub mod scope;
 mod trace_id;
 mod volume;
 
