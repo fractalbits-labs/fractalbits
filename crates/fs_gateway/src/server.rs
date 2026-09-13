@@ -24,9 +24,10 @@ use compio_net::{TcpListener, TcpSocket, TcpStream};
 use data_types::TraceId;
 use data_types::object_layout::{
     HARDLINK_PREFIX, InodeRecord, MpuState, ORPHAN_PREFIX, ObjectLayout, ObjectState, orphan_key,
-    posix_only_moved,
+    parse_orphan_instance, posix_only_moved,
 };
 use data_types::ovr_map::{OVR_GC_PREFIX, OVR_ROW_PREFIX};
+use data_types::scope::{ROOT_SCOPE, normalize_scope, scope_ancestors};
 use fs_gateway_codec::*;
 use futures::channel::mpsc;
 use futures::{SinkExt, StreamExt};
@@ -152,6 +153,53 @@ fn reject_reserved_key(key: &str) -> Result<(), FsError> {
         .any(|prefix| key.starts_with(prefix))
     {
         return Err(FsError::Unauthorized("reserved gateway key".into()));
+    }
+    Ok(())
+}
+
+/// Every key a request names must lie under the session's scope. Two
+/// hidden keyspaces are legitimate targets outside every scope: an
+/// orphan key minted for this mount's own instance, and a hardlink record
+/// (shared by links that may live in other scopes; the `via_key` binding
+/// that would tie it to this scope comes with scoped tokens).
+pub(crate) fn check_key(session: &Session, key: &str) -> Result<(), FsError> {
+    reject_reserved_key(key)?;
+    if session.in_scope(key) {
+        return Ok(());
+    }
+    if key.starts_with(ORPHAN_PREFIX) {
+        return match parse_orphan_instance(key) {
+            Some(instance) if instance == session.instance => Ok(()),
+            _ => Err(FsError::Unauthorized("orphan key of another mount".into())),
+        };
+    }
+    if key.starts_with(HARDLINK_PREFIX) {
+        return Ok(());
+    }
+    Err(FsError::Unauthorized(format!(
+        "key outside mount scope {}",
+        session.scope
+    )))
+}
+
+/// A scoped mount roots at an existing directory: a writer creates the
+/// scope and its ancestors as `mkdir -p` would, a reader of a missing
+/// scope fails at `Mount`.
+async fn ensure_scope_dir(
+    backend: &StorageBackend,
+    scope: &str,
+    read_write: bool,
+    trace_id: &TraceId,
+) -> Result<(), FsError> {
+    for dir in scope_ancestors(scope) {
+        match backend.get_inode_raw(&dir, trace_id).await {
+            Ok(_) => {}
+            Err(FsError::NotFound) if read_write => backend.put_dir_marker(&dir, trace_id).await?,
+            Err(FsError::NotFound) => {
+                return Err(FsError::NotFound);
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }
@@ -313,13 +361,21 @@ impl Gateway {
         trace_id: &TraceId,
     ) -> Result<mount_response::Session, FsError> {
         let rss = thread_rss(&self.config);
-        self.auth
+        let owner = self
+            .auth
             .verify_mount(&req, rss, self.config.rss_rpc_timeout(), trace_id)
             .await?;
+        let scope = normalize_scope(&req.prefix)
+            .map_err(|e| FsError::Unauthorized(format!("mount prefix: {e}")))?;
         let cfg = self.resolve_bucket(&req.bucket).await?;
+        if scope != ROOT_SCOPE {
+            let backend = thread_backend(&cfg)?;
+            ensure_scope_dir(&backend, &scope, req.read_write, trace_id).await?;
+        }
         tracing::info!(
             bucket = %cfg.bucket_name,
             read_write = req.read_write,
+            scope = %scope,
             "mount session issued"
         );
         // One scavenge pass per mount, as the old per-process fs_server
@@ -335,7 +391,9 @@ impl Gateway {
         let session = Session {
             bucket: req.bucket,
             read_write: req.read_write,
+            owner,
             instance,
+            scope,
         };
         Ok(mount_response::Session {
             token: self.auth.issue_token(&session),
@@ -348,8 +406,8 @@ impl Gateway {
         req: ReadBlockRequest,
         trace_id: &TraceId,
     ) -> Result<read_block_response::Block, FsError> {
-        let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
-        reject_reserved_key(&req.key)?;
+        let (session, _, backend) = self.authorize(req.caller.as_ref(), false)?;
+        check_key(&session, &req.key)?;
         let expected = expected_version(&req.expected_version_id)?;
         match backend
             .read_block_at_key(
@@ -374,8 +432,8 @@ impl Gateway {
         req: ProbeDataBlocksRequest,
         trace_id: &TraceId,
     ) -> Result<probe_data_blocks_response::Blocks, FsError> {
-        let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
-        reject_reserved_key(&req.key)?;
+        let (session, _, backend) = self.authorize(req.caller.as_ref(), false)?;
+        check_key(&session, &req.key)?;
         let expected = expected_version(&req.expected_version_id)?;
         let data_blocks = backend
             .probe_data_blocks(
@@ -394,8 +452,8 @@ impl Gateway {
         req: PrefetchInodeRequest,
         trace_id: &TraceId,
     ) -> Result<(), FsError> {
-        let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
-        reject_reserved_key(&req.key)?;
+        let (session, _, backend) = self.authorize(req.caller.as_ref(), false)?;
+        check_key(&session, &req.key)?;
         let Some(dc) = &self.disk_cache else {
             return Ok(());
         };
@@ -510,6 +568,7 @@ impl Gateway {
     /// copies the source layout into its shared record).
     async fn validate_put(
         backend: &StorageBackend,
+        session: &Session,
         key: &str,
         value: &[u8],
         proof_key: &str,
@@ -522,7 +581,7 @@ impl Gateway {
         if proof_key.is_empty() {
             return Self::binding_carried(None, &new.layout);
         }
-        reject_reserved_key(proof_key)?;
+        check_key(session, proof_key)?;
         let proof = backend.layout_at(proof_key, trace_id).await?;
         Self::binding_carried(proof.as_ref(), &new.layout)
     }
@@ -541,7 +600,7 @@ impl Gateway {
         trace_id: &TraceId,
     ) -> Result<delete_inode_response::Deleted, FsError> {
         let (session, cfg, backend) = self.authorize(req.caller.as_ref(), true)?;
-        reject_reserved_key(&req.key)?;
+        check_key(&session, &req.key)?;
         let current = if req.orphan {
             match backend.get_inode_raw(&req.key, trace_id).await {
                 Ok(bytes) => Some(bytes),
@@ -596,8 +655,8 @@ impl Gateway {
         trace_id: &TraceId,
     ) -> Result<rename_file_response::Displaced, FsError> {
         let (session, cfg, backend) = self.authorize(req.caller.as_ref(), true)?;
-        reject_reserved_key(&req.src_key)?;
-        reject_reserved_key(&req.dst_key)?;
+        check_key(&session, &req.src_key)?;
+        check_key(&session, &req.dst_key)?;
         // Record the teardown intent for the displaced blob's rows before
         // the swap makes its blob_id unrecoverable.
         if req.teardown_displaced && !req.orphan_displaced {
@@ -678,8 +737,8 @@ impl Gateway {
             Command::GetInode => {
                 let req = decode!(GetInodeRequest);
                 let run = async {
-                    let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
-                    reject_reserved_key(&req.key)?;
+                    let (session, _, backend) = self.authorize(req.caller.as_ref(), false)?;
+                    check_key(&session, &req.key)?;
                     backend.get_inode_raw(&req.key, trace_id).await
                 };
                 respond!(GetInodeResponse, get_inode_response, run.await)
@@ -687,8 +746,8 @@ impl Gateway {
             Command::ListInodes => {
                 let req = decode!(ListInodesRequest);
                 let run = async {
-                    let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
-                    reject_reserved_key(&req.prefix)?;
+                    let (session, _, backend) = self.authorize(req.caller.as_ref(), false)?;
+                    check_key(&session, &req.prefix)?;
                     let (entries, has_more) = backend
                         .list_inodes_page(
                             &req.prefix,
@@ -712,9 +771,17 @@ impl Gateway {
             Command::PutInode => {
                 let req = decode!(PutInodeRequest);
                 let run = async {
-                    let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    Self::validate_put(&backend, &req.key, &req.value, &req.proof_key, trace_id)
-                        .await?;
+                    let (session, _, backend) = self.authorize(req.caller.as_ref(), true)?;
+                    check_key(&session, &req.key)?;
+                    Self::validate_put(
+                        &backend,
+                        &session,
+                        &req.key,
+                        &req.value,
+                        &req.proof_key,
+                        trace_id,
+                    )
+                    .await?;
                     let previous = backend.put_inode(&req.key, req.value, trace_id).await?;
                     backend.forget_layout(&req.key);
                     Ok::<_, FsError>(previous)
@@ -724,7 +791,8 @@ impl Gateway {
             Command::PutInodeCas => {
                 let req = decode!(PutInodeCasRequest);
                 let run = async {
-                    let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
+                    let (session, _, backend) = self.authorize(req.caller.as_ref(), true)?;
+                    check_key(&session, &req.key)?;
                     Self::validate_cas(&req.key, &req.value, &req.expected_old_value)?;
                     let previous = backend
                         .put_inode_cas(&req.key, req.value, req.expected_old_value, trace_id)
@@ -753,9 +821,9 @@ impl Gateway {
             Command::RenameFolder => {
                 let req = decode!(RenameFolderRequest);
                 let run = async {
-                    let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    reject_reserved_key(&req.src_key)?;
-                    reject_reserved_key(&req.dst_key)?;
+                    let (session, _, backend) = self.authorize(req.caller.as_ref(), true)?;
+                    check_key(&session, &req.src_key)?;
+                    check_key(&session, &req.dst_key)?;
                     backend
                         .rename_folder(&req.src_key, &req.dst_key, trace_id)
                         .await
@@ -765,8 +833,8 @@ impl Gateway {
             Command::PutDirMarker => {
                 let req = decode!(PutDirMarkerRequest);
                 let run = async {
-                    let (_, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    reject_reserved_key(&req.key)?;
+                    let (session, _, backend) = self.authorize(req.caller.as_ref(), true)?;
+                    check_key(&session, &req.key)?;
                     backend.put_dir_marker(&req.key, trace_id).await
                 };
                 respond!(PutDirMarkerResponse, put_dir_marker_response, run.await)
@@ -774,8 +842,8 @@ impl Gateway {
             Command::ListMpuParts => {
                 let req = decode!(ListMpuPartsRequest);
                 let run = async {
-                    let (_, _, backend) = self.authorize(req.caller.as_ref(), false)?;
-                    reject_reserved_key(&req.key)?;
+                    let (session, _, backend) = self.authorize(req.caller.as_ref(), false)?;
+                    check_key(&session, &req.key)?;
                     let upload_id = uuid::Uuid::from_slice(&req.upload_id)
                         .map_err(|e| FsError::Internal(format!("invalid upload id: {e}")))?;
                     let parts = backend
@@ -816,7 +884,7 @@ impl Gateway {
                 let req = decode!(BeginFlushRequest);
                 let run = async {
                     let (session, _, backend) = self.authorize(req.caller.as_ref(), true)?;
-                    reject_reserved_key(&req.key)?;
+                    check_key(&session, &req.key)?;
                     flush::begin(self, &backend, &session, req, trace_id).await
                 };
                 respond!(BeginFlushResponse, begin_flush_response, run.await)
@@ -1076,5 +1144,43 @@ mod validate_tests {
         Gateway::validate_cas("/a", &encode(&empty), b"").expect("empty create");
         Gateway::validate_cas("/a", &encode(&empty), &encode(&stored))
             .expect("dropping a binding is allowed");
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    fn session(scope: &str) -> Session {
+        Session {
+            bucket: "proj".into(),
+            read_write: true,
+            owner: false,
+            instance: Uuid::new_v4(),
+            scope: scope.into(),
+        }
+    }
+
+    #[test]
+    fn keys_are_confined_to_the_scope() {
+        let s = session("/repo/");
+        check_key(&s, "/repo/").expect("scope dir");
+        check_key(&s, "/repo/src/x").expect("inside");
+        check_key(&s, "/repository/x").expect_err("sibling prefix");
+        check_key(&s, "/x").expect_err("outside");
+        check_key(&s, "/").expect_err("bucket root");
+        check_key(&session("/"), "/anything/at/all").expect("root scope");
+    }
+
+    #[test]
+    fn hidden_keyspaces_keep_their_own_rules() {
+        let s = session("/repo/");
+        let own = orphan_key(s.instance, Uuid::new_v4());
+        check_key(&s, &own).expect("own orphan");
+        let other = orphan_key(Uuid::new_v4(), Uuid::new_v4());
+        check_key(&s, &other).expect_err("another mount's orphan");
+        check_key(&s, &format!("{HARDLINK_PREFIX}rec")).expect("hardlink record");
+        check_key(&s, &format!("{OVR_ROW_PREFIX}x")).expect_err("reserved row keyspace");
+        check_key(&s, &format!("{OVR_GC_PREFIX}x")).expect_err("reserved gc keyspace");
     }
 }

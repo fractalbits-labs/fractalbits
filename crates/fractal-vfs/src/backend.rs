@@ -104,6 +104,8 @@ async fn mount(
             config.api_key_secret.as_bytes(),
             &config.api_key_id,
             &config.bucket_name,
+            &config.prefix,
+            "",
             timestamp_ms,
             &nonce,
         )
@@ -116,6 +118,7 @@ async fn mount(
         nonce: Bytes::copy_from_slice(&nonce),
         signature: Bytes::from(signature),
         instance: Bytes::copy_from_slice(instance.as_bytes()),
+        prefix: config.prefix.clone(),
     };
     let resp = rpc_retry!(
         "fs_gateway",

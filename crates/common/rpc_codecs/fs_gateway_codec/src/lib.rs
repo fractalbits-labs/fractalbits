@@ -59,12 +59,16 @@ impl Error {
     }
 }
 
-/// HMAC-SHA256 over `key_id | bucket | timestamp_ms | nonce`, shared by
-/// the mount client and the gateway so both sides sign the same bytes.
+/// HMAC-SHA256 over `key_id | bucket | prefix | holder | timestamp_ms |
+/// nonce`, shared by the mount client and the gateway so both sides sign
+/// the same bytes. `holder` is empty until claims land; it is in the
+/// layout now so that work adds a field without changing the signature.
 pub fn mount_signature(
     secret_key: &[u8],
     key_id: &str,
     bucket: &str,
+    prefix: &str,
+    holder: &str,
     timestamp_ms: u64,
     nonce: &[u8],
 ) -> Vec<u8> {
@@ -74,6 +78,10 @@ pub fn mount_signature(
     mac.update(key_id.as_bytes());
     mac.update(b"\n");
     mac.update(bucket.as_bytes());
+    mac.update(b"\n");
+    mac.update(prefix.as_bytes());
+    mac.update(b"\n");
+    mac.update(holder.as_bytes());
     mac.update(b"\n");
     mac.update(&timestamp_ms.to_le_bytes());
     mac.update(nonce);

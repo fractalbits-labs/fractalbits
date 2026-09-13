@@ -320,6 +320,8 @@ fn open_ticket(auth: &Auth, session: &Session, signed: &[u8]) -> Result<FlushTic
             "flush ticket for another bucket".into(),
         ));
     }
+    // The `BeginFlush` scope check, carried forward through the ticket.
+    crate::server::check_key(session, &ticket.key)?;
     if unix_ms().saturating_sub(ticket.issued_ms) > TICKET_TTL.as_millis() as u64 {
         return Err(FsError::Unauthorized("flush ticket expired".into()));
     }
