@@ -145,7 +145,7 @@ gcloud-sdk = { version = "0.25.8", default-features = false }
 
 # Dev dependencies
 aws-sdk-s3 = "1.132.0"
-cmd_lib = { version = "2.0", features = ["tracing"] }
+cmd_lib = { version = "2.0.1", features = ["tracing"] }
 tracing-test = {version = "0.2.6", features = ["no-env-filter"]}
 env_logger = "0.11.9"
 num_cpus = "1.17.0"
