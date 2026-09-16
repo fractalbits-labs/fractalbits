@@ -72,7 +72,7 @@ coverage-add +args:
 
 # Generate coverage report from accumulated data.
 # Uses llvm tools directly (instead of cargo llvm-cov report) to include
-# fs_gateway / fractalbits-mount from the isolated compio build that cargo llvm-cov can't discover.
+# fs_gateway / artfs-mount from the isolated compio build that cargo llvm-cov can't discover.
 coverage-report:
   #!/usr/bin/env bash
   set -euo pipefail
