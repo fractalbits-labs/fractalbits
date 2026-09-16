@@ -9,7 +9,7 @@ use std::time::Duration;
 use test_common::*;
 
 pub const MOUNT_POINT: &str = "/tmp/fs_server_test";
-/// Where `fractalbits-mount` reaches the local `fs_gateway` unit.
+/// Where `artfs-mount` reaches the local `fs_gateway` unit.
 pub const GATEWAY_ADDR: &str = "127.0.0.1:8180";
 const BUCKET_NAME: &str = "test-file-server";
 
@@ -18,17 +18,17 @@ pub async fn run_fs_server_tests(disk_cache: bool) -> CmdResult {
     fuse::run_fuse_tests_with_disk_cache(disk_cache).await
 }
 
-/// Build `fs_gateway` and `fractalbits-mount` using the isolated
+/// Build `fs_gateway` and `artfs-mount` using the isolated
 /// COMPIO_TARGET_DIR to prevent workspace feature unification from
 /// enabling tokio-runtime on their compio-only RPC deps.
 pub fn build_fs_binaries() -> CmdResult {
     let compio_target_dir = crate::cmd_build::COMPIO_TARGET_DIR;
     run_cmd! {
-        info "Building fs_gateway + fractalbits-mount (isolated compio build) ...";
+        info "Building fs_gateway + artfs-mount (isolated compio build) ...";
         CARGO_TARGET_DIR=$compio_target_dir cargo build -p fs_gateway -p fs_client;
-        rm -f target/debug/fs_gateway target/debug/fractalbits-mount;
+        rm -f target/debug/fs_gateway target/debug/artfs-mount;
                 cp $compio_target_dir/debug/fs_gateway target/debug/fs_gateway;
-        cp $compio_target_dir/debug/fractalbits-mount target/debug/fractalbits-mount;
+        cp $compio_target_dir/debug/artfs-mount target/debug/artfs-mount;
     }
 }
 
@@ -153,7 +153,9 @@ pub fn unmount_fs(mount_point: &str) -> CmdResult {
         ignore fusermount -u $mount_point 2>/dev/null;
     }?;
     let _ = cmd_service::stop_service(ServiceName::FsMount);
-    run_cmd! { ignore pkill -f "/fractalbits-mount" 2>/dev/null; }?;
+    // The name now fits the 15-byte comm limit, so match the process name
+    // exactly rather than any command line containing it.
+    run_cmd! { ignore pkill -x artfs-mount 2>/dev/null; }?;
     std::thread::sleep(Duration::from_millis(500));
     Ok(())
 }

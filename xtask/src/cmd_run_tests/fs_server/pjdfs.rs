@@ -1,5 +1,5 @@
 //! pjdfstest driver. Clones, bootstraps, and runs the POSIX
-//! filesystem compliance suite against a fractalbits-mount FUSE mount in
+//! filesystem compliance suite against a artfs-mount FUSE mount in
 //! `writeback_mode=default` so the writeback queue path is exercised.
 //!
 //! pjdfstest is a third-party C + Perl test suite that walks the

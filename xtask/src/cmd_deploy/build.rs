@@ -208,15 +208,15 @@ fn build_rust_for_target(
     };
     let destination = format!("target/{rust_target}/{profile}");
     run_cmd! {
-        info "Building fs_gateway + fractalbits-mount for $rust_target (isolated compio build)";
+        info "Building fs_gateway + artfs-mount for $rust_target (isolated compio build)";
         RUSTFLAGS="-C target-cpu=$rust_cpu"
         CARGO_TARGET_DIR=$compio_target_dir
         $[build_envs] cargo zigbuild
             --target $rust_target $rust_build_opt -p fs_gateway -p fs_client;
         mkdir -p $destination;
         cp $compio_target_dir/$rust_target/$profile/fs_gateway $destination/fs_gateway;
-        cp $compio_target_dir/$rust_target/$profile/fractalbits-mount
-            $destination/fractalbits-mount;
+        cp $compio_target_dir/$rust_target/$profile/artfs-mount
+            $destination/artfs-mount;
     }?;
     Ok(())
 }
