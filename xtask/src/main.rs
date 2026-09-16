@@ -574,7 +574,7 @@ pub struct FsGatewayConfig {
     pub data_volume: String,
 }
 
-/// Local `fs_mount` unit: `fractalbits-mount` against the local gateway.
+/// Local `fs_mount` unit: `artfs-mount` against the local gateway.
 #[derive(Clone, Default)]
 pub struct FsMountConfig {
     pub bucket_name: String,

@@ -143,12 +143,12 @@ pub fn build_rust_servers(mode: BuildMode) -> CmdResult {
                     --exclude fs_gateway --exclude fs_client;
             }?;
             run_cmd! {
-                info "Building fs_gateway + fractalbits-mount (isolated compio build) ...";
+                info "Building fs_gateway + artfs-mount (isolated compio build) ...";
                 CARGO_TARGET_DIR=$compio_target_dir
                 $[build_envs] cargo build -p fs_gateway -p fs_client;
-                rm -f target/debug/fs_gateway target/debug/fractalbits-mount;
+                rm -f target/debug/fs_gateway target/debug/artfs-mount;
                 cp $compio_target_dir/debug/fs_gateway target/debug/fs_gateway;
-                cp $compio_target_dir/debug/fractalbits-mount target/debug/fractalbits-mount;
+                cp $compio_target_dir/debug/artfs-mount target/debug/artfs-mount;
             }?;
         }
         BuildMode::Release => {
@@ -160,12 +160,12 @@ pub fn build_rust_servers(mode: BuildMode) -> CmdResult {
                     --release;
             }?;
             run_cmd! {
-                info "Building fs_gateway + fractalbits-mount (isolated compio build) ...";
+                info "Building fs_gateway + artfs-mount (isolated compio build) ...";
                 CARGO_TARGET_DIR=$compio_target_dir
                 $[build_envs] cargo build -p fs_gateway -p fs_client --release;
-                rm -f target/release/fs_gateway target/release/fractalbits-mount;
+                rm -f target/release/fs_gateway target/release/artfs-mount;
                 cp $compio_target_dir/release/fs_gateway target/release/fs_gateway;
-                cp $compio_target_dir/release/fractalbits-mount target/release/fractalbits-mount;
+                cp $compio_target_dir/release/artfs-mount target/release/artfs-mount;
             }?;
         }
     }
@@ -317,12 +317,12 @@ pub fn build_prebuilt_dev() -> CmdResult {
 
         let compio_target_dir = COMPIO_TARGET_DIR;
         run_cmd! {
-            info "Building fs_gateway + fractalbits-mount for $arch (isolated compio build)...";
+            info "Building fs_gateway + artfs-mount for $arch (isolated compio build)...";
             RUSTFLAGS="-C target-cpu=$rust_cpu -C opt-level=z -C codegen-units=1 -C strip=symbols"
             CARGO_TARGET_DIR=$compio_target_dir
             $[build_envs] cargo zigbuild --release --target $rust_target -p fs_gateway -p fs_client;
             cp $compio_target_dir/$rust_target/release/fs_gateway $build_dir/fs_gateway;
-            cp $compio_target_dir/$rust_target/release/fractalbits-mount $build_dir/fractalbits-mount;
+            cp $compio_target_dir/$rust_target/release/artfs-mount $build_dir/artfs-mount;
         }?;
 
         info!("Copying binaries to prebuilt/dev/{arch} directory...");
@@ -334,7 +334,7 @@ pub fn build_prebuilt_dev() -> CmdResult {
             "root_server",
             "rss_admin",
             "fs_gateway",
-            "fractalbits-mount",
+            "artfs-mount",
             "zig-out/bin/bss_server",
             "zig-out/bin/nss_server",
         ] {
