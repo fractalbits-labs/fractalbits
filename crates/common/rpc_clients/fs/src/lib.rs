@@ -1,5 +1,5 @@
 //! Client for the `fs_gateway` protocol. Linked only by `VfsCore` hosts
-//! (`fractalbits-mount`); the gateway itself only uses the codec.
+//! (`artfs-mount`); the gateway itself only uses the codec.
 
 pub mod client;
 pub mod rpc;

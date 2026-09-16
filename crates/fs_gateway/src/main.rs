@@ -24,7 +24,7 @@ use crate::server::Gateway;
 #[derive(Parser)]
 #[clap(
     name = "fs_gateway",
-    about = "Stateless storage gateway for fractalbits-mount"
+    about = "Stateless storage gateway for artfs-mount"
 )]
 struct Opt {
     #[clap(short = 'c', long = "config", help = "Config file path")]

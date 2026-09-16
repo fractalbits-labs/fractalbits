@@ -1323,7 +1323,7 @@ Environment="MINIO_REGION=localdev""##
             if fs.allow_other {
                 env_settings += "\nEnvironment=\"FS_MOUNT_ALLOW_OTHER=true\"";
             }
-            resolve_binary_path("fractalbits-mount", build_mode)
+            resolve_binary_path("artfs-mount", build_mode)
         }
         _ => unreachable!(),
     };
