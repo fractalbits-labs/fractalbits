@@ -98,6 +98,22 @@ impl Config {
         Duration::from_secs(self.attr_cache_ttl_seconds)
     }
 
+    /// Start this mount's connections at a random gateway. Every worker
+    /// thread connects to the first address that accepts it and stays on
+    /// that connection, so without this every mount on a cluster lands on
+    /// the first listed gateway; with it, mounts spread while each mount
+    /// still keeps one gateway, and its caches, until that one fails.
+    pub fn spread_gateways(&mut self) {
+        if self.gateway_addrs.len() > 1 {
+            let start = rand::random_range(0..self.gateway_addrs.len());
+            self.rotate_gateways(start);
+        }
+    }
+
+    fn rotate_gateways(&mut self, start: usize) {
+        self.gateway_addrs.rotate_left(start);
+    }
+
     /// Override config fields from FS_MOUNT_* environment variables.
     pub fn apply_env_overrides(&mut self) {
         if let Ok(v) = std::env::var("FS_MOUNT_GATEWAY_ADDRS") {
@@ -155,5 +171,38 @@ impl Default for Config {
             writeback_mode: default_writeback_mode(),
             writeback_poll_ms: default_writeback_poll_ms(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotation_keeps_every_gateway_and_only_reorders() {
+        let mut cfg = Config {
+            gateway_addrs: vec!["a".into(), "b".into(), "c".into()],
+            ..Default::default()
+        };
+        cfg.rotate_gateways(1);
+        assert_eq!(cfg.gateway_addrs, vec!["b", "c", "a"], "rotated by one");
+        cfg.rotate_gateways(2);
+        assert_eq!(cfg.gateway_addrs, vec!["a", "b", "c"], "rotated back");
+        for _ in 0..20 {
+            cfg.spread_gateways();
+            let mut sorted = cfg.gateway_addrs.clone();
+            sorted.sort();
+            assert_eq!(sorted, vec!["a", "b", "c"], "a spread is a rotation");
+        }
+        let mut single = Config {
+            gateway_addrs: vec!["only".into()],
+            ..Default::default()
+        };
+        single.spread_gateways();
+        assert_eq!(
+            single.gateway_addrs,
+            vec!["only"],
+            "one address is left alone"
+        );
     }
 }
