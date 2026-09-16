@@ -113,7 +113,7 @@ pub fn unmount_fuse() -> CmdResult {
 
 // ── Second mount instance helpers ──────────────────────────────────
 //
-// Spawns a second fractalbits-mount process directly (not via systemd)
+// Spawns a second artfs-mount process directly (not via systemd)
 // with a different mount point on the same bucket, through the same
 // gateway. Used for cross-instance cache invalidation tests.
 
@@ -132,7 +132,7 @@ fn spawn_second_fuse(bucket: &str, read_write: bool) -> std::io::Result<Child> {
     std::fs::create_dir_all(mount_point)?;
 
     let binary = format!(
-        "{}/target/debug/fractalbits-mount",
+        "{}/target/debug/artfs-mount",
         std::env::current_dir()?.display()
     );
     let mut cmd = Command::new(&binary);

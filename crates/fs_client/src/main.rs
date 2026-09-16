@@ -19,7 +19,7 @@ use crate::fuse_server::FuseServer;
 
 #[derive(Parser)]
 #[clap(
-    name = "fractalbits-mount",
+    name = "artfs-mount",
     about = "Mount a fractalbits bucket over FUSE via an fs_gateway endpoint"
 )]
 struct Opt {
@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bucket = %cfg.bucket_name,
         gateway = ?cfg.gateway_addrs,
         read_write = read_write,
-        "Starting fractalbits-mount"
+        "Starting artfs-mount"
     );
 
     // Establish the gateway session before touching the kernel: a refused

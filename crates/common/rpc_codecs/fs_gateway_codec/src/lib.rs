@@ -1,4 +1,4 @@
-//! Wire protocol between `fractalbits-mount` (client) and `fs_gateway`.
+//! Wire protocol between `artfs-mount` (client) and `fs_gateway`.
 //!
 //! The command set is the storage surface `VfsCore` consumes: inode
 //! primitives, data primitives addressed by inode key and logical block
