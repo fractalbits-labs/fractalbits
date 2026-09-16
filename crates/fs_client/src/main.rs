@@ -113,6 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Config::default(),
     };
     cfg.apply_env_overrides();
+    cfg.spread_gateways();
 
     let mount_point = cfg.mount_point.clone();
     let read_write = cfg.read_write;
