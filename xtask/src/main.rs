@@ -580,6 +580,11 @@ pub struct FsMountConfig {
     pub bucket_name: String,
     pub mount_point: String,
     pub read_write: bool,
+    /// Subtree to mount (`FS_MOUNT_PREFIX`), a directory key such as
+    /// `/work/`. Empty means the whole bucket, unless the environment
+    /// sets `FS_MOUNT_PREFIX`, so pjdfstest and the untar bench can run
+    /// scoped without a code change.
+    pub prefix: String,
     /// Writeback durability mode passed through via the
     /// `FS_MOUNT_WRITEBACK_MODE` env var. Empty string = use the
     /// client config default (`default`).

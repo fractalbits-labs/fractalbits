@@ -26,7 +26,7 @@ use super::{
     mount_fs, setup_test_bucket, unmount_fs,
 };
 
-const MOUNT_POINT_B: &str = "/tmp/fs_server_test_b";
+pub(super) const MOUNT_POINT_B: &str = "/tmp/fs_server_test_b";
 
 /// Restarts bss@0 + bss@3 on drop unless disarmed: keeps a failed
 /// EC-write-hole test from leaving the cluster degraded for the rest of
@@ -69,6 +69,17 @@ fn disk_cache_path() -> String {
 /// Bring up (or keep) the gateway with the requested disk-cache setting,
 /// then mount `bucket` through it in the given writeback mode.
 fn mount_with(bucket: &str, read_write: bool, disk_cache: bool, writeback_mode: &str) -> CmdResult {
+    mount_with_prefix(bucket, read_write, disk_cache, writeback_mode, "")
+}
+
+/// The primary mount confined to `prefix`; empty for the whole bucket.
+fn mount_with_prefix(
+    bucket: &str,
+    read_write: bool,
+    disk_cache: bool,
+    writeback_mode: &str,
+    prefix: &str,
+) -> CmdResult {
     ensure_gateway(
         BuildMode::Debug,
         &gateway_config(disk_cache, &disk_cache_path(), 1),
@@ -80,6 +91,7 @@ fn mount_with(bucket: &str, read_write: bool, disk_cache: bool, writeback_mode: 
             mount_point: MOUNT_POINT.to_string(),
             read_write,
             writeback_mode: writeback_mode.to_string(),
+            prefix: prefix.to_string(),
             ..Default::default()
         },
     )
@@ -118,6 +130,16 @@ pub fn unmount_fuse() -> CmdResult {
 // gateway. Used for cross-instance cache invalidation tests.
 
 fn spawn_second_fuse(bucket: &str, read_write: bool) -> std::io::Result<Child> {
+    spawn_second_fuse_at(bucket, read_write, "")
+}
+
+/// As `spawn_second_fuse`, confined to `prefix` (a directory key such as
+/// `/agents/b/`; empty for the whole bucket).
+pub(super) fn spawn_second_fuse_at(
+    bucket: &str,
+    read_write: bool,
+    prefix: &str,
+) -> std::io::Result<Child> {
     let mount_point = MOUNT_POINT_B;
 
     // Clean up any stale mount
@@ -142,6 +164,9 @@ fn spawn_second_fuse(bucket: &str, read_write: bool) -> std::io::Result<Child> {
         .env("FS_MOUNT_READ_WRITE", read_write.to_string())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    if !prefix.is_empty() {
+        cmd.env("FS_MOUNT_PREFIX", prefix);
+    }
     // Propagate LLVM_PROFILE_FILE for coverage instrumentation
     if let Ok(profile_file) = std::env::var("LLVM_PROFILE_FILE") {
         cmd.env("LLVM_PROFILE_FILE", profile_file);
@@ -167,7 +192,7 @@ fn spawn_second_fuse(bucket: &str, read_write: bool) -> std::io::Result<Child> {
     )))
 }
 
-fn stop_second_fuse(mut child: Child) {
+pub(super) fn stop_second_fuse(mut child: Child) {
     let mount_point = MOUNT_POINT_B;
     let _ = std::process::Command::new("fusermount3")
         .args(["-u", mount_point])
@@ -400,6 +425,15 @@ async fn run_fuse_test_suite(disk_cache: bool) -> CmdResult {
     run_test!(
         "Cross-Instance Directory Owner After Listing",
         test_cross_instance_dir_owner_after_listing
+    );
+    run_test!(
+        "Subtree mounts: disjoint scopes",
+        test_subtree_disjoint_scopes
+    );
+    run_test!("Subtree mounts: nested scopes", test_subtree_nested_scopes);
+    run_test!(
+        "Subtree mounts: read-only mount of a missing prefix fails",
+        test_subtree_readonly_missing_prefix
     );
 
     // Destructive: stops/starts bss@0 to exercise override durability
@@ -5439,6 +5473,154 @@ async fn test_writeback_default_mode_o_sync(disk_cache: bool) -> CmdResult {
     println!(
         "{}",
         "SUCCESS: writeback default mode O_DSYNC drain passed".green()
+    );
+    Ok(())
+}
+
+// ---------- Subtree mounts ----------
+
+fn list_names(dir: &str) -> std::io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        names.push(entry?.file_name().to_string_lossy().to_string());
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Two writers on one bucket, each confined to its own directory: each
+/// sees only its tree, both trees are visible at full paths over S3 and
+/// through a whole-bucket mount, and `..` at the scoped root stays put.
+async fn test_subtree_disjoint_scopes(disk_cache: bool) -> CmdResult {
+    let (ctx, bucket) = setup_test_bucket().await;
+    let keys = ["agents/a/x.txt", "agents/a/sub/y.txt", "agents/b/z.txt"];
+    cleanup_objects(&ctx, &bucket, &keys).await;
+
+    println!("  Step 1: Mount A at /agents/a/ and B at /agents/b/ (both read-write)");
+    mount_with_prefix(&bucket, true, disk_cache, "strict", "/agents/a/")?;
+    let child_b = spawn_second_fuse_at(&bucket, true, "/agents/b/")?;
+
+    println!("  Step 2: Write in each, list each");
+    std::fs::write(format!("{MOUNT_POINT}/x.txt"), b"from a")?;
+    std::fs::create_dir(format!("{MOUNT_POINT}/sub"))?;
+    std::fs::write(format!("{MOUNT_POINT}/sub/y.txt"), b"from a sub")?;
+    std::fs::write(format!("{MOUNT_POINT_B}/z.txt"), b"from b")?;
+    assert_eq!(
+        list_names(MOUNT_POINT)?,
+        vec!["sub", "x.txt"],
+        "A sees only its tree"
+    );
+    assert_eq!(
+        list_names(MOUNT_POINT_B)?,
+        vec!["z.txt"],
+        "B sees only its tree"
+    );
+    assert_eq!(
+        list_names(&format!("{MOUNT_POINT}/sub/.."))?,
+        vec!["sub", "x.txt"],
+        ".. of a child is the scoped root"
+    );
+
+    println!("  Step 3: Both trees at full paths over S3");
+    for (key, want) in [
+        ("agents/a/x.txt", "from a"),
+        ("agents/a/sub/y.txt", "from a sub"),
+        ("agents/b/z.txt", "from b"),
+    ] {
+        let got = ctx
+            .client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| std::io::Error::other(format!("get {key}: {e}")))?
+            .body
+            .collect()
+            .await
+            .expect("body")
+            .into_bytes();
+        assert_eq!(got.as_ref(), want.as_bytes(), "{key} over S3");
+    }
+
+    println!("  Step 4: A whole-bucket mount sees both");
+    stop_second_fuse(child_b);
+    unmount_fuse()?;
+    mount_fuse_rw(&bucket, disk_cache)?;
+    assert_eq!(
+        std::fs::read(format!("{MOUNT_POINT}/agents/a/x.txt"))?,
+        b"from a",
+        "a via root mount"
+    );
+    assert_eq!(
+        std::fs::read(format!("{MOUNT_POINT}/agents/b/z.txt"))?,
+        b"from b",
+        "b via root mount"
+    );
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &keys).await;
+    println!("{}", "SUCCESS: Subtree disjoint scopes test passed".green());
+    Ok(())
+}
+
+/// Nested scopes `/repo/` and `/repo/tests/` see each other's writes
+/// within the attr TTL: cross-mount coherence is kernel TTLs with no
+/// shared dirty state.
+async fn test_subtree_nested_scopes(disk_cache: bool) -> CmdResult {
+    let (ctx, bucket) = setup_test_bucket().await;
+    let keys = ["repo/tests/t.txt", "repo/tests/u.txt"];
+    cleanup_objects(&ctx, &bucket, &keys).await;
+
+    println!("  Step 1: Mount A at /repo/ and B at /repo/tests/");
+    mount_with_prefix(&bucket, true, disk_cache, "strict", "/repo/")?;
+    let child_b = spawn_second_fuse_at(&bucket, true, "/repo/tests/")?;
+
+    println!("  Step 2: B writes, A reads after the TTL");
+    std::fs::write(format!("{MOUNT_POINT_B}/t.txt"), b"inner")?;
+    std::thread::sleep(CACHE_TTL_WAIT);
+    assert_eq!(
+        std::fs::read(format!("{MOUNT_POINT}/tests/t.txt"))?,
+        b"inner",
+        "outer sees the inner write"
+    );
+
+    println!("  Step 3: A writes, B reads after the TTL");
+    std::fs::write(format!("{MOUNT_POINT}/tests/u.txt"), b"outer")?;
+    std::thread::sleep(CACHE_TTL_WAIT);
+    assert_eq!(
+        std::fs::read(format!("{MOUNT_POINT_B}/u.txt"))?,
+        b"outer",
+        "inner sees the outer write"
+    );
+
+    stop_second_fuse(child_b);
+    unmount_fuse()?;
+    cleanup_objects(&ctx, &bucket, &keys).await;
+    println!("{}", "SUCCESS: Subtree nested scopes test passed".green());
+    Ok(())
+}
+
+/// A read-only mount cannot create its scope, so a missing prefix is
+/// refused at `Mount` and the process never reaches the kernel.
+async fn test_subtree_readonly_missing_prefix(disk_cache: bool) -> CmdResult {
+    let (_ctx, bucket) = setup_test_bucket().await;
+    ensure_gateway(
+        BuildMode::Debug,
+        &gateway_config(disk_cache, &disk_cache_path(), 1),
+    )?;
+    println!("  Step 1: Read-only mount of /no-such-scope/");
+    match spawn_second_fuse_at(&bucket, false, "/no-such-scope/") {
+        Ok(child) => {
+            stop_second_fuse(child);
+            return Err(std::io::Error::other(
+                "read-only mount of a missing prefix should fail",
+            ));
+        }
+        Err(e) => println!("    refused as expected: {e}"),
+    }
+    println!(
+        "{}",
+        "SUCCESS: Subtree read-only missing prefix test passed".green()
     );
     Ok(())
 }

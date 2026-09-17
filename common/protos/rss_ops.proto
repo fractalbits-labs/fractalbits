@@ -47,7 +47,9 @@ message PutRequest {
 
 message PutResponse {
   oneof result {
-    google.protobuf.Empty ok = 1;
+    // The version now stored, as Get would report it: the handle for the
+    // next compare-and-set, so a writer never re-reads what it just wrote.
+    int64 ok = 1;
     google.protobuf.Empty err_retry = 2;
     string err_other = 3;
   }
@@ -75,12 +77,17 @@ message ValueWithVersion {
 // Delete
 message DeleteRequest {
   string key = 1;
+  // Compare-and-set: when non-zero, delete only if the stored version
+  // (as reported by Get) still matches; 0 deletes unconditionally.
+  int64 version = 2;
 }
 
 message DeleteResponse {
   oneof result {
     google.protobuf.Empty ok = 1;
-    string err = 2;
+    // The version no longer matched: the caller re-reads and decides.
+    google.protobuf.Empty err_retry = 2;
+    string err_other = 3;
   }
 }
 
@@ -145,12 +152,18 @@ message CreateBucketResponse {
 message DeleteBucketRequest {
   string bucket_name = 1;
   string api_key_id = 2;
+  // Incarnation fence: when set, the bucket record's root_blob_name must
+  // match or nothing is deleted. A bucket deleted and recreated under the
+  // same name has a new root, so a stale request cannot delete the
+  // replacement. Empty means any incarnation.
+  string expected_root_blob_name = 3;
 }
 
 message DeleteBucketResponse {
   oneof result {
     google.protobuf.Empty ok = 1;
-    string error = 2;
+    google.protobuf.Empty err_incarnation_mismatch = 2;
+    string err_other = 3;
   }
 }
 
