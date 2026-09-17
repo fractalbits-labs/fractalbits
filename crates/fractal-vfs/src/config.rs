@@ -16,6 +16,10 @@ pub enum WritebackMode {
     Default,
 }
 
+fn default_prefix() -> String {
+    "/".to_string()
+}
+
 fn default_writeback_mode() -> String {
     "default".to_string()
 }
@@ -47,6 +51,10 @@ pub struct Config {
     pub api_key_id: String,
     #[serde(default)]
     pub api_key_secret: String,
+    /// Directory key this mount is confined to, `/` for the whole bucket.
+    /// Must start and end with `/`.
+    #[serde(default = "default_prefix")]
+    pub prefix: String,
 
     pub rpc_request_timeout_seconds: u64,
     pub rpc_connection_timeout_seconds: u64,
@@ -131,6 +139,9 @@ impl Config {
         if let Ok(v) = std::env::var("FS_MOUNT_API_KEY_SECRET") {
             self.api_key_secret = v;
         }
+        if let Ok(v) = std::env::var("FS_MOUNT_PREFIX") {
+            self.prefix = v;
+        }
         if let Ok(v) = std::env::var("FS_MOUNT_READ_WRITE") {
             self.read_write = v.parse().unwrap_or(self.read_write);
         }
@@ -156,6 +167,7 @@ impl Default for Config {
             bucket_name: "default".to_string(),
             mount_point: "/mnt/fractalbits".to_string(),
             api_key_id: String::new(),
+            prefix: default_prefix(),
             api_key_secret: String::new(),
             rpc_request_timeout_seconds: 30,
             rpc_connection_timeout_seconds: 5,

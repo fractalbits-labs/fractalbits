@@ -10,6 +10,7 @@ use std::thread;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use data_types::scope::normalize_scope;
 use fractal_vfs::backend;
 use fractal_vfs::config::Config;
 use fractal_vfs::inode;
@@ -113,6 +114,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Config::default(),
     };
     cfg.apply_env_overrides();
+    cfg.prefix = normalize_scope(&cfg.prefix)
+        .map_err(|e| std::io::Error::other(format!("FS_MOUNT_PREFIX {:?}: {e}", cfg.prefix)))?;
     cfg.spread_gateways();
 
     let mount_point = cfg.mount_point.clone();
@@ -120,6 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(
         bucket = %cfg.bucket_name,
+        prefix = %cfg.prefix,
         gateway = ?cfg.gateway_addrs,
         read_write = read_write,
         "Starting artfs-mount"
@@ -136,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let backend_config = Arc::new(backend_config);
 
-    let inodes = Arc::new(inode::InodeTable::new());
+    let inodes = Arc::new(inode::InodeTable::new(&backend_config.config.prefix));
     let vfs_core = VfsCore::new(backend_config, inodes, read_write);
 
     tracing::info!(mount_point = %mount_point, "Starting FUSE client");

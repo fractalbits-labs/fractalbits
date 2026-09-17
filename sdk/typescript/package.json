@@ -1,0 +1,27 @@
+{
+  "name": "@fractalbits/artfs",
+  "version": "0.1.0",
+  "description": "Control-plane SDK for fractalbits ARTFS drives",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\""
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "prettier": "^3.3.3",
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.1"
+  }
+}

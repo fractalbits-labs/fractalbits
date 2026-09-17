@@ -1,5 +1,6 @@
 use actix_web::HttpResponse;
 use bytes::Buf;
+use data_types::drive::is_valid_bucket_name;
 use rpc_client_common::RpcError;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -41,13 +42,23 @@ pub async fn create_bucket_handler(ctx: BucketRequestContext) -> Result<HttpResp
 
     // Validate permissions and bucket name
     let api_key_id = {
+        // The cached key may still list a bucket that another gateway or the
+        // management API deleted since; confirm against RSS before answering
+        // "already owned", or the create would be skipped for a bucket that
+        // no longer exists.
         if ctx
             .api_key
             .data
             .authorized_buckets
             .contains_key(&ctx.bucket_name)
         {
-            return Err(S3Error::BucketAlreadyOwnedByYou);
+            let fresh = ctx
+                .app
+                .refresh_api_key(ctx.api_key.data.key_id.clone(), &ctx.trace_id)
+                .await?;
+            if fresh.data.authorized_buckets.contains_key(&ctx.bucket_name) {
+                return Err(S3Error::BucketAlreadyOwnedByYou);
+            }
         }
         if !ctx.api_key.data.allow_create_bucket {
             return Err(S3Error::AccessDenied);
@@ -94,26 +105,4 @@ pub async fn create_bucket_handler(ctx: BucketRequestContext) -> Result<HttpResp
             }
         }
     }
-}
-
-// Check if a bucket name is valid.
-//
-// The requirements are listed here:
-// <https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html>
-fn is_valid_bucket_name(n: &str) -> bool {
-    // Bucket names must be between 3 and 63 characters
-    n.len() >= 3 && n.len() <= 63
-	// Bucket names must be composed of lowercase letters, numbers,
-	// dashes and dots
-	&& n.chars().all(|c| matches!(c, '.' | '-' | 'a'..='z' | '0'..='9'))
-	//  Bucket names must start and end with a letter or a number
-	&& !n.starts_with(&['-', '.'][..])
-	&& !n.ends_with(&['-', '.'][..])
-	// Bucket names must not be formatted as an IP address
-	&& n.parse::<std::net::IpAddr>().is_err()
-	// Bucket names must not start with "xn--"
-	&& !n.starts_with("xn--")
-	&& !n.contains(".xn--")
-	// Bucket names must not end with "-s3alias"
-	&& !n.ends_with("-s3alias")
 }
