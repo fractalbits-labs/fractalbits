@@ -30,5 +30,8 @@ await fb.drives.waitDeleted(drive.name);
 Requests carry an `FBSIG1` HMAC signature under the API key's secret, so
 the secret never travels.
 
+Full reference, including the HTTP API and the signature format:
+[docs/ARTFS_DRIVE_SDK.md](../../docs/ARTFS_DRIVE_SDK.md).
+
 Development: `npm install`, `npm run typecheck`, `npm test` against a
 local cluster started with `just service start`.

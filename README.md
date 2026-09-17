@@ -273,6 +273,10 @@ FractalBits supports the most commonly used S3 operations with full AWS Signatur
 
 We're actively working on expanding S3 API coverage. See our [Roadmap](docs/ROADMAP.md) for planned features and timeline.
 
+### ARTFS Drives
+
+An ARTFS drive is a bucket with control-plane metadata that sandboxes mount over POSIX with `artfs-mount`. The TypeScript SDK in `sdk/typescript` creates, lists and deletes drives and renders mount configs; see [ARTFS Drive SDK](docs/ARTFS_DRIVE_SDK.md) for the SDK and HTTP API reference.
+
 ## Support
 
 - 📖 **Documentation**: See [docs/](docs/) directory
