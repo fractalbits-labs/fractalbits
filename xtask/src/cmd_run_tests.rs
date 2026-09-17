@@ -200,9 +200,10 @@ pub async fn run_tests(
         TestType::All => {
             fs_server_stage(false, data_blob_storage).await?;
             pjdfstest_stage(None, data_blob_storage).await?;
-            // EC quorum and repair only apply to data blobs held in BSS.
-            if matches!(data_blob_storage, DataBlobStorage::S3HybridSingleAz) {
-                info!("Skipping bss-node-failure and bss-repair: data blobs are on the S3 volume");
+            // Both suites bring up their own six-node all-in-BSS cluster, so under an S3-backed
+            // storage setting they would only repeat the BSS-only run.
+            if data_blob_storage.uses_s3_volume() {
+                info!("Skipping bss-node-failure and bss-repair: they only cover all-in-BSS data");
             } else {
                 bss_node_failure_stage().await?;
                 bss_repair_stage().await?;

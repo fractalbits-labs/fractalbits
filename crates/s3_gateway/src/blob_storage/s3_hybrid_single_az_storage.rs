@@ -15,6 +15,8 @@ use uuid::Uuid;
 pub struct S3HybridSingleAzStorage {
     data_vg_proxy: Arc<DataVgProxy>,
     store: S3BlobStore,
+    /// `DataInS3` backend: no size threshold or EC routing, every block goes to S3.
+    all_data_in_s3: bool,
 }
 
 impl S3HybridSingleAzStorage {
@@ -24,6 +26,7 @@ impl S3HybridSingleAzStorage {
         rpc_request_timeout: Duration,
         rpc_connection_timeout: Duration,
         ec_read_hedge_delay: Duration,
+        all_data_in_s3: bool,
     ) -> Result<Self, BlobStorageError> {
         debug!("Initializing S3HybridSingleAzStorage with pre-fetched DataVgInfo");
 
@@ -46,6 +49,7 @@ impl S3HybridSingleAzStorage {
         Ok(Self {
             data_vg_proxy,
             store: S3BlobStore::new(client_s3, s3_hybrid_config.s3_bucket.clone()),
+            all_data_in_s3,
         })
     }
 
@@ -95,7 +99,7 @@ impl S3HybridSingleAzStorage {
         // Determine location based on size (single block and small size)
         let is_small = block_number == 0 && body.len() < ObjectLayout::DEFAULT_BLOCK_SIZE as usize;
 
-        if is_small || Volume::is_ec_volume_id(volume_id) {
+        if !self.all_data_in_s3 && (is_small || Volume::is_ec_volume_id(volume_id)) {
             // Small blob or EC-routed blob - store in DataVgProxy
             let blob_guid = DataBlobGuid { blob_id, volume_id };
             self.data_vg_proxy
@@ -128,7 +132,7 @@ impl S3HybridSingleAzStorage {
 
         let is_small = block_number == 0 && total_size < ObjectLayout::DEFAULT_BLOCK_SIZE as usize;
 
-        if is_small || Volume::is_ec_volume_id(volume_id) {
+        if !self.all_data_in_s3 && (is_small || Volume::is_ec_volume_id(volume_id)) {
             let blob_guid = DataBlobGuid { blob_id, volume_id };
             self.data_vg_proxy
                 .put_blob_vectored(blob_guid, block_number, chunks, 1, trace_id)

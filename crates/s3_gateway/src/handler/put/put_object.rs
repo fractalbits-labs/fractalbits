@@ -78,6 +78,26 @@ async fn enqueue_replaced_object_cleanup(
     Ok(())
 }
 
+/// Point the layout at the S3 volume when the blocks were written there: always for `DataInS3`,
+/// and for large non-EC objects on the hybrid backend. Reads route by this volume id.
+fn assign_layout_volume(
+    backend: &BlobStorageBackend,
+    blob_guid: &mut DataBlobGuid,
+    total_size: u64,
+) {
+    let in_s3 = match backend {
+        BlobStorageBackend::DataInS3 => true,
+        BlobStorageBackend::S3HybridSingleAz => {
+            total_size >= ObjectLayout::DEFAULT_BLOCK_SIZE as u64
+                && !Volume::is_ec_volume_id(blob_guid.volume_id)
+        }
+        BlobStorageBackend::AllInBssSingleAz => false,
+    };
+    if in_s3 {
+        blob_guid.volume_id = DataBlobGuid::S3_VOLUME;
+    }
+}
+
 fn split_chunks_into_blocks(
     chunks: Vec<actix_web::web::Bytes>,
     block_size: usize,
@@ -442,17 +462,11 @@ async fn put_object_streaming_internal(
         .map_err(|_| S3Error::InternalError)?;
 
     let total_size = size;
-    // Only use S3_VOLUME for large objects when using S3-based backends
-    let uses_s3_for_large_blobs = matches!(
-        ctx.app.config.blob_storage.backend,
-        BlobStorageBackend::S3HybridSingleAz
+    assign_layout_volume(
+        &ctx.app.config.blob_storage.backend,
+        &mut blob_guid,
+        total_size,
     );
-    if uses_s3_for_large_blobs
-        && total_size >= ObjectLayout::DEFAULT_BLOCK_SIZE as u64
-        && !Volume::is_ec_volume_id(blob_guid.volume_id)
-    {
-        blob_guid.volume_id = DataBlobGuid::S3_VOLUME;
-    }
 
     histogram!("object_size", "operation" => "put").record(total_size as f64);
     histogram!("put_object_handler", "stage" => "put_blob")
@@ -639,6 +653,9 @@ async fn put_object_with_no_trailer(
             result?;
         }
     }
+
+    let mut blob_guid = blob_guid;
+    assign_layout_volume(&ctx.app.config.blob_storage.backend, &mut blob_guid, size);
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

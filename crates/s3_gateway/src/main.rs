@@ -75,6 +75,7 @@ fn main() -> std::io::Result<()> {
                 info!("APP_BLOB_STORAGE_BACKEND: {backend}");
                 match backend.as_str() {
                     "s3_hybrid_single_az" => Config::s3_hybrid_single_az(),
+                    "data_in_s3" => Config::data_in_s3(),
                     "all_in_bss_single_az" => Config::all_in_bss_single_az(),
                     _ => {
                         error!("Invalid APP_BLOB_STORAGE_BACKEND value: {backend}");

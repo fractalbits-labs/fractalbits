@@ -5,7 +5,6 @@ use chrono::Utc;
 use uuid::Uuid;
 use xtask_common::{
     BootstrapClusterConfig, ClusterAwsConfig, ClusterEtcdConfig, ClusterGlobalConfig,
-    DataBlobStorage,
 };
 
 use super::super::common::VpcConfig;
@@ -23,9 +22,13 @@ pub fn generate_bootstrap_config(vpc_config: &VpcConfig) -> Result<BootstrapClus
     let journal_uuid = Uuid::now_v7().to_string();
 
     let aws_config = ClusterAwsConfig {
-        // data_blob_bucket: for AllInBss it's unused; for S3Hybrid it comes from CDK output
-        // and is not pre-knowable. Leave None — S3 gateway reads it from DDB service discovery.
-        data_blob_bucket: None,
+        // The bucket name is fixed up front (CDK creates it under that name), so the gateway
+        // config can reference it before the stack exists.
+        data_blob_bucket: if vpc_config.data_blob_storage.uses_s3_volume() {
+            Some(super::super::common::get_data_blob_bucket_name()?)
+        } else {
+            None
+        },
     };
 
     let config = BootstrapClusterConfig {
@@ -33,7 +36,7 @@ pub fn generate_bootstrap_config(vpc_config: &VpcConfig) -> Result<BootstrapClus
             deploy_target: xtask_common::DeployTarget::Aws,
             region,
             for_bench: vpc_config.with_bench,
-            data_blob_storage: DataBlobStorage::AllInBssSingleAz,
+            data_blob_storage: vpc_config.data_blob_storage,
             rss_ha_enabled: vpc_config.root_server_ha,
             rss_backend: vpc_config.rss_backend,
             num_nss_nodes: Some(1), // CDK creates nss-0 only

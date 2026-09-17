@@ -50,6 +50,8 @@ const benchClientInstanceType =
   app.node.tryGetContext("benchClientInstanceType") ?? "c8g.xlarge";
 const dataBlobStorage =
   app.node.tryGetContext("dataBlobStorage") ?? "all_in_bss_single_az";
+const dataBlobBucketName =
+  app.node.tryGetContext("dataBlobBucketName") ?? undefined;
 const rssBackend = app.node.tryGetContext("rssBackend") ?? "ddb";
 const browserIp = app.node.tryGetContext("browserIp") ?? null;
 // Note: Context values from CLI are always strings, so convert to numbers
@@ -78,6 +80,7 @@ const vpcStack = new FractalbitsVpcStack(app, "FractalbitsVpcStack", {
   benchClientInstanceType: benchClientInstanceType,
   nssInstanceType: nssInstanceType,
   dataBlobStorage: dataBlobStorage,
+  dataBlobBucketName: dataBlobBucketName,
   rssBackend: rssBackend,
   rootServerHa: rootServerHa,
   deployOS: deployOS,

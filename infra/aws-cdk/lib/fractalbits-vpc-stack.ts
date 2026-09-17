@@ -17,7 +17,8 @@ import {
   DeployOS,
 } from "./ec2-utils";
 
-export type DataBlobStorage = "all_in_bss_single_az" | "s3_hybrid_single_az";
+export type DataBlobStorage =
+  "all_in_bss_single_az" | "s3_hybrid_single_az" | "data_in_s3";
 
 export interface FractalbitsVpcStackProps extends cdk.StackProps {
   numS3Gateways: number;
@@ -31,6 +32,8 @@ export interface FractalbitsVpcStackProps extends cdk.StackProps {
   nssInstanceType: string;
   browserIp?: string;
   dataBlobStorage: DataBlobStorage;
+  // Fixed name from xtask so the bootstrap config can reference the bucket pre-deploy.
+  dataBlobBucketName?: string;
   rootServerHa: boolean;
   rssBackend: "etcd" | "ddb";
   deployOS?: DeployOS;
@@ -155,10 +158,11 @@ export class FractalbitsVpcStack extends cdk.Stack {
       );
     }
 
-    // Create data blob bucket only for s3_hybrid_single_az mode
+    // Create the data blob bucket for the S3-backed storage modes
     let dataBlobBucket: s3.Bucket | undefined;
-    if (props.dataBlobStorage === "s3_hybrid_single_az") {
+    if (props.dataBlobStorage !== "all_in_bss_single_az") {
       dataBlobBucket = new s3.Bucket(this, "DataBlobBucket", {
+        bucketName: props.dataBlobBucketName,
         removalPolicy: cdk.RemovalPolicy.DESTROY,
         autoDeleteObjects: true,
       });

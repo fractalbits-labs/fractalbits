@@ -2,6 +2,7 @@ use crate::config::{BootstrapConfig, DeployTarget};
 use crate::stage_helpers::{InstancesReadyStage, ServicesReadyStageDef};
 use crate::workflow::{WorkflowBarrier, WorkflowServiceType, stages};
 use crate::*;
+use xtask_common::DataBlobStorage;
 use xtask_common::stages::{VerifiedGlobalDep, VerifiedNodeDep};
 
 struct ServicesReadyStage;
@@ -84,8 +85,12 @@ pub fn create_config(config: &BootstrapConfig) -> CmdResult {
         .join(", ");
 
     let config_content = if let Some(bucket_name) = data_blob_bucket {
-        // S3 Hybrid single-az configuration (AWS only)
+        // S3-backed configuration (AWS only): hybrid, or every data blob in S3
         let aws_region = get_current_aws_region()?;
+        let backend = match config.global.data_blob_storage {
+            DataBlobStorage::DataInS3 => "data_in_s3",
+            _ => "s3_hybrid_single_az",
+        };
         format!(
             r##"rss_addrs = [{rss_addrs_toml}]
 region = "{aws_region}"
@@ -113,21 +118,21 @@ key_file = "/opt/fractalbits/etc/key.pem"
 force_http1_only = false
 
 [blob_storage]
-backend = "s3_hybrid_single_az"
+backend = "{backend}"
 
-[blob_storage.s3_hybrid_single_az]
+[blob_storage.{backend}]
 s3_host = "http://s3.{aws_region}.amazonaws.com"
 s3_port = 80
 s3_region = "{aws_region}"
 s3_bucket = "{bucket_name}"
 
-[blob_storage.s3_hybrid_single_az.ratelimit]
+[blob_storage.{backend}.ratelimit]
 enabled = false
 put_qps = 7000
 get_qps = 10000
 delete_qps = 5000
 
-[blob_storage.s3_hybrid_single_az.retry_config]
+[blob_storage.{backend}.retry_config]
 enabled = true
 max_attempts = 8
 initial_backoff_us = 15000

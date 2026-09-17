@@ -814,7 +814,7 @@ fn all_services(
     };
 
     let mut services = match data_blob_storage {
-        DataBlobStorage::S3HybridSingleAz => {
+        DataBlobStorage::S3HybridSingleAz | DataBlobStorage::DataInS3 => {
             let mut services = vec![
                 ServiceName::S3Gateway,
                 ServiceName::NssRoleAgent,
@@ -861,7 +861,7 @@ fn get_rss_backend_setting() -> RssBackend {
 /// blob backend so a mount can serve S3-resident objects; the data volume
 /// for new files follows it too unless `data_volume` overrides it.
 pub fn fs_gateway_data_volume_env(data_volume: &str) -> Vec<(&'static str, String)> {
-    let hybrid = get_data_blob_storage_setting() == DataBlobStorage::S3HybridSingleAz;
+    let hybrid = get_data_blob_storage_setting().uses_s3_volume();
     let data_volume = match data_volume {
         "" if hybrid => "s3",
         "" => "bss",
@@ -881,6 +881,9 @@ pub fn fs_gateway_data_volume_env(data_volume: &str) -> Vec<(&'static str, Strin
 fn get_data_blob_storage_setting() -> DataBlobStorage {
     if run_cmd!(grep -q s3_hybrid_single_az data/etc/s3_gateway.service &>/dev/null).is_ok() {
         DataBlobStorage::S3HybridSingleAz
+    } else if run_cmd!(grep -q "BACKEND=data_in_s3" data/etc/s3_gateway.service &>/dev/null).is_ok()
+    {
+        DataBlobStorage::DataInS3
     } else {
         DataBlobStorage::AllInBssSingleAz
     }
@@ -1101,12 +1104,9 @@ fn start_all_services() -> CmdResult {
     }
 
     // Start minio only for S3-based backends
-    match data_blob_storage {
-        DataBlobStorage::S3HybridSingleAz => {
-            info!("Starting minio for S3HybridSingleAz");
-            start_service(ServiceName::Minio)?;
-        }
-        DataBlobStorage::AllInBssSingleAz => {}
+    if data_blob_storage.uses_s3_volume() {
+        info!("Starting minio for {data_blob_storage:?}");
+        start_service(ServiceName::Minio)?;
     }
 
     // For Firestore backend, re-init API key after RSS starts (emulator is in-memory)
@@ -1114,7 +1114,9 @@ fn start_all_services() -> CmdResult {
 
     // Start all main services - systemd dependencies will handle ordering
     match data_blob_storage {
-        DataBlobStorage::S3HybridSingleAz | DataBlobStorage::AllInBssSingleAz => {
+        DataBlobStorage::S3HybridSingleAz
+        | DataBlobStorage::DataInS3
+        | DataBlobStorage::AllInBssSingleAz => {
             info!("Starting single_az services");
             start_service(ServiceName::Rss)?;
             if reinit_api_key {
@@ -1360,7 +1362,7 @@ Environment="MINIO_REGION=localdev""##
             }
         }
         ServiceName::FsGateway => match get_data_blob_storage_setting() {
-            DataBlobStorage::S3HybridSingleAz => {
+            DataBlobStorage::S3HybridSingleAz | DataBlobStorage::DataInS3 => {
                 "After=rss.service nss_role_agent@0.service minio.service\nWants=rss.service nss_role_agent@0.service minio.service\n".to_string()
             }
             DataBlobStorage::AllInBssSingleAz => {

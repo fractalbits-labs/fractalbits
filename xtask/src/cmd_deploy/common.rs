@@ -15,6 +15,7 @@ pub struct VpcConfig {
     pub az: Option<String>,
     pub root_server_ha: bool,
     pub rss_backend: crate::RssBackend,
+    pub data_blob_storage: DataBlobStorage,
     pub watch_bootstrap: bool,
     pub skip_upload: bool,
     pub use_generic_binaries: bool,
@@ -89,6 +90,14 @@ pub(super) const RUST_BINS: &[&str] = &[
 ];
 
 pub(super) const ZIG_BINS: &[&str] = &["nss_server", "bss_server"];
+
+/// Bucket holding data blobs for the S3-backed storage modes. Named up front so the bootstrap
+/// config can carry it before CDK creates it.
+pub fn get_data_blob_bucket_name() -> FunResult {
+    let region = run_fun!(aws configure get region)?;
+    let account_id = run_fun!(aws sts get-caller-identity --query Account --output text)?;
+    Ok(format!("fractalbits-data-blobs-{region}-{account_id}"))
+}
 
 /// Get the cloud storage bootstrap bucket name.
 /// - AWS: `fractalbits-bootstrap-{region}-{account}` (real S3)

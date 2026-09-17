@@ -5,7 +5,8 @@ use std::path::Path;
 
 use super::super::bootstrap_progress;
 use super::super::common::{
-    DeployTarget, VpcConfig, get_bootstrap_bucket_name, upload_config_and_blueprint,
+    DeployTarget, VpcConfig, get_bootstrap_bucket_name, get_data_blob_bucket_name,
+    upload_config_and_blueprint,
 };
 use super::super::upload;
 use super::config_gen;
@@ -53,7 +54,7 @@ pub fn create_vpc(mut config: VpcConfig) -> CmdResult {
     }
 
     // Build CDK context parameters
-    let context_params = build_cdk_context(&config);
+    let context_params = build_cdk_context(&config)?;
 
     // 3. Generate and upload bootstrap config BEFORE CDK deploy so instances find it immediately on boot
     info!("Generating bootstrap config (pre-deploy)...");
@@ -126,7 +127,7 @@ pub fn destroy_vpc() -> CmdResult {
     Ok(())
 }
 
-fn build_cdk_context(config: &VpcConfig) -> Vec<String> {
+fn build_cdk_context(config: &VpcConfig) -> Result<Vec<String>, std::io::Error> {
     let mut params = Vec::new();
     let mut add = |key: &str, value: String| {
         params.push("--context".to_string());
@@ -156,12 +157,19 @@ fn build_cdk_context(config: &VpcConfig) -> Vec<String> {
         add("rootServerHa", "true".to_string());
     }
     add("rssBackend", config.rss_backend.as_ref().to_string());
+    add(
+        "dataBlobStorage",
+        config.data_blob_storage.as_ref().to_string(),
+    );
+    if config.data_blob_storage.uses_s3_volume() {
+        add("dataBlobBucketName", get_data_blob_bucket_name()?);
+    }
     if config.use_generic_binaries {
         add("useGenericBinaries", "true".to_string());
     }
     add("deployOS", config.deploy_os.as_ref().to_string());
 
-    params
+    Ok(params)
 }
 
 /// Apply template defaults to VpcConfig fields before CDK deploy.
@@ -183,7 +191,11 @@ fn apply_template_defaults(config: &mut VpcConfig) {
             config.nss_instance_type = "r7g.4xlarge".to_string();
             config.root_server_ha = true;
             config.num_s3_gateways = 14;
-            config.num_bss_nodes = 6;
+            // With every data blob in S3, BSS only carries the journal and metadata volumes.
+            config.num_bss_nodes = match config.data_blob_storage {
+                DataBlobStorage::DataInS3 => 3,
+                _ => 6,
+            };
             config.num_bench_clients = 42;
         }
         None => {}
