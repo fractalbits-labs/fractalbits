@@ -13,7 +13,7 @@ use crate::{
     cmd_service,
 };
 
-pub async fn run_tests(test_type: TestType) -> CmdResult {
+pub async fn run_tests(test_type: TestType, with_leader_election: bool) -> CmdResult {
     let test_leader_election = || {
         // Test with DDB backend
         info!("Testing leader election with DDB backend...");
@@ -199,7 +199,10 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
             bss_node_failure_stage().await?;
             bss_repair_stage().await?;
             nss_failover_stage(RssBackend::Etcd).await?;
-            leader_election_stage().await
+            if with_leader_election {
+                leader_election_stage().await?;
+            }
+            Ok(())
         }
     }
 }
