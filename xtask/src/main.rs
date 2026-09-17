@@ -114,6 +114,13 @@ enum Cmd {
         )]
         all: bool,
 
+        #[clap(
+            long,
+            requires = "all",
+            long_help = "Include the leader election suite in --all (off by default)"
+        )]
+        with_leader_election: bool,
+
         #[clap(long, long_help = "Enable HTTPS tests")]
         with_https: bool,
 
@@ -153,6 +160,12 @@ enum Cmd {
 
     #[clap(about = "Run various test suites")]
     RunTests {
+        #[clap(
+            long,
+            long_help = "Include the leader election suite when running all suites (off by default)"
+        )]
+        with_leader_election: bool,
+
         #[clap(subcommand)]
         test_type: Option<TestType>,
     },
@@ -844,6 +857,7 @@ async fn main() -> CmdResult {
             debug_s3_gateway,
             with_fractal_art_tests,
             all,
+            with_leader_election,
             with_https,
             data_blob_storage,
             docker,
@@ -854,15 +868,16 @@ async fn main() -> CmdResult {
                 ..Default::default()
             };
 
-            cmd_precheckin::run_cmd_precheckin(
+            cmd_precheckin::run_cmd_precheckin(cmd_precheckin::PrecheckinOpts {
                 init_config,
                 s3_api_only,
                 zig_unit_tests_only,
                 debug_s3_gateway,
                 with_fractal_art_tests,
                 all,
+                with_leader_election,
                 docker,
-            )
+            })
             .await?;
         }
         Cmd::Nightly { multi_bss } => cmd_nightly::run_cmd_nightly(multi_bss)?,
@@ -1010,9 +1025,12 @@ async fn main() -> CmdResult {
                 ssh_config.as_deref(),
             )?,
         },
-        Cmd::RunTests { test_type } => {
+        Cmd::RunTests {
+            with_leader_election,
+            test_type,
+        } => {
             let test_type = test_type.unwrap_or(TestType::All);
-            cmd_run_tests::run_tests(test_type).await?
+            cmd_run_tests::run_tests(test_type, with_leader_election).await?
         }
         Cmd::OverwriteBench {
             disk_cache,

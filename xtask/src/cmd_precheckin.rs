@@ -27,15 +27,28 @@ pub async fn substage(name: impl Into<String>, fut: impl Future<Output = CmdResu
     run_stage(&"-".repeat(70), name.into(), fut).await
 }
 
-pub async fn run_cmd_precheckin(
-    init_config: InitConfig,
-    s3_api_only: bool,
-    zig_unit_tests_only: bool,
-    debug_s3_gateway: bool,
-    with_fractal_art_tests: bool,
-    all: bool,
-    docker: DockerTestMode,
-) -> CmdResult {
+pub struct PrecheckinOpts {
+    pub init_config: InitConfig,
+    pub s3_api_only: bool,
+    pub zig_unit_tests_only: bool,
+    pub debug_s3_gateway: bool,
+    pub with_fractal_art_tests: bool,
+    pub all: bool,
+    pub with_leader_election: bool,
+    pub docker: DockerTestMode,
+}
+
+pub async fn run_cmd_precheckin(opts: PrecheckinOpts) -> CmdResult {
+    let PrecheckinOpts {
+        init_config,
+        s3_api_only,
+        zig_unit_tests_only,
+        debug_s3_gateway,
+        with_fractal_art_tests,
+        all,
+        with_leader_election,
+        docker,
+    } = opts;
     let build_envs = cmd_build::get_build_envs();
     if docker == DockerTestMode::Only {
         return run_docker_tests().await;
@@ -89,7 +102,7 @@ pub async fn run_cmd_precheckin(
     }
 
     if all {
-        cmd_run_tests::run_tests(TestType::All).await?;
+        cmd_run_tests::run_tests(TestType::All, with_leader_election).await?;
     }
 
     check_for_core_dumps()?;
