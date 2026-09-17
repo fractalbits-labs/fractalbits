@@ -1,4 +1,5 @@
 use crate::cmd_build::BuildMode;
+use crate::cmd_precheckin::substage;
 use crate::cmd_service;
 use crate::{CmdResult, FsMountConfig, InitConfig, ServiceName};
 use aws_sdk_s3::primitives::ByteStream;
@@ -207,14 +208,12 @@ pub(super) fn stop_second_fuse(mut child: Child) {
 }
 
 pub async fn run_fuse_tests_with_disk_cache(disk_cache_only: bool) -> CmdResult {
-    info!("Running FUSE integration tests...");
-
     if !disk_cache_only {
-        println!(
-            "\n{}",
-            ">>> Running FUSE tests WITHOUT disk cache <<<".bold()
-        );
-        run_fuse_test_suite(false).await?;
+        substage(
+            "fs-server: FUSE tests without disk cache",
+            run_fuse_test_suite(false),
+        )
+        .await?;
 
         // Reinit services to clear stale state from the first suite.
         cmd_service::stop_service(ServiceName::All)?;
@@ -226,8 +225,11 @@ pub async fn run_fuse_tests_with_disk_cache(disk_cache_only: bool) -> CmdResult 
         cmd_service::start_service(ServiceName::All)?;
     }
 
-    println!("\n{}", ">>> Running FUSE tests WITH disk cache <<<".bold());
-    run_fuse_test_suite(true).await?;
+    substage(
+        "fs-server: FUSE tests with disk cache",
+        run_fuse_test_suite(true),
+    )
+    .await?;
 
     println!("\n{}", "=== All FUSE Tests PASSED ===".green().bold());
     Ok(())
