@@ -172,6 +172,9 @@ just precheckin --s3-api-only
 
 # Run with all unit tests also
 just precheckin
+
+# Run everything: precheckin plus `just run-tests` and `just fstest`
+just precheckin --all
 ```
 
 ## Quick Start - Docker

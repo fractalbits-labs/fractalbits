@@ -1,76 +1,125 @@
 use crate::*;
+use std::future::Future;
+use std::time::Instant;
 
-pub fn run_cmd_precheckin(
+async fn run_stage(bar: &str, name: String, fut: impl Future<Output = CmdResult>) -> CmdResult {
+    info!("{bar}");
+    info!("STAGE: {name}");
+    info!("{bar}");
+    let start = Instant::now();
+    let result = fut.await;
+    let secs = start.elapsed().as_secs();
+    match &result {
+        Ok(()) => info!("STAGE DONE: {name} ({secs}s)"),
+        Err(_) => error!("STAGE FAILED: {name} ({secs}s)"),
+    }
+    result
+}
+
+/// Run a top-level stage with banners and elapsed time, so each one is easy to spot in a long
+/// precheckin log.
+pub async fn stage(name: impl Into<String>, fut: impl Future<Output = CmdResult>) -> CmdResult {
+    run_stage(&"=".repeat(70), name.into(), fut).await
+}
+
+/// Like `stage`, with a lighter banner for a pass nested inside a stage.
+pub async fn substage(name: impl Into<String>, fut: impl Future<Output = CmdResult>) -> CmdResult {
+    run_stage(&"-".repeat(70), name.into(), fut).await
+}
+
+pub async fn run_cmd_precheckin(
     init_config: InitConfig,
     s3_api_only: bool,
     zig_unit_tests_only: bool,
     debug_s3_gateway: bool,
     with_fractal_art_tests: bool,
+    all: bool,
     docker: DockerTestMode,
 ) -> CmdResult {
     let build_envs = cmd_build::get_build_envs();
     if docker == DockerTestMode::Only {
-        return run_docker_tests();
+        return run_docker_tests().await;
     }
 
     if debug_s3_gateway {
-        cmd_service::stop_service(ServiceName::S3Gateway)?;
-        run_cmd! {
-            $[build_envs] cargo build -p s3_gateway;
-        }?;
+        stage("build s3_gateway", async {
+            cmd_service::stop_service(ServiceName::S3Gateway)?;
+            run_cmd! {
+                $[build_envs] cargo build -p s3_gateway;
+            }
+        })
+        .await?;
     } else {
-        cmd_service::stop_service(ServiceName::All)?;
-        cmd_build::build_rust_servers(BuildMode::Debug)?;
-        cmd_build::build_zig_servers(cmd_build::ZigBuildOpts {
-            mode: BuildMode::Debug,
-            ..Default::default()
-        })?;
+        stage("build servers (debug)", async {
+            cmd_service::stop_service(ServiceName::All)?;
+            cmd_build::build_rust_servers(BuildMode::Debug)?;
+            cmd_build::build_zig_servers(cmd_build::ZigBuildOpts {
+                mode: BuildMode::Debug,
+                ..Default::default()
+            })
+        })
+        .await?;
     }
 
     if s3_api_only {
-        return run_s3_api_tests(&init_config, debug_s3_gateway);
+        return run_s3_api_tests(&init_config, debug_s3_gateway).await;
     }
 
     if zig_unit_tests_only {
-        return run_zig_unit_tests();
+        return run_zig_unit_tests().await;
     }
 
     cmd_service::init_service(ServiceName::All, BuildMode::Debug, &init_config)?;
-    run_zig_unit_tests()?;
-    run_cmd! {
-        info "Run cargo tests (except s3 api, fs_gateway and fs_client)";
-        $[build_envs] cargo test --workspace
-            --exclude s3_gateway --exclude fs_gateway --exclude fs_client;
-    }?;
+    run_zig_unit_tests().await?;
+    stage(
+        "cargo tests (except s3 api, fs_gateway and fs_client)",
+        async {
+            run_cmd! {
+                $[build_envs] cargo test --workspace
+                    --exclude s3_gateway --exclude fs_gateway --exclude fs_client;
+            }
+        },
+    )
+    .await?;
 
-    run_s3_api_tests(&init_config, false)?;
+    run_s3_api_tests(&init_config, false).await?;
 
     if with_fractal_art_tests {
-        run_fractal_art_tests()?;
+        run_fractal_art_tests().await?;
+    }
+
+    if all {
+        cmd_run_tests::run_tests(TestType::All).await?;
     }
 
     check_for_core_dumps()?;
 
     if docker == DockerTestMode::Included {
-        run_docker_tests()?;
+        run_docker_tests().await?;
     }
 
     info!("Precheckin is OK");
     Ok(())
 }
 
-fn run_fractal_art_tests() -> CmdResult {
-    let format_log = "data/logs/format.log";
-    let ts = ["ts", "-m", TS_FMT];
+async fn run_fractal_art_tests() -> CmdResult {
     let working_dir = run_fun!(pwd)?;
-    let nss_server = format!("{working_dir}/{ZIG_DEBUG_OUT}/bin/nss_server");
     let test_async_fractal_art =
         format!("{working_dir}/{ZIG_DEBUG_OUT}/bin/test_async_fractal_art");
-
     if !std::path::Path::new(&test_async_fractal_art).exists() {
         info!("Skipping fractal-art-tests");
         return Ok(());
     }
+    stage("fractal art tests", async {
+        run_fractal_art_tests_inner(&working_dir, &test_async_fractal_art)
+    })
+    .await
+}
+
+fn run_fractal_art_tests_inner(working_dir: &str, test_async_fractal_art: &str) -> CmdResult {
+    let format_log = "data/logs/format.log";
+    let ts = ["ts", "-m", TS_FMT];
+    let nss_server = format!("{working_dir}/{ZIG_DEBUG_OUT}/bin/nss_server");
 
     // Start BSS instance for testing
     cmd_service::start_service(ServiceName::Bss)?;
@@ -106,87 +155,71 @@ fn run_fractal_art_tests() -> CmdResult {
     Ok(())
 }
 
-fn run_s3_api_tests(init_config: &InitConfig, debug_s3_gateway: bool) -> CmdResult {
+async fn run_s3_api_tests(init_config: &InitConfig, debug_s3_gateway: bool) -> CmdResult {
     let build_envs = cmd_build::get_build_envs();
     if debug_s3_gateway {
-        cmd_service::start_service(ServiceName::S3Gateway)?;
-        run_cmd! {
-            info "Run cargo tests (s3 api tests)";
-            $[build_envs] cargo test --package s3_gateway;
-        }?;
-        if init_config.with_https {
+        return stage("s3 api tests", async {
+            cmd_service::start_service(ServiceName::S3Gateway)?;
             run_cmd! {
-                info "Run cargo tests (s3 https api tests)";
-                $[build_envs] USE_HTTPS_ENDPOINT=true cargo test --package s3_gateway;
+                $[build_envs] cargo test --package s3_gateway;
             }?;
-        }
-        return Ok(());
+            if init_config.with_https {
+                run_cmd! {
+                    info "Run cargo tests (s3 https api tests)";
+                    $[build_envs] USE_HTTPS_ENDPOINT=true cargo test --package s3_gateway;
+                }?;
+            }
+            Ok(())
+        })
+        .await;
     }
 
-    // Test with DDB backend
-    let ddb_config = InitConfig {
-        rss_backend: RssBackend::Ddb,
-        ..init_config.clone()
-    };
-    info!("Testing with DDB backend...");
-    cmd_service::init_service(ServiceName::All, BuildMode::Debug, &ddb_config)?;
-    cmd_service::start_service(ServiceName::All)?;
-    run_cmd! {
-        info "Run cargo tests (s3 api tests - DDB backend)";
-        $[build_envs] cargo test --package s3_gateway;
-    }?;
-
-    if init_config.with_https {
-        run_cmd! {
-            info "Run cargo tests (s3 https api tests - DDB backend)";
-            $[build_envs] USE_HTTPS_ENDPOINT=true cargo test --package s3_gateway;
-        }?;
+    for backend in [RssBackend::Ddb, RssBackend::Etcd] {
+        let config = InitConfig {
+            rss_backend: backend,
+            ..init_config.clone()
+        };
+        stage(format!("s3 api tests ({backend:?} backend)"), async {
+            cmd_service::init_service(ServiceName::All, BuildMode::Debug, &config)?;
+            cmd_service::start_service(ServiceName::All)?;
+            run_cmd! {
+                $[build_envs] cargo test --package s3_gateway;
+            }?;
+            if config.with_https {
+                run_cmd! {
+                    info "Run cargo tests (s3 https api tests)";
+                    $[build_envs] USE_HTTPS_ENDPOINT=true cargo test --package s3_gateway;
+                }?;
+            }
+            Ok(())
+        })
+        .await?;
+        let _ = cmd_service::stop_service(ServiceName::All);
     }
-
-    cmd_service::stop_service(ServiceName::All)?;
-
-    // Test with etcd backend
-    let etcd_config = InitConfig {
-        rss_backend: RssBackend::Etcd,
-        ..init_config.clone()
-    };
-    info!("Testing with etcd backend...");
-    cmd_service::init_service(ServiceName::All, BuildMode::Debug, &etcd_config)?;
-    cmd_service::start_service(ServiceName::All)?;
-    run_cmd! {
-        info "Run cargo tests (s3 api tests - etcd backend)";
-        $[build_envs] cargo test --package s3_gateway;
-    }?;
-
-    if init_config.with_https {
-        run_cmd! {
-            info "Run cargo tests (s3 https api tests - etcd backend)";
-            $[build_envs] USE_HTTPS_ENDPOINT=true cargo test --package s3_gateway;
-        }?;
-    }
-
-    let _ = cmd_service::stop_service(ServiceName::All);
 
     Ok(())
 }
 
-pub fn run_zig_unit_tests() -> CmdResult {
+pub async fn run_zig_unit_tests() -> CmdResult {
     if !std::path::Path::new(&format!("{ZIG_REPO_PATH}/build.zig")).exists() {
         info!("Skipping zig unit-tests");
         return Ok(());
     }
 
-    run_cmd! {
-        info "Running zig unit tests";
-        cd $ZIG_REPO_PATH;
-        zig build -p ../$ZIG_DEBUG_OUT test --summary all 2>&1;
-    }?;
-
-    info!("Zig unit tests completed successfully");
-    Ok(())
+    stage("zig unit tests", async {
+        run_cmd! {
+            cd $ZIG_REPO_PATH;
+            zig build -p ../$ZIG_DEBUG_OUT test --summary all 2>&1;
+        }
+    })
+    .await
 }
 
-fn run_docker_tests() -> CmdResult {
+async fn run_docker_tests() -> CmdResult {
+    stage("docker tests", async { run_docker_tests_inner() }).await
+}
+
+fn run_docker_tests_inner() -> CmdResult {
     info!("Building Docker image...");
     cmd_docker::run_cmd_docker(DockerCommand::Build {
         release: true,
@@ -222,10 +255,7 @@ fn run_docker_tests() -> CmdResult {
     let stop_result = cmd_docker::run_cmd_docker(DockerCommand::Stop { name: None });
 
     result?;
-    stop_result?;
-
-    info!("Docker tests completed successfully");
-    Ok(())
+    stop_result
 }
 
 pub fn check_for_core_dumps() -> CmdResult {

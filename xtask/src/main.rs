@@ -107,6 +107,13 @@ enum Cmd {
         #[clap(long, long_help = "Run fractal art tests in addition to other tests")]
         with_fractal_art_tests: bool,
 
+        #[clap(
+            long,
+            conflicts_with_all = ["s3_api_only", "zig_unit_tests_only", "debug_s3_gateway"],
+            long_help = "Also run `just run-tests` (which includes `just fstest`) after the regular precheckin"
+        )]
+        all: bool,
+
         #[clap(long, long_help = "Enable HTTPS tests")]
         with_https: bool,
 
@@ -811,7 +818,7 @@ async fn main() -> CmdResult {
             Some(build_cmd) => match build_cmd {
                 BuildCommand::All => cmd_build::build_all(release)?,
                 BuildCommand::Zig { command } => match command {
-                    Some(ZigCommand::Test) => cmd_precheckin::run_zig_unit_tests()?,
+                    Some(ZigCommand::Test) => cmd_precheckin::run_zig_unit_tests().await?,
                     None => {
                         let mode = cmd_build::build_mode(release);
                         cmd_build::build_zig_servers(cmd_build::ZigBuildOpts {
@@ -836,6 +843,7 @@ async fn main() -> CmdResult {
             zig_unit_tests_only,
             debug_s3_gateway,
             with_fractal_art_tests,
+            all,
             with_https,
             data_blob_storage,
             docker,
@@ -852,8 +860,10 @@ async fn main() -> CmdResult {
                 zig_unit_tests_only,
                 debug_s3_gateway,
                 with_fractal_art_tests,
+                all,
                 docker,
-            )?;
+            )
+            .await?;
         }
         Cmd::Nightly { multi_bss } => cmd_nightly::run_cmd_nightly(multi_bss)?,
         Cmd::Bench {

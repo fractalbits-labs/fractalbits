@@ -3,6 +3,7 @@ pub mod fuse;
 pub mod pjdfs;
 
 use crate::cmd_build::BuildMode;
+use crate::cmd_precheckin::substage;
 use crate::{CmdResult, FsGatewayConfig, FsMountConfig, InitConfig, ServiceName, cmd_service};
 use cmd_lib::*;
 use std::sync::Mutex;
@@ -15,9 +16,12 @@ pub const GATEWAY_ADDR: &str = "127.0.0.1:8180";
 const BUCKET_NAME: &str = "test-file-server";
 
 pub async fn run_fs_server_tests(disk_cache: bool) -> CmdResult {
-    info!("Running fs_server integration tests...");
     fuse::run_fuse_tests_with_disk_cache(disk_cache).await?;
-    drives::run_drive_e2e(disk_cache).await
+    substage(
+        "fs-server: drive CRUD e2e",
+        drives::run_drive_e2e(disk_cache),
+    )
+    .await
 }
 
 /// Build `fs_gateway` and `artfs-mount` using the isolated
