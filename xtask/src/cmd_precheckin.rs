@@ -102,7 +102,12 @@ pub async fn run_cmd_precheckin(opts: PrecheckinOpts) -> CmdResult {
     }
 
     if all {
-        cmd_run_tests::run_tests(TestType::All, with_leader_election).await?;
+        cmd_run_tests::run_tests(
+            TestType::All,
+            with_leader_election,
+            init_config.data_blob_storage,
+        )
+        .await?;
     }
 
     check_for_core_dumps()?;

@@ -166,6 +166,14 @@ enum Cmd {
         )]
         with_leader_election: bool,
 
+        #[clap(
+            long,
+            value_enum,
+            long_help = "Data blob backend for the all-suites run; the per-suite subcommands take their own"
+        )]
+        #[arg(default_value_t)]
+        data_blob_storage: DataBlobStorage,
+
         #[clap(subcommand)]
         test_type: Option<TestType>,
     },
@@ -1027,10 +1035,11 @@ async fn main() -> CmdResult {
         },
         Cmd::RunTests {
             with_leader_election,
+            data_blob_storage,
             test_type,
         } => {
             let test_type = test_type.unwrap_or(TestType::All);
-            cmd_run_tests::run_tests(test_type, with_leader_election).await?
+            cmd_run_tests::run_tests(test_type, with_leader_election, data_blob_storage).await?
         }
         Cmd::OverwriteBench {
             disk_cache,

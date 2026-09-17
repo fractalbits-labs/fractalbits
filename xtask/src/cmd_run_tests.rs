@@ -13,7 +13,11 @@ use crate::{
     cmd_service,
 };
 
-pub async fn run_tests(test_type: TestType, with_leader_election: bool) -> CmdResult {
+pub async fn run_tests(
+    test_type: TestType,
+    with_leader_election: bool,
+    data_blob_storage: DataBlobStorage,
+) -> CmdResult {
     let test_leader_election = || {
         // Test with DDB backend
         info!("Testing leader election with DDB backend...");
@@ -194,10 +198,15 @@ pub async fn run_tests(test_type: TestType, with_leader_election: bool) -> CmdRe
             data_blob_storage,
         } => pjdfstest_stage(subdir, data_blob_storage).await,
         TestType::All => {
-            fs_server_stage(false, DataBlobStorage::AllInBssSingleAz).await?;
-            pjdfstest_stage(None, DataBlobStorage::AllInBssSingleAz).await?;
-            bss_node_failure_stage().await?;
-            bss_repair_stage().await?;
+            fs_server_stage(false, data_blob_storage).await?;
+            pjdfstest_stage(None, data_blob_storage).await?;
+            // EC quorum and repair only apply to data blobs held in BSS.
+            if matches!(data_blob_storage, DataBlobStorage::S3HybridSingleAz) {
+                info!("Skipping bss-node-failure and bss-repair: data blobs are on the S3 volume");
+            } else {
+                bss_node_failure_stage().await?;
+                bss_repair_stage().await?;
+            }
             nss_failover_stage(RssBackend::Etcd).await?;
             if with_leader_election {
                 leader_election_stage().await?;
