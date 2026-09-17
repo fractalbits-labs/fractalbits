@@ -780,9 +780,27 @@ enum ToolKind {
     },
 }
 
+/// `cargo xtask` is `cargo run`, which injects CARGO_MANIFEST_DIR and CARGO_PKG_* into our
+/// environment. Every cargo command we spawn would inherit them, and build scripts such as
+/// ring's mark them rerun-if-env-changed, so a plain-shell or IDE cargo invocation in between
+/// flips their fingerprint and forces a rebuild of ring and every TLS-dependent crate.
+fn scrub_cargo_run_env() {
+    let inherited: Vec<String> = std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| {
+            k.starts_with("CARGO_PKG_") || k == "CARGO_MANIFEST_DIR" || k == "CARGO_MANIFEST_PATH"
+        })
+        .collect();
+    for key in inherited {
+        // SAFETY: called first thing in main, before any thread of ours reads the environment.
+        unsafe { std::env::remove_var(key) };
+    }
+}
+
 #[tokio::main]
 #[cmd_lib::main]
 async fn main() -> CmdResult {
+    scrub_cargo_run_env();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_target(false)
         .init();
