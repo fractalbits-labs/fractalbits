@@ -1,3 +1,4 @@
+use crate::AppState;
 use crate::{
     blob_client::enqueue_blob_deletion,
     handler::{
@@ -9,36 +10,43 @@ use crate::{
 };
 use actix_web::HttpResponse;
 use data_types::object_layout::{MpuState, ObjectLayout, ObjectState};
+use data_types::{Bucket, TraceId};
 use file_ops::parse_delete_inode;
 use metrics_wrapper::histogram;
 use rkyv::{self, rancor::Error};
 use rpc_client_common::nss_rpc_retry;
+use std::sync::Arc;
 
 pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResponse, S3Error> {
     tracing::debug!("DeleteObject handler: {}/{}", ctx.bucket_name, ctx.key);
 
     let bucket = ctx.resolve_bucket().await?;
+    delete_object_by_key(&ctx.app, &bucket, &ctx.key, &ctx.trace_id).await?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// Delete one object of a resolved bucket: the inode, its blob generations
+/// and any multipart parts. Shared by `DeleteObject`, `DeleteObjects` and the
+/// drive `force` sweep. A missing object is a success, as in S3.
+pub async fn delete_object_by_key(
+    app: &Arc<AppState>,
+    bucket: &Bucket,
+    key: &str,
+    trace_id: &TraceId,
+) -> Result<(), S3Error> {
     let routing_key = &bucket.routing_key;
-    ctx.app
-        .get_blob_client(routing_key)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "failed to start deletion worker before object delete");
-            S3Error::InternalError
-        })?;
-    let rpc_timeout = ctx.app.config.rpc_request_timeout();
-    let nss_client = ctx.app.get_nss_rpc_client(routing_key).await?;
+    app.get_blob_client(routing_key).await.map_err(|error| {
+        tracing::warn!(%error, "failed to start deletion worker before object delete");
+        S3Error::InternalError
+    })?;
+    let rpc_timeout = app.config.rpc_request_timeout();
+    let nss_client = app.get_nss_rpc_client(routing_key).await?;
     let resp = nss_rpc_retry!(
         nss_client,
-        delete_inode(
-            &bucket.root_blob_name,
-            &ctx.key,
-            Some(rpc_timeout),
-            &ctx.trace_id
-        ),
-        ctx.app,
+        delete_inode(&bucket.root_blob_name, key, Some(rpc_timeout), trace_id),
+        app,
         routing_key,
-        &ctx.trace_id
+        trace_id
     )
     .await?;
 
@@ -52,11 +60,11 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
             tracing::debug!(
                 "delete non-existing or already-deleted object {}/{}",
                 bucket.bucket_name,
-                ctx.key
+                key
             );
-            let mpu_prefix = mpu_get_uploads_prefix(ctx.key.clone());
+            let mpu_prefix = mpu_get_uploads_prefix(key.to_string());
             if let Ok(mpus) = list_raw_objects(
-                &ctx.app,
+                app,
                 routing_key,
                 &bucket.root_blob_name,
                 10000,
@@ -64,26 +72,21 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
                 "",
                 "",
                 false,
-                &ctx.trace_id,
+                trace_id,
             )
             .await
             {
                 for (mpu_key, mpu_obj) in mpus.iter() {
                     let _ = nss_rpc_retry!(
                         nss_client,
-                        delete_inode(
-                            &bucket.root_blob_name,
-                            mpu_key,
-                            Some(rpc_timeout),
-                            &ctx.trace_id
-                        ),
-                        ctx.app,
+                        delete_inode(&bucket.root_blob_name, mpu_key, Some(rpc_timeout), trace_id),
+                        app,
                         routing_key,
-                        &ctx.trace_id
+                        trace_id
                     )
                     .await;
                     let _ = enqueue_blob_deletion(
-                        ctx.app.clone(),
+                        app.clone(),
                         *routing_key,
                         &bucket.root_blob_name,
                         mpu_obj,
@@ -95,11 +98,11 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
                         "Cleaned up {} orphaned MPU parts for {}/{}",
                         mpus.len(),
                         bucket.bucket_name,
-                        ctx.key
+                        key
                     );
                 }
             }
-            return Ok(HttpResponse::NoContent().finish());
+            return Ok(());
         }
     };
 
@@ -119,13 +122,8 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
         match &object.state {
             ObjectState::Normal(..) => {
                 // Delete blob for normal objects
-                enqueue_blob_deletion(
-                    ctx.app.clone(),
-                    *routing_key,
-                    &bucket.root_blob_name,
-                    &object,
-                )
-                .await?;
+                enqueue_blob_deletion(app.clone(), *routing_key, &bucket.root_blob_name, &object)
+                    .await?;
             }
             ObjectState::Mpu(mpu_state) => match mpu_state {
                 MpuState::Uploading => {
@@ -134,9 +132,9 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
                 }
                 MpuState::Completed { .. } => {
                     // Clean up completed multipart upload parts
-                    let mpu_prefix = mpu_get_part_prefix(ctx.key.clone(), object.version_id, 0);
+                    let mpu_prefix = mpu_get_part_prefix(key.to_string(), object.version_id, 0);
                     let mpus = list_raw_objects(
-                        &ctx.app,
+                        app,
                         routing_key,
                         &bucket.root_blob_name,
                         10000,
@@ -144,7 +142,7 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
                         "",
                         "",
                         false,
-                        &ctx.trace_id,
+                        trace_id,
                     )
                     .await?;
                     for (mpu_key, mpu_obj) in mpus.iter() {
@@ -154,16 +152,16 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
                                 &bucket.root_blob_name,
                                 &mpu_key,
                                 Some(rpc_timeout),
-                                &ctx.trace_id
+                                trace_id
                             ),
-                            ctx.app,
+                            app,
                             routing_key,
-                            &ctx.trace_id
+                            trace_id
                         )
                         .await?;
                         // Delete blob for each multipart upload part
                         enqueue_blob_deletion(
-                            ctx.app.clone(),
+                            app.clone(),
                             *routing_key,
                             &bucket.root_blob_name,
                             mpu_obj,
@@ -184,5 +182,5 @@ pub async fn delete_object_handler(ctx: ObjectRequestContext) -> Result<HttpResp
         }
     }
 
-    Ok(HttpResponse::NoContent().finish())
+    Ok(())
 }

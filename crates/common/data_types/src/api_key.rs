@@ -3,7 +3,7 @@ use super::permission::BucketKeyPerm;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKey {
     pub key_id: String,
     pub secret_key: String,

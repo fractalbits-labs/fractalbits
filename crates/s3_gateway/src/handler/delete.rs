@@ -2,7 +2,7 @@ mod abort_multipart_upload;
 mod delete_object;
 
 pub use abort_multipart_upload::abort_multipart_upload_handler;
-pub use delete_object::delete_object_handler;
+pub use delete_object::{delete_object_by_key, delete_object_handler};
 
 use super::common::authorization::Authorization;
 

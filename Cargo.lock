@@ -2005,6 +2005,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "hex",
+ "hmac 0.12.1",
  "rand 0.10.1",
  "rkyv",
  "serde",
@@ -5865,6 +5866,12 @@ version = "0.1.0"
 dependencies = [
  "aws-sdk-s3",
  "cmd_lib",
+ "data_types",
+ "hex",
+ "reqwest 0.13.2",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
 ]
 
 [[package]]

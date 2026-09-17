@@ -19,6 +19,7 @@ use common::{
 };
 use data_types::{ApiKey, Bucket, TraceId, Versioned};
 use delete::DeleteEndpoint;
+pub use delete::delete_object_by_key;
 use endpoint::Endpoint;
 use get::GetEndpoint;
 use head::HeadEndpoint;
@@ -222,6 +223,12 @@ pub async fn any_handler(req: HttpRequest, payload: Payload) -> Result<HttpRespo
             histogram!("request_duration_nanos", "status" => format!("{endpoint_name}_Err"))
                 .record(duration.as_nanos() as f64);
             error!(%trace_id, endpoint = %endpoint_name, %bucket, %key, %client_addr, error = ?e, "failed to handle request");
+            // A cached record whose root blob is gone (deleted and maybe
+            // recreated under the same name elsewhere) must not be served
+            // until the TTL; the next request refetches from RSS.
+            if matches!(e, S3Error::NoSuchBucket) && !bucket.is_empty() {
+                app_data.invalidate_bucket_cache(&bucket).await;
+            }
             Ok(e.error_response_with_resource(&resource, trace_id))
         }
     }

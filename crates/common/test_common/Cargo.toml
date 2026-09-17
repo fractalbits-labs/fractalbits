@@ -6,3 +6,9 @@ edition = "2024"
 [dependencies]
 aws-sdk-s3.workspace = true
 cmd_lib.workspace = true
+data_types.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
