@@ -1,10 +1,7 @@
 fn main() {
-    println!("cargo:rerun-if-changed=../../../../common/protos/bss_ops.proto");
+    println!("cargo:rerun-if-changed=src/proto/bss_ops.proto");
     prost_build::Config::new()
         .bytes(["."])
-        .compile_protos(
-            &["../../../../common/protos/bss_ops.proto"],
-            &["../../../../common/protos"],
-        )
+        .compile_protos(&["src/proto/bss_ops.proto"], &["src/proto/"])
         .unwrap();
 }
