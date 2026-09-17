@@ -6,6 +6,9 @@ use super::config_gen;
 const TERRAFORM_DIR: &str = "infra/gcp-terraform";
 
 pub fn create_vpc(config: VpcConfig) -> CmdResult {
+    if config.data_blob_storage.uses_s3_volume() {
+        cmd_die!("S3-backed data blob storage is only wired for AWS deployments");
+    }
     let project_id = super::resolve_gcp_project(config.gcp_project.as_deref())?;
     let zone = super::resolve_gcp_zone(config.gcp_zone.as_deref());
     let region = zone

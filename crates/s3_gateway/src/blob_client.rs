@@ -137,23 +137,26 @@ impl BlobClient {
         data_vg_info: data_types::DataVgInfo,
     ) -> Result<Arc<BlobStorageImpl>, BlobStorageError> {
         let storage = match &blob_storage_config.backend {
-            BlobStorageBackend::S3HybridSingleAz => {
-                let s3_hybrid_config = blob_storage_config
-                    .s3_hybrid_single_az
-                    .as_ref()
-                    .ok_or_else(|| {
-                        BlobStorageError::Config(
-                            "S3 hybrid configuration required for Hybrid backend".into(),
-                        )
-                    })?;
+            BlobStorageBackend::S3HybridSingleAz | BlobStorageBackend::DataInS3 => {
+                let all_data_in_s3 =
+                    matches!(blob_storage_config.backend, BlobStorageBackend::DataInS3);
+                let s3_config = if all_data_in_s3 {
+                    blob_storage_config.data_in_s3.as_ref()
+                } else {
+                    blob_storage_config.s3_hybrid_single_az.as_ref()
+                }
+                .ok_or_else(|| {
+                    BlobStorageError::Config("S3 configuration required for S3 backends".into())
+                })?;
 
                 BlobStorageImpl::HybridSingleAz(
                     S3HybridSingleAzStorage::new_with_data_vg_info(
                         data_vg_info.clone(),
-                        s3_hybrid_config,
+                        s3_config,
                         rpc_request_timeout,
                         rpc_connection_timeout,
                         ec_read_hedge_delay,
+                        all_data_in_s3,
                     )
                     .await?,
                 )

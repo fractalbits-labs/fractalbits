@@ -387,6 +387,14 @@ pub enum DeployCommand {
         )]
         rss_backend: RssBackend,
 
+        #[clap(
+            long,
+            value_enum,
+            long_help = "Where data blobs live; the S3-backed modes are AWS only. With perf_demo, data_in_s3 deploys 3 BSS nodes instead of 6"
+        )]
+        #[arg(default_value_t)]
+        data_blob_storage: DataBlobStorage,
+
         #[clap(long, long_help = "Watch bootstrap progress inline after VPC creation")]
         watch_bootstrap: bool,
 
@@ -969,6 +977,7 @@ async fn main() -> CmdResult {
                 az,
                 root_server_ha,
                 rss_backend,
+                data_blob_storage,
                 watch_bootstrap,
                 skip_upload,
                 use_generic_binaries,
@@ -989,6 +998,7 @@ async fn main() -> CmdResult {
                     az,
                     root_server_ha,
                     rss_backend,
+                    data_blob_storage,
                     watch_bootstrap,
                     skip_upload,
                     use_generic_binaries,

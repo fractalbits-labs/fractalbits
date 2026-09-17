@@ -175,7 +175,17 @@ pub enum JournalType {
 pub enum DataBlobStorage {
     #[default]
     AllInBssSingleAz,
+    /// Data blobs >= one block go to S3, smaller ones and EC volumes stay in BSS.
     S3HybridSingleAz,
+    /// Every data blob goes to S3; BSS only holds the journal and metadata volumes.
+    DataInS3,
+}
+
+impl DataBlobStorage {
+    /// True for the backends that put data blobs on the S3 volume (and need minio locally).
+    pub fn uses_s3_volume(&self) -> bool {
+        matches!(self, Self::S3HybridSingleAz | Self::DataInS3)
+    }
 }
 
 #[derive(

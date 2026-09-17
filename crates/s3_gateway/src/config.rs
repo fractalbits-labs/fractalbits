@@ -7,6 +7,8 @@ use volume_group_proxy::DEFAULT_EC_HEDGE_DELAY;
 #[serde(rename_all = "snake_case")]
 pub enum BlobStorageBackend {
     S3HybridSingleAz,
+    /// Every data blob lives in S3; BSS only serves the journal and metadata volumes.
+    DataInS3,
     #[default]
     AllInBssSingleAz,
 }
@@ -16,6 +18,10 @@ pub struct BlobStorageConfig {
     pub backend: BlobStorageBackend,
 
     pub s3_hybrid_single_az: Option<S3HybridSingleAzConfig>,
+
+    /// S3 endpoint for the `DataInS3` backend (same shape as the hybrid config).
+    #[serde(default)]
+    pub data_in_s3: Option<S3HybridSingleAzConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -141,6 +147,16 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn data_in_s3() -> Self {
+        let mut config = Self::s3_hybrid_single_az();
+        config.blob_storage = BlobStorageConfig {
+            backend: BlobStorageBackend::DataInS3,
+            data_in_s3: config.blob_storage.s3_hybrid_single_az.take(),
+            s3_hybrid_single_az: None,
+        };
+        config
+    }
+
     pub fn s3_hybrid_single_az() -> Self {
         Self {
             rss_addrs: vec!["127.0.0.1:8086".to_string()],
@@ -168,6 +184,7 @@ impl Config {
                     ratelimit: RatelimitConfig::default(),
                     retry_config: S3RetryConfig::default(),
                 }),
+                data_in_s3: None,
             },
             allow_missing_or_bad_signature: false,
             mgmt_auth_required: true,
@@ -196,6 +213,7 @@ impl Config {
             blob_storage: BlobStorageConfig {
                 backend: BlobStorageBackend::AllInBssSingleAz,
                 s3_hybrid_single_az: None,
+                data_in_s3: None,
             },
             allow_missing_or_bad_signature: false,
             mgmt_auth_required: true,
