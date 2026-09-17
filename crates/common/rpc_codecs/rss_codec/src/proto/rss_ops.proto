@@ -1,1 +1,226 @@
-../../../../../../common/protos/rss_ops.proto
+syntax = "proto3";
+
+package rss_ops;
+
+import "google/protobuf/empty.proto";
+
+enum Command {
+  Invalid = 0;
+  Handshake = 1;
+
+  Put = 16;
+  Get = 17;
+  Delete = 18;
+  List = 19;
+
+  // NSS role management
+  GetNssRole = 21;
+
+  reserved 22, 23;
+
+  // Bucket management
+  CreateBucket = 24;
+  DeleteBucket = 25;
+
+  // Data Volume Group management
+  GetDataVgInfo = 26;
+
+  // Metadata Volume Group management
+  GetMetadataVgInfo = 27;
+
+  // Active NSS address query
+  GetActiveNssAddress = 28;
+
+  // Journal Volume Group management
+  GetJournalVgInfo = 29;
+
+  // Journal config management
+  GetJournalConfig = 30;
+}
+
+// Put
+message PutRequest {
+  int64 version = 1;
+  string key = 2;
+  string value = 3;
+}
+
+message PutResponse {
+  oneof result {
+    // The version now stored, as Get would report it: the handle for the
+    // next compare-and-set, so a writer never re-reads what it just wrote.
+    int64 ok = 1;
+    google.protobuf.Empty err_retry = 2;
+    string err_other = 3;
+  }
+}
+
+
+// Get
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  oneof result {
+    ValueWithVersion ok = 1;
+    google.protobuf.Empty err_not_found = 2;
+    string err_other = 3;
+  }
+}
+
+message ValueWithVersion {
+  int64 version = 1;
+  string value = 2;
+}
+
+// Delete
+message DeleteRequest {
+  string key = 1;
+  // Compare-and-set: when non-zero, delete only if the stored version
+  // (as reported by Get) still matches; 0 deletes unconditionally.
+  int64 version = 2;
+}
+
+message DeleteResponse {
+  oneof result {
+    google.protobuf.Empty ok = 1;
+    // The version no longer matched: the caller re-reads and decides.
+    google.protobuf.Empty err_retry = 2;
+    string err_other = 3;
+  }
+}
+
+
+// List
+message ListRequest {
+  string prefix = 1;
+}
+
+message ListResponse {
+  oneof result {
+    ListKeyValues ok = 1;
+    string err = 2;
+  }
+}
+
+message ListKeyValues {
+  repeated string kvs = 3;
+}
+
+// GetNssRole - Query NSS instance role from service-discovery table
+message GetNssRoleRequest {
+  string instance_id = 1;  // "nss-A" or "nss-B"
+  optional NssAgentHealthReport health_report = 2;  // Agent reports its managed service health
+}
+
+// Health report pushed by nss_role_agent when calling GetNssRole
+message NssAgentHealthReport {
+  string service_type = 1;    // "nss"
+  string status = 2;          // "active", "solo", "standby", "degraded", "failure"
+  bool is_running = 3;
+  uint64 timestamp_ms = 4;    // When health was last checked
+  string network_address = 5; // "ip:port" of the NSS service
+}
+
+message GetNssRoleResponse {
+  oneof result {
+    string role = 1;
+    string error = 2;
+  }
+  optional string journal_config_json = 3;
+}
+
+// CreateBucket - Create a new bucket with full NSS integration
+message CreateBucketRequest {
+  string bucket_name = 1;
+  bool enable_versioning = 2;
+  string api_key_id = 3;
+  reserved 4;
+}
+
+message CreateBucketResponse {
+  oneof result {
+    google.protobuf.Empty ok = 1;
+    google.protobuf.Empty err_bucket_already_exists = 2;
+    google.protobuf.Empty err_bucket_already_owned_by_you = 3;
+    string err_other = 4;
+  }
+}
+
+// DeleteBucket - Delete an existing bucket with NSS integration
+message DeleteBucketRequest {
+  string bucket_name = 1;
+  string api_key_id = 2;
+  // Incarnation fence: when set, the bucket record's root_blob_name must
+  // match or nothing is deleted. A bucket deleted and recreated under the
+  // same name has a new root, so a stale request cannot delete the
+  // replacement. Empty means any incarnation.
+  string expected_root_blob_name = 3;
+}
+
+message DeleteBucketResponse {
+  oneof result {
+    google.protobuf.Empty ok = 1;
+    google.protobuf.Empty err_incarnation_mismatch = 2;
+    string err_other = 3;
+  }
+}
+
+// GetDataVgInfo - Get data volume group configuration
+message GetDataVgInfoRequest {
+  // Empty for now - could add parameters later
+}
+
+message GetDataVgInfoResponse {
+  oneof result {
+    string info_json = 1;
+    string error = 2;
+  }
+}
+
+// GetMetadataVgInfo - Get metadata volume group configuration
+message GetMetadataVgInfoRequest {
+  // Empty for now - could add parameters later
+}
+
+message GetMetadataVgInfoResponse {
+  oneof result {
+    string info_json = 1;
+    string error = 2;
+  }
+}
+
+// GetJournalVgInfo - Get journal volume group configuration
+message GetJournalVgInfoRequest {
+}
+
+message GetJournalVgInfoResponse {
+  oneof result {
+    string info_json = 1;
+    string error = 2;
+  }
+}
+
+// GetJournalConfig - Get per-journal configuration
+message GetJournalConfigRequest {
+}
+
+message GetJournalConfigResponse {
+  oneof result {
+    string config_json = 1;  // JSON-serialized JournalConfig
+    string error = 2;
+  }
+}
+
+// GetActiveNssAddress - Query the NSS network address for a given routing key
+message GetActiveNssAddressRequest {
+  bytes routing_key = 1;  // 16-byte opaque routing key; required
+}
+
+message GetActiveNssAddressResponse {
+  oneof result {
+    string address = 1;  // "ip:port" of active NSS
+    string error = 2;
+  }
+}
