@@ -4,12 +4,14 @@ pub mod fs_server;
 pub mod leader_election;
 pub mod nss_failover;
 
+use cmd_lib::*;
+
 use crate::{
     CmdResult, DataBlobStorage, InitConfig, RssBackend, ServiceName, TestType,
     cmd_build::{self, BuildMode},
+    cmd_precheckin::stage,
     cmd_service,
 };
-use cmd_lib::*;
 
 pub async fn run_tests(test_type: TestType) -> CmdResult {
     let test_leader_election = || {
@@ -120,49 +122,84 @@ pub async fn run_tests(test_type: TestType) -> CmdResult {
         result
     };
 
+    let test_pjdfstest = |subdir: Option<String>, data_blob_storage: DataBlobStorage| async move {
+        cmd_service::init_service(
+            ServiceName::All,
+            BuildMode::Debug,
+            &InitConfig {
+                data_blob_storage,
+                ..Default::default()
+            },
+        )?;
+        cmd_service::start_service(ServiceName::All)?;
+        let result = fs_server::pjdfs::run_pjdfstest(subdir.as_deref()).await;
+        let _ = fs_server::stop_gateway();
+        cmd_service::stop_service(ServiceName::All)?;
+        result
+    };
+
     // prepare: the fs units are standalone, so a previous run that died
     // mid-test can leave them running with the binaries about to be rebuilt.
-    let _ = fs_server::unmount_fs(fs_server::MOUNT_POINT);
-    let _ = fs_server::stop_gateway();
-    cmd_service::stop_service(ServiceName::All)?;
-    cmd_build::build_zig_servers(cmd_build::ZigBuildOpts {
-        mode: BuildMode::Debug,
-        ..Default::default()
-    })?;
-    cmd_build::build_rust_servers(BuildMode::Debug)?;
+    stage("run-tests: build servers (debug)", async {
+        let _ = fs_server::unmount_fs(fs_server::MOUNT_POINT);
+        let _ = fs_server::stop_gateway();
+        cmd_service::stop_service(ServiceName::All)?;
+        cmd_build::build_zig_servers(cmd_build::ZigBuildOpts {
+            mode: BuildMode::Debug,
+            ..Default::default()
+        })?;
+        cmd_build::build_rust_servers(BuildMode::Debug)
+    })
+    .await?;
+
+    let fs_server_stage = |disk_cache_only: bool, data_blob_storage: DataBlobStorage| {
+        stage(
+            format!(
+                "run-tests fs-server (disk_cache_only={disk_cache_only}, {data_blob_storage:?})"
+            ),
+            test_fs_server(disk_cache_only, data_blob_storage),
+        )
+    };
+    let pjdfstest_stage = |subdir: Option<String>, data_blob_storage: DataBlobStorage| {
+        stage(
+            format!("run-tests pjdfstest ({data_blob_storage:?})"),
+            test_pjdfstest(subdir, data_blob_storage),
+        )
+    };
+    let bss_node_failure_stage = || stage("run-tests bss-node-failure", test_bss_node_failure());
+    let bss_repair_stage = || stage("run-tests bss-repair", test_bss_repair());
+    let nss_failover_stage = |backend: RssBackend| {
+        stage(
+            format!("run-tests nss-failover ({backend:?} backend)"),
+            test_nss_failover(backend),
+        )
+    };
+    let leader_election_stage = || {
+        stage("run-tests leader-election", async {
+            test_leader_election()
+        })
+    };
+
     match test_type {
-        TestType::LeaderElection => test_leader_election(),
-        TestType::BssNodeFailure => test_bss_node_failure().await,
-        TestType::BssRepair => test_bss_repair().await,
-        TestType::NssFailover => test_nss_failover(RssBackend::Etcd).await,
+        TestType::LeaderElection => leader_election_stage().await,
+        TestType::BssNodeFailure => bss_node_failure_stage().await,
+        TestType::BssRepair => bss_repair_stage().await,
+        TestType::NssFailover => nss_failover_stage(RssBackend::Etcd).await,
         TestType::FsServer {
             disk_cache_only,
             data_blob_storage,
-        } => test_fs_server(disk_cache_only, data_blob_storage).await,
+        } => fs_server_stage(disk_cache_only, data_blob_storage).await,
         TestType::Pjdfstest {
             subdir,
             data_blob_storage,
-        } => {
-            cmd_service::init_service(
-                ServiceName::All,
-                BuildMode::Debug,
-                &InitConfig {
-                    data_blob_storage,
-                    ..Default::default()
-                },
-            )?;
-            cmd_service::start_service(ServiceName::All)?;
-            let result = fs_server::pjdfs::run_pjdfstest(subdir.as_deref()).await;
-            let _ = fs_server::stop_gateway();
-            cmd_service::stop_service(ServiceName::All)?;
-            result
-        }
+        } => pjdfstest_stage(subdir, data_blob_storage).await,
         TestType::All => {
-            test_fs_server(false, DataBlobStorage::AllInBssSingleAz).await?;
-            test_bss_node_failure().await?;
-            test_bss_repair().await?;
-            test_nss_failover(RssBackend::Etcd).await?;
-            test_leader_election()
+            fs_server_stage(false, DataBlobStorage::AllInBssSingleAz).await?;
+            pjdfstest_stage(None, DataBlobStorage::AllInBssSingleAz).await?;
+            bss_node_failure_stage().await?;
+            bss_repair_stage().await?;
+            nss_failover_stage(RssBackend::Etcd).await?;
+            leader_election_stage().await
         }
     }
 }
