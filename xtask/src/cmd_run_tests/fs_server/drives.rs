@@ -7,7 +7,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use colored::*;
 use serde_json::json;
 use std::time::Duration;
-use test_common::mgmt::MgmtClient;
+use test_common::fs_control::ControlClient;
 use test_common::{Context, context};
 
 use super::fuse::{MOUNT_POINT_B, spawn_second_fuse_at, stop_second_fuse};
@@ -58,19 +58,19 @@ fn names(dir: &str) -> std::io::Result<Vec<String>> {
 
 pub async fn run_drive_e2e(disk_cache: bool) -> CmdResult {
     println!("\n{}", "=== Test: Drive CRUD end to end ===".bold());
-    let mgmt = MgmtClient::new();
+    let client = ControlClient::new();
     let ctx = context();
     ensure_gateway(BuildMode::Debug, &gateway_config(disk_cache, "", 1))?;
 
     println!("  Step 0: Clean slate");
-    let _ = mgmt.delete_drive(DRIVE, true).await;
+    let _ = client.delete_drive(DRIVE, true).await;
     assert!(
-        mgmt.wait_deleted(DRIVE, Duration::from_secs(60)).await,
+        client.wait_deleted(DRIVE, Duration::from_secs(60)).await,
         "previous drive gone"
     );
 
     println!("  Step 1: Create the drive over /v1");
-    let (status, body) = mgmt
+    let (status, body) = client
         .create_drive(DRIVE, json!({ "suite": "fs-server" }))
         .await;
     assert_eq!(status.as_u16(), 200, "create: {body}");
@@ -117,10 +117,10 @@ pub async fn run_drive_e2e(disk_cache: bool) -> CmdResult {
     );
 
     println!("  Step 5: Force delete, then a fresh mount is refused");
-    let (status, body) = mgmt.delete_drive(DRIVE, true).await;
+    let (status, body) = client.delete_drive(DRIVE, true).await;
     assert_eq!(status.as_u16(), 202, "force delete: {body}");
     assert!(
-        mgmt.wait_deleted(DRIVE, Duration::from_secs(120)).await,
+        client.wait_deleted(DRIVE, Duration::from_secs(120)).await,
         "force delete finished"
     );
     assert!(!head(&ctx, "in/hello.txt").await, "objects gone over S3");

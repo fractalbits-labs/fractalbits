@@ -57,7 +57,7 @@ ARCH=$(arch)
 gunzip -c /var/fractalbits-image.tar.gz | docker load
 docker tag fractalbits:$ARCH fractalbits:latest
 docker run -d --privileged --name fractalbits-bootstrap \
-    -p 8080:8080 -p 18080:18080 \
+    -p 8080:8080 -p 8181:8181 -p 18080:18080 \
     -v fractalbits-data:/data \
     fractalbits:latest
 ```
@@ -331,4 +331,6 @@ Ensure these ports are open between nodes:
 | 2380 | TCP | etcd peer | BSS <-> BSS |
 | 8088 | TCP | Service RPC | RSS <-> NSS <-> BSS <-> S3 Gateway |
 | 9999 | TCP | Mirrord | NSS active <-> NSS standby |
+| 8181 | TCP | ARTFS control plane | Clients -> S3 Gateway (signed /v1 drive API) |
+| 18080 | TCP | S3 Gateway management | Internal health checks and API key admin |
 | 18088 | TCP | Management | Internal health checks |

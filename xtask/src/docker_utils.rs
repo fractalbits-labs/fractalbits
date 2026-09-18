@@ -89,7 +89,7 @@ RUN chmod +x /opt/fractalbits/bin/*
 ENV PATH="/opt/fractalbits/bin:$PATH"
 ENV RUST_LOG=info
 
-EXPOSE 8080 18080 2379
+EXPOSE 8080 8181 18080 2379
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD curl -sf http://localhost:18080/mgmt/health || exit 1

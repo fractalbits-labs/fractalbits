@@ -32,6 +32,7 @@ resource "google_compute_firewall" "internal" {
       "2379",  # etcd client
       "2380",  # etcd peer
       "8080",  # Docker S3 API
+      "8181",  # ARTFS control plane (signed /v1 drive API)
       "8086",  # RSS RPC
       "8087",  # NSS RPC
       "8088",  # BSS RPC

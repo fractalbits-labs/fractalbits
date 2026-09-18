@@ -64,12 +64,20 @@ impl Default for HttpsConfig {
     }
 }
 
+fn default_fs_control_port() -> u16 {
+    8181
+}
+
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Config {
     pub rss_addrs: Vec<String>,
 
     pub port: u16,
     pub mgmt_port: u16,
+    /// ARTFS control plane (`/v1`), the only listener safe to expose:
+    /// it carries signed routes and nothing else.
+    #[serde(default = "default_fs_control_port")]
+    pub fs_control_port: u16,
     pub https: HttpsConfig,
     pub region: String,
     pub root_domain: String,
@@ -162,6 +170,7 @@ impl Config {
             rss_addrs: vec!["127.0.0.1:8086".to_string()],
             port: 8080,
             mgmt_port: 18080,
+            fs_control_port: default_fs_control_port(),
             https: HttpsConfig::default(),
             region: "localdev".into(),
             root_domain: ".localhost".into(),
@@ -198,6 +207,7 @@ impl Config {
             rss_addrs: vec!["127.0.0.1:8086".to_string()],
             port: 8080,
             mgmt_port: 18080,
+            fs_control_port: default_fs_control_port(),
             https: HttpsConfig::default(),
             region: "localdev".into(),
             root_domain: ".localhost".into(),

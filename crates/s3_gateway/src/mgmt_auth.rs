@@ -1,4 +1,4 @@
-//! `FBSIG1` request signatures for the management `/v1` routes.
+//! `FBSIG1` request signatures for the control-plane `/v1` routes.
 //!
 //! `Authorization: FBSIG1 key_id=<id>, ts=<unix ms>, nonce=<hex>, sig=<hex>`
 //! where `sig` is `data_types::mgmt_sig::mgmt_signature` over the method,
