@@ -322,9 +322,12 @@ pub fn build_prebuilt_dev() -> CmdResult {
             info "Zig build complete for $arch";
         }?;
 
+        // `-A linker_messages`: at opt-level 2 or 3 rustc passes `-Wl,-O1`, which zig
+        // 0.14 ignores with a warning that rustc 1.98 forwards per linked binary.
+        // Inert at opt-level z, kept so a profile change never brings it back.
         run_cmd! {
             info "Building Rust binaries for $arch (size-optimized release mode with zigbuild)...";
-            RUSTFLAGS="-C target-cpu=$rust_cpu -C opt-level=z -C codegen-units=1 -C strip=symbols"
+            RUSTFLAGS="-C target-cpu=$rust_cpu -C opt-level=z -C codegen-units=1 -C strip=symbols -A linker_messages"
             $[build_envs] cargo zigbuild --release --target $rust_target
                 --workspace --exclude fractalbits-bootstrap --exclude rewrk* --exclude fractal-s3
                 --exclude xtask --exclude container-all-in-one
@@ -343,7 +346,7 @@ pub fn build_prebuilt_dev() -> CmdResult {
         if fs_repo_exists() {
             run_cmd! {
                 info "Building fs_gateway + artfs-mount for $arch (isolated compio build)...";
-                RUSTFLAGS="-C target-cpu=$rust_cpu -C opt-level=z -C codegen-units=1 -C strip=symbols"
+                RUSTFLAGS="-C target-cpu=$rust_cpu -C opt-level=z -C codegen-units=1 -C strip=symbols -A linker_messages"
                 CARGO_TARGET_DIR=$compio_target_dir
                 $[build_envs] cargo zigbuild --release --target $rust_target -p fs_gateway -p fs_client;
                 cp $compio_target_dir/$rust_target/release/fs_gateway $build_dir/fs_gateway;
