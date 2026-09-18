@@ -142,11 +142,6 @@ export class FractalbitsVpcStack extends cdk.Stack {
     );
     privateSg.addIngressRule(
       ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
-      ec2.Port.tcp(18080),
-      "Allow access to port 18080 (S3 gateway management) from within VPC",
-    );
-    privateSg.addIngressRule(
-      ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
       ec2.Port.tcp(9999),
       "Allow access to port 9999 from within VPC",
     );
