@@ -184,6 +184,17 @@ pub async fn run_tests(
         })
     };
 
+    let fs_repo_exists = cmd_build::fs_repo_exists();
+    if !fs_repo_exists
+        && matches!(
+            test_type,
+            TestType::FsServer { .. } | TestType::Pjdfstest { .. }
+        )
+    {
+        let fs_repo = cmd_build::FS_REPO_PATH;
+        cmd_die!("fs suites need the fs repo at $fs_repo");
+    }
+
     match test_type {
         TestType::LeaderElection => leader_election_stage().await,
         TestType::BssNodeFailure => bss_node_failure_stage().await,
@@ -198,8 +209,15 @@ pub async fn run_tests(
             data_blob_storage,
         } => pjdfstest_stage(subdir, data_blob_storage).await,
         TestType::All => {
-            fs_server_stage(false, data_blob_storage).await?;
-            pjdfstest_stage(None, data_blob_storage).await?;
+            if fs_repo_exists {
+                fs_server_stage(false, data_blob_storage).await?;
+                pjdfstest_stage(None, data_blob_storage).await?;
+            } else {
+                info!(
+                    "Skipping fs-server and pjdfstest: no fs repo at {}",
+                    cmd_build::FS_REPO_PATH
+                );
+            }
             // Both suites bring up their own six-node all-in-BSS cluster, so under an S3-backed
             // storage setting they would only repeat the BSS-only run.
             if data_blob_storage.uses_s3_volume() {

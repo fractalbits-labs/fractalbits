@@ -20,22 +20,25 @@ exclude = [
     "crates/common/rpc_clients/client_common/src",
     "crates/common/rpc_clients/nss/src",
     "crates/common/rpc_clients/rss/src",
-    "crates/common/rpc_clients/fs/src",
+    "crates/fs/rpc_client/src",
     "crates/common/rpc_codecs/bss_codec/src",
     "crates/common/rpc_codecs/codec_common/src",
     "crates/common/file_ops/src",
     "crates/common/rpc_codecs/nss_codec/src",
     "crates/common/rpc_codecs/rss_codec/src",
-    "crates/common/rpc_codecs/fs_gateway_codec/src",
+    "crates/fs/gateway_codec/src",
     "crates/common/test_common/src",
     "crates/common/s3_blob_store/src",
     "crates/common/volume_group_proxy/src",
-    "crates/fs_gateway/src",
-    "crates/fs_client/src",
-    "crates/fractal-fuse/src",
-    "crates/fractal-fuse/examples",
-    "crates/fractal-fuse/tests",
-    "crates/fractal-vfs/src",
+    "crates/fs/docs",
+    "crates/fs/sdk",
+    "crates/fs/.git",
+    "crates/fs/fs_gateway/src",
+    "crates/fs/fs_client/src",
+    "crates/fs/fractal-fuse/src",
+    "crates/fs/fractal-fuse/examples",
+    "crates/fs/fractal-fuse/tests",
+    "crates/fs/fractal-vfs/src",
     "crates/fractal-s3/demo",
     "crates/fractal-s3/src",
     "crates/ha/bss_repair/src",
@@ -59,13 +62,13 @@ s3_blob_store = { path = "crates/common/s3_blob_store" }
 rpc_client_bss = { path = "crates/common/rpc_clients/bss", default-features = false }
 rpc_client_nss = { path = "crates/common/rpc_clients/nss", default-features = false }
 rpc_client_rss = { path = "crates/common/rpc_clients/rss", default-features = false }
-rpc_client_fs = { path = "crates/common/rpc_clients/fs", default-features = false }
+rpc_client_fs = { path = "crates/fs/rpc_client", default-features = false }
 rpc_codec_common = { path = "crates/common/rpc_codecs/codec_common" }
 bss_codec = { path = "crates/common/rpc_codecs/bss_codec" }
 nss_codec = { path = "crates/common/rpc_codecs/nss_codec" }
 file_ops = { path = "crates/common/file_ops" }
 rss_codec = { path = "crates/common/rpc_codecs/rss_codec" }
-fs_gateway_codec = { path = "crates/common/rpc_codecs/fs_gateway_codec" }
+fs_gateway_codec = { path = "crates/fs/gateway_codec" }
 test_common = { path = "crates/common/test_common" }
 xtask_common = { path = "xtask/common" }
 
