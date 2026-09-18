@@ -788,6 +788,12 @@ pub fn stop_service(service: ServiceName) -> CmdResult {
         } else if service == ServiceName::NssRoleAgent {
             // Handle nss_role_agent template instances
             for_each_nss_role_agent_service(stop_unit_with_retry)?;
+            // The agent stops its nss@N unit on shutdown, but if it was killed or timed out the
+            // unit lingers into the next init with stale volume configs, and a fresh agent adopts
+            // it (health only checks the journal uuid). Once no agent runs, any nss@N is an orphan.
+            for nss_service_name in get_nss_service_names() {
+                stop_unit_with_retry(nss_service_name)?;
+            }
         } else if service == ServiceName::Bss {
             // Handle BSS template instances using helper function
             for_each_bss_service(stop_unit_with_retry)?;

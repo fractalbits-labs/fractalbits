@@ -72,7 +72,7 @@ jobs:
       if: failure()
       run: |
         mkdir -p ci-debug
-        journalctl --user --no-pager -n 5000 > ci-debug/journal-user.log 2>&1 || true
+        journalctl --user --no-pager -n 50000 > ci-debug/journal-user.log 2>&1 || true
         sudo dmesg > ci-debug/dmesg.log 2>&1 || true
         cp -r data/logs ci-debug/ 2>/dev/null || true
         cp -r data/etc ci-debug/ 2>/dev/null || true
@@ -143,7 +143,7 @@ jobs:
       if: failure()
       run: |
         mkdir -p ci-debug
-        journalctl --user --no-pager -n 5000 > ci-debug/journal-user.log 2>&1 || true
+        journalctl --user --no-pager -n 50000 > ci-debug/journal-user.log 2>&1 || true
         sudo dmesg > ci-debug/dmesg.log 2>&1 || true
         docker ps -a > ci-debug/docker-ps.log 2>&1 || true
         docker logs fractalbits-dev > ci-debug/docker-fractalbits-dev.log 2>&1 || true
