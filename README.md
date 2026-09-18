@@ -173,7 +173,7 @@ just precheckin --s3-api-only
 # Run with all unit tests also
 just precheckin
 
-# Run everything: precheckin plus `just run-tests` and `just fstest`
+# Run everything: precheckin plus `just run-tests`
 just precheckin --all
 ```
 
@@ -275,10 +275,6 @@ just deploy destroy-vpc
 FractalBits supports the most commonly used S3 operations with full AWS Signature V4 authentication. For complete details including supported operations, extension APIs, authentication, and limitations, see [S3 API Compatibility](docs/S3_API_COMPATIBILITY.md).
 
 We're actively working on expanding S3 API coverage. See our [Roadmap](docs/ROADMAP.md) for planned features and timeline.
-
-### ARTFS Drives
-
-An ARTFS drive is a bucket with control-plane metadata that sandboxes mount over POSIX with `artfs-mount`. The TypeScript SDK in `sdk/typescript` creates, lists and deletes drives and renders mount configs; see [ARTFS Drive SDK](docs/ARTFS_DRIVE_SDK.md) for the SDK and HTTP API reference.
 
 ## Support
 

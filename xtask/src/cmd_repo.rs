@@ -38,6 +38,11 @@ const GIT_REPOS: &[Repo] = &[
         branch: "main",
     },
     Repo {
+        path: cmd_build::FS_REPO_PATH,
+        url: "https://github.com/fractalbits-labs/fractal-fs.git",
+        branch: "main",
+    },
+    Repo {
         path: UI_REPO_PATH,
         url: "https://github.com/fractalbits-labs/fractalbits-ui.git",
         branch: "main",

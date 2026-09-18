@@ -5,6 +5,7 @@
 !.github/
 !.gitignore
 !.rustfmt.toml
+Cargo.lock
 
 */.zig-cache/*
 */zig-out/*

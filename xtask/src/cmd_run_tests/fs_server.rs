@@ -28,6 +28,10 @@ pub async fn run_fs_server_tests(disk_cache: bool) -> CmdResult {
 /// COMPIO_TARGET_DIR to prevent workspace feature unification from
 /// enabling tokio-runtime on their compio-only RPC deps.
 pub fn build_fs_binaries() -> CmdResult {
+    if !crate::cmd_build::fs_repo_exists() {
+        let fs_repo = crate::cmd_build::FS_REPO_PATH;
+        cmd_die!("fs_gateway needs the fs repo at $fs_repo");
+    }
     let compio_target_dir = crate::cmd_build::COMPIO_TARGET_DIR;
     run_cmd! {
         info "Building fs_gateway + artfs-mount (isolated compio build) ...";

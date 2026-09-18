@@ -8,6 +8,14 @@ use strum::{AsRefStr, EnumString};
 /// feature unification from enabling tokio-runtime on compio-only RPC deps.
 pub const COMPIO_TARGET_DIR: &str = "target/compio";
 
+/// The filesystem crates live in their own tree (and may be a separate, optional repo like
+/// crates/ha), so every fs-specific build or test step checks for it first.
+pub const FS_REPO_PATH: &str = "crates/fs";
+
+pub fn fs_repo_exists() -> bool {
+    Path::new(FS_REPO_PATH).exists()
+}
+
 pub static BUILD_ENVS: LazyLock<Vec<String>> =
     LazyLock::new(|| build_envs().expect("failed to initialize BUILD_ENVS"));
 
@@ -142,14 +150,18 @@ pub fn build_rust_servers(mode: BuildMode) -> CmdResult {
                     --exclude rewrk*
                     --exclude fs_gateway --exclude fs_client;
             }?;
-            run_cmd! {
-                info "Building fs_gateway + artfs-mount (isolated compio build) ...";
-                CARGO_TARGET_DIR=$compio_target_dir
-                $[build_envs] cargo build -p fs_gateway -p fs_client;
-                rm -f target/debug/fs_gateway target/debug/artfs-mount;
-                cp $compio_target_dir/debug/fs_gateway target/debug/fs_gateway;
-                cp $compio_target_dir/debug/artfs-mount target/debug/artfs-mount;
-            }?;
+            if fs_repo_exists() {
+                run_cmd! {
+                    info "Building fs_gateway + artfs-mount (isolated compio build) ...";
+                    CARGO_TARGET_DIR=$compio_target_dir
+                    $[build_envs] cargo build -p fs_gateway -p fs_client;
+                    rm -f target/debug/fs_gateway target/debug/artfs-mount;
+                    cp $compio_target_dir/debug/fs_gateway target/debug/fs_gateway;
+                    cp $compio_target_dir/debug/artfs-mount target/debug/artfs-mount;
+                }?;
+            } else {
+                info!("No fs repo found ({FS_REPO_PATH}), skipping fs_gateway + artfs-mount");
+            }
         }
         BuildMode::Release => {
             run_cmd! {
@@ -159,14 +171,18 @@ pub fn build_rust_servers(mode: BuildMode) -> CmdResult {
                     --exclude fs_gateway --exclude fs_client
                     --release;
             }?;
-            run_cmd! {
-                info "Building fs_gateway + artfs-mount (isolated compio build) ...";
-                CARGO_TARGET_DIR=$compio_target_dir
-                $[build_envs] cargo build -p fs_gateway -p fs_client --release;
-                rm -f target/release/fs_gateway target/release/artfs-mount;
-                cp $compio_target_dir/release/fs_gateway target/release/fs_gateway;
-                cp $compio_target_dir/release/artfs-mount target/release/artfs-mount;
-            }?;
+            if fs_repo_exists() {
+                run_cmd! {
+                    info "Building fs_gateway + artfs-mount (isolated compio build) ...";
+                    CARGO_TARGET_DIR=$compio_target_dir
+                    $[build_envs] cargo build -p fs_gateway -p fs_client --release;
+                    rm -f target/release/fs_gateway target/release/artfs-mount;
+                    cp $compio_target_dir/release/fs_gateway target/release/fs_gateway;
+                    cp $compio_target_dir/release/artfs-mount target/release/artfs-mount;
+                }?;
+            } else {
+                info!("No fs repo found ({FS_REPO_PATH}), skipping fs_gateway + artfs-mount");
+            }
         }
     }
     Ok(())
@@ -315,29 +331,33 @@ pub fn build_prebuilt_dev() -> CmdResult {
                 --exclude fs_gateway --exclude fs_client;
         }?;
 
-        let compio_target_dir = COMPIO_TARGET_DIR;
-        run_cmd! {
-            info "Building fs_gateway + artfs-mount for $arch (isolated compio build)...";
-            RUSTFLAGS="-C target-cpu=$rust_cpu -C opt-level=z -C codegen-units=1 -C strip=symbols"
-            CARGO_TARGET_DIR=$compio_target_dir
-            $[build_envs] cargo zigbuild --release --target $rust_target -p fs_gateway -p fs_client;
-            cp $compio_target_dir/$rust_target/release/fs_gateway $build_dir/fs_gateway;
-            cp $compio_target_dir/$rust_target/release/artfs-mount $build_dir/artfs-mount;
-        }?;
-
-        info!("Copying binaries to prebuilt/dev/{arch} directory...");
-        let prebuilt_dir = format!("prebuilt/dev/{arch}");
-        run_cmd!(mkdir -p $prebuilt_dir)?;
-        for bin in [
+        let mut bins = vec![
             "bss_repair",
             "nss_role_agent",
             "root_server",
             "rss_admin",
-            "fs_gateway",
-            "artfs-mount",
             "zig-out/bin/bss_server",
             "zig-out/bin/nss_server",
-        ] {
+        ];
+        let compio_target_dir = COMPIO_TARGET_DIR;
+        if fs_repo_exists() {
+            run_cmd! {
+                info "Building fs_gateway + artfs-mount for $arch (isolated compio build)...";
+                RUSTFLAGS="-C target-cpu=$rust_cpu -C opt-level=z -C codegen-units=1 -C strip=symbols"
+                CARGO_TARGET_DIR=$compio_target_dir
+                $[build_envs] cargo zigbuild --release --target $rust_target -p fs_gateway -p fs_client;
+                cp $compio_target_dir/$rust_target/release/fs_gateway $build_dir/fs_gateway;
+                cp $compio_target_dir/$rust_target/release/artfs-mount $build_dir/artfs-mount;
+            }?;
+            bins.extend(["fs_gateway", "artfs-mount"]);
+        } else {
+            info!("No fs repo found ({FS_REPO_PATH}), skipping fs_gateway + artfs-mount");
+        }
+
+        info!("Copying binaries to prebuilt/dev/{arch} directory...");
+        let prebuilt_dir = format!("prebuilt/dev/{arch}");
+        run_cmd!(mkdir -p $prebuilt_dir)?;
+        for bin in bins {
             run_cmd!(cp -f $build_dir/$bin $prebuilt_dir/)?;
         }
     }

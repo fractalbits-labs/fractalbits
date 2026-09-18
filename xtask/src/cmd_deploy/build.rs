@@ -207,6 +207,13 @@ fn build_rust_for_target(
         "release"
     };
     let destination = format!("target/{rust_target}/{profile}");
+    if !cmd_build::fs_repo_exists() {
+        info!(
+            "No fs repo found ({}), skipping fs_gateway + artfs-mount",
+            cmd_build::FS_REPO_PATH
+        );
+        return Ok(());
+    }
     run_cmd! {
         info "Building fs_gateway + artfs-mount for $rust_target (isolated compio build)";
         RUSTFLAGS="-C target-cpu=$rust_cpu"
