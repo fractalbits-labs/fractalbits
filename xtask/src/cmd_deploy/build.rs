@@ -71,12 +71,16 @@ pub fn build(
     Ok(())
 }
 
+/// Every zigbuild call allows `linker_messages`: at opt-level 2 or 3 rustc passes
+/// `-Wl,-O1`, which zig 0.14 ignores with a warning that rustc 1.98 forwards per
+/// linked binary. Native builds keep the lint.
 fn build_bootstrap(rust_build_opt: &str, build_dir: &str) -> CmdResult {
     let build_envs = cmd_build::get_build_envs();
     for arch in ["x86_64", "aarch64"] {
         let rust_target = format!("{arch}-unknown-linux-gnu");
         run_cmd! {
             info "Building fractalbits-bootstrap for $arch";
+            RUSTFLAGS="-A linker_messages"
             $[build_envs] cargo zigbuild
                 -p fractalbits-bootstrap --target $rust_target $rust_build_opt;
         }?;
@@ -177,7 +181,7 @@ fn build_rust_for_target(
         let excludes = &excludes;
         run_cmd! {
             info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [$label]";
-            RUSTFLAGS="-C target-cpu=$rust_cpu"
+            RUSTFLAGS="-C target-cpu=$rust_cpu -A linker_messages"
             $[build_envs] cargo zigbuild
                 --target $rust_target $rust_build_opt --workspace $[excludes];
         }?;
@@ -188,12 +192,12 @@ fn build_rust_for_target(
         let excludes_with_api = &excludes_with_api;
         run_cmd! {
             info "Building Rust projects for $rust_target ($arch, cpu=$rust_cpu) [$label]";
-            RUSTFLAGS="-C target-cpu=$rust_cpu"
+            RUSTFLAGS="-C target-cpu=$rust_cpu -A linker_messages"
             $[build_envs] cargo zigbuild
                 --target $rust_target $rust_build_opt --workspace $[excludes_with_api];
 
             info "Building s3_gateway ...";
-            RUSTFLAGS="-C target-cpu=$rust_cpu"
+            RUSTFLAGS="-C target-cpu=$rust_cpu -A linker_messages"
             $[s3_gateway_build_env] $[build_envs] cargo zigbuild
                 --target $rust_target $rust_build_opt
                 --package s3_gateway;
@@ -216,7 +220,7 @@ fn build_rust_for_target(
     }
     run_cmd! {
         info "Building fs_gateway + artfs-mount for $rust_target (isolated compio build)";
-        RUSTFLAGS="-C target-cpu=$rust_cpu"
+        RUSTFLAGS="-C target-cpu=$rust_cpu -A linker_messages"
         CARGO_TARGET_DIR=$compio_target_dir
         $[build_envs] cargo zigbuild
             --target $rust_target $rust_build_opt -p fs_gateway -p fs_client;
