@@ -332,5 +332,5 @@ Ensure these ports are open between nodes:
 | 8088 | TCP | Service RPC | RSS <-> NSS <-> BSS <-> S3 Gateway |
 | 9999 | TCP | Mirrord | NSS active <-> NSS standby |
 | 8181 | TCP | ARTFS control plane | Clients -> S3 Gateway (signed /v1 drive API) |
-| 18080 | TCP | S3 Gateway management | Internal health checks and API key admin |
+| 18080 | TCP | S3 Gateway management | Host-only (health and unauthenticated API key admin) |
 | 18088 | TCP | Management | Internal health checks |
