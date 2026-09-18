@@ -117,8 +117,9 @@ fn run_docker_container(
 
     let port_mapping = format!("{}:8080", port);
     let mgmt_port_mapping = "18080:18080";
+    let fs_control_port_mapping = "8181:8181";
     if detach {
-        run_cmd!(docker run -d --privileged --name $container_name -p $port_mapping -p $mgmt_port_mapping -v "fractalbits-data:/data" $image)?;
+        run_cmd!(docker run -d --privileged --name $container_name -p $port_mapping -p $mgmt_port_mapping -p $fs_control_port_mapping -v "fractalbits-data:/data" $image)?;
         info!("Container started in detached mode: {}", container_name);
         if wait_ready {
             wait_for_container_ready(container_name)?;
@@ -136,6 +137,8 @@ fn run_docker_container(
                 &port_mapping,
                 "-p",
                 mgmt_port_mapping,
+                "-p",
+                fs_control_port_mapping,
                 "-v",
                 "fractalbits-data:/data",
                 &image,

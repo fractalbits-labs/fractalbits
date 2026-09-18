@@ -107,6 +107,11 @@ export class FractalbitsVpcStack extends cdk.Stack {
       ec2.Port.tcp(80),
       "Allow HTTP access from anywhere",
     );
+    publicSg.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(8181),
+      "Allow ARTFS control plane access from anywhere",
+    );
 
     const privateSg = new ec2.SecurityGroup(this, "PrivateInstanceSG", {
       vpc: this.vpc,
@@ -122,6 +127,11 @@ export class FractalbitsVpcStack extends cdk.Stack {
     );
     privateSg.addIngressRule(
       ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+      ec2.Port.tcp(8181),
+      "Allow ARTFS control plane access from within VPC",
+    );
+    privateSg.addIngressRule(
+      ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
       ec2.Port.tcp(8088),
       "Allow access to port 8088 from within VPC",
     );
@@ -129,6 +139,11 @@ export class FractalbitsVpcStack extends cdk.Stack {
       ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
       ec2.Port.tcp(18088),
       "Allow access to port 18088 (management) from within VPC",
+    );
+    privateSg.addIngressRule(
+      ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+      ec2.Port.tcp(18080),
+      "Allow access to port 18080 (S3 gateway management) from within VPC",
     );
     privateSg.addIngressRule(
       ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
@@ -404,17 +419,28 @@ export class FractalbitsVpcStack extends cdk.Stack {
         vpcSubnets: { subnetType: privateSubnetType },
         crossZoneEnabled: false,
       });
+      const healthCheck = {
+        enabled: true,
+        healthyThresholdCount: 2,
+        unhealthyThresholdCount: 2,
+        interval: cdk.Duration.seconds(5),
+        timeout: cdk.Duration.seconds(2),
+      };
       const listener = nlb.addListener("ApiListener", { port: 80 });
       listener.addTargets("ApiTargets", {
         port: 80,
         targets: [s3GatewayAsg],
-        healthCheck: {
-          enabled: true,
-          healthyThresholdCount: 2,
-          unhealthyThresholdCount: 2,
-          interval: cdk.Duration.seconds(5),
-          timeout: cdk.Duration.seconds(2),
-        },
+        healthCheck,
+      });
+      // ARTFS control plane: the signed /v1 drive API on its own port, so
+      // the private mgmt port (unauthenticated /api_keys) is never exposed.
+      const fsControlListener = nlb.addListener("FsControlListener", {
+        port: 8181,
+      });
+      fsControlListener.addTargets("FsControlTargets", {
+        port: 8181,
+        targets: [s3GatewayAsg],
+        healthCheck,
       });
     }
 

@@ -3,7 +3,7 @@ use aws_sdk_s3::operation::list_buckets::ListBucketsOutput;
 use aws_sdk_s3::{Client, Config};
 use cmd_lib::*;
 
-pub mod mgmt;
+pub mod fs_control;
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 const DEFAULT_HTTPS_PORT: u16 = 8443;

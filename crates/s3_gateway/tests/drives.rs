@@ -7,7 +7,7 @@ use rpc_client_common::{RpcError, rss_rpc_retry};
 use rpc_client_rss::RpcClientRss;
 use serde_json::json;
 use std::time::Duration;
-use test_common::mgmt::MgmtClient;
+use test_common::fs_control::{ControlClient, mgmt_base};
 use test_common::*;
 
 const RSS_ADDR: &str = "127.0.0.1:8086";
@@ -43,16 +43,16 @@ async fn put_object(ctx: &Context, bucket: &str, key: &str) {
 }
 
 /// A second API key with no bucket permissions, minted through /api_keys.
-async fn other_key() -> MgmtClient {
+async fn other_key() -> ControlClient {
     let resp = reqwest::Client::new()
-        .post(format!("{}/api_keys/", MgmtClient::new().base))
+        .post(format!("{}/api_keys/", mgmt_base()))
         .json(&json!({ "name": "drives-test-other" }))
         .send()
         .await
         .expect("create api key");
     assert_eq!(resp.status(), StatusCode::OK, "create api key");
     let key: serde_json::Value = resp.json().await.expect("key json");
-    MgmtClient::with_key(
+    ControlClient::with_key(
         key["key_id"].as_str().expect("key_id"),
         key["secret_key"].as_str().expect("secret_key"),
     )
@@ -60,37 +60,37 @@ async fn other_key() -> MgmtClient {
 
 #[tokio::test]
 async fn test_drive_crud() {
-    let mgmt = MgmtClient::new();
+    let client = ControlClient::new();
     let name = "drv-crud";
     // Clean slate if a previous run died.
-    let _ = mgmt.delete_drive(name, true).await;
+    let _ = client.delete_drive(name, true).await;
     assert!(
-        mgmt.wait_deleted(name, Duration::from_secs(30)).await,
+        client.wait_deleted(name, Duration::from_secs(30)).await,
         "clean slate"
     );
 
-    let (status, body) = mgmt.create_drive(name, json!({ "run": "r1" })).await;
+    let (status, body) = client.create_drive(name, json!({ "run": "r1" })).await;
     assert_eq!(status, StatusCode::OK, "create: {body}");
     assert_eq!(body["name"], name, "name");
     assert_eq!(body["status"], "ready", "status");
     assert_eq!(body["labels"]["run"], "r1", "labels");
     let id = body["id"].as_str().expect("id").to_string();
 
-    let (status, again) = mgmt.create_drive(name, json!({ "run": "r1" })).await;
+    let (status, again) = client.create_drive(name, json!({ "run": "r1" })).await;
     assert_eq!(status, StatusCode::OK, "idempotent create: {again}");
     assert_eq!(again["id"], id, "same drive");
 
-    let (status, body) = mgmt.create_drive(name, json!({ "run": "r2" })).await;
+    let (status, body) = client.create_drive(name, json!({ "run": "r2" })).await;
     assert_eq!(status, StatusCode::CONFLICT, "different metadata: {body}");
     assert_eq!(body["code"], "already_exists", "code");
 
-    let (status, body) = mgmt.get_drive(name).await;
+    let (status, body) = client.get_drive(name).await;
     assert_eq!(status, StatusCode::OK, "get by name: {body}");
-    let (status, body) = mgmt.get_drive(&id).await;
+    let (status, body) = client.get_drive(&id).await;
     assert_eq!(status, StatusCode::OK, "get by id: {body}");
     assert_eq!(body["name"], name, "id resolves to the name");
 
-    let (status, body) = mgmt
+    let (status, body) = client
         .request(Method::GET, "/v1/drives?limit=200", None)
         .await;
     assert_eq!(status, StatusCode::OK, "list: {body}");
@@ -111,40 +111,40 @@ async fn test_drive_crud() {
         "bucket listed over S3"
     );
 
-    let (status, body) = mgmt.delete_drive(name, false).await;
+    let (status, body) = client.delete_drive(name, false).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "delete empty: {body}");
-    let (status, _) = mgmt.get_drive(name).await;
+    let (status, _) = client.get_drive(name).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "gone");
-    let (status, _) = mgmt.delete_drive(name, false).await;
+    let (status, _) = client.delete_drive(name, false).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "delete again");
 }
 
 #[tokio::test]
 async fn test_drive_validation_and_auth() {
-    let mgmt = MgmtClient::new();
-    let (status, body) = mgmt.create_drive("AB", json!({})).await;
+    let client = ControlClient::new();
+    let (status, body) = client.create_drive("AB", json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "bad name: {body}");
     assert_eq!(body["code"], "invalid_name", "code");
 
     // Unsigned and badly signed requests are refused.
     let resp = reqwest::Client::new()
-        .get(format!("{}/v1/drives", mgmt.base))
+        .get(format!("{}/v1/drives", client.base))
         .send()
         .await
         .expect("unsigned");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "unsigned");
-    let bad = MgmtClient::with_key(TEST_KEY, "wrong-secret");
+    let bad = ControlClient::with_key(TEST_KEY, "wrong-secret");
     let (status, body) = bad.request(Method::GET, "/v1/drives", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "bad secret: {body}");
-    let unknown = MgmtClient::with_key("no-such-key", "x");
+    let unknown = ControlClient::with_key("no-such-key", "x");
     let (status, _) = unknown.request(Method::GET, "/v1/drives", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "unknown key");
 
     // A signature over the bare path must not authorize the same request
     // with `force=true` appended: the query string is signed.
-    let header = mgmt.fbsig1_header(&Method::DELETE, "/v1/drives/drv-crud", "", b"");
+    let header = client.fbsig1_header(&Method::DELETE, "/v1/drives/drv-crud", "", b"");
     let resp = reqwest::Client::new()
-        .delete(format!("{}/v1/drives/drv-crud?force=true", mgmt.base))
+        .delete(format!("{}/v1/drives/drv-crud?force=true", client.base))
         .header("authorization", header)
         .send()
         .await
@@ -157,15 +157,15 @@ async fn test_drive_validation_and_auth() {
 /// must not attach its id to the new bucket.
 #[tokio::test]
 async fn test_drive_stale_record_after_recreate() {
-    let mgmt = MgmtClient::new();
+    let client = ControlClient::new();
     let ctx = context();
     let name = "drv-stale";
-    let _ = mgmt.delete_drive(name, true).await;
+    let _ = client.delete_drive(name, true).await;
     assert!(
-        mgmt.wait_deleted(name, Duration::from_secs(30)).await,
+        client.wait_deleted(name, Duration::from_secs(30)).await,
         "clean slate"
     );
-    let (status, body) = mgmt.create_drive(name, json!({ "gen": "1" })).await;
+    let (status, body) = client.create_drive(name, json!({ "gen": "1" })).await;
     assert_eq!(status, StatusCode::OK, "create: {body}");
     let old_id = body["id"].as_str().expect("id").to_string();
 
@@ -173,7 +173,7 @@ async fn test_drive_stale_record_after_recreate() {
     ctx.delete_bucket(name).await;
     ctx.create_bucket(name).await;
 
-    let (status, body) = mgmt
+    let (status, body) = client
         .request(Method::GET, "/v1/drives?limit=200", None)
         .await;
     assert_eq!(status, StatusCode::OK, "list: {body}");
@@ -187,26 +187,26 @@ async fn test_drive_stale_record_after_recreate() {
         !listed.contains(&name),
         "stale record is not listed: {listed:?}"
     );
-    let (status, _) = mgmt.get_drive(name).await;
+    let (status, _) = client.get_drive(name).await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
         "old record is stale, not served"
     );
-    let (status, _) = mgmt.get_drive(&old_id).await;
+    let (status, _) = client.get_drive(&old_id).await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
         "old id never resolves to the new bucket"
     );
-    let (status, body) = mgmt.create_drive(name, json!({ "gen": "2" })).await;
+    let (status, body) = client.create_drive(name, json!({ "gen": "2" })).await;
     assert_eq!(status, StatusCode::OK, "adopt the new incarnation: {body}");
     assert_ne!(body["id"], old_id, "a new drive, not the old id");
     assert_eq!(
         body["labels"]["gen"], "2",
         "new metadata, no conflict with the old"
     );
-    let (status, _) = mgmt.delete_drive(name, false).await;
+    let (status, _) = client.delete_drive(name, false).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "delete");
 }
 
@@ -233,7 +233,7 @@ async fn test_drive_force_delete_with_revoked_key() {
     let (status, _) = owner.get_drive(&name).await;
     assert_eq!(status, StatusCode::OK, "cached");
     let resp = reqwest::Client::new()
-        .delete(format!("{}/api_keys/{}", owner.base, owner.key_id))
+        .delete(format!("{}/api_keys/{}", mgmt_base(), owner.key_id))
         .send()
         .await
         .expect("delete api key");
@@ -247,23 +247,23 @@ async fn test_drive_force_delete_with_revoked_key() {
 
 #[tokio::test]
 async fn test_drive_adoption_and_ownership() {
-    let mgmt = MgmtClient::new();
+    let client = ControlClient::new();
     let ctx = context();
     let name = "drv-adopt";
-    let _ = mgmt.delete_drive(name, true).await;
+    let _ = client.delete_drive(name, true).await;
     assert!(
-        mgmt.wait_deleted(name, Duration::from_secs(30)).await,
+        client.wait_deleted(name, Duration::from_secs(30)).await,
         "clean slate"
     );
 
     // A bucket made over S3 is not a drive until the owner adopts it.
     ctx.create_bucket(name).await;
-    let (status, _) = mgmt.get_drive(name).await;
+    let (status, _) = client.get_drive(name).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "not a drive yet");
     let other = other_key().await;
     let (status, body) = other.create_drive(name, json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT, "adopt by non-owner: {body}");
-    let (status, body) = mgmt.create_drive(name, json!({})).await;
+    let (status, body) = client.create_drive(name, json!({})).await;
     assert_eq!(status, StatusCode::OK, "adopt by owner: {body}");
 
     // The non-owner cannot see or delete it.
@@ -280,14 +280,14 @@ async fn test_drive_adoption_and_ownership() {
 
     // With an object present, plain delete refuses and force empties.
     put_object(&ctx, name, "a/b").await;
-    let (status, body) = mgmt.delete_drive(name, false).await;
+    let (status, body) = client.delete_drive(name, false).await;
     assert_eq!(status, StatusCode::CONFLICT, "not empty: {body}");
     assert_eq!(body["code"], "not_empty", "code");
-    let (status, body) = mgmt.delete_drive(name, true).await;
+    let (status, body) = client.delete_drive(name, true).await;
     assert_eq!(status, StatusCode::ACCEPTED, "force: {body}");
     assert_eq!(body["status"], "deleting", "status");
     assert!(
-        mgmt.wait_deleted(name, Duration::from_secs(60)).await,
+        client.wait_deleted(name, Duration::from_secs(60)).await,
         "force delete finished"
     );
     let head = ctx.client.head_bucket().bucket(name).send().await;
@@ -296,15 +296,15 @@ async fn test_drive_adoption_and_ownership() {
 
 #[tokio::test]
 async fn test_drive_force_delete_pages() {
-    let mgmt = MgmtClient::new();
+    let client = ControlClient::new();
     let ctx = context();
     let name = "drv-force";
-    let _ = mgmt.delete_drive(name, true).await;
+    let _ = client.delete_drive(name, true).await;
     assert!(
-        mgmt.wait_deleted(name, Duration::from_secs(60)).await,
+        client.wait_deleted(name, Duration::from_secs(60)).await,
         "clean slate"
     );
-    let (status, body) = mgmt.create_drive(name, json!({})).await;
+    let (status, body) = client.create_drive(name, json!({})).await;
     assert_eq!(status, StatusCode::OK, "create: {body}");
 
     // Three list pages: two full and one partial.
@@ -314,23 +314,26 @@ async fn test_drive_force_delete_pages() {
         futures::future::join_all(keys.iter().map(|k| put_object(&ctx, name, k))).await;
     }
 
-    let (a, b) = tokio::join!(mgmt.delete_drive(name, true), mgmt.delete_drive(name, true));
+    let (a, b) = tokio::join!(
+        client.delete_drive(name, true),
+        client.delete_drive(name, true)
+    );
     assert_eq!(a.0, StatusCode::ACCEPTED, "force: {}", a.1);
     assert_eq!(b.0, StatusCode::ACCEPTED, "concurrent force: {}", b.1);
     // The status flip is a compare-and-set on the stored record: the record
     // must never still read `ready` once a force delete was accepted.
-    let (status, body) = mgmt.get_drive(name).await;
+    let (status, body) = client.get_drive(name).await;
     assert!(
         status == StatusCode::NOT_FOUND || body["status"] == "deleting",
         "record after force: {status} {body}"
     );
-    let (status, body) = mgmt.create_drive(name, json!({})).await;
+    let (status, body) = client.create_drive(name, json!({})).await;
     assert!(
         status == StatusCode::CONFLICT || status == StatusCode::OK,
         "create while deleting or after: {status} {body}"
     );
     assert!(
-        mgmt.wait_deleted(name, Duration::from_secs(120)).await,
+        client.wait_deleted(name, Duration::from_secs(120)).await,
         "force delete finished"
     );
     let head = ctx.client.head_bucket().bucket(name).send().await;

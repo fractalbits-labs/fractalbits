@@ -1,5 +1,5 @@
-//! A signed client for the s3_gateway management API (`/v1`), shared by
-//! the S3 API tests and the FUSE suite in xtask.
+//! A signed client for the s3_gateway ARTFS control plane (`/v1`), shared
+//! by the S3 API tests and the FUSE suite in xtask.
 
 use data_types::mgmt_sig::mgmt_signature;
 use reqwest::{Client, Method, StatusCode};
@@ -7,23 +7,30 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The private mgmt port: health and the unauthenticated `/api_keys`.
 pub const DEFAULT_MGMT_PORT: u16 = 18080;
+/// The exposable control port: only the signed `/v1` routes.
+pub const DEFAULT_FS_CONTROL_PORT: u16 = 8181;
 
-pub struct MgmtClient {
+pub fn mgmt_base() -> String {
+    format!("http://127.0.0.1:{DEFAULT_MGMT_PORT}")
+}
+
+pub struct ControlClient {
     pub base: String,
     pub key_id: String,
     pub secret: String,
     http: Client,
 }
 
-impl MgmtClient {
+impl ControlClient {
     pub fn new() -> Self {
         Self::with_key(crate::TEST_KEY, crate::TEST_SECRET)
     }
 
     pub fn with_key(key_id: &str, secret: &str) -> Self {
         Self {
-            base: format!("http://127.0.0.1:{DEFAULT_MGMT_PORT}"),
+            base: format!("http://127.0.0.1:{DEFAULT_FS_CONTROL_PORT}"),
             key_id: key_id.to_string(),
             secret: secret.to_string(),
             http: Client::new(),
@@ -77,7 +84,7 @@ impl MgmtClient {
         if body.is_some() {
             req = req.header("content-type", "application/json").body(bytes);
         }
-        let resp = req.send().await.expect("mgmt request");
+        let resp = req.send().await.expect("control request");
         let status = resp.status();
         let text = resp.text().await.expect("body");
         let json = if text.is_empty() {
@@ -117,7 +124,7 @@ impl MgmtClient {
     }
 }
 
-impl Default for MgmtClient {
+impl Default for ControlClient {
     fn default() -> Self {
         Self::new()
     }

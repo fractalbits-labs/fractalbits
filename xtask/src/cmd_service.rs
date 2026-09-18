@@ -1512,7 +1512,7 @@ pub fn wait_for_service_ready(service: ServiceName, timeout_secs: u32) -> CmdRes
             ("BSS ports", ports)
         }
         ServiceName::Nss => ("port 8087", vec![8087]),
-        ServiceName::S3Gateway => ("port 8080", vec![8080]),
+        ServiceName::S3Gateway => ("ports 8080 and 8181", vec![8080, 8181]),
         ServiceName::NssRoleAgent => {
             unreachable!(
                 "nss_role_agent is templated; start_service dispatches to start_nss_role_agent_instance"

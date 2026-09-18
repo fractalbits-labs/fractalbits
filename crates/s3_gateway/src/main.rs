@@ -2,7 +2,7 @@
 
 use actix_files::Files;
 use actix_web::HttpResponse;
-use actix_web::{App, HttpServer, middleware::Logger, rt::System, web};
+use actix_web::{App, HttpServer, dev::ServerHandle, middleware::Logger, rt::System, web};
 use clap::Parser;
 use rustls::{
     ServerConfig,
@@ -24,6 +24,10 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// AppState ids for the auxiliary servers, distinct from the S3 workers.
+const MGMT_WORKER_ID: u16 = u16::MAX;
+const FS_CONTROL_WORKER_ID: u16 = u16::MAX - 1;
 
 #[derive(Parser)]
 #[clap(name = "s3_gateway", about = "S3 gateway")]
@@ -126,6 +130,7 @@ fn main() -> std::io::Result<()> {
     let config = Arc::new(config);
     let port = config.port;
     let mgmt_port = config.mgmt_port;
+    let fs_control_port = config.fs_control_port;
     let mut https_config = config.https.clone();
     if std::env::var("HTTPS_DISABLED")
         .map(|v| v == "1")
@@ -156,6 +161,7 @@ fn main() -> std::io::Result<()> {
 
     let http_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     let mgmt_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), mgmt_port);
+    let fs_control_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), fs_control_port);
     let https_addr = if https_config.enabled {
         Some(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -167,7 +173,7 @@ fn main() -> std::io::Result<()> {
 
     info!(
         port,
-        mgmt_port, worker_count, "Starting server with {worker_count} threads"
+        mgmt_port, fs_control_port, worker_count, "Starting server with {worker_count} threads"
     );
 
     let stats_writer_handle = if config.enable_stats_writer {
@@ -240,12 +246,12 @@ fn main() -> std::io::Result<()> {
                             core_affinity::set_for_current(core_id);
                         }
 
-                        // Admin routes (/mgmt, /api_keys) live on the mgmt
-                        // HttpServer on its own port. This keeps them off the
-                        // S3 workers (so cache-invalidation POSTs can't queue
-                        // behind stuck S3 requests) and also frees up "mgmt"
-                        // and "api_keys" as valid S3 bucket names on the main
-                        // port.
+                        // Admin routes (/mgmt, /api_keys) and the ARTFS control
+                        // plane (/v1) live on their own HttpServers and ports.
+                        // This keeps them off the S3 workers (so cache-invalidation
+                        // POSTs can't queue behind stuck S3 requests) and also
+                        // frees up "mgmt", "api_keys" and any future "/vN" as
+                        // valid S3 bucket names on the main port.
                         let app_state = server_app_state.clone();
                         let mut app = App::new()
                             .app_data(web::Data::new(app_state))
@@ -329,84 +335,39 @@ fn main() -> std::io::Result<()> {
         handles.push(handle);
     }
 
-    // Dedicated mgmt HttpServer: serves on mgmt_addr using a shared AppState.
-    // Having this on its own thread means /mgmt/health responds even when the
-    // S3 workers are all stuck waiting on RSS/NSS, avoiding the circular stall
-    // that trips the observer's stale-health detector.
-    let mgmt_server_handle = {
+    // The mgmt and control planes each run a dedicated HttpServer thread.
+    // Health answers even when the S3 workers are all stuck waiting on
+    // RSS/NSS, avoiding the circular stall that trips the observer's
+    // stale-health detector, and a control-plane call never queues behind
+    // an S3 request. The control port carries only signed `/v1` routes, so
+    // it is the one a deployment may expose; `/api_keys` mints keys
+    // unauthenticated and stays on the private mgmt port.
+    let mut aux_threads = Vec::new();
+    for (name, addr, worker_id, routes) in [
+        (
+            "mgmt",
+            mgmt_addr,
+            MGMT_WORKER_ID,
+            mgmt_routes as fn(&mut web::ServiceConfig),
+        ),
+        (
+            "fs-control",
+            fs_control_addr,
+            FS_CONTROL_WORKER_ID,
+            fs_control_routes,
+        ),
+    ] {
         let config = config.clone();
         let nss_clients = nss_clients.clone();
-        let (mgmt_tx, mgmt_rx) = std::sync::mpsc::channel();
-        let mgmt_handle = thread::Builder::new()
-            .name("actix-mgmt".to_string())
-            .spawn(move || {
-                System::new().block_on(async move {
-                    let app_state = Arc::new(AppState::new_per_core_sync(
-                        config.clone(),
-                        nss_clients,
-                        u16::MAX, // mgmt worker id (distinct from S3 workers)
-                    ));
-                    let server_app_state = app_state.clone();
-
-                    let server = HttpServer::new(move || {
-                        let app_state = server_app_state.clone();
-                        App::new()
-                            .app_data(web::Data::new(app_state))
-                            .wrap(Logger::default())
-                            .service(web::scope("/mgmt").route(
-                                "/health",
-                                web::get().to(|| async {
-                                    HttpResponse::Ok().json(serde_json::json!({
-                                        "status": "healthy",
-                                        "service": "s3_gateway"
-                                    }))
-                                }),
-                            ))
-                            .service(
-                                web::scope("/api_keys")
-                                    .route("/", web::post().to(api_key_routes::create_api_key))
-                                    .route("/", web::get().to(api_key_routes::list_api_keys))
-                                    .route(
-                                        "/{key_id}",
-                                        web::delete().to(api_key_routes::delete_api_key),
-                                    ),
-                            )
-                            .service(
-                                web::scope("/v1")
-                                    .wrap(actix_web::middleware::from_fn(mgmt_auth::fbsig1_auth))
-                                    .app_data(web::PayloadConfig::new(mgmt_auth::MAX_BODY))
-                                    .service(
-                                        web::scope("/drives")
-                                            .route("", web::post().to(drive_routes::create_drive))
-                                            .route("", web::get().to(drive_routes::list_drives))
-                                            .route(
-                                                "/{name}",
-                                                web::get().to(drive_routes::get_drive),
-                                            )
-                                            .route(
-                                                "/{name}",
-                                                web::delete().to(drive_routes::delete_drive),
-                                            ),
-                                    ),
-                            )
-                    })
-                    .workers(1)
-                    .disable_signals()
-                    .bind(mgmt_addr)
-                    .expect("Failed to bind mgmt HttpServer");
-
-                    let server = server.run();
-                    let _ = mgmt_tx.send(server.handle());
-                    drop(mgmt_tx);
-                    let result = server.await;
-                    app_state.shutdown_blob_deletions().await;
-                    result
-                })
-            })?;
-        let handle = mgmt_rx.recv().expect("mgmt HttpServer failed to start");
+        let (thread, handle) = spawn_aux_http_server(
+            name,
+            addr,
+            move || AppState::new_per_core_sync(config, nss_clients, worker_id),
+            routes,
+        )?;
         server_handles.push(handle);
-        mgmt_handle
-    };
+        aux_threads.push((name, thread));
+    }
 
     drop(handle_tx);
 
@@ -462,8 +423,10 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    if let Err(e) = mgmt_server_handle.join() {
-        error!("mgmt server thread panicked: {e:?}");
+    for (name, thread) in aux_threads {
+        if let Err(e) = thread.join() {
+            error!("{name} server thread panicked: {e:?}");
+        }
     }
 
     if let Err(e) = signal_handle.join() {
@@ -479,6 +442,83 @@ fn main() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+/// One-worker HttpServer on its own thread with its own AppState, for a
+/// plane that must never queue behind the S3 workers.
+fn spawn_aux_http_server(
+    name: &'static str,
+    addr: SocketAddr,
+    make_state: impl FnOnce() -> AppState + Send + 'static,
+    routes: fn(&mut web::ServiceConfig),
+) -> std::io::Result<(thread::JoinHandle<std::io::Result<()>>, ServerHandle)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread = thread::Builder::new()
+        .name(format!("actix-{name}"))
+        .spawn(move || {
+            System::new().block_on(async move {
+                let app_state = Arc::new(make_state());
+                let server_app_state = app_state.clone();
+                let server = HttpServer::new(move || {
+                    App::new()
+                        .app_data(web::Data::new(server_app_state.clone()))
+                        .wrap(Logger::default())
+                        .configure(routes)
+                })
+                .workers(1)
+                .disable_signals()
+                .bind(addr)
+                .unwrap_or_else(|e| panic!("Failed to bind {name} HttpServer on {addr}: {e}"))
+                .run();
+                let _ = tx.send(server.handle());
+                drop(tx);
+                let result = server.await;
+                app_state.shutdown_blob_deletions().await;
+                result
+            })
+        })?;
+    let handle = rx
+        .recv()
+        .unwrap_or_else(|_| panic!("{name} HttpServer failed to start"));
+    Ok((thread, handle))
+}
+
+/// Private port: the observer's health probe and the unauthenticated key admin.
+fn mgmt_routes(cfg: &mut web::ServiceConfig) {
+    cfg.service(web::scope("/mgmt").route(
+        "/health",
+        web::get().to(|| async {
+            HttpResponse::Ok().json(serde_json::json!({
+                "status": "healthy",
+                "service": "s3_gateway"
+            }))
+        }),
+    ))
+    .service(
+        web::scope("/api_keys")
+            .route("/", web::post().to(api_key_routes::create_api_key))
+            .route("/", web::get().to(api_key_routes::list_api_keys))
+            .route(
+                "/{key_id}",
+                web::delete().to(api_key_routes::delete_api_key),
+            ),
+    );
+}
+
+/// Exposable port: every route sits behind the `FBSIG1` signature.
+fn fs_control_routes(cfg: &mut web::ServiceConfig) {
+    cfg.service(
+        web::scope("/v1")
+            .wrap(actix_web::middleware::from_fn(mgmt_auth::fbsig1_auth))
+            .app_data(web::PayloadConfig::new(mgmt_auth::MAX_BODY))
+            .service(
+                web::scope("/drives")
+                    .route("", web::post().to(drive_routes::create_drive))
+                    .route("", web::get().to(drive_routes::list_drives))
+                    .route("/{name}", web::get().to(drive_routes::get_drive))
+                    .route("/{name}", web::delete().to(drive_routes::delete_drive)),
+            ),
+    );
 }
 
 fn make_reuseport_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
